@@ -1682,7 +1682,9 @@ name = "vp-dns"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "httparse",
  "rand 0.9.5",
+ "rcgen",
  "tokio",
  "tokio-rustls",
  "tracing",

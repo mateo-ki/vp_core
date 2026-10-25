@@ -28,8 +28,8 @@ use vp_transport::{TransportConfig, WsConfig};
 #[cfg(test)]
 pub(crate) mod test_support {
     use async_trait::async_trait;
-    use std::sync::Arc;
-    use vp_core::{Outbound, Resolution, Router as RouterTrait, Session};
+    
+    use vp_core::{Resolution, Router as RouterTrait, Session};
 
     pub struct NoopRouter();
 

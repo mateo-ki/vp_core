@@ -119,6 +119,14 @@ proxies:
     password: pw123
     sni: t.example.com
     skip-cert-verify: true
+  - name: "at1"
+    type: anytls
+    server: a.example.com
+    port: 443
+    password: pw456
+    sni: a.example.com
+    client-fingerprint: chrome
+    udp: true
   - name: "sk1"
     type: socks5
     server: 127.0.0.1
@@ -161,7 +169,7 @@ sub-rules:
         assert_eq!(cfg.mixed_port, Some(7890));
         assert!(cfg.allow_lan);
         assert_eq!(cfg.mode, Mode::Rule);
-        assert_eq!(cfg.proxies.len(), 6);
+        assert_eq!(cfg.proxies.len(), 7);
         assert_eq!(cfg.proxy_groups.len(), 2);
         assert_eq!(cfg.rules.len(), 5);
         assert!(validate::validate(&cfg).is_ok());
@@ -190,6 +198,15 @@ sub-rules:
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(cfg.proxy_groups[1].kind, GroupKind::UrlTest));
+        match &cfg.proxies[4].kind {
+            ProxyKind::Anytls(a) => {
+                assert_eq!(a.password, "pw456");
+                assert_eq!(a.server_name.as_deref(), Some("a.example.com"));
+                assert_eq!(a.client_fingerprint.as_deref(), Some("chrome"));
+                assert!(a.udp);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

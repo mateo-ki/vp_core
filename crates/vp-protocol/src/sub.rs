@@ -54,7 +54,7 @@ impl SubNode {
                 "
     plugin-opts:
       host: {host}
-      password: {password}{{port_line}}
+      password: {password}{port_line}
       version: 3"
             ));
         }
@@ -90,6 +90,8 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_trojan(rest)
     } else if let Some(rest) = line.strip_prefix("ss://") {
         parse_ss(rest)
+    } else if let Some(rest) = line.strip_prefix("anytls://") {
+        parse_anytls(rest)
     } else {
         Err(Error::Config(format!("无法识别的分享链接: {}", &line[..line.len().min(32)])))
     }
@@ -225,6 +227,36 @@ fn parse_trojan(rest: &str) -> Result<SubNode> {
     Ok(SubNode { fields: f })
 }
 
+fn parse_anytls(rest: &str) -> Result<SubNode> {
+    // anytls://password@host:port?sni=x&insecure=1&udp=1&fp=chrome#name
+    let (password, host, port, p, name) = split_main(rest)?;
+    let mut f = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "anytls".into()),
+        ("server".into(), host),
+        ("port".into(), port),
+        ("password".into(), q(&password)),
+    ];
+    if let Some(sni) = p.get("sni").or_else(|| p.get("peer")) {
+        f.push(("sni".into(), sni.clone()));
+    }
+    let insecure = p
+        .get("insecure")
+        .or_else(|| p.get("allowInsecure"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if insecure {
+        f.push(("skip-cert-verify".into(), "true".into()));
+    }
+    if p.get("udp").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        f.push(("udp".into(), "true".into()));
+    }
+    if let Some(fp) = p.get("fp").or_else(|| p.get("client-fingerprint")) {
+        f.push(("client-fingerprint".into(), q(fp)));
+    }
+    Ok(SubNode { fields: f })
+}
+
 fn parse_ss(rest: &str) -> Result<SubNode> {
     // ss://base64(method:pass)@host:port#name 或 SIP002
     // 兼容直接调用（可能仍带 ss:// 前缀）
@@ -336,8 +368,11 @@ pub fn parse_subscription(text: &str) -> Vec<SubNode> {
     for l in lines.into_iter().filter(|l| l.contains("://")) {
         match parse_uri(&l) {
             Ok(n) => {
-                // 只保留本内核支持的传输（tcp/ws/grpc）
-                let net_ok = n.fields.iter().any(|(k, v)| k == "network" && matches!(v.trim_matches('"'), "tcp" | "ws" | "grpc"));
+                // 只保留本内核支持的传输（tcp/ws/grpc）；无 network 字段的协议（ss/trojan/anytls）直接接受
+                let net_ok = match n.fields.iter().find(|(k, _)| k == "network") {
+                    None => true,
+                    Some((_, v)) => matches!(v.trim_matches('"'), "tcp" | "ws" | "grpc"),
+                };
                 if net_ok {
                     out.push(n);
                 } else {
@@ -378,6 +413,22 @@ pub fn build_config(nodes: &[SubNode], port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anytls_uri() {
+        let n = parse_uri("anytls://pw123@a.com:8388?sni=a.com&insecure=1&udp=1&fp=chrome#at1").unwrap();
+        assert_eq!(n.name(), "at1");
+        let y = n.to_yaml();
+        assert!(y.contains("type: anytls"), "{y}");
+        assert!(y.contains("password: \"pw123\""));
+        assert!(y.contains("sni: a.com"));
+        assert!(y.contains("skip-cert-verify: true"));
+        assert!(y.contains("udp: true"));
+        assert!(y.contains("client-fingerprint: \"chrome\""));
+        // 订阅打包不被 network 过滤丢弃
+        let nodes = parse_subscription("anytls://pw@a.com:443#n1");
+        assert_eq!(nodes.len(), 1);
+    }
 
     #[test]
     fn vless_uri() {

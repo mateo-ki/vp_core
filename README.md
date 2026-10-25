@@ -72,7 +72,8 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **hysteria2 QPACK 全兼容（已完成）**：解码端完整支持 RFC 9204 静态表（99 项）索引引用、literal-with-name-reference 与 Huffman 字符串（RFC 7541 附录 B 全 257 符号表，已知向量验证）；编码端补上此前缺失的 QPACK 头块前缀（insert count/base）——此前即使 literal-only 形式也无法被标准解码端解析。本端宣告动态表容量 0，对端动态表引用明确报错。官方 hysteria2 客户端/服务端现可互通
 - **UDP over TCP / UoT v1（已完成）**：与 Clash.Meta/mihomo/sing-box 互通的通用 UDP 隧道——任意流型出站（vmess/vless/trojan/ss/socks5/http）配置 `udp-over-tcp: true` 即获得 UDP 能力（客户端向魔法地址 `sp.udp-over-tcp.arpa` 建流，v1 每帧自带地址，天然多目标）；入站分发层识别魔法地址自动进入 UoT 中继（按目标懒建出站会话，回包帧化带源地址）。全链路 e2e：socks5 UDP 关联 → mixed → UoT 包装 ss 出站 → ss listener → direct → UDP echo（源端口断言）
 - **uTLS 指纹（已完成）**：手写 Chrome 风格 TLS 1.3 客户端（零新增依赖，复用 rustls 已链接的 ring）——完整握手栈：自绘 ClientHello（Chrome 扩展顺序/套件表/sigalgs/x25519 key_share）+ 标准 TLS 1.3 状态机（SH/EE/CERT/CertificateVerify/Finished 全验、transcript 含握手头、密钥调度 Extract/Derive-Secret/ExpandLabel、记录层 AES-GCM/ChaCha20 双套件 + 16KB 分帧 + KeyUpdate/close_notify）+ 证书校验（webpki 链+SNI 或 ring 直验 CertificateVerify，覆盖 ECDSA P-256/P-384、RSA-PSS、Ed25519）。vmess/vless/trojan 配置 `client-fingerprint: chrome`（Clash 语法）即启用。仅 TLS 1.3（HRR/客户端证书/PSK 明确报错）。e2e：rustls 服务端 300KB 回显逐字节一致 + ALPN 协商
-- **长尾协议（计划）**：anytls/mieru/brook/ssh/naive、插件市场、热重载完善
+- **anytls 出+入站（已完成）**：sing-anytls v2 协议完整实现——TLS 流上多路复用（帧 `[cmd][sid][len][data]`，cmd 0 waste/1 SYN/2 PSH/3 FIN/4 settings/6 scheme 更新/7 SYNACK/8+9 心跳/10 server-settings），密码 = sha256 前导 32 字节认证；**padding scheme 全套**（参考实现默认 scheme、按包号 waste 帧填充、双端 md5 不一致时服务端下发更新、握手 padding）对抗 TLS-in-TLS 流量分析；settings 缺失/密码错误服务端拒接（Alert）。Clash 语法 `type: anytls`（password/sni/skip-cert-verify/client-fingerprint/udp——UDP 经 UoT 提供），listener `type: anytls`（users 密码列表 + `padding_scheme` 自定义），订阅 `anytls://password@host:port?sni&insecure&udp&fp#name`。自环测试：300KB 回显逐字节一致（跨 PSH 分帧+waste 混入）/错误密码拒绝/自定义 scheme 互通/裸协议缺 settings 收 Alert
+- **长尾协议（计划）**：mieru/brook/ssh/naive、插件市场、热重载完善
 
 ## 插件开发
 

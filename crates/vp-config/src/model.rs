@@ -181,6 +181,7 @@ pub enum ProxyKind {
     Vmess(VmessCfg),
     Vless(VlessCfg),
     Trojan(TrojanCfg),
+    Anytls(AnytlsCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
@@ -198,6 +199,7 @@ impl ProxyKind {
             ProxyKind::Vmess(_) => "vmess",
             ProxyKind::Vless(_) => "vless",
             ProxyKind::Trojan(_) => "trojan",
+            ProxyKind::Anytls(_) => "anytls",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
@@ -334,6 +336,22 @@ pub struct TrojanCfg {
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
     pub grpc_opts: Option<GrpcOpts>,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+/// anytls：TLS 之上的多路复用流协议（sing-anytls v2）。协议本身强制 TLS。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnytlsCfg {
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    pub server_name: Option<String>,
+    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    pub skip_cert_verify: bool,
+    #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
+    pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub udp: bool,
 }

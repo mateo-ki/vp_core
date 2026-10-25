@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 默认 fake-ip 网段（198.18.0.0/15，benchmark 保留段）
 pub const DEFAULT_RANGE: &str = "198.18.0.0/15";
@@ -19,13 +19,15 @@ struct Inner {
     next: u32,
 }
 
+#[derive(Clone)]
 pub struct FakeIpPool {
     base: u32,
     /// 网段总容量（contains 判定用）
     size: u32,
     /// 可分配地址数（扣除网络/广播地址）
     usable: u32,
-    inner: Mutex<Inner>,
+    /// 共享状态（Clone 共享同一池）
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl FakeIpPool {
@@ -40,7 +42,12 @@ impl FakeIpPool {
         let base = u32::from(ip) & mask_of(plen);
         let size = if plen == 0 { u32::MAX } else { 1u32 << (32 - plen) };
         let usable = size.saturating_sub(2);
-        Some(FakeIpPool { base, size, usable, inner: Mutex::new(Inner::default()) })
+        Some(FakeIpPool {
+            base,
+            size,
+            usable,
+            inner: Arc::new(Mutex::new(Inner::default())),
+        })
     }
 
     pub fn contains(&self, ip: IpAddr) -> bool {

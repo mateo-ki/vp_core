@@ -64,6 +64,47 @@ pub struct Config {
     pub sub_rules: HashMap<String, Vec<String>>,
     #[serde(alias = "rule-providers", alias = "rule_providers", default, deserialize_with = "null_to_default")]
     pub rule_providers: HashMap<String, RuleProviderCfg>,
+    #[serde(default)]
+    pub tun: Option<TunCfg>,
+}
+
+/// TUN 配置段（Clash 风格）
+#[derive(Debug, Clone, Deserialize)]
+pub struct TunCfg {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default = "default_tun_addr")]
+    pub address: String,
+    #[serde(default = "default_tun_mask")]
+    pub netmask: String,
+    #[serde(default = "default_tun_mtu")]
+    pub mtu: u16,
+    #[serde(alias = "fake-ip-range", alias = "fake_ip_range", default = "default_fake_range")]
+    pub fake_ip_range: String,
+    #[serde(alias = "auto-route", alias = "auto_route", default = "default_true")]
+    pub auto_route: bool,
+    #[serde(default)]
+    pub auto_redirect: Option<bool>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_tun_addr() -> String {
+    "198.18.0.1".into()
+}
+
+fn default_tun_mask() -> String {
+    "255.255.0.0".into()
+}
+
+fn default_tun_mtu() -> u16 {
+    1500
+}
+
+fn default_fake_range() -> String {
+    "198.18.0.0/16".into()
 }
 
 fn default_bind() -> String {

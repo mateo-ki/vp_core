@@ -60,6 +60,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 json5 = "0.4"
+serde_path_to_error = "0.1"
 
 # 错误 / 日志
 thiserror = "2"

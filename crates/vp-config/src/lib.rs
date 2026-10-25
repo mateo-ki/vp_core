@@ -1,1 +1,240 @@
+//! vp-config：配置加载与校验。
+//!
+//! 同一套 Clash 兼容 schema，两种前端：
+//! - YAML（`.yaml` / `.yml`）
+//! - JSON / JSON5（`.json`，容忍注释）
 
+pub mod convert;
+pub mod model;
+pub mod validate;
+
+pub use model::*;
+
+use vp_common::{Error, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Yaml,
+    Json,
+}
+
+impl Format {
+    pub fn from_path(path: &str) -> Format {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".yaml") || lower.ends_with(".yml") {
+            Format::Yaml
+        } else {
+            Format::Json
+        }
+    }
+}
+
+/// 解析配置文本。格式由参数指定。
+pub fn parse(text: &str, fmt: Format) -> Result<Config> {
+    let json_value: serde_json::Value = match fmt {
+        Format::Yaml => {
+            let v: serde_yaml::Value = serde_yaml::from_str(text)
+                .map_err(|e| Error::Config(format!("YAML 解析失败: {e}")))?;
+            convert::yaml_to_json(v).map_err(Error::Config)?
+        }
+        Format::Json => {
+            json5::from_str(text).map_err(|e| Error::Config(format!("JSON 解析失败: {e}")))?
+        }
+    };
+    use serde::de::IntoDeserializer;
+    let deserializer = json_value.into_deserializer();
+    let cfg: Config = serde_path_to_error::deserialize(deserializer)
+        .map_err(|e| Error::Config(format!("配置结构错误: {}", e)))?;
+    Ok(cfg)
+}
+
+/// 从文件加载（扩展名决定格式）
+pub async fn load(path: &std::path::Path) -> Result<Config> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| Error::Config(format!("读取 {} 失败: {e}", path.display())))?;
+    parse(&text, Format::from_path(&path.to_string_lossy()))
+}
+
+/// 解析 + 校验，一步到位
+pub fn parse_and_validate(text: &str, fmt: Format) -> std::result::Result<Config, Vec<String>> {
+    let cfg = parse(text, fmt).map_err(|e| vec![e.to_string()])?;
+    match validate::validate(&cfg) {
+        Ok(()) => Ok(cfg),
+        Err(errs) => Err(errs),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_YAML: &str = r#"
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: debug
+external-controller: 127.0.0.1:9090
+secret: "abc"
+dns:
+  enable: true
+  nameserver:
+    - 223.5.5.5
+    - https://doh.pub/dns-query
+proxies:
+  - name: "ss1"
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: passw0rd
+    udp: true
+  - name: "vm1"
+    type: vmess
+    server: v.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: v.example.com
+    network: ws
+    ws-opts:
+      path: /path
+      headers:
+        Host: v.example.com
+  - name: "vl1"
+    type: vless
+    server: v2.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    flow: xtls-rprx-vision
+    tls: true
+    network: tcp
+  - name: "tr1"
+    type: trojan
+    server: t.example.com
+    port: 443
+    password: pw123
+    sni: t.example.com
+    skip-cert-verify: true
+  - name: "sk1"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: "ht1"
+    type: http
+    server: 127.0.0.1
+    port: 8080
+    username: u
+    password: p
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO
+      - ss1
+  - name: AUTO
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - vm1
+      - vl1
+      - tr1
+rules:
+  - DOMAIN-SUFFIX,google.com,PROXY
+  - DOMAIN-KEYWORD,github,PROXY
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+sub-rules:
+  sub1:
+    - MATCH,DIRECT
+"#;
+
+    #[test]
+    fn parse_yaml_full() {
+        let cfg = parse(SAMPLE_YAML, Format::Yaml).unwrap();
+        assert_eq!(cfg.mixed_port, Some(7890));
+        assert!(cfg.allow_lan);
+        assert_eq!(cfg.mode, Mode::Rule);
+        assert_eq!(cfg.proxies.len(), 6);
+        assert_eq!(cfg.proxy_groups.len(), 2);
+        assert_eq!(cfg.rules.len(), 5);
+        assert!(validate::validate(&cfg).is_ok());
+
+        match &cfg.proxies[1].kind {
+            ProxyKind::Vmess(v) => {
+                assert_eq!(v.uuid, "b831381d-6324-4d53-ad4f-8cda48b30811");
+                assert_eq!(v.alter_id, 0);
+                assert!(v.tls);
+                assert_eq!(v.network.as_deref(), Some("ws"));
+                assert_eq!(v.ws_opts.as_ref().unwrap().path.as_deref(), Some("/path"));
+                assert_eq!(
+                    v.ws_opts.as_ref().unwrap().headers.as_ref().unwrap()["Host"],
+                    "v.example.com"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &cfg.proxies[3].kind {
+            ProxyKind::Trojan(t) => {
+                assert_eq!(t.password, "pw123");
+                assert_eq!(t.server_name.as_deref(), Some("t.example.com"));
+                assert!(t.skip_cert_verify);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(cfg.proxy_groups[1].kind, GroupKind::UrlTest));
+    }
+
+    #[test]
+    fn json_frontend_same_schema() {
+        // 同构 JSON（含注释），字段语义一致
+        let json = r#"
+{
+  // 双格式支持
+  "mixed-port": 7891,
+  "proxies": [
+    {"name": "a", "type": "ss", "server": "1.1.1.1", "port": 8388,
+     "cipher": "chacha20-ietf-poly1305", "password": "p"}
+  ],
+  "proxy-groups": [{"name": "G", "type": "select", "proxies": ["a"]}],
+  "rules": ["MATCH,G"]
+}
+"#;
+        let cfg = parse(json, Format::Json).unwrap();
+        assert_eq!(cfg.mixed_port, Some(7891));
+        assert_eq!(cfg.proxies.len(), 1);
+        assert!(validate::validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn yaml_aliases_kebab_snake() {
+        let y = "port: 1080\nsocks-port: 1081\nredir-port: 1082\nrules: ['MATCH,DIRECT']\n";
+        let cfg = parse(y, Format::Yaml).unwrap();
+        assert_eq!(cfg.port, Some(1080));
+        assert_eq!(cfg.socks_port, Some(1081));
+        assert_eq!(cfg.redir_port, Some(1082));
+    }
+
+    #[test]
+    fn error_has_field_path() {
+        // 缺 password
+        let y = "proxies:\n  - name: a\n    type: ss\n    server: x\n    port: 1\n    cipher: aes\n";
+        let err = parse(y, Format::Yaml).unwrap_err();
+        assert!(err.to_string().contains("password"), "{err}");
+    }
+
+    #[test]
+    fn defaults() {
+        let cfg = parse("rules: ['MATCH,DIRECT']\n", Format::Yaml).unwrap();
+        assert!(!cfg.allow_lan);
+        assert_eq!(cfg.bind_address, "*");
+        assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.mode, Mode::Rule);
+        assert!(!cfg.dns.enable);
+    }
+}

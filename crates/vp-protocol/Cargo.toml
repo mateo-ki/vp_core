@@ -1,0 +1,47 @@
+[package]
+name = "vp-protocol"
+description = "出入站协议：mixed/socks5/http 入站；direct/reject/socks5/http/ss/vmess/vless/trojan 出入站"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+vp-core.workspace = true
+vp-config.workspace = true
+vp-transport.workspace = true
+vp-crypto.workspace = true
+vp-dns.workspace = true
+vp-router.workspace = true
+vp-plugin.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+httparse.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+blake3.workspace = true
+base64.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["socks5", "http", "ss", "vmess", "vless", "trojan", "plugin"]
+socks5 = []
+http = []
+ss = []
+vmess = []
+vless = []
+trojan = []
+plugin = []

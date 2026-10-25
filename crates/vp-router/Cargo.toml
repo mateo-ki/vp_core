@@ -1,0 +1,19 @@
+[package]
+name = "vp-router"
+description = "路由决策与策略组"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+vp-core.workspace = true
+vp-config.workspace = true
+vp-rule.workspace = true
+vp-dns.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+serde.workspace = true

@@ -19,6 +19,7 @@ pub mod trojan;
 pub mod udp_out;
 #[cfg(feature = "vless")]
 pub mod vless;
+pub mod uot;
 #[cfg(feature = "vmess")]
 pub mod vmess;
 
@@ -194,7 +195,16 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Vless(vl) => build_vless(cfg.name.as_str(), vl)?,
         ProxyKind::Trojan(tr) => build_trojan(cfg.name.as_str(), tr)?,
     };
-    Ok(o)
+    // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
+    Ok(match cfg.kind {
+        ProxyKind::Wireguard(_)
+        | ProxyKind::Hysteria2(_)
+        | ProxyKind::Tuic(_)
+        | ProxyKind::Direct
+        | ProxyKind::Reject => o,
+        _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o)),
+        _ => o,
+    })
 }
 
 /// 组定义转换

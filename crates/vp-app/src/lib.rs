@@ -815,4 +815,92 @@ rules: ['MATCH,DIRECT']
             Ok(_) => panic!("应当报错"),
         }
     }
+    #[tokio::test]
+    async fn uot_ss_e2e() {
+        // UDP echo 源站
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            loop {
+                if let Ok((n, from)) = echo.recv_from(&mut b).await {
+                    let _ = echo.send_to(&b[..n], from).await;
+                }
+            }
+        });
+
+        // 先占位取两个空闲端口（避免固定端口撞车）
+        async fn free_port() -> u16 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        }
+        let mixed_port = free_port().await;
+        let ss_port = free_port().await;
+
+        // ss listener（服务端）+ ss 出站（udp-over-tcp 包装），mixed 入站走 socks5 UDP 关联
+        let cfg = format!(
+            "mixed-port: {mixed_port}
+proxies:
+  - name: ss-uot
+    type: ss
+    server: 127.0.0.1
+    port: {ss_port}
+    cipher: aes-128-gcm
+    password: pw
+    udp: true
+    udp-over-tcp: true
+listeners:
+  - name: uot-srv
+    type: ss
+    port: {ss_port}
+    users: [pw]
+    cipher: aes-128-gcm
+rules: ['MATCH,ss-uot']
+"
+        );
+        let _app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+
+        // socks5 握手 + UDP ASSOCIATE
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", mixed_port))
+            .await
+            .unwrap();
+        tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut buf = [0u8; 2];
+        tcp.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, [0x05, 0x00]);
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        // 应答：[3 头][ATYP][4B 地址][2B 端口] = 10 字节
+        let mut rep = [0u8; 10];
+        tcp.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00, "ASSOCIATE 应成功");
+        let relay_port = u16::from_be_bytes([rep[8], rep[9]]);
+        assert_ne!(relay_port, 0);
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        relay.connect(("127.0.0.1", relay_port)).await.unwrap();
+
+        // socks5 UDP 帧：[rsv2][frag][ATYP 1][127.0.0.1][port][payload]
+        let mut dgram = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+        dgram.extend_from_slice(&echo_port.to_be_bytes());
+        dgram.extend_from_slice(b"uot-e2e");
+        relay.send(&dgram).await.unwrap();
+        let mut rbuf = vec![0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), relay.recv(&mut rbuf))
+            .await
+            .expect("UoT 回包超时")
+            .unwrap();
+        // 回包：[rsv2][frag][ATYP 1][127.0.0.1][echo_port][payload]
+        assert_eq!(rbuf[3], 0x01, "回包 ATYP 应为 IPv4");
+        assert_eq!(&rbuf[4..8], &[127, 0, 0, 1]);
+        assert_eq!(
+            u16::from_be_bytes([rbuf[8], rbuf[9]]),
+            echo_port,
+            "源端口应为 echo 端口"
+        );
+        assert_eq!(&rbuf[10..n], b"uot-e2e");
+    }
 }

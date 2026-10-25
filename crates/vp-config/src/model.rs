@@ -167,6 +167,9 @@ pub struct DnsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyCfg {
     pub name: String,
+    /// UDP over TCP（UoT v1）：仅流型协议出站生效
+    #[serde(default, alias = "udp_over_tcp")]
+    pub udp_over_tcp: bool,
     #[serde(flatten)]
     pub kind: ProxyKind,
 }

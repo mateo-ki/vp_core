@@ -28,6 +28,12 @@ pub async fn dispatch_stream(
     mut client: Box<dyn ProxyStream>,
     reply: ClientReply<'_>,
 ) {
+    // UDP over TCP（UoT）：魔法地址目标交由 UoT 中继处理
+    if crate::uot::is_magic(&sess.dst) {
+        let _ = crate::uot::serve_client(ctx, sess, client).await;
+        return;
+    }
+
     // 进程归属（Windows 查表 + 缓存；其它平台 None）
     if sess.process.is_none() {
         if let Some(src) = sess.src {

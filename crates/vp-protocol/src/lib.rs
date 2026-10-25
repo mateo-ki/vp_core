@@ -4,6 +4,7 @@
 
 pub mod basic_out;
 pub mod direct;
+pub mod hysteria2;
 pub mod inbound;
 #[cfg(feature = "ss")]
 pub mod ss;
@@ -152,6 +153,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
     let o: Arc<dyn Outbound> = match &cfg.kind {
         ProxyKind::Direct => Arc::new(DirectOutbound::new(deps.dns.clone(), deps.ipv6)),
         ProxyKind::Reject => Arc::new(RejectOutbound),
+        ProxyKind::Hysteria2(h) => Arc::new(hysteria2::Hysteria2Outbound::new(h)?),
         ProxyKind::Socks5(SocksCfg { server, port, username, password, udp, .. }) => {
             Arc::new(NamedOutbound::new_named(
                 &cfg.name,

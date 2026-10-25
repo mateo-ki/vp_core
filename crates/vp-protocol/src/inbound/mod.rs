@@ -1,6 +1,6 @@
 //! 入站：mixed（socks5+http 同端口自动识别）、socks5、http。
 
-mod dispatch;
+pub mod dispatch;
 mod http_in;
 mod mixed;
 mod socks5_in;

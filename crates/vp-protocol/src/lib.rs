@@ -6,6 +6,7 @@ pub mod basic_out;
 pub mod direct;
 pub mod hysteria2;
 pub mod tuic;
+pub mod redir;
 pub mod inbound;
 #[cfg(feature = "ss")]
 pub mod ss;

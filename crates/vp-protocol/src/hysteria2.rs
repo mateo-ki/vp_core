@@ -15,10 +15,8 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use vp_common::{DstAddr, Error, Result};
-use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
-use vp_core::tunnel::{relay, RelayHook};
-use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
+use vp_core::{Outbound, PacketConn, ProxyStream, UdpPacket};
 
 const TCP_REQUEST_ID: u64 = 0x401;
 
@@ -199,7 +197,7 @@ impl Outbound for Hysteria2Outbound {
             return Err(Error::ProtoMsg("hy2 TCPResponse 错误".into()));
         }
         let (msg_len, used) = read_varint(&head[1..]).ok_or(Error::Proto("hy2 varint"))?;
-        let mut rest = vec![0u8; (msg_len as usize).saturating_sub(head.len() - 1 - used) + 4];
+        let rest = vec![0u8; (msg_len as usize).saturating_sub(head.len() - 1 - used) + 4];
         // 简化：小消息直接吞掉（msg+pad）
         if msg_len > 0 {
             let mut skip = vec![0u8; msg_len as usize];

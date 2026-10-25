@@ -10,7 +10,11 @@ license.workspace = true
 vp-common.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
+httparse.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 rand.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

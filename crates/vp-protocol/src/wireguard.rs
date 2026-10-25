@@ -25,6 +25,7 @@ use tracing::warn;
 
 use vp_common::{DstAddr, Error, Result};
 use vp_config::WgCfg;
+use vp_core::stream::UdpPacket;
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 
 use crate::direct::DirectOutbound;
@@ -111,7 +112,7 @@ impl Device for QueueDevice {
 // 会话
 // ---------------------------------------------------------------------------
 
-type SessionInner = Result<(mpsc::Receiver<Bytes>, mpsc::Sender<Vec<u8>>)>;
+type SessionInner = Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)>;
 type SessionReply = tokio::sync::oneshot::Sender<SessionInner>;
 
 enum Cmd {
@@ -119,16 +120,36 @@ enum Cmd {
         dst: SocketAddr,
         reply: SessionReply,
     },
+    ConnectUdp {
+        reply: tokio::sync::oneshot::Sender<
+            Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)>,
+        >,
+    },
+}
+
+/// 栈→应用消息（TCP 数据流 / UDP 数据报）
+pub enum UpMsg {
+    Tcp(Bytes),
+    Udp { src: SocketAddr, data: Bytes },
+}
+
+/// 应用→栈消息
+pub enum DownMsg {
+    Tcp(Vec<u8>),
+    Udp { dst: SocketAddr, data: Vec<u8> },
+}
+
+enum SessKind {
+    Tcp { handle: SocketHandle, pending: Option<Vec<u8>> },
+    Udp { handle: SocketHandle },
 }
 
 struct Sess {
-    handle: SocketHandle,
-    /// 部分写入时的未发数据
-    pending: Option<Vec<u8>>,
+    kind: SessKind,
     /// 栈→应用数据
-    up_tx: mpsc::Sender<Bytes>,
+    up_tx: mpsc::Sender<UpMsg>,
     /// 应用→栈数据
-    down_rx: mpsc::Receiver<Vec<u8>>,
+    down_rx: mpsc::Receiver<DownMsg>,
     /// 栈侧已读满/关闭标志
     closed: bool,
 }
@@ -368,6 +389,10 @@ async fn stack_task(
                         );
                         let _ = reply.send(r);
                     }
+                    Cmd::ConnectUdp { reply } => {
+                        let r = connect_udp_session(&mut sockets, &mut sessions, &mut next_sess_id);
+                        let _ = reply.send(r);
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -379,7 +404,7 @@ async fn stack_task(
     }
 }
 
-type SessionPair = (mpsc::Receiver<Bytes>, mpsc::Sender<Vec<u8>>);
+type SessionPair = (mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>);
 
 fn connect_session(
     iface: &mut Interface,
@@ -421,21 +446,61 @@ fn connect_session(
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]);
     let mut sock = tcp::Socket::new(rx_buf, tx_buf);
-    // sock.set_nagle_enabled(false); // 实验：恢复 Nagle 观察重复段
+    sock.set_nagle_enabled(false);
     if let Err(e) = sock.connect(iface.context(), remote, local) {
         return Err(Error::ProtoMsg(format!("wireguard 栈 connect: {:?}", e)));
     }
     let handle = sockets.add(sock);
 
-    let (up_tx, up_rx) = mpsc::channel::<Bytes>(CHAN_CAP);
-    let (down_tx, down_rx) = mpsc::channel::<Vec<u8>>(CHAN_CAP);
+    let (up_tx, up_rx) = mpsc::channel::<UpMsg>(CHAN_CAP);
+    let (down_tx, down_rx) = mpsc::channel::<DownMsg>(CHAN_CAP);
     let id = *next_sess_id;
     *next_sess_id += 1;
     sessions.insert(
         id,
         Sess {
-            handle,
-            pending: None,
+            kind: SessKind::Tcp {
+                handle,
+                pending: None,
+            },
+            up_tx,
+            down_rx,
+            closed: false,
+        },
+    );
+
+    Ok((up_rx, down_tx))
+}
+
+/// 新建栈内 UDP 会话（connect_packet 的 dst 在 send 时动态携带）。
+fn connect_udp_session(
+    sockets: &mut SocketSet<'_>,
+    sessions: &mut HashMap<u64, Sess>,
+    next_sess_id: &mut u64,
+) -> Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)> {
+    let rx_buf = smoltcp::socket::udp::PacketBuffer::new(
+        vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 64],
+        vec![0u8; SOCK_BUF],
+    );
+    let tx_buf = smoltcp::socket::udp::PacketBuffer::new(
+        vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 64],
+        vec![0u8; SOCK_BUF],
+    );
+    let mut sock = smoltcp::socket::udp::Socket::new(rx_buf, tx_buf);
+    let local_port = WgCore::next_local_port();
+    if let Err(e) = sock.bind(local_port) {
+        return Err(Error::ProtoMsg(format!("wireguard 栈 udp bind: {:?}", e)));
+    }
+    let handle = sockets.add(sock);
+
+    let (up_tx, up_rx) = mpsc::channel::<UpMsg>(CHAN_CAP);
+    let (down_tx, down_rx) = mpsc::channel::<DownMsg>(CHAN_CAP);
+    let id = *next_sess_id;
+    *next_sess_id += 1;
+    sessions.insert(
+        id,
+        Sess {
+            kind: SessKind::Udp { handle },
             up_tx,
             down_rx,
             closed: false,
@@ -453,80 +518,182 @@ fn pump_sessions(
 ) {
     let mut reaped: Vec<u64> = Vec::new();
     for (id, sess) in sessions.iter_mut() {
-        let sock = sockets.get_mut::<tcp::Socket>(sess.handle);
-        // 应用 → 栈（先冲上轮部分写入的残留）
-        while sock.can_send() {
-            if let Some(p) = sess.pending.take() {
-                match sock.send_slice(&p) {
-                    Ok(n) if n == p.len() => continue,
-                    Ok(n) => {
-                        sess.pending = Some(p[n..].to_vec());
+        match &mut sess.kind {
+            SessKind::Udp { handle } => {
+                let sock = sockets.get_mut::<smoltcp::socket::udp::Socket>(*handle);
+                // 应用 → 栈
+                loop {
+                    if !sock.can_send() {
                         break;
                     }
-                    Err(e) => {
-                        warn!("wireguard pump pending err: {e:?}");
-                        sess.closed = true;
-                        break;
+                    match sess.down_rx.try_recv() {
+                        Ok(DownMsg::Udp { dst, data }) => {
+                            let remote = IpEndpoint::from(dst);
+                            if let Err(e) = sock.send_slice(&data, remote) {
+                                warn!("wireguard udp send_slice: {e:?}");
+                            }
+                        }
+                        _ => break,
                     }
                 }
+                // 栈 → 应用
+                if sess.up_tx.capacity() > 0 {
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        match sock.recv_slice(&mut buf) {
+                            Ok((0, _)) => break,
+                            Ok((n, meta)) => {
+                                let src = endpoint_to_std(meta.endpoint);
+                                let msg = UpMsg::Udp {
+                                    src,
+                                    data: Bytes::copy_from_slice(&buf[..n]),
+                                };
+                                if sess.up_tx.try_send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                continue;
             }
-            match sess.down_rx.try_recv() {
-                Ok(data) => {
-                    match sock.send_slice(&data) {
-                        Ok(n) if n == data.len() => {}
-                        Ok(n) => {
-                            // 部分写入（缓冲满）：未发部分暂存，下轮续写
-                            sess.pending = Some(data[n..].to_vec());
+            SessKind::Tcp { handle, pending } => {
+                let sock = sockets.get_mut::<tcp::Socket>(*handle);
+                // 应用 → 栈（先冲上轮部分写入的残留）
+                while sock.can_send() {
+                    if let Some(p) = pending.take() {
+                        match sock.send_slice(&p) {
+                            Ok(n) if n == p.len() => continue,
+                            Ok(n) => {
+                                *pending = Some(p[n..].to_vec());
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("wireguard pump pending err: {e:?}");
+                                sess.closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    match sess.down_rx.try_recv() {
+                        Ok(DownMsg::Tcp(data)) => {
+                            match sock.send_slice(&data) {
+                                Ok(n) if n == data.len() => {}
+                                Ok(n) => {
+                                    // 部分写入（缓冲满）：未发部分暂存，下轮续写
+                                    *pending = Some(data[n..].to_vec());
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!("wireguard pump send err: {e:?}");
+                                    sess.closed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            // 应用侧写完：半关闭（发 FIN）
+                            sock.close();
                             break;
                         }
-                        Err(e) => {
-                            warn!("wireguard pump send err: {e:?}");
+                        Ok(_) => {}
+                    }
+                }
+                // 栈 → 应用（通道满时不取，数据留在 socket 缓冲待下轮）
+                loop {
+                    if !sock.may_recv() {
+                        if sock.state() == tcp::State::Closed {
                             sess.closed = true;
-                            break;
                         }
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // 应用侧写完：半关闭（发 FIN）
-                    sock.close();
-                    break;
-                }
-            }
-        }
-        // 栈 → 应用（通道满时不取，数据留在 socket 缓冲待下轮）
-        loop {
-            if !sock.may_recv() {
-                if sock.state() == tcp::State::Closed {
-                    sess.closed = true;
-                }
-                break;
-            }
-            if sess.up_tx.capacity() == 0 {
-                break;
-            }
-            let mut buf = [0u8; 64 * 1024];
-            match sock.recv_slice(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => match sess.up_tx.try_send(Bytes::copy_from_slice(&buf[..n])) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => break,
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        sess.closed = true;
                         break;
                     }
-                },
-                Err(_) => break,
+                    if sess.up_tx.capacity() == 0 {
+                        break;
+                    }
+                    let mut buf = [0u8; 64 * 1024];
+                    match sock.recv_slice(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            match sess
+                                .up_tx
+                                .try_send(UpMsg::Tcp(Bytes::copy_from_slice(&buf[..n])))
+                            {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => break,
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    sess.closed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                    // 尽量搬空
+                }
+                if sess.closed {
+                    reaped.push(*id);
+                }
             }
-            // 尽量搬空
-        }
-        if sess.closed {
-            reaped.push(*id);
         }
     }
     for id in reaped {
         if let Some(s) = sessions.remove(&id) {
-            sockets.remove(s.handle);
+            match s.kind {
+                SessKind::Tcp { handle, .. } | SessKind::Udp { handle } => {
+                    sockets.remove(handle);
+                }
+            }
+        }
+    }
+}
+
+/// smoltcp IpEndpoint → std SocketAddr
+fn endpoint_to_std(ep: smoltcp::wire::IpEndpoint) -> SocketAddr {
+    match ep.addr {
+        IpAddress::Ipv4(v4) => {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.0)), ep.port)
+        }
+        IpAddress::Ipv6(v6) => {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.0)), ep.port)
+        }
+    }
+}
+
+/// UDP 会话连接：数据报直达栈内 UDP socket，dst 动态携带（多点目标）。
+pub struct WgUdpConn {
+    up_rx: mpsc::Receiver<UpMsg>,
+    down_tx: mpsc::Sender<DownMsg>,
+    /// 隧道内本机地址（回包 UdpPacket.dst 填充）
+    local: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl PacketConn for WgUdpConn {
+    async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+        self.down_tx
+            .send(DownMsg::Udp {
+                dst: pkt.dst,
+                data: pkt.data.to_vec(),
+            })
+            .await
+            .map_err(|_| Error::ProtoMsg("wireguard UDP 会话已关闭".into()))
+    }
+
+    async fn recv(&mut self) -> Result<UdpPacket> {
+        loop {
+            match self.up_rx.recv().await {
+                Some(UpMsg::Udp { src, data }) => {
+                    return Ok(UdpPacket {
+                        src,
+                        dst: self.local,
+                        data,
+                    });
+                }
+                Some(UpMsg::Tcp(_)) => continue,
+                None => return Err(Error::ProtoMsg("wireguard UDP 会话已关闭".into())),
+            }
         }
     }
 }
@@ -536,8 +703,8 @@ fn pump_sessions(
 // ---------------------------------------------------------------------------
 
 pub struct WgTcpStream {
-    up_rx: Pin<Box<mpsc::Receiver<Bytes>>>,
-    down_tx: Pin<Box<mpsc::Sender<Vec<u8>>>>,
+    up_rx: Pin<Box<mpsc::Receiver<UpMsg>>>,
+    down_tx: Pin<Box<mpsc::Sender<DownMsg>>>,
     /// 满时的 reserve future（慢路径缓存）
         cur: Option<Bytes>,
     eof: bool,
@@ -545,7 +712,7 @@ pub struct WgTcpStream {
 }
 
 impl WgTcpStream {
-    fn new(up_rx: mpsc::Receiver<Bytes>, down_tx: mpsc::Sender<Vec<u8>>) -> Self {
+    fn new(up_rx: mpsc::Receiver<UpMsg>, down_tx: mpsc::Sender<DownMsg>) -> Self {
         WgTcpStream {
             up_rx: Box::pin(up_rx),
             down_tx: Box::pin(down_tx),
@@ -580,13 +747,14 @@ impl AsyncRead for WgTcpStream {
                 return Poll::Ready(Ok(()));
             }
             match Pin::new(&mut this.up_rx).poll_recv(cx) {
-                Poll::Ready(Some(b)) => {
+                Poll::Ready(Some(UpMsg::Tcp(b))) => {
                     if b.is_empty() {
                         this.eof = true;
                         return Poll::Ready(Ok(()));
                     }
                     this.cur = Some(b);
                 }
+                Poll::Ready(Some(UpMsg::Udp { .. })) => continue,
                 Poll::Ready(None) => {
                     this.eof = true;
                     return Poll::Ready(Ok(()));
@@ -605,7 +773,7 @@ impl AsyncWrite for WgTcpStream {
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
         // 快路径 try_send；满时唤醒重试（栈任务 ≤1ms 后泵走数据）
-        match this.down_tx.try_send(buf.to_vec()) {
+        match this.down_tx.try_send(DownMsg::Tcp(buf.to_vec())) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 cx.waker().wake_by_ref();
@@ -711,7 +879,25 @@ impl Outbound for WgOutbound {
         _sess: &Session,
         _dst: &DstAddr,
     ) -> Result<Box<dyn PacketConn>> {
-        Err(Error::Unsupported("wireguard UDP 出站暂未实现".into()))
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<
+            Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)>,
+        >();
+        self.core
+            .cmd_tx
+            .send(Cmd::ConnectUdp { reply: reply_tx })
+            .await
+            .map_err(|_| Error::ProtoMsg("wireguard 隧道任务已退出".into()))?;
+        let (up_rx, down_tx) = reply_rx
+            .await
+            .map_err(|_| Error::ProtoMsg("wireguard 隧道任务已退出".into()))??;
+        Ok(Box::new(WgUdpConn {
+            up_rx,
+            down_tx,
+            local: SocketAddr::new(
+                std::net::IpAddr::V4(self.core.local_v4),
+                0,
+            ),
+        }))
     }
 
     fn support_udp(&self) -> bool {
@@ -776,6 +962,19 @@ mod tests {
             )));
         });
         let mut sockets = SocketSet::new(vec![]);
+        let mut udp_echo = smoltcp::socket::udp::Socket::new(
+            smoltcp::socket::udp::PacketBuffer::new(
+                vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 64],
+                vec![0u8; SOCK_BUF],
+            ),
+            smoltcp::socket::udp::PacketBuffer::new(
+                vec![smoltcp::socket::udp::PacketMetadata::EMPTY; 64],
+                vec![0u8; SOCK_BUF],
+            ),
+        );
+        udp_echo.bind(5353).expect("udp bind");
+        let udp_handle = sockets.add(udp_echo);
+
         let mut echo = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
             tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
@@ -837,6 +1036,15 @@ mod tests {
                                 let _ = sock.send_slice(&buf[..n]);
                             }
                         }
+                    }
+                    // UDP echo
+                    let uecho = sockets.get_mut::<smoltcp::socket::udp::Socket>(udp_handle);
+                    let mut ubuf = [0u8; 2048];
+                    while let Ok((n, meta)) = uecho.recv_slice(&mut ubuf) {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = uecho.send_slice(&ubuf[..n], meta.endpoint);
                     }
                 }
             }
@@ -937,6 +1145,23 @@ mod tests {
             got += n;
         }
         assert_eq!(echo, big, "大数据回显应逐字节一致");
+
+        // UDP 往返
+        assert!(out.support_udp());
+        let mut conn = out.connect_packet(&sess, &dst).await.expect("wg UDP 应可用");
+        conn.send(&vp_core::stream::UdpPacket {
+            src: "0.0.0.0:0".parse().unwrap(),
+            dst: SocketAddr::new(SERVER_TUN_IP.into(), 5353),
+            data: b"wg-udp-ping".to_vec().into(),
+        })
+        .await
+        .unwrap();
+        let pong = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong.data.as_ref(), b"wg-udp-ping");
+        assert_eq!(pong.src.port(), 5353, "回包源端口应为 5353");
         let _ = (client_pub_b64, server_pub, wpos);
     }
 }

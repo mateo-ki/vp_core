@@ -459,47 +459,103 @@ rules:
         assert_eq!(&got, b"app-ok");
     }
 
-    /// listeners 全协议启动验证：vmess/vless/ss 端口全部监听
-    /// （协议出入站数据面由各协议 crate 的 loopback 测试覆盖）
+    /// vless/ss listener 数据面 e2e（复用 vmess 最小复现模式）
     #[tokio::test]
-    async fn all_listeners_start() {
+    async fn vless_ss_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn one_echo() -> u16 {
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = echo.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let (mut s, _) = echo.accept().await.unwrap();
+                let mut b = [0u8; 256];
+                loop {
+                    let n = s.read(&mut b).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    s.write_all(&b[..n]).await.unwrap();
+                }
+            });
+            p
+        }
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
-        let cfg = [
-            "mixed-port: 17896".to_string(),
-            "listeners:".to_string(),
-            format!("  - name: srv-vm
-    type: vmess
-    port: 0
-    users: [\"{uuid}\"]"),
-            format!("  - name: srv-vl
-    type: vless
-    port: 0
-    users: [\"{uuid}\"]"),
-            "  - name: srv-ss
-    type: ss
-    port: 0
-    users: [\"ss-pass\"]
-    cipher: aes-128-gcm".to_string(),
-            "rules: ['MATCH,DIRECT']".to_string(),
-        ]
-        .join("
-")
-            + "
-";
-        let app = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true),
+        // vless
+        let echo_port = one_echo().await;
+        let cfg = format!(
+            "listeners:\n  - name: srv-vl\n    type: vless\n    port: 0\n    users: [\"{uuid}\"]\nrules: ['MATCH,DIRECT']\n"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let vl_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-vl")
+            .map(|(_, p)| *p)
+            .expect("vless listener 应已监听");
+        let out = vp_protocol::vless::VlessOutbound::new(&vp_config::VlessCfg {
+            server: "127.0.0.1".into(),
+            port: vl_port,
+            uuid: uuid.into(),
+            flow: None,
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            udp: false,
+        })
+        .unwrap();
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            out.connect_stream(&sess, &dst),
         )
         .await
-        .expect("App::start 超时")
+        .expect("vless 出站应完成")
+        .expect("vless 出站应成功");
+        s.write_all(b"vl-e2e").await.unwrap();
+        let mut buf = [0u8; 6];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"vl-e2e");
+
+        // ss
+        let echo_port = one_echo().await;
+        let cfg = "listeners:\n  - name: srv-ss\n    type: ss\n    port: 0\n    users: [\"pw\"]\n    cipher: aes-128-gcm\nrules: ['MATCH,DIRECT']\n";
+        let app = App::start(cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let ss_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-ss")
+            .map(|(_, p)| *p)
+            .expect("ss listener 应已监听");
+        let out = vp_protocol::ss::SsOutbound::new(&vp_config::SsCfg {
+            server: "127.0.0.1".into(),
+            port: ss_port,
+            cipher: "aes-128-gcm".into(),
+            password: "pw".into(),
+            udp: false,
+            plugin: None,
+        })
         .unwrap();
-        for tag in ["srv-vm", "srv-vl", "srv-ss"] {
-            assert!(
-                app.listen_ports.iter().any(|(t, _)| t == tag),
-                "{tag} 应已监听: {:?}",
-                app.listen_ports
-            );
-        }
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            out.connect_stream(&sess, &dst),
+        )
+        .await
+        .expect("ss 出站应完成")
+        .expect("ss 出站应成功");
+        s.write_all(b"ss-e2e").await.unwrap();
+        let mut buf = [0u8; 6];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ss-e2e");
     }
 
     /// vmess listener 数据面最小复现（修上轮挂起缺陷）

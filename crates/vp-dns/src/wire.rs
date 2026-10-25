@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const TYPE_A: u16 = 1;
 pub const TYPE_CNAME: u16 = 5;
 pub const TYPE_AAAA: u16 = 28;
+pub const TYPE_PTR: u16 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QType {
@@ -133,6 +134,99 @@ impl<'a> Reader<'a> {
             self.pos = pos;
         }
         Some(labels.join("."))
+    }
+}
+
+/// 解析查询报文首个问题：返回 (id, 域名, qtype)
+pub fn parse_query(buf: &[u8]) -> Option<(u16, String, u16)> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([buf[0], buf[1]]);
+    let qd = u16::from_be_bytes([buf[4], buf[5]]);
+    if qd == 0 {
+        return None;
+    }
+    let mut r = Reader { buf, pos: 12 };
+    let name = r.name(0)?;
+    let qtype = r.u16()?;
+    let _class = r.u16()?;
+    Some((id, name, qtype))
+}
+
+/// 基于查询构造 A 记录应答（fake-ip）
+pub fn build_a_response(query: &[u8], answer_ip: std::net::Ipv4Addr) -> Vec<u8> {
+    // 问题段长度 = 域名 + 4
+    let qend = query_question_end(query).unwrap_or(query.len());
+    let mut out = Vec::with_capacity(qend + 16);
+    out.extend_from_slice(&query[..2]); // id
+    out.extend_from_slice(&[0x81, 0x80]); // QR=1 RD=1 RA=1
+    out.extend_from_slice(&query[4..6]); // qdcount
+    out.extend_from_slice(&[0x00, 0x01]); // ancount=1
+    out.extend_from_slice(&[0x00, 0x00]); // ns
+    out.extend_from_slice(&[0x00, 0x00]); // ar
+    out.extend_from_slice(&query[12..qend]);
+    // answer: 指针回问题名
+    out.extend_from_slice(&[0xc0, 0x0c]);
+    out.extend_from_slice(&TYPE_A.to_be_bytes());
+    out.extend_from_slice(&[0x00, 0x01]); // IN
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // ttl=1
+    out.extend_from_slice(&[0x00, 0x04]);
+    out.extend_from_slice(&answer_ip.octets());
+    out
+}
+
+/// 构造 PTR 应答（fake-ip → 域名）
+pub fn build_ptr_response(query: &[u8], domain: &str) -> Vec<u8> {
+    let qend = query_question_end(query).unwrap_or(query.len());
+    let mut out = Vec::with_capacity(qend + 32);
+    out.extend_from_slice(&query[..2]);
+    out.extend_from_slice(&[0x81, 0x80]);
+    out.extend_from_slice(&query[4..6]);
+    out.extend_from_slice(&[0x00, 0x01]);
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    out.extend_from_slice(&query[12..qend]);
+    out.extend_from_slice(&[0xc0, 0x0c]);
+    out.extend_from_slice(&TYPE_PTR.to_be_bytes());
+    out.extend_from_slice(&[0x00, 0x01]);
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    // rdata: 域名标签
+    let mut rdata = Vec::new();
+    for label in domain.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
+        rdata.push(label.len() as u8);
+        rdata.extend_from_slice(label.as_bytes());
+    }
+    rdata.push(0);
+    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    out.extend_from_slice(&rdata);
+    out
+}
+
+/// 构造空 NOERROR 应答（如 fake-ip 模式下的 AAAA）
+pub fn build_empty_response(query: &[u8]) -> Vec<u8> {
+    let qend = query_question_end(query).unwrap_or(query.len());
+    let mut out = Vec::with_capacity(qend);
+    out.extend_from_slice(&query[..2]);
+    out.extend_from_slice(&[0x81, 0x80]);
+    out.extend_from_slice(&query[4..6]);
+    out.extend_from_slice(&[0x00, 0x00]); // an=0
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    out.extend_from_slice(&query[12..qend]);
+    out
+}
+
+/// 问题段结束偏移（含 qtype/qclass）
+fn query_question_end(query: &[u8]) -> Option<usize> {
+    let mut pos = 12usize;
+    loop {
+        let len = *query.get(pos)? as usize;
+        if len == 0 {
+            return Some(pos + 5);
+        }
+        pos += 1 + len;
+        if pos > query.len() {
+            return None;
+        }
     }
 }
 

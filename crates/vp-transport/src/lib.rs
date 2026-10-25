@@ -12,6 +12,20 @@ use std::time::Duration;
 use vp_common::Result;
 use vp_core::ProxyStream;
 
+/// 套接字调优：内核持有的所有 TCP 连接统一设置。
+/// - TCP_NODELAY：关闭 Nagle，交互流量不被合并延迟（流畅的关键）
+/// - TCP keepalive：探测对端僵死连接，避免句柄泄漏（稳定的保障）
+pub fn tune(stream: &tokio::net::TcpStream) {
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_tcp_nodelay(true);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let ka = ka.with_retries(3);
+    let _ = sock.set_tcp_keepalive(&ka);
+}
+
 /// 传输配置（各协议出站共用）
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -39,6 +53,7 @@ pub async fn dial(
             format!("连接 {server_host}:{server_port} 超时"),
         ))
     })??;
+    tune(&tcp);
 
     if cfg.tls {
         let tls = tls::tls_connect(

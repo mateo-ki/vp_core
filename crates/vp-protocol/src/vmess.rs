@@ -742,6 +742,7 @@ impl Inbound for VmessInbound {
             loop {
                 match listener.accept().await {
                     Ok((stream, src)) => {
+                        vp_transport::tune(&stream);
                         let this = this.clone();
                         let ctx = ctx.clone();
                         tokio::spawn(async move {

@@ -41,7 +41,10 @@ impl Outbound for DirectOutbound {
         let mut last = Error::Addr(format!("无法解析 {dst}"));
         for a in addrs {
             match TcpStream::connect(&a).await {
-                Ok(s) => return Ok(Box::new(s)),
+                Ok(s) => {
+                    vp_transport::tune(&s);
+                    return Ok(Box::new(s));
+                }
                 Err(e) => last = e.into(),
             }
         }

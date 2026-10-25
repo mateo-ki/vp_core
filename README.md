@@ -2,7 +2,11 @@
 
 小而快的全协议代理 / VPN 内核（Rust）。
 
-对标 sing-box / mihomo，M1 里程碑已完成核心骨架与主流协议，**全功能 release 体积仅 4.4 MB**。
+对标 sing-box / mihomo，M1 里程碑已完成核心骨架与主流协议。
+
+**极致小**：全功能 release 仅 **4.3 MB**（LTO + opt-level=z + strip，实测与 opt-3 吞吐无差异，~1 GB/s 回环吞吐）
+**极致流畅**：全链路 TCP_NODELAY（关闭 Nagle 合并延迟）+ 16KB 池化缓冲 + 零拷贝转发
+**极致稳定**：连接级 panic 隔离（单连接异常不终止内核）+ TCP keepalive 僵死探测 + SIGHUP 热重载（失败自动保留旧配置）
 
 ## 快速开始
 

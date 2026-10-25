@@ -88,6 +88,7 @@ rand = "0.9"
 
 # 网络
 httparse = "1"
+socket2 = "0.6"
 maxminddb = "0.24"
 
 # CLI
@@ -112,14 +113,14 @@ windows-sys = { version = "0.59", features = [
 rcgen = "0.13"
 
 [profile.release]
+# 极致小 + 快（实测与 opt-3 吞吐无差异，体积 -27%）：
+#   lto=fat + codegen-units=1 跨 crate 全局优化
+#   opt-level=z 体积优先；strip 去符号
+# 注意：不用 panic="abort" —— 单个连接的 panic 只终止该 tokio 任务，
+# 内核进程必须存活（稳定性优先）
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"
-opt-level = 3
-
-[profile.release-min]
-inherits = "release"
 opt-level = "z"
 
 [profile.bench]

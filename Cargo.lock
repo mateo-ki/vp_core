@@ -1395,6 +1395,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "sha1",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",

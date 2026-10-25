@@ -69,7 +69,8 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **订阅支持（已完成）**：`vpcore sub <URL>` 一键拉取订阅 → 自动解析 vless/vmess/trojan/ss 分享链接（含 base64 包装）→ 生成完整可运行配置（自动选择组 + 控制器 + 规则），不支持的传输自动跳过。**已用真实订阅（300 节点）端到端验证：google 204 / 出口 IP 正确 / API 可用**。122 项测试，release 6.63 MB
 - **M6（部分完成）**：**shadow-tls v3 出+入站**——手写 Chrome 风格 TLS 1.3 ClientHello（session_id 尾 4 字节嵌 HMAC-SHA1 认证，无需 hack TLS 库）+ HMAC 链记录层（ServerRandom 派生 C/S 双向链 + XOR 掩码包装伪装帧）；客户端读到首个认证伪装帧即确认真实服务端、直接切数据相位；服务端未认证连接/主动探测自动回退转发伪装站。ss 出站 `plugin: shadow-tls`（Clash 语法）与 ss listener `shadow-tls:` 段均可配，订阅 `plugin=shadow-tls;...` 参数自动解析。自环测试覆盖数据面（含残留帧过滤）/错误密码 fallback/HMAC 篡改检测；HelloRetryRequest 暂不支持（明确报错）
 - **M7（部分完成）**：**WireGuard 出站**——boringtun 噪声协议（握手维护/重协商 + keepalive）+ smoltcp 用户态 TCP 栈（每连接一个栈内 TCP 会话，数据经 mpsc 通道交换）；UDP IO 与栈轮询双任务架构避免高吞吐饿死轮询；点对点路由 + ephemeral 端口分配；自环测试覆盖完整噪声握手 + 栈内 TCP echo（16B～256KB 逐字节一致）+ UDP 数据报回显（源端口断言）。Clash 语法 `type: wireguard`（server/port/private-key/public-key/ip/ipv6/udp）；UDP over WG 同样实现（栈内 udp::Socket + 动态目标回包 NAT，自环测试覆盖）。WARP（masque 协议）节点的 key 为 DER 格式需自行转 raw 32 字节 base64 后使用
-- **M7 剩余（计划）**：uTLS 指纹（需换 TLS 栈）、hysteria2 服务端 QPACK Huffman/静态表、vmess UoT
+- **hysteria2 QPACK 全兼容（已完成）**：解码端完整支持 RFC 9204 静态表（99 项）索引引用、literal-with-name-reference 与 Huffman 字符串（RFC 7541 附录 B 全 257 符号表，已知向量验证）；编码端补上此前缺失的 QPACK 头块前缀（insert count/base）——此前即使 literal-only 形式也无法被标准解码端解析。本端宣告动态表容量 0，对端动态表引用明确报错。官方 hysteria2 客户端/服务端现可互通
+- **M7 剩余（计划）**：uTLS 指纹（需换 TLS 栈）、vmess UoT
 - **长尾协议（计划）**：anytls/mieru/brook/ssh/naive、插件市场、热重载完善
 
 ## 插件开发

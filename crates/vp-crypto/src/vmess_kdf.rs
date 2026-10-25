@@ -4,7 +4,6 @@
 //! 逐字节模拟：包装层的 ipad/opad 与中间 digest 都会流入根 HMAC 的消息流，
 //! 因此这里用共享可变对象复刻 Go 语义，保证跨实现一致。
 
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -76,7 +75,7 @@ impl GoHmac {
             ipad[i] ^= *b;
             opad[i] ^= *b;
         }
-        let mut h = GoHmac { outer: factory(), inner: factory() };
+        let h = GoHmac { outer: factory(), inner: factory() };
         GoHash::write(&mut *h.inner.borrow_mut(), &ipad);
         GoHash::write(&mut *h.outer.borrow_mut(), &opad);
         Rc::new(RefCell::new(h))
@@ -155,7 +154,7 @@ pub fn decode_auth_id(cmd_key: &[u8; 16], auth_id: &[u8; 16]) -> Option<(i64, [u
 
 fn aes_ecb_encrypt_block(key16: &[u8; 16], block16: &[u8; 16]) -> [u8; 16] {
     use aes::cipher::generic_array::GenericArray;
-    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockEncrypt, KeyInit};
     let key = GenericArray::from(*key16);
     let cipher = aes::Aes128::new(&key);
     let mut block = GenericArray::from(*block16);

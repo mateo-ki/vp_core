@@ -1,7 +1,6 @@
 //! 出站（协议客户端 / 策略组）统一抽象。
 
 use async_trait::async_trait;
-use std::sync::Arc;
 use vp_common::{DstAddr, Error, Result};
 
 use crate::session::Session;

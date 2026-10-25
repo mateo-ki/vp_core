@@ -102,7 +102,6 @@ impl Drop for TransformPlugin {
 pub struct TransformStream<S> {
     inner: S,
     plugin: Arc<TransformPlugin>,
-    raw: Vec<u8>,      // 读方向未变换数据
     pending: Vec<u8>,  // 变换后待读
     out: Vec<u8>,      // 写方向积压
     closed: bool,
@@ -113,7 +112,6 @@ impl<S> TransformStream<S> {
         TransformStream {
             inner,
             plugin,
-            raw: Vec::new(),
             pending: Vec::new(),
             out: Vec::new(),
             closed: false,
@@ -148,7 +146,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TransformStream<S> {
             // 读到底层
             let mut tmp = [0u8; 16 * 1024];
             let mut rb = ReadBuf::new(&mut tmp);
-            let n = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+            std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
             let filled = rb.filled().len();
             if filled == 0 {
                 this.closed = true;

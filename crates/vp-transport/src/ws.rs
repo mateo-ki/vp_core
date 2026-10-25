@@ -322,7 +322,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
             this.raw.reserve(16 * 1024);
             let spare = this.raw.spare_capacity_mut();
             let mut rb = ReadBuf::uninit(spare);
-            let n = std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+            std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
             let filled = rb.filled().len();
             if filled == 0 {
                 this.closed = true;

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
@@ -95,6 +95,7 @@ pub struct PrefixedStream<S> {
 }
 
 impl<S> PrefixedStream<S> {
+    #[allow(dead_code)]
     pub fn new(inner: S, prefix: u8) -> Self {
         PrefixedStream { inner, prefix, consumed: false }
     }

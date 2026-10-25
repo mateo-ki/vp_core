@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use vp_common::Stats;
 use vp_config::Mode;
-use vp_core::{ConnTable, Inbound, InboundCtx, Router as _};
+use vp_core::{ConnTable, InboundCtx};
 use vp_dns::Resolver;
 use vp_protocol::direct::DirectOutbound;
 use vp_protocol::{build_inbound, InboundKind};
@@ -170,7 +170,7 @@ async fn mixed_http_connect_full_chain() {
 
 #[tokio::test]
 async fn rule_routing_hits_group() {
-    let (port, router, echo_port) = build_core().await;
+    let (port, _router, echo_port) = build_core().await;
     // proxy.test 域名 → PROXY 组（via=DIRECT 穿透）
     let mut c = socks5_connect(port, "localhost", echo_port).await;
     c.write_all(b"x").await.unwrap();

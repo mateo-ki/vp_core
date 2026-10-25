@@ -1,0 +1,94 @@
+# VP_Core 示例配置（Clash 兼容语法；同一份结构也支持 JSON/JSON5）
+mixed-port: 7890            # HTTP + SOCKS5 同端口
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+
+# 外部控制器（Clash 兼容 REST API）
+external-controller: 127.0.0.1:9090
+secret: ""
+
+dns:
+  enable: true
+  # 留空则使用系统解析
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+proxies:
+  # Shadowsocks（AEAD 与 2022 系均支持）
+  - name: "ss-示例"
+    type: ss
+    server: server.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: "your-password"
+    udp: true
+
+  # VMess（AEAD 头，ws/tcp、tls 均支持）
+  - name: "vmess-示例"
+    type: vmess
+    server: v.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: v.example.com
+    network: ws
+    ws-opts:
+      path: /path
+      headers:
+        Host: v.example.com
+
+  # VLESS
+  - name: "vless-示例"
+    type: vless
+    server: vl.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    network: tcp
+
+  # Trojan
+  - name: "trojan-示例"
+    type: trojan
+    server: t.example.com
+    port: 443
+    password: "your-password"
+    sni: t.example.com
+    skip-cert-verify: false
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - 自动选择
+      - ss-示例
+      - DIRECT
+
+  - name: 自动选择
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - vmess-示例
+      - vless-示例
+      - trojan-示例
+
+rule-providers:
+  # 文本域名集（+.google.com 语法）；classical/ipcidr 行为同样支持
+  # my-direct:
+  #   behavior: domain
+  #   path: rules/direct.list
+  #   interval: 86400
+
+rules:
+  # - RULE-SET,my-direct,DIRECT
+  # - GEOSITE,cn,DIRECT        # 需要 geosite.dat
+  # - GEOIP,CN,DIRECT          # 需要 geoip.metadb / Country.mmdb
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - MATCH,PROXY

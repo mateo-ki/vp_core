@@ -48,8 +48,8 @@ pub async fn relay(left: Box<dyn ProxyStream>, right: Box<dyn ProxyStream>, hook
         None => (None, Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))),
     };
 
-    let (mut lr, mut lw) = tokio::io::split(left);
-    let (mut rr, mut rw) = tokio::io::split(right);
+    let (lr, lw) = tokio::io::split(left);
+    let (rr, rw) = tokio::io::split(right);
 
     let stats = hook.stats.clone();
     let t1: JoinHandle<()> = tokio::spawn(pump(lr, rw, up.clone(), stats.clone(), Dir::Up));

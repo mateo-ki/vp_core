@@ -1,6 +1,11 @@
 //! vp-dns：DNS 解析器（UDP/TCP）+ TTL 缓存。
 
+pub mod fakeip;
+pub mod server;
 pub mod wire;
+
+pub use fakeip::FakeIpPool;
+pub use server::DnsServer;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -48,6 +53,11 @@ impl Resolver {
         let parsed: Vec<ServerAddr> = servers.iter().filter_map(|s| parse_server(s)).collect();
         let use_system = parsed.is_empty();
         Resolver { servers: parsed, cache: Mutex::new(CacheInner::default()), use_system }
+    }
+
+    /// 第一个 UDP 上游（DNS 服务器原样转发用）
+    pub fn first_udp_server(&self) -> Option<SocketAddr> {
+        self.servers.iter().find(|s| !s.tcp).map(|s| s.addr)
     }
 
     pub fn system() -> Self {

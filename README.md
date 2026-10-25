@@ -60,8 +60,9 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 ## 里程碑
 
 - **M1（已完成）**：如上
-- **M2（已完成）**：TUN 透明代理（tun+ipstack + fake-ip + DNS 劫持 + auto-route）、UDP 全链路、DoT 上游。release 4.94 MB
-- **M3**：QUIC 系（hysteria2、TUIC、quic transport）、grpc/h2 传输、uTLS 指纹、shadowtls、WireGuard、DoH、redir/tproxy
+- **M2（已完成）**：TUN 透明代理（tun+ipstack + fake-ip + DNS 劫持 + auto-route）、UDP 全链路、DoT 上游
+- **M3（部分完成）**：DoH 上游（RFC8484 + #insecure）、gRPC(h2) 传输、QUIC 传输基座（quinn）、hysteria2 出站框架（h3 认证 + varint/TCP/UDPMessage 帧）。release 6.32 MB，110 项测试
+- **M4（计划）**：TUIC v5、shadowtls、WireGuard、hysteria2 服务端互操作、uTLS 指纹、redir/tproxy
 - **M4**：anytls/mieru/brook/ssh/naive、插件市场、热重载完善
 
 ## 插件开发

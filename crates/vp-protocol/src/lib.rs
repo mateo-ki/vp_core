@@ -23,6 +23,23 @@ use vp_dns::Resolver;
 use vp_router::{GroupSpec, GroupType, LbStrategy};
 use vp_transport::{TransportConfig, WsConfig};
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use vp_core::{Outbound, Resolution, Router as RouterTrait, Session};
+
+    pub struct NoopRouter();
+
+    #[async_trait]
+    impl RouterTrait for NoopRouter {
+        async fn pick(&self, _sess: &Session) -> Resolution {
+            unreachable!("noop router")
+        }
+    }
+
+}
+
 pub use basic_out::{HttpOutbound, RejectOutbound, Socks5Outbound};
 pub use direct::DirectOutbound;
 pub use inbound::{build_inbound, dispatch_stream, InboundKind};

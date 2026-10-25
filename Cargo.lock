@@ -1340,6 +1340,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "vp-common",
  "vp-config",
  "vp-core",
@@ -1347,6 +1348,7 @@ dependencies = [
  "vp-dns",
  "vp-plugin",
  "vp-router",
+ "vp-rule",
  "vp-transport",
 ]
 

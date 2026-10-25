@@ -1,6 +1,7 @@
 //! vp-transport：传输层（TCP / TLS / WebSocket）。
 
 pub mod grpc;
+pub mod quic;
 pub mod tls;
 pub mod ws;
 

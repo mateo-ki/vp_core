@@ -2,7 +2,6 @@
 
 use base64::Engine;
 use hkdf::Hkdf;
-use hmac::Hmac;
 use md5::{Digest, Md5};
 use sha1::Sha1;
 
@@ -234,7 +233,7 @@ mod tests {
     #[test]
     fn hmac_sha1_available() {
         use hmac::Mac as _;
-        let mut mac = <Hmac<Sha1> as hmac::Mac>::new_from_slice(b"key").unwrap();
+        let mut mac = <hmac::Hmac<Sha1> as hmac::Mac>::new_from_slice(b"key").unwrap();
         mac.update(b"data");
         assert_eq!(mac.finalize().into_bytes().len(), 20);
     }

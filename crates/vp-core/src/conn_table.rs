@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tokio::task::AbortHandle;
-use vp_common::now_millis;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConnMeta {
@@ -163,7 +162,7 @@ mod tests {
             process: None,
             rule: None,
             chain: None,
-            start: now_millis(),
+            start: vp_common::now_millis(),
         };
         let rc = t.register(meta);
         assert_eq!(t.len(), 1);

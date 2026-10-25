@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use vp_common::addr::{decode_socks_addr, encode_socks_addr};
+use vp_common::addr::encode_socks_addr;
 use vp_common::{DstAddr, Error, Result};
 use vp_core::{Outbound, ProxyStream, Session};
 

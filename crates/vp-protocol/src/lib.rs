@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use vp_common::{Error, Result};
 use vp_config::{GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
-use vp_core::Outbound;
+use vp_core::{Outbound, PacketConn, ProxyStream, Session};
+use vp_common::DstAddr;
 use vp_dns::Resolver;
 use vp_router::{GroupSpec, GroupType, LbStrategy};
 use vp_transport::{TransportConfig, WsConfig};
@@ -41,6 +42,45 @@ pub(crate) mod test_support {
 }
 
 pub use basic_out::{HttpOutbound, RejectOutbound, Socks5Outbound};
+
+/// 名称装饰器：让出站以配置名呈现
+pub struct NamedOutbound<T> {
+    name: Arc<str>,
+    inner: T,
+}
+
+impl<T> NamedOutbound<T> {
+    pub fn new_named(name: &str, inner: T) -> Self {
+        NamedOutbound { name: name.into(), inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: Outbound> Outbound for NamedOutbound<T> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
+        self.inner.connect_stream(sess, dst).await
+    }
+    async fn connect_over(
+        &self,
+        sess: &Session,
+        dst: &DstAddr,
+        underlying: Box<dyn ProxyStream>,
+    ) -> Result<Box<dyn ProxyStream>> {
+        self.inner.connect_over(sess, dst, underlying).await
+    }
+    fn support_udp(&self) -> bool {
+        self.inner.support_udp()
+    }
+    async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        self.inner.connect_packet(sess, dst).await
+    }
+    fn remote_addr(&self) -> Option<(String, u16)> {
+        self.inner.remote_addr()
+    }
+}
 pub use direct::DirectOutbound;
 pub use inbound::{build_inbound, dispatch_stream, InboundKind};
 
@@ -90,19 +130,27 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Direct => Arc::new(DirectOutbound::new(deps.dns.clone(), deps.ipv6)),
         ProxyKind::Reject => Arc::new(RejectOutbound),
         ProxyKind::Socks5(SocksCfg { server, port, username, password, .. }) => {
-            Arc::new(Socks5Outbound {
-                server: server.clone(),
-                port: *port,
-                username: username.clone(),
-                password: password.clone(),
-            })
+            Arc::new(NamedOutbound::new_named(
+                &cfg.name,
+                Socks5Outbound {
+                    server: server.clone(),
+                    port: *port,
+                    username: username.clone(),
+                    password: password.clone(),
+                },
+            ))
         }
-        ProxyKind::Http(HttpCfg { server, port, username, password, .. }) => Arc::new(HttpOutbound {
-            server: server.clone(),
-            port: *port,
-            username: username.clone(),
-            password: password.clone(),
-        }),
+        ProxyKind::Http(HttpCfg { server, port, username, password, .. }) => {
+            Arc::new(NamedOutbound::new_named(
+                &cfg.name,
+                HttpOutbound {
+                    server: server.clone(),
+                    port: *port,
+                    username: username.clone(),
+                    password: password.clone(),
+                },
+            ))
+        }
         ProxyKind::Ss(ss) => build_ss(cfg.name.as_str(), ss)?,
         ProxyKind::Vmess(vm) => build_vmess(cfg.name.as_str(), vm)?,
         ProxyKind::Vless(vl) => build_vless(cfg.name.as_str(), vl)?,
@@ -138,8 +186,8 @@ pub fn group_spec(g: &GroupCfg) -> GroupSpec {
 #[cfg(feature = "ss")]
 use ss::SsOutbound;
 #[cfg(feature = "ss")]
-fn build_ss(_name: &str, ss_cfg: &SsCfg) -> Result<Arc<dyn Outbound>> {
-    Ok(Arc::new(SsOutbound::new(ss_cfg)?))
+fn build_ss(name: &str, ss_cfg: &SsCfg) -> Result<Arc<dyn Outbound>> {
+    Ok(Arc::new(SsOutbound::new_named(name, ss_cfg)?))
 }
 
 #[cfg(not(feature = "ss"))]
@@ -150,8 +198,8 @@ fn build_ss(_name: &str, _ss_cfg: &SsCfg) -> Result<Arc<dyn Outbound>> {
 #[cfg(feature = "vmess")]
 use vmess::VmessOutbound;
 #[cfg(feature = "vmess")]
-fn build_vmess(_name: &str, vm: &VmessCfg) -> Result<Arc<dyn Outbound>> {
-    Ok(Arc::new(VmessOutbound::new(vm)?))
+fn build_vmess(name: &str, vm: &VmessCfg) -> Result<Arc<dyn Outbound>> {
+    Ok(Arc::new(VmessOutbound::new_named(name, vm)?))
 }
 
 #[cfg(not(feature = "vmess"))]
@@ -162,8 +210,8 @@ fn build_vmess(_name: &str, _vm: &VmessCfg) -> Result<Arc<dyn Outbound>> {
 #[cfg(feature = "vless")]
 use vless::VlessOutbound;
 #[cfg(feature = "vless")]
-fn build_vless(_name: &str, vl: &VlessCfg) -> Result<Arc<dyn Outbound>> {
-    Ok(Arc::new(VlessOutbound::new(vl)?))
+fn build_vless(name: &str, vl: &VlessCfg) -> Result<Arc<dyn Outbound>> {
+    Ok(Arc::new(VlessOutbound::new_named(name, vl)?))
 }
 
 #[cfg(not(feature = "vless"))]
@@ -174,8 +222,8 @@ fn build_vless(_name: &str, _vl: &VlessCfg) -> Result<Arc<dyn Outbound>> {
 #[cfg(feature = "trojan")]
 use trojan::TrojanOutbound;
 #[cfg(feature = "trojan")]
-fn build_trojan(_name: &str, tr: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
-    Ok(Arc::new(TrojanOutbound::new(tr)?))
+fn build_trojan(name: &str, tr: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
+    Ok(Arc::new(TrojanOutbound::new_named(name, tr)?))
 }
 
 #[cfg(not(feature = "trojan"))]

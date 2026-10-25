@@ -164,7 +164,7 @@ impl TrojanInbound {
         }
         // SOCKS 地址增量读
         let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
-        let (dst, used) = loop {
+        let (dst, _used) = loop {
             match decode_socks_addr(&addr_buf) {
                 Ok(x) => break x,
                 Err(Error::Proto("address truncated")) | Err(Error::Proto("empty domain")) => {

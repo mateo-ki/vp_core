@@ -47,7 +47,7 @@ pub struct MatchCtx<'a> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogicOp {
+pub enum LogicOp {
     And,
     Or,
     Not,
@@ -219,10 +219,10 @@ impl RuleEngine {
 // ---------------------------------------------------------------------------
 
 /// 规则目标（策略名）合法性由外部注入：节点名 + 组名 + 内置名
-pub type KnownTargets = dyn Fn(&str) -> bool + Send + Sync;
+pub type KnownTargets<'a> = dyn Fn(&str) -> bool + Send + Sync + 'a;
 
 pub struct CompileEnv<'a> {
-    pub is_known_target: &'a KnownTargets,
+    pub is_known_target: &'a KnownTargets<'a>,
     pub geosite: &'a Option<geosite::GeoSiteDb>,
     #[cfg(feature = "geoip")]
     pub geoip: &'a Option<geoip::GeoIpDb>,

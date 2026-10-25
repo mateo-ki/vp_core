@@ -1,7 +1,16 @@
 //! 配置 IR：Clash 兼容 schema（YAML / JSON 同构双前端）。
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
+
+/// null 视为缺省（兼容手写配置中的空键）
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 fn default_mode() -> Mode {
     Mode::Rule
@@ -43,17 +52,17 @@ pub struct Config {
     pub external_controller: Option<String>,
     #[serde(default)]
     pub secret: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub dns: DnsConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub proxies: Vec<ProxyCfg>,
-    #[serde(alias = "proxy-groups", alias = "proxy_groups", default)]
+    #[serde(alias = "proxy-groups", alias = "proxy_groups", default, deserialize_with = "null_to_default")]
     pub proxy_groups: Vec<GroupCfg>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub rules: Vec<String>,
-    #[serde(alias = "sub-rules", alias = "sub_rules", default)]
+    #[serde(alias = "sub-rules", alias = "sub_rules", default, deserialize_with = "null_to_default")]
     pub sub_rules: HashMap<String, Vec<String>>,
-    #[serde(alias = "rule-providers", alias = "rule_providers", default)]
+    #[serde(alias = "rule-providers", alias = "rule_providers", default, deserialize_with = "null_to_default")]
     pub rule_providers: HashMap<String, RuleProviderCfg>,
 }
 
@@ -75,11 +84,11 @@ pub struct DnsConfig {
     pub ipv6: bool,
     #[serde(alias = "enhanced-mode", alias = "enhanced_mode", default)]
     pub enhanced_mode: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub nameserver: Vec<String>,
     #[serde(alias = "default-nameserver", alias = "default_nameserver", default)]
     pub default_nameserver: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub fallback: Vec<String>,
     #[serde(alias = "fake-ip-range", alias = "fake_ip_range", default)]
     pub fake_ip_range: Option<String>,

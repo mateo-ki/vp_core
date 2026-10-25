@@ -127,6 +127,12 @@ proxies:
     sni: a.example.com
     client-fingerprint: chrome
     udp: true
+  - name: "ssh1"
+    type: ssh
+    server: s.example.com
+    port: 22
+    username: root
+    password: pw789
   - name: "sk1"
     type: socks5
     server: 127.0.0.1
@@ -169,7 +175,7 @@ sub-rules:
         assert_eq!(cfg.mixed_port, Some(7890));
         assert!(cfg.allow_lan);
         assert_eq!(cfg.mode, Mode::Rule);
-        assert_eq!(cfg.proxies.len(), 7);
+        assert_eq!(cfg.proxies.len(), 8);
         assert_eq!(cfg.proxy_groups.len(), 2);
         assert_eq!(cfg.rules.len(), 5);
         assert!(validate::validate(&cfg).is_ok());
@@ -198,6 +204,13 @@ sub-rules:
             other => panic!("unexpected {other:?}"),
         }
         assert!(matches!(cfg.proxy_groups[1].kind, GroupKind::UrlTest));
+        match &cfg.proxies[5].kind {
+            ProxyKind::Ssh(sh) => {
+                assert_eq!(sh.username, "root");
+                assert_eq!(sh.password.as_deref(), Some("pw789"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         match &cfg.proxies[4].kind {
             ProxyKind::Anytls(a) => {
                 assert_eq!(a.password, "pw456");

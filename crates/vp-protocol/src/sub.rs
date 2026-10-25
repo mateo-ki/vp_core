@@ -92,6 +92,8 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_ss(rest)
     } else if let Some(rest) = line.strip_prefix("anytls://") {
         parse_anytls(rest)
+    } else if let Some(rest) = line.strip_prefix("ssh://") {
+        parse_ssh(rest)
     } else {
         Err(Error::Config(format!("无法识别的分享链接: {}", &line[..line.len().min(32)])))
     }
@@ -223,6 +225,26 @@ fn parse_trojan(rest: &str) -> Result<SubNode> {
     if network == "ws" {
         f.push(("__ws_path".into(), q(&p.get("path").cloned().unwrap_or_else(|| "/".into()))));
         f.push(("__ws_host".into(), q(&p.get("host").cloned().unwrap_or_default())));
+    }
+    Ok(SubNode { fields: f })
+}
+
+fn parse_ssh(rest: &str) -> Result<SubNode> {
+    // ssh://user[:pass]@host:port#name
+    let (userinfo, host, port, _p, name) = split_main(rest)?;
+    let (username, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u.to_string(), Some(p.to_string())),
+        None => (userinfo, None),
+    };
+    let mut f = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "ssh".into()),
+        ("server".into(), host),
+        ("port".into(), port),
+        ("username".into(), q(&username)),
+    ];
+    if let Some(pw) = password {
+        f.push(("password".into(), q(&pw)));
     }
     Ok(SubNode { fields: f })
 }

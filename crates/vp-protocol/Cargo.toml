@@ -15,6 +15,7 @@ quinn.workspace = true
 boringtun.workspace = true
 smoltcp.workspace = true
 rustls.workspace = true
+ring.workspace = true
 webpki-roots.workspace = true
 rustls-pemfile.workspace = true
 http.workspace = true
@@ -33,6 +34,8 @@ sha1.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
+poly1305.workspace = true
+universal-hash.workspace = true
 blake3.workspace = true
 base64.workspace = true
 hkdf.workspace = true
@@ -43,6 +46,8 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]
+chacha20 = { version = "0.10", features = ["legacy"] }
+cipher = "0.5"
 log = "0.4"
 tracing-subscriber.workspace = true
 rcgen.workspace = true

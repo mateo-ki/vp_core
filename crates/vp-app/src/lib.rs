@@ -190,6 +190,24 @@ impl App {
                 }
             }
 
+            // 协议服务端入站（listeners）
+            for l in &cfg.listeners {
+                let inb: Arc<dyn vp_core::Inbound> = match build_listener(l) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        warn!("listener {:?} 构建失败: {e}", l.name);
+                        continue;
+                    }
+                };
+                match inb.clone().start(make_ctx()).await {
+                    Ok(bound) => {
+                        info!("listener {} [{}] 监听 {bind}:{bound}", l.name, l.kind);
+                        listen_ports.push((l.name.clone(), bound));
+                    }
+                    Err(e) => warn!("listener {:?} 启动失败: {e}", l.name),
+                }
+            }
+
             // TUN 模式
             if let Some(tun_cfg) = &cfg.tun {
                 if tun_cfg.enable {
@@ -281,6 +299,47 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// 构建 listeners 段的服务端入站（trojan/vmess/vless/ss）
+fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound>> {
+    let tag = l.name.as_str();
+    match l.kind.as_str() {
+        "trojan" => {
+            if l.users.is_empty() {
+                return Err(Error::Config("trojan listener 需要 users（密码）".into()));
+            }
+            Ok(Arc::new(vp_protocol::trojan::TrojanInbound::new(
+                "0.0.0.0", l.port, tag, &l.users,
+            )?))
+        }
+        "vmess" => {
+            if l.users.is_empty() {
+                return Err(Error::Config("vmess listener 需要 users（uuid）".into()));
+            }
+            Ok(Arc::new(vp_protocol::vmess::VmessInbound::new(
+                "0.0.0.0", l.port, tag, &l.users,
+            )?))
+        }
+        "vless" => {
+            if l.users.is_empty() {
+                return Err(Error::Config("vless listener 需要 users（uuid）".into()));
+            }
+            Ok(Arc::new(vp_protocol::vless::VlessInbound::new(
+                "0.0.0.0", l.port, tag, &l.users,
+            )?))
+        }
+        "ss" => {
+            let password = l.users.first().ok_or_else(|| {
+                Error::Config("ss listener 需要 users[0]（密码）".into())
+            })?;
+            let cipher = l.cipher.as_deref().unwrap_or("aes-128-gcm");
+            Ok(Arc::new(vp_protocol::ss::SsInbound::new(
+                "0.0.0.0", l.port, tag, cipher, password,
+            )?))
+        }
+        other => Err(Error::Unsupported(format!("listener 类型 {other:?}（M1 支持 trojan/vmess/vless/ss）"))),
     }
 }
 
@@ -398,6 +457,70 @@ rules:
         let mut got = [0u8; 6];
         c.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"app-ok");
+    }
+
+    /// listeners 段端到端：trojan 服务端入站 ← TrojanOutbound ← echo
+    #[tokio::test]
+    async fn trojan_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // echo
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+        let cfg = format!(
+            "mixed-port: 17895
+listeners:
+  - name: srv-tj
+    type: trojan
+    port: 0
+    users: [pw-e2e]
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        // listeners[0] 实际端口
+        let tj_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-tj")
+            .map(|(_, p)| *p)
+            .expect("trojan listener 应已监听");
+
+        let out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+            server: "127.0.0.1".into(),
+            port: tj_port,
+            password: "pw-e2e".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            udp: false,
+        })
+        .unwrap();
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("trojan 出站应成功");
+        s.write_all(b"listener-e2e").await.unwrap();
+        let mut buf = [0u8; 12];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"listener-e2e");
     }
 
     #[tokio::test]

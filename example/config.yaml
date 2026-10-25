@@ -87,6 +87,13 @@ proxy-groups:
 #   fake-ip-range: 198.18.0.0/16
 #   auto-route: true
 
+# 自建服务器：协议服务端入站（trojan/vmess/vless/ss）
+# listeners:
+#   - name: srv-trojan
+#     type: trojan
+#     port: 10443
+#     users: ["your-password"]
+
 rule-providers:
   # 文本域名集（+.google.com 语法）；classical/ipcidr 行为同样支持
   # my-direct:

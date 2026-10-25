@@ -91,6 +91,9 @@ pub struct ListenerCfg {
     pub cert: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
+    /// shadow-tls v3 外层伪装（ss listener 可选；host 为伪装转发目标）
+    #[serde(alias = "shadow-tls", alias = "shadowtls", alias = "shadow-tls-opts", alias = "shadow_tls_opts", default)]
+    pub shadow_tls: Option<ShadowTlsCfg>,
 }
 
 /// TUN 配置段（Clash 风格）
@@ -220,6 +223,22 @@ pub struct WsOpts {
     pub max_early_data: Option<u64>,
 }
 
+/// shadow-tls v3 伪装选项。字段全 Option 以容忍其它插件（如 simple-obfs）的
+/// plugin-opts 形状——只在 plugin 为 shadow-tls 时才要求 host/password。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShadowTlsCfg {
+    /// 伪装站域名（客户端写入 ClientHello SNI；服务端转发伪装目标）
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// 伪装站端口（默认 443）
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub version: Option<u32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SsCfg {
     pub server: String,
@@ -228,9 +247,11 @@ pub struct SsCfg {
     pub password: String,
     #[serde(default)]
     pub udp: bool,
-    /// 插件名（如 simple-obfs）；M1 记录并警告，转发能力由内核插件体系承担
+    /// 插件名：shadow-tls 由内核原生支持；其它（如 simple-obfs）记录警告并忽略
     #[serde(default)]
     pub plugin: Option<String>,
+    #[serde(alias = "plugin-opts", alias = "plugin_opts", default)]
+    pub plugin_opts: Option<ShadowTlsCfg>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

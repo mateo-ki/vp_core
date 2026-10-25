@@ -237,6 +237,7 @@ pub struct SsOutbound {
     cipher: Cipher,
     key: Vec<u8>,
     udp: bool,
+    shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
 }
 
 impl SsOutbound {
@@ -250,9 +251,30 @@ impl SsOutbound {
 
     fn internal_new(name: Option<&str>, cfg: &SsCfg) -> Result<Self> {
         let cipher = Cipher::parse(&cfg.cipher)?;
-        if cfg.plugin.is_some() {
-            warn!("ss 节点配置了 plugin 字段，请改用内核插件体系（已忽略）");
-        }
+        let shadow_tls = match cfg.plugin.as_deref() {
+            Some(p) if p.contains("shadow-tls") => {
+                let o = cfg.plugin_opts.as_ref().ok_or_else(|| {
+                    Error::Config("shadow-tls 插件缺少 plugin-opts（host/password）".into())
+                })?;
+                let host = o
+                    .host
+                    .clone()
+                    .ok_or_else(|| Error::Config("shadow-tls plugin-opts 缺少 host".into()))?;
+                let password = o.password.clone().ok_or_else(|| {
+                    Error::Config("shadow-tls plugin-opts 缺少 password".into())
+                })?;
+                Some(crate::shadowtls::ShadowTlsDial {
+                    host,
+                    port: o.port.unwrap_or(443),
+                    password,
+                })
+            }
+            Some(p) => {
+                warn!("ss 节点 plugin {p:?} 不支持（已忽略；支持 shadow-tls）");
+                None
+            }
+            None => None,
+        };
         let key = cipher.derive_key(&cfg.password)?;
         Ok(SsOutbound {
             name: name.unwrap_or("shadowsocks").into(),
@@ -261,6 +283,7 @@ impl SsOutbound {
             cipher,
             key,
             udp: cfg.udp,
+            shadow_tls,
         })
     }
 
@@ -297,8 +320,15 @@ impl Outbound for SsOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::dial(&self.server, self.port, &transport::TransportConfig::default())
+        let tcp = transport::dial(&self.server, self.port, &transport::TransportConfig::default())
             .await?;
+        let io = match &self.shadow_tls {
+            Some(st) => {
+                Box::new(crate::shadowtls::client_handshake(tcp, &st.password, &st.host).await?)
+                    as Box<dyn ProxyStream>
+            }
+            None => tcp,
+        };
         self.handshake(io, dst).await
     }
 
@@ -338,10 +368,23 @@ pub struct SsInbound {
     cipher: Cipher,
     key: Vec<u8>,
     direct: Arc<DirectOutbound>,
+    shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
 }
 
 impl SsInbound {
     pub fn new(bind: &str, port: u16, tag: &str, cipher: &str, password: &str) -> Result<Self> {
+        Self::new_with_shadow_tls(bind, port, tag, cipher, password, None)
+    }
+
+    /// 带 shadow-tls v3 外层伪装的入站（伪装流量转发至 host:port）。
+    pub fn new_with_shadow_tls(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        cipher: &str,
+        password: &str,
+        shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
+    ) -> Result<Self> {
         let cipher = Cipher::parse(cipher)?;
         let key = cipher.derive_key(password)?;
         Ok(SsInbound {
@@ -351,6 +394,7 @@ impl SsInbound {
             cipher,
             key,
             direct: Arc::new(DirectOutbound::new(Arc::new(Resolver::system()), false)),
+            shadow_tls,
         })
     }
 
@@ -442,12 +486,15 @@ impl SsInbound {
         }
     }
 
-    async fn serve(
+    async fn serve<S>(
         self: &Arc<Self>,
-        mut stream: tokio::net::TcpStream,
+        mut stream: S,
         src: std::net::SocketAddr,
         ctx: &InboundCtx,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         // 读客户端 salt
         let mut salt = vec![0u8; self.cipher.salt_len()];
         stream.read_exact(&mut salt).await?;
@@ -549,7 +596,31 @@ impl Inbound for SsInbound {
                                     let this = this.clone();
                                     let ctx = ctx.clone();
                                     tokio::spawn(async move {
-                                        if let Err(e) = this.serve(stream, src, &ctx).await {
+                                        let handled = match &this.shadow_tls {
+                                            Some(st) => {
+                                                match crate::shadowtls::server_handshake(
+                                                    stream,
+                                                    &st.password,
+                                                    &st.host,
+                                                    st.port,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(wrapped) => {
+                                                        this.serve(wrapped, src, &ctx).await
+                                                    }
+                                                    Err(
+                                                        crate::shadowtls::ServerHandshakeError::Fallback,
+                                                    ) => Ok(()),
+                                                    Err(e) => {
+                                                        warn!("shadowtls 入站握手失败: {e}");
+                                                        Ok(())
+                                                    }
+                                                }
+                                            }
+                                            None => this.serve(stream, src, &ctx).await,
+                                        };
+                                        if let Err(e) = handled {
                                             warn!("ss 入站会话结束: {e}");
                                         }
                                     });
@@ -618,6 +689,7 @@ mod tests {
             password: password.into(),
             udp: false,
             plugin: None,
+            plugin_opts: None,
         })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), echo_addr.port());

@@ -335,8 +335,24 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 Error::Config("ss listener 需要 users[0]（密码）".into())
             })?;
             let cipher = l.cipher.as_deref().unwrap_or("aes-128-gcm");
-            Ok(Arc::new(vp_protocol::ss::SsInbound::new(
-                "0.0.0.0", l.port, tag, cipher, password,
+            let stls = match &l.shadow_tls {
+                Some(o) => {
+                    let host = o.host.clone().ok_or_else(|| {
+                        Error::Config("shadow-tls 入站缺少 host（伪装站）".into())
+                    })?;
+                    let pw = o.password.clone().ok_or_else(|| {
+                        Error::Config("shadow-tls 入站缺少 password".into())
+                    })?;
+                    Some(vp_protocol::shadowtls::ShadowTlsDial {
+                        host,
+                        port: o.port.unwrap_or(443),
+                        password: pw,
+                    })
+                }
+                None => None,
+            };
+            Ok(Arc::new(vp_protocol::ss::SsInbound::new_with_shadow_tls(
+                "0.0.0.0", l.port, tag, cipher, password, stls,
             )?))
         }
         other => Err(Error::Unsupported(format!("listener 类型 {other:?}（M1 支持 trojan/vmess/vless/ss）"))),
@@ -541,6 +557,7 @@ rules:
             password: "pw".into(),
             udp: false,
             plugin: None,
+            plugin_opts: None,
         })
         .unwrap();
         let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -681,6 +698,113 @@ rules: ['MATCH,DIRECT']
         let mut buf = [0u8; 12];
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"listener-e2e");
+    }
+
+    /// 全栈：App ss listener + shadow-tls v3 伪装 ← SsOutbound(plugin: shadow-tls) ← echo
+    #[tokio::test]
+    async fn ss_shadowtls_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // echo 源站
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        // 伪装站 stub：读 ClientHello → 回 TLS1.3 ServerHello + 1 帧伪 appdata
+        let cam = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cam_port = cam.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = cam.accept().await.unwrap();
+            let mut hdr = [0u8; 5];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut ch = vec![0u8; u16::from_be_bytes([hdr[3], hdr[4]]) as usize];
+            s.read_exact(&mut ch).await.unwrap();
+            // ServerHello（supported_versions=0304）
+            let mut body = vec![0x02, 0x03, 0x03];
+            body.extend_from_slice(&[0x11u8; 32]); // random
+            body.push(32);
+            body.extend_from_slice(&[0x42u8; 32]); // sid echo
+            body.extend_from_slice(&[0x13, 0x01, 0x01, 0x00]);
+            body.extend_from_slice(&6u16.to_be_bytes()); // exts len
+            body.extend_from_slice(&43u16.to_be_bytes());
+            body.extend_from_slice(&2u16.to_be_bytes());
+            body.extend_from_slice(&[0x03, 0x04]);
+            let mut msg = vec![0x02, 0x00, 0x00, 0x00];
+            msg[1..4].copy_from_slice(&(((body.len() - 1) as u32) << 8).to_be_bytes()[1..]);
+            msg.extend_from_slice(&body[1..]);
+            let mut rec = vec![0x16, 0x03, 0x03];
+            rec.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+            rec.extend_from_slice(&msg);
+            s.write_all(&rec).await.unwrap();
+            // 一帧伪 appdata（供客户端授权判定）
+            s.write_all(&[0x17, 0x03, 0x03, 0x00, 0x04, 1, 2, 3, 4])
+                .await
+                .unwrap();
+            let mut b = [0u8; 64];
+            let _ = s.read(&mut b).await;
+        });
+
+        let cfg = format!(
+            "mixed-port: 17898
+listeners:
+  - name: srv-stls
+    type: ss
+    port: 0
+    users: [ss-pass]
+    cipher: aes-128-gcm
+    shadow-tls:
+      host: 127.0.0.1
+      port: {cam_port}
+      password: stls-pass
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let ss_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-stls")
+            .map(|(_, p)| *p)
+            .expect("ss+shadowtls listener 应已监听");
+
+        let out = vp_protocol::ss::SsOutbound::new(&vp_config::SsCfg {
+            server: "127.0.0.1".into(),
+            port: ss_port,
+            cipher: "aes-128-gcm".into(),
+            password: "ss-pass".into(),
+            udp: false,
+            plugin: Some("shadow-tls".into()),
+            plugin_opts: Some(vp_config::ShadowTlsCfg {
+                host: Some("127.0.0.1".into()),
+                password: Some("stls-pass".into()),
+                port: Some(cam_port),
+                version: Some(3),
+            }),
+        })
+        .unwrap();
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("ss over shadow-tls 应成功");
+        s.write_all(b"stls-e2e").await.unwrap();
+        let mut buf = [0u8; 8];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"stls-e2e");
     }
 
     #[tokio::test]

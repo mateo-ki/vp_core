@@ -1276,6 +1276,7 @@ dependencies = [
 name = "vp-crypto"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "base64",
  "blake3",

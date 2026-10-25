@@ -459,6 +459,49 @@ rules:
         assert_eq!(&got, b"app-ok");
     }
 
+    /// listeners 全协议启动验证：vmess/vless/ss 端口全部监听
+    /// （协议出入站数据面由各协议 crate 的 loopback 测试覆盖）
+    #[tokio::test]
+    async fn all_listeners_start() {
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let cfg = [
+            "mixed-port: 17896".to_string(),
+            "listeners:".to_string(),
+            format!("  - name: srv-vm
+    type: vmess
+    port: 0
+    users: [\"{uuid}\"]"),
+            format!("  - name: srv-vl
+    type: vless
+    port: 0
+    users: [\"{uuid}\"]"),
+            "  - name: srv-ss
+    type: ss
+    port: 0
+    users: [\"ss-pass\"]
+    cipher: aes-128-gcm".to_string(),
+            "rules: ['MATCH,DIRECT']".to_string(),
+        ]
+        .join("
+")
+            + "
+";
+        let app = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true),
+        )
+        .await
+        .expect("App::start 超时")
+        .unwrap();
+        for tag in ["srv-vm", "srv-vl", "srv-ss"] {
+            assert!(
+                app.listen_ports.iter().any(|(t, _)| t == tag),
+                "{tag} 应已监听: {:?}",
+                app.listen_ports
+            );
+        }
+    }
+
     /// listeners 段端到端：trojan 服务端入站 ← TrojanOutbound ← echo
     #[tokio::test]
     async fn trojan_listener_e2e() {

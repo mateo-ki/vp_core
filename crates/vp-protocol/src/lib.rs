@@ -4,6 +4,7 @@
 
 pub mod basic_out;
 pub mod direct;
+pub mod h3_min;
 pub mod hysteria2;
 pub mod tuic;
 pub mod redir;

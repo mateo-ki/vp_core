@@ -11,8 +11,15 @@ vp-common.workspace = true
 maxminddb = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
 tracing.workspace = true
+serde_yaml.workspace = true
+serde.workspace = true
 
 [features]
 default = ["geoip", "regex-rules"]
 geoip = ["dep:maxminddb"]
 regex-rules = ["dep:regex"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]

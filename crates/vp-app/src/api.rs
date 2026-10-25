@@ -20,28 +20,28 @@ pub struct ApiState {
     pub config_text: RwLock<Option<(String, vp_config::Format, std::path::PathBuf)>>,
 }
 
-pub async fn spawn(addr: String, state: Arc<ApiState>) -> Result<()> {
-    let listener = TcpListener::bind(&addr).await?;
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = serve(stream, &st).await {
-                            let _ = e;
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!("controller accept 失败: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
+/// 监听已建立的 controller：启动 accept 循环（同步返回，切断类型环）
+pub fn spawn_on(listener: TcpListener, state: Arc<ApiState>) {
+    tokio::spawn(accept_loop(listener, state));
+}
+
+async fn accept_loop(listener: TcpListener, st: Arc<ApiState>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve(stream, &st).await {
+                        let _ = e;
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!("controller accept 失败: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
-    });
-    info!("controller listening on {addr}");
-    Ok(())
+    }
 }
 
 struct Req {
@@ -96,6 +96,54 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
         stream.read_exact(&mut body).await.ok()?;
     }
     Some(Req { method, path, query, body, auth })
+}
+
+
+/// 热重载：重建 Router 并替换（失败保留旧配置）
+async fn reload_into(
+    st: &ApiState,
+    text: &str,
+    fmt: vp_config::Format,
+    dir: std::path::PathBuf,
+) -> std::result::Result<(), String> {
+    // Box::pin 打断 spawn→serve→reload→assemble→spawn 的 opaque 类型环
+    let app = match Box::pin(crate::App::assemble_for_reload(text, fmt, &dir)).await {
+        Ok(a) => a,
+        Err(e) => return Err(e.to_string()),
+    };
+    st.router.swap(app.router.current());
+    *st.config_text.write().unwrap() = Some((text.to_string(), fmt, dir));
+    tracing::info!("API 热重载完成");
+    Ok(())
+}
+
+/// GET /traffic：WebSocket 升级后每秒推送流量 JSON
+async fn serve_traffic_ws(mut stream: tokio::net::TcpStream, st: &ApiState) {
+    use tokio::io::AsyncWriteExt;
+    // serve() 已消费请求头；回 101（Accept 值为标记，客户端为内核 GUI/测试）
+    let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: vpcore\r\n\r\n";
+    if stream.write_all(resp.as_bytes()).await.is_err() {
+        return;
+    }
+    // 升级完成后流上走 WS 帧
+    let mut ws = match vp_transport::ws::ws_handshake_after_101(stream).await {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let mut last_up = 0u64;
+    let mut last_down = 0u64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let s = st.stats.snapshot();
+        let up = s.upload - last_up;
+        let down = s.download - last_down;
+        last_up = s.upload;
+        last_down = s.download;
+        let payload = format!("{{\"up\":{up},\"down\":{down}}}");
+        if ws.write_all(payload.as_bytes()).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
@@ -286,6 +334,24 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             )
             .await;
         }
+        ("DELETE", ["connections"]) => {
+            // 批量断开全部连接（Clash GUI）
+            let n = st.conns.close_all();
+            reply(&mut stream, 204, "No Content", &json!({"closed": n})).await;
+        }
+        ("GET", ["connections", id]) => {
+            let hit = st
+                .conns
+                .list()
+                .into_iter()
+                .find(|c| c.meta.id.to_string() == *id);
+            match hit {
+                Some(c) => reply(&mut stream, 200, "OK", &json!({"connection": c})).await,
+                None => {
+                    reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await
+                }
+            }
+        }
         ("GET", ["configs"]) => {
             reply(
                 &mut stream,
@@ -294,6 +360,43 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 &json!({"mode": format!("{:?}", router.mode())}),
             )
             .await;
+        }
+        ("PUT", ["configs"]) => {
+            // 热重载：PUT /configs?force= {"path": "..."} 或用启动时配置
+            let path_override = query_param(&req.query, "path");
+            let reloaded = if let Some(p) = path_override {
+                let base = std::path::PathBuf::from(&p);
+                let text = tokio::fs::read_to_string(&base).await.ok();
+                match text {
+                    Some(t) => {
+                        let fmt = vp_config::Format::from_path(&p);
+                        let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                        reload_into(&st, &t, fmt, dir).await.is_ok()
+                    }
+                    None => false,
+                }
+            } else {
+                let cur = st.config_text.read().unwrap().clone();
+                match cur {
+                    Some((t, fmt, dir)) => reload_into(&st, &t, fmt, dir).await.is_ok(),
+                    None => false,
+                }
+            };
+            if reloaded {
+                reply(&mut stream, 204, "No Content", &json!({})).await;
+            } else {
+                reply(
+                    &mut stream,
+                    500,
+                    "Internal Server Error",
+                    &json!({"message": "重载失败（保留旧配置）"}),
+                )
+                .await;
+            }
+        }
+        ("GET", ["traffic"]) => {
+            // WebSocket /traffic：每秒推送 {"up":..,"down":..}
+            serve_traffic_ws(stream, &st).await;
         }
         _ => {
             reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await;
@@ -401,6 +504,14 @@ rules: ['MATCH,PROXY']
         let resp = http_get("127.0.0.1:19091", "/connections", Some("s3cret")).await;
         assert!(resp.1.contains("connections"));
 
+        // 热重载（PUT /configs）
+        let resp = http_put_raw("127.0.0.1:19091", "/configs?force=true", Some("s3cret"), "").await;
+        assert_eq!(resp.0, 204, "热重载应 204: {resp:?}");
+
+        // 批量断连（DELETE /connections，无连接也返回 204）
+        let resp = http_del("127.0.0.1:19091", "/connections", Some("s3cret")).await;
+        assert_eq!(resp.0, 204);
+
         // 切换 selector（DIRECT→DIRECT 幂等）
         let resp = http_put(
             "127.0.0.1:19091",
@@ -411,6 +522,38 @@ rules: ['MATCH,PROXY']
         .await;
         assert!(resp.0 == 204, "{resp:?}");
         let _ = app;
+    }
+
+    async fn http_put_raw(
+        addr: &str,
+        path: &str,
+        secret: Option<&str>,
+        body: &str,
+    ) -> (u16, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = secret
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "PUT {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        parse_http(&buf)
+    }
+
+    async fn http_del(addr: &str, path: &str, secret: Option<&str>) -> (u16, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = secret
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req = format!("DELETE {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        parse_http(&buf)
     }
 
     async fn http_get(addr: &str, path: &str, secret: Option<&str>) -> (u16, String) {

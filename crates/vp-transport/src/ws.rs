@@ -97,6 +97,14 @@ where
     Ok(WsStream::new(io, false))
 }
 
+/// 101 已发送后的服务端流：直接进入帧模式
+pub async fn ws_handshake_after_101<S>(io: S) -> Result<WsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    Ok(WsStream::new(io, false))
+}
+
 async fn read_until_header_end<S: AsyncRead + Unpin>(io: &mut S) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];

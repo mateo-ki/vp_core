@@ -31,6 +31,33 @@ enum Cmd {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// 拉取订阅并生成配置
+    Sub {
+        /// 订阅 URL
+        url: String,
+        /// 输出配置文件路径
+        #[arg(short, long, default_value = "vpcore-sub.yaml")]
+        output: PathBuf,
+        /// 本地 mixed 监听端口
+        #[arg(short, long, default_value_t = 7890)]
+        port: u16,
+    },
+}
+
+/// HTTP GET 拉取（ureq 默认跟随重定向）
+fn fetch(url: String) -> Result<String, String> {
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .set("User-Agent", "vpcore/sub")
+        .call()
+        .map_err(|e| format!("{e}"))?;
+    let mut body = String::new();
+    use std::io::Read;
+    resp.into_reader()
+        .take(16 << 20)
+        .read_to_string(&mut body)
+        .map_err(|e| format!("{e}"))?;
+    Ok(body)
 }
 
 fn init_logging(level: &str) {
@@ -74,6 +101,38 @@ async fn main() {
                     }
                     std::process::exit(1);
                 }
+            }
+        }
+        Cmd::Sub { url, output, port } => {
+            init_logging("warn");
+            // 拉取（跟随重定向的最小 HTTP GET）
+            let body = tokio::task::spawn_blocking(move || fetch(url))
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| {
+                    eprintln!("拉取订阅失败: {e}");
+                    std::process::exit(2);
+                });
+            let nodes = vp_protocol::sub::parse_subscription(&body);
+            if nodes.is_empty() {
+                eprintln!("订阅中没有可识别的节点");
+                std::process::exit(1);
+            }
+            let cfg = vp_protocol::sub::build_config(&nodes, port);
+            std::fs::write(&output, cfg).unwrap_or_else(|e| {
+                eprintln!("写入 {} 失败: {e}", output.display());
+                std::process::exit(2);
+            });
+            println!(
+                "✓ {} 个节点 → {}（mixed-port {port}）",
+                nodes.len(),
+                output.display()
+            );
+            for n in nodes.iter().take(5) {
+                println!("  - {}", n.name());
+            }
+            if nodes.len() > 5 {
+                println!("  ... 共 {} 个", nodes.len());
             }
         }
         Cmd::Test { config } => {

@@ -13,8 +13,10 @@ path = "src/main.rs"
 [dependencies]
 vp-common.workspace = true
 vp-app.workspace = true
+vp-protocol.workspace = true
 vp-config.workspace = true
 tokio.workspace = true
 clap.workspace = true
+ureq.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

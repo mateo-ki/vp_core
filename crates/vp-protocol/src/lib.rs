@@ -8,6 +8,7 @@ pub mod h3_min;
 pub mod hysteria2;
 pub mod tuic;
 pub mod redir;
+pub mod sub;
 pub mod inbound;
 #[cfg(feature = "ss")]
 pub mod ss;

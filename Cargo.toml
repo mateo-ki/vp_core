@@ -98,6 +98,7 @@ socket2 = "0.6"
 maxminddb = "0.24"
 
 # CLI
+ureq = { version = "2", features = ["tls"] }
 clap = { version = "4", features = ["derive", "std", "help", "usage", "error-context"] }
 
 # 插件宿主

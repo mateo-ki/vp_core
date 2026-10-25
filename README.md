@@ -13,13 +13,15 @@
 ```bash
 cargo build --release -p vp-bin
 
+# 一键订阅（拉取 → 解析 → 生成配置）
+./target/release/vpcore sub "https://example.com/sub" -o my.yaml
+./target/release/vpcore run -c my.yaml
+
 # 校验配置（YAML / JSON 双格式）
 ./target/release/vpcore validate -c example/config.yaml
 
-# 启动
+# 启动 / 全组测速
 ./target/release/vpcore run -c example/config.yaml
-
-# 全组测速
 ./target/release/vpcore test -c example/config.yaml
 ```
 
@@ -64,6 +66,7 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **M3（部分完成）**：DoH 上游（RFC8484 + #insecure）、gRPC(h2) 传输、QUIC 传输基座（quinn）、hysteria2 出站框架（h3 认证 + varint/TCP/UDPMessage 帧）
 - **M4（完成）**：**TUIC v5 出+入站**（TLS keying material token 认证、Connect/Packet/Dissociate/Heartbeat、UDP 会话 NAT、自环测试）、redir/tproxy 入站（Linux，非 Linux 明确报错不阻断）
 - **M5（部分完成）**：**hysteria2 出+入站全链路**——自写最小 HTTP/3 认证层（h3_min：QPACK literal 无 Huffman 编解码、HEADERS/SETTINGS 帧层、bi 流首字节嗅探分流），替代 h3 crate 依赖；自环测试覆盖认证/TCP/UDP/错误密码拒绝。对官方服务端可认证互通（literal 是合法 QPACK）；服务端不解析 Huffman/动态表（明确边界）。116 项测试
+- **订阅支持（已完成）**：`vpcore sub <URL>` 一键拉取订阅 → 自动解析 vless/vmess/trojan/ss 分享链接（含 base64 包装）→ 生成完整可运行配置（自动选择组 + 控制器 + 规则），不支持的传输自动跳过。**已用真实订阅（300 节点）端到端验证：google 204 / 出口 IP 正确 / API 可用**。122 项测试，release 6.63 MB
 - **M6（计划）**：shadowtls v3（需手写 TLS 记录层）、WireGuard、uTLS 指纹
 - **M4**：anytls/mieru/brook/ssh/naive、插件市场、热重载完善
 

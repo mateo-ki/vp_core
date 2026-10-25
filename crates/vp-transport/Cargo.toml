@@ -25,3 +25,6 @@ serde.workspace = true
 [features]
 default = ["tls"]
 tls = []
+
+[dev-dependencies]
+rcgen.workspace = true

@@ -30,6 +30,34 @@ impl SubNode {
             .collect();
         let mut out = String::from("  - ");
         out.push_str(&lines.join("\n    "));
+        // plugin-opts 块（shadow-tls，若存在）
+        if let Some((_, host)) = self.fields.iter().find(|(k, _)| k == "__stls_host") {
+            let password = self
+                .fields
+                .iter()
+                .find(|(k, _)| k == "__stls_password")
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("\"\"");
+            let port = self
+                .fields
+                .iter()
+                .find(|(k, _)| k == "__stls_port")
+                .map(|(_, v)| v.trim_matches('"'))
+                .unwrap_or("");
+            let port_line = if port.is_empty() {
+                String::new()
+            } else {
+                format!("
+      port: {port}")
+            };
+            out.push_str(&format!(
+                "
+    plugin-opts:
+      host: {host}
+      password: {password}{{port_line}}
+      version: 3"
+            ));
+        }
         // ws-opts 块（若存在）
         if let Some((_, path)) = self.fields.iter().find(|(k, _)| k == "__ws_path") {
             let host = self
@@ -205,8 +233,25 @@ fn parse_ss(rest: &str) -> Result<SubNode> {
         Some((b, n)) => (b, urldecode(n)),
         None => (rest, String::new()),
     };
-    let (main, _qs) = body.split_once('?').unwrap_or((body, ""));
+    let (main, qs) = body.split_once('?').unwrap_or((body, ""));
     let (encoded, hostport) = main.rsplit_once('@').ok_or(Error::Config("ss 缺少 @".into()))?;
+    // SIP002: plugin=shadow-tls;mode=v3;host=xx;password=yy（urlencoded）
+    let mut stls: Option<Vec<(String, String)>> = None;
+    for kv in qs.split('&') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        if urldecode(k) != "plugin" {
+            continue;
+        }
+        let p = urldecode(v);
+        let mut parts = p.split(';');
+        let name = parts.next().unwrap_or_default().to_string();
+        let opts: Vec<(String, String)> = parts
+            .filter_map(|o| o.split_once('=').map(|(a, b)| (a.to_string(), b.to_string())))
+            .collect();
+        if name.contains("shadow-tls") {
+            stls = Some(opts);
+        }
+    }
     use base64::Engine;
     let userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
@@ -217,16 +262,27 @@ fn parse_ss(rest: &str) -> Result<SubNode> {
         .split_once(':')
         .ok_or(Error::Config("ss userinfo 格式".into()))?;
     let (host, port) = hostport.rsplit_once(':').ok_or(Error::Config("ss 缺端口".into()))?;
-    Ok(SubNode {
-        fields: vec![
-            ("name".into(), q(&name)),
-            ("type".into(), "ss".into()),
-            ("server".into(), host.to_string()),
-            ("port".into(), port.to_string()),
-            ("cipher".into(), method.to_string()),
-            ("password".into(), q(password)),
-        ],
-    })
+    let mut fields = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "ss".into()),
+        ("server".into(), host.to_string()),
+        ("port".into(), port.to_string()),
+        ("cipher".into(), method.to_string()),
+        ("password".into(), q(password)),
+    ];
+    if let Some(opts) = stls {
+        let get = |k: &str| {
+            opts.iter()
+                .find(|(a, _)| a == k)
+                .map(|(_, b)| b.clone())
+                .unwrap_or_default()
+        };
+        fields.push(("plugin".into(), "shadow-tls".into()));
+        fields.push(("__stls_host".into(), q(&get("host"))));
+        fields.push(("__stls_password".into(), q(&get("password"))));
+        fields.push(("__stls_port".into(), q(&get("port"))));
+    }
+    Ok(SubNode { fields })
 }
 
 fn urldecode(s: &str) -> String {
@@ -339,6 +395,22 @@ mod tests {
         assert!(n.to_yaml().contains("password: \"pw123\""));
         let s = parse_ss("ss://YWVzLTI1Ni1nY206cGFzcw@a.com:8388#s1").unwrap();
         assert!(s.to_yaml().contains("cipher: aes-256-gcm"));
+    }
+
+    #[test]
+    fn ss_shadowtls_plugin() {
+        // SIP002: plugin 参数 urlencoded，分号分隔
+        let uri = "ss://YWVzLTI1Ni1nY206cGFzcw@a.com:8388?plugin=shadow-tls%3Bmode%3Dv3%3Bhost%3Dwww.apple.com%3Bpassword%3Dstls-pw#s1";
+        let n = parse_uri(uri).unwrap();
+        let y = n.to_yaml();
+        assert!(y.contains("plugin: shadow-tls"), "{y}");
+        assert!(y.contains("plugin-opts:"));
+        assert!(y.contains("host: \"www.apple.com\""));
+        assert!(y.contains("password: \"stls-pw\""));
+        assert!(y.contains("version: 3"));
+        // 无 plugin 的 ss 不应生成 plugin 段
+        let plain = parse_ss("ss://YWVzLTI1Ni1nY206cGFzcw@a.com:8388#s2").unwrap();
+        assert!(!plain.to_yaml().contains("plugin"));
     }
 
     #[test]

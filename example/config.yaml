@@ -93,6 +93,29 @@ proxy-groups:
 #     type: trojan
 #     port: 10443
 #     users: ["your-password"]
+#   - name: srv-ss-stls
+#     type: ss
+#     port: 10444
+#     users: ["ss-password"]
+#     cipher: aes-128-gcm
+#     # shadow-tls v3 外层伪装：未认证连接/主动探测回退转发至伪装站
+#     shadow-tls:
+#       host: www.apple.com   # 伪装站（需 TLS 1.3）
+#       port: 443
+#       password: stls-password
+
+# proxies 中的 ss 节点使用 shadow-tls（机场订阅 plugin 参数自动生成）：
+#   - name: stls-node
+#     type: shadowsocks
+#     cipher: aes-128-gcm
+#     password: ss-password
+#     server: example.com
+#     port: 10444
+#     plugin: shadow-tls
+#     plugin-opts:
+#       host: www.apple.com
+#       password: stls-password
+#       version: 3
 
 rule-providers:
   # 文本域名集（+.google.com 语法）；classical/ipcidr 行为同样支持

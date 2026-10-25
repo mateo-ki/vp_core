@@ -6,6 +6,7 @@ pub mod basic_out;
 pub mod direct;
 pub mod h3_min;
 pub mod hysteria2;
+pub mod shadowtls;
 pub mod tuic;
 pub mod redir;
 pub mod sub;

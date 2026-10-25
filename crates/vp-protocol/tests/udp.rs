@@ -190,6 +190,7 @@ async fn ss_udp_loopback() {
         password: "udp-pass".into(),
         udp: true,
         plugin: None,
+        plugin_opts: None,
     })
     .unwrap();
     assert!(out.support_udp());

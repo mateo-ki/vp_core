@@ -66,6 +66,31 @@ pub struct Config {
     pub rule_providers: HashMap<String, RuleProviderCfg>,
     #[serde(default)]
     pub tun: Option<TunCfg>,
+    /// 协议服务端入站（自建服务器场景）
+    #[serde(default)]
+    pub listeners: Vec<ListenerCfg>,
+}
+
+/// 服务端入站定义（M1：trojan/vmess/vless/ss，TLS 证书项随 M3 补）
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListenerCfg {
+    pub name: String,
+    /// trojan / vmess / vless / ss
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub port: u16,
+    /// trojan: 密码列表；vmess/vless: uuid 列表；ss: 单密码
+    #[serde(default)]
+    pub users: Vec<String>,
+    /// ss 加密方式
+    #[serde(default)]
+    pub cipher: Option<String>,
+    /// TLS 证书 PEM 路径（可选；提供则套 TLS）
+    #[serde(default)]
+    pub cert: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 /// TUN 配置段（Clash 风格）

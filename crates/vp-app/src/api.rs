@@ -5,7 +5,6 @@ use std::sync::{Arc, RwLock};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
 
 use vp_common::Result;
 use vp_core::ConnTable;

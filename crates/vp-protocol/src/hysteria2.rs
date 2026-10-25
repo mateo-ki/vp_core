@@ -475,7 +475,7 @@ impl Hysteria2Inbound {
                     let st = read_varint(&tb).map(|(v, _)| v).unwrap_or(u64::MAX);
                     if st == crate::h3_min::STREAM_CONTROL {
                         // 客户端开了控制流：服务端也开一条并回应空 SETTINGS
-                        if let Ok(mut out) = conn.open_uni().await {
+                        if let Ok(out) = conn.open_uni().await {
                             let _ = crate::h3_min::server_init_stream(out, crate::h3_min::STREAM_CONTROL).await;
                         }
                     }

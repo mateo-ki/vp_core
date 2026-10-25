@@ -19,6 +19,7 @@ base64.workspace = true
 sha1.workspace = true
 rand.workspace = true
 bytes.workspace = true
+socket2.workspace = true
 tracing.workspace = true
 serde.workspace = true
 

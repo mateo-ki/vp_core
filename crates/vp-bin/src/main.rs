@@ -38,6 +38,10 @@ fn init_logging(level: &str) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    // panic 不退出（任务级隔离），但记录到日志
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("panic（已隔离）: {info}");
+    }));
 }
 
 #[tokio::main]
@@ -117,14 +121,28 @@ async fn main() {
             if let Some(c) = &app.controller {
                 println!("  controller: http://{c}");
             }
-            // 等待退出信号
+            // SIGHUP 热重载 / SIGINT·SIGTERM 退出
             #[cfg(unix)]
             {
-                let mut sig =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sig.recv() => {}
+                let mut term = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                )
+                .unwrap();
+                let mut hup = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::hangup(),
+                )
+                .unwrap();
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = term.recv() => break,
+                        Some(_) = hup.recv() => {
+                            match app.reload().await {
+                                Ok(()) => println!("已热重载"),
+                                Err(e) => eprintln!("热重载失败（保留旧配置）: {e}"),
+                            }
+                        }
+                    }
                 }
             }
             #[cfg(not(unix))]

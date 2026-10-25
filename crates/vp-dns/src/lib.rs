@@ -45,7 +45,15 @@ pub struct Resolver {
 #[derive(Debug, Clone)]
 struct ServerAddr {
     addr: SocketAddr,
-    tcp: bool,
+    /// udp / tcp / tls(DoT)
+    proto: Proto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proto {
+    Udp,
+    Tcp,
+    Tls,
 }
 
 impl Resolver {
@@ -57,7 +65,10 @@ impl Resolver {
 
     /// 第一个 UDP 上游（DNS 服务器原样转发用）
     pub fn first_udp_server(&self) -> Option<SocketAddr> {
-        self.servers.iter().find(|s| !s.tcp).map(|s| s.addr)
+        self.servers
+            .iter()
+            .find(|s| s.proto == Proto::Udp)
+            .map(|s| s.addr)
     }
 
     pub fn system() -> Self {
@@ -138,22 +149,23 @@ fn parse_server(s: &str) -> Option<ServerAddr> {
         Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
             (h.to_string(), p.parse::<u16>().ok()?)
         }
-        _ => (host.to_string(), 53),
+        _ => (host.to_string(), if proto == "tls" { 853 } else { 53 }),
     };
     let ip: IpAddr = host.parse().ok()?;
-    let tcp = match proto {
-        "tcp" => true,
-        "udp" => false,
-        _ => return None, // tls/https 随 M2
+    let proto = match proto {
+        "tcp" => Proto::Tcp,
+        "udp" => Proto::Udp,
+        "tls" => Proto::Tls,
+        _ => return None, // https(DoH) 随 M3
     };
-    Some(ServerAddr { addr: SocketAddr::new(ip, port), tcp })
+    Some(ServerAddr { addr: SocketAddr::new(ip, port), proto })
 }
 
 async fn query_server(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
-    if server.tcp {
-        query_tcp(server.addr, domain, qtype).await
-    } else {
-        query_udp(server.addr, domain, qtype).await
+    match server.proto {
+        Proto::Udp => query_udp(server.addr, domain, qtype).await,
+        Proto::Tcp => query_tcp(server.addr, domain, qtype).await,
+        Proto::Tls => query_tls(server.addr, domain, qtype).await,
     }
 }
 
@@ -219,6 +231,42 @@ async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<Vec<I
     Ok(wire::extract_ips(&msg, qtype.code()).into_iter().map(|(ip, _)| ip).collect())
 }
 
+/// DoT（RFC 7858）：TLS 上的 DNS，2 字节长度前缀帧
+async fn query_tls(addr: SocketAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::{rustls::ClientConfig, TlsConnector};
+    use std::sync::Arc;
+
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    // SNI：无主机名场景（IP 上游）按 IP 形式构造
+    let sni = ServerName::IpAddress(addr.ip().into());
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let mut tls = connector.connect(sni, tcp).await?;
+
+    let id = query_id();
+    let q = wire::build_query(id, domain, qtype);
+    let mut framed = Vec::with_capacity(q.len() + 2);
+    framed.extend_from_slice(&(q.len() as u16).to_be_bytes());
+    framed.extend_from_slice(&q);
+    tls.write_all(&framed).await?;
+    let mut len_buf = [0u8; 2];
+    tls.read_exact(&mut len_buf).await?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; len];
+    tls.read_exact(&mut resp).await?;
+    let msg = wire::parse_response(&resp).ok_or(Error::Proto("DoT 响应解析失败"))?;
+    if msg.rcode != 0 {
+        return Err(Error::Dns(format!("DoT 错误码 {}", msg.rcode)));
+    }
+    Ok(wire::extract_ips(&msg, qtype.code()).into_iter().map(|(ip, _)| ip).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,12 +274,13 @@ mod tests {
     #[test]
     fn server_parsing() {
         assert_eq!(
-            parse_server("8.8.8.8").map(|s| (s.addr.to_string(), s.tcp)),
-            Some(("8.8.8.8:53".into(), false))
+            parse_server("8.8.8.8").map(|s| (s.addr.to_string(), s.proto)),
+            Some(("8.8.8.8:53".into(), Proto::Udp))
         );
         assert_eq!(parse_server("udp://1.1.1.1:5353").map(|s| s.addr.port()), Some(5353));
-        assert_eq!(parse_server("tcp://192.168.1.1").map(|s| s.tcp), Some(true));
-        assert!(parse_server("https://doh.pub/dns-query").is_none()); // M2
+        assert!(matches!(parse_server("tcp://192.168.1.1"), Some(s) if s.proto == Proto::Tcp));
+        assert!(parse_server("https://doh.pub/dns-query").is_none()); // DoH 随 M3
+        assert!(matches!(parse_server("tls://8.8.8.8"), Some(s) if s.proto == Proto::Tls));
     }
 
     #[tokio::test]

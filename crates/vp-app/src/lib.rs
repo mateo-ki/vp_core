@@ -65,6 +65,15 @@ impl App {
         Ok(app)
     }
 
+    /// 热重载用：仅重建（不启动监听），返回新 App 供 router 替换
+    pub async fn assemble_for_reload(
+        text: &str,
+        fmt: vp_config::Format,
+        base_dir: &Path,
+    ) -> Result<Arc<App>> {
+        Self::assemble(text, fmt, base_dir, false).await
+    }
+
     pub async fn reload(&self) -> Result<()> {
         let (text, fmt, dir) = self
             .config_text
@@ -243,7 +252,8 @@ impl App {
                     secret: cfg.secret.clone().filter(|s| !s.is_empty()),
                     config_text: RwLock::new(Some((text.to_string(), fmt, base_dir.to_path_buf()))),
                 };
-                api::spawn(addr.clone(), Arc::new(app_ref)).await?;
+                let listener = tokio::net::TcpListener::bind(&addr).await?;
+                api::spawn_on(listener, Arc::new(app_ref));
                 info!("外部控制器 http://{addr}");
             }
         }

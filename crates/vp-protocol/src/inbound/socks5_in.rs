@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, warn};
@@ -11,8 +12,10 @@ use vp_common::addr::decode_socks_addr;
 use vp_common::{DstAddr, Error, Result};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
+use vp_core::stream::UdpPacket;
 
 use super::dispatch::{dispatch_stream, ClientReply};
+use super::udp_nat::UdpNat;
 
 pub struct Socks5Inbound {
     bind: String,
@@ -100,10 +103,91 @@ where
             Ok(())
         }
         0x03 => {
-            // UDP ASSOCIATE：M1 优雅拒绝（UDP 随 TUN 里程碑）
-            stream
-                .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await?;
+            // UDP ASSOCIATE：申请中继 socket，回复绑定地址，转入 UDP 泵
+            let relay = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
+                Err(_) => {
+                    stream
+                        .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let bound = relay.local_addr()?;
+            // 回复对客户端可达的地址：默认回环（本机客户端场景）；
+            // 远程客户端需内核开启 allow-lan 时由其自行访问绑定端口
+            let local_ip = std::net::IpAddr::V4([127, 0, 0, 1].into());
+            let reply_addr = std::net::SocketAddr::new(local_ip, bound.port());
+            let mut rep = Vec::with_capacity(18);
+            rep.extend_from_slice(&[0x05, 0x00, 0x00]);
+            vp_common::addr::encode_socks_addr(&DstAddr::ip(local_ip, bound.port()), &mut rep);
+            stream.write_all(&rep).await?;
+            debug!("socks5 UDP ASSOCIATE {src} -> {reply_addr}");
+            let relay = Arc::new(relay);
+            let nat = UdpNat::new(ctx.clone(), tag.clone(), relay.clone());
+            nat.set_reply_formatter(Arc::new(|from_srv: std::net::SocketAddr, data: &[u8]| {
+                // [rsv rsv frag][socks addr of server][payload]
+                let mut pkt = vec![0x00, 0x00, 0x00];
+                vp_common::addr::encode_socks_addr(
+                    &DstAddr::ip(from_srv.ip(), from_srv.port()),
+                    &mut pkt,
+                );
+                pkt.extend_from_slice(data);
+                pkt
+            }));
+            let mut tcp_buf = [0u8; 1];
+            // 客户端 → 中继 socket（限定来源地址）
+            let mut buf = vec![0u8; 65535];
+            let mut idle = tokio::time::interval(Duration::from_secs(300));
+            idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            idle.tick().await; // interval 首个 tick 立即就绪，先消耗
+            loop {
+                tokio::select! {
+                    r = relay.recv_from(&mut buf) => {
+                        let Ok((n, from)) = r else { break };
+                        tracing::debug!("udp relay 收到 {n}B from {from} (src={src})");
+                        // RFC1928 允许客户端使用不同于控制连接的 UDP 端口，
+                        // 仅校验同 IP（防外部注入）；严格校验随 M3 配置项提供
+                        if from.ip() != src.ip() {
+                            tracing::debug!("udp 来源 IP 不匹配 {from} != {src}");
+                            continue;
+                        }
+                        if n < 4 {
+                            continue;
+                        }
+                        // socks udp: [rsv2][frag1][socks addr][payload]
+                        if buf[2] != 0x00 {
+                            continue; // 分片不支持
+                        }
+                        let (dst_addr, used) = match vp_common::addr::decode_socks_addr(&buf[3..n]) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        let pkt = UdpPacket {
+                            src: from,
+                            dst: std::net::SocketAddr::new(
+                                match &dst_addr.host {
+                                    vp_common::Host::Ip(ip) => *ip,
+                                    // 域名目标（socks5 UDP 支持域名）：让 NAT 决策时解析
+                                    vp_common::Host::Domain(_) => [0, 0, 0, 0].into(),
+                                },
+                                dst_addr.port,
+                            ),
+                            data: buf[3 + used..n].to_vec().into(),
+                        };
+                        let fake = match &dst_addr.host {
+                            vp_common::Host::Domain(d) => Some(d.clone()),
+                            vp_common::Host::Ip(_) => None,
+                        };
+                        if let Err(e) = nat.dispatch(pkt, fake).await {
+                            debug!("udp 分发失败: {e}");
+                        }
+                    }
+                    // TCP 控制连接断开即结束
+                    _ = stream.read(&mut tcp_buf) => break,
+                    _ = idle.tick() => break,
+                }
+            }
             Ok(())
         }
         other => Err(Error::ProtoMsg(format!("socks5 入站: 不支持的命令 {other}"))),

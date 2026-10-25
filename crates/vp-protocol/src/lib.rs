@@ -9,6 +9,7 @@ pub mod inbound;
 pub mod ss;
 #[cfg(feature = "trojan")]
 pub mod trojan;
+pub mod udp_out;
 #[cfg(feature = "vless")]
 pub mod vless;
 #[cfg(feature = "vmess")]
@@ -129,7 +130,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
     let o: Arc<dyn Outbound> = match &cfg.kind {
         ProxyKind::Direct => Arc::new(DirectOutbound::new(deps.dns.clone(), deps.ipv6)),
         ProxyKind::Reject => Arc::new(RejectOutbound),
-        ProxyKind::Socks5(SocksCfg { server, port, username, password, .. }) => {
+        ProxyKind::Socks5(SocksCfg { server, port, username, password, udp, .. }) => {
             Arc::new(NamedOutbound::new_named(
                 &cfg.name,
                 Socks5Outbound {
@@ -137,6 +138,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
                     port: *port,
                     username: username.clone(),
                     password: password.clone(),
+                    udp: *udp,
                 },
             ))
         }

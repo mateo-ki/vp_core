@@ -4,10 +4,12 @@ mod dispatch;
 mod http_in;
 mod mixed;
 mod socks5_in;
+pub mod udp_nat;
 
 pub use dispatch::dispatch_stream;
 pub use http_in::HttpInbound;
 pub use mixed::MixedInbound;
+pub use udp_nat::UdpNat;
 pub use socks5_in::Socks5Inbound;
 
 use std::sync::Arc;

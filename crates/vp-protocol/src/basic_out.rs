@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 
 use vp_common::addr::encode_socks_addr;
 use vp_common::{DstAddr, Error, Result};
-use vp_core::{Outbound, ProxyStream, Session};
+use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 
 // ---------------------------------------------------------------------------
 // REJECT
@@ -35,6 +35,7 @@ pub struct Socks5Outbound {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub udp: bool,
 }
 
 impl Socks5Outbound {
@@ -118,6 +119,21 @@ impl Outbound for Socks5Outbound {
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
         Ok(Box::new(self.handshake(underlying, dst).await?))
+    }
+
+    fn support_udp(&self) -> bool {
+        self.udp
+    }
+
+    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        let conn = crate::udp_out::socks5_udp_connect(
+            &self.server,
+            self.port,
+            &self.username,
+            &self.password,
+        )
+        .await?;
+        Ok(Box::new(conn))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {

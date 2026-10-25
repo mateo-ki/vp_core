@@ -182,6 +182,7 @@ pub enum ProxyKind {
     Vless(VlessCfg),
     Trojan(TrojanCfg),
     Anytls(AnytlsCfg),
+    Ssh(SshCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
@@ -200,6 +201,7 @@ impl ProxyKind {
             ProxyKind::Vless(_) => "vless",
             ProxyKind::Trojan(_) => "trojan",
             ProxyKind::Anytls(_) => "anytls",
+            ProxyKind::Ssh(_) => "ssh",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
@@ -338,6 +340,21 @@ pub struct TrojanCfg {
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(default)]
     pub udp: bool,
+}
+
+/// ssh：SSH-2.0 出站（direct-tcpip 通道）。password 与 private-key 二选一。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SshCfg {
+    pub server: String,
+    pub port: u16,
+    pub username: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(alias = "private-key", alias = "private_key", default)]
+    pub private_key: Option<String>,
+    /// 期望的主机密钥（"SHA256:base64" 指纹或原始 blob base64）；None 不校验
+    #[serde(alias = "host-key", alias = "host_key", default)]
+    pub host_key: Option<String>,
 }
 
 /// anytls：TLS 之上的多路复用流协议（sing-anytls v2）。协议本身强制 TLS。

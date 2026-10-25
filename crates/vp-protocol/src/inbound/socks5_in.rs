@@ -85,8 +85,8 @@ where
     stream.read_exact(&mut methods).await?;
     stream.write_all(&[0x05, 0x00]).await?; // 无认证
 
-    // 请求头
-    let mut req = [0u8; 4];
+    // 请求头：[ver][cmd][rsv]（atyp 起由 read_socks_addr 解析）
+    let mut req = [0u8; 3];
     stream.read_exact(&mut req).await?;
     if req[0] != 0x05 {
         return Err(Error::Proto("socks5 入站: 请求版本错误"));

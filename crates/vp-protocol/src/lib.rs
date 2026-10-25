@@ -3,6 +3,7 @@
 //! M1：direct / reject / socks5 / http / shadowsocks / vmess / vless / trojan（出+入对称）
 
 pub mod basic_out;
+pub mod anytls;
 pub mod direct;
 pub mod h3_min;
 pub mod hysteria2;
@@ -26,7 +27,7 @@ pub mod vmess;
 use std::sync::Arc;
 
 use vp_common::{Error, Result};
-use vp_config::{GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
+use vp_config::{AnytlsCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_common::DstAddr;
 use vp_dns::Resolver;
@@ -198,6 +199,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Vmess(vm) => build_vmess(cfg.name.as_str(), vm)?,
         ProxyKind::Vless(vl) => build_vless(cfg.name.as_str(), vl)?,
         ProxyKind::Trojan(tr) => build_trojan(cfg.name.as_str(), tr)?,
+        ProxyKind::Anytls(a) => build_anytls(cfg, a)?,
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     Ok(match cfg.kind {
@@ -279,6 +281,16 @@ fn build_trojan(name: &str, tr: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
 }
 
 #[cfg(not(feature = "trojan"))]
-fn build_trojan(_name: &str, _tr: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
+fn build_trojan(_name: &str, _tr_cfg: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
     Err(Error::Unsupported("此构建未启用 trojan".into()))
+}
+
+fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
+    let base: Arc<dyn Outbound> = Arc::new(anytls::AnytlsOutbound::new_named(cfg.name.as_str(), a)?);
+    // anytls 无原生 UDP：udp: true 时经 UoT 提供（显式 udp-over-tcp 标志避免双包装）
+    if a.udp && !cfg.udp_over_tcp {
+        Ok(Arc::new(uot::UotOutbound::new(base)))
+    } else {
+        Ok(base)
+    }
 }

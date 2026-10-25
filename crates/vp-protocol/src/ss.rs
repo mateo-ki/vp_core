@@ -15,7 +15,7 @@ use vp_config::SsCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::tunnel::{relay, RelayHook};
-use vp_core::{Inbound, Outbound, ProxyStream};
+use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::ss::{AeadChunkCodec, Cipher};
 
 use crate::direct::DirectOutbound;
@@ -315,6 +315,13 @@ impl Outbound for SsOutbound {
         self.udp
     }
 
+    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        let conn =
+            crate::udp_out::SsUdpConn::bind(&self.server, self.port, self.cipher.clone(), self.key.clone())
+                .await?;
+        Ok(Box::new(conn))
+    }
+
     fn remote_addr(&self) -> Option<(String, u16)> {
         Some((self.server.clone(), self.port))
     }
@@ -345,6 +352,94 @@ impl SsInbound {
             key,
             direct: Arc::new(DirectOutbound::new(Arc::new(Resolver::system()), false)),
         })
+    }
+
+    /// ss UDP 服务端：每包独立 salt；client→target 直连转发；回包重新加密
+    async fn serve_udp(self: Arc<Self>, sock: tokio::net::UdpSocket) -> Result<()> {
+        use std::collections::HashMap;
+        let sock = Arc::new(sock);
+        let mut buf = vec![0u8; 65535];
+        let nat: Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, Arc<tokio::net::UdpSocket>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        loop {
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+            let salt_len = self.cipher.salt_len();
+            if n <= salt_len {
+                continue;
+            }
+            let Ok(sub) = self.cipher.subkey(&self.key, &buf[..salt_len]) else { continue };
+            let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) else { continue };
+            let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else { continue };
+            let Ok((dst, used)) = decode_socks_addr(&plain) else { continue };
+            let payload = plain[used..].to_vec();
+
+            // 客户端 → 目标 socket（每客户端一个，惰性创建；锁内不做 await）
+            let existing = nat.lock().unwrap().get(&from).cloned();
+            let (target, is_new) = match existing {
+                Some(t) => (t, false),
+                None => {
+                    let t = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+                    let mut nat = nat.lock().unwrap();
+                    match nat.get(&from) {
+                        Some(prev) => (prev.clone(), false), // 并发竞争：他方先插入
+                        None => {
+                            nat.insert(from, t.clone());
+                            (t, true)
+                        }
+                    }
+                }
+            };
+
+            if is_new {
+                let target = target.clone();
+                let sock2 = sock.clone();
+                let cipher = self.cipher.clone();
+                let key = self.key.clone();
+                let nat2 = nat.clone();
+                let client = from;
+                tokio::spawn(async move {
+                    let mut rbuf = [0u8; 65535];
+                    loop {
+                        let recv = match tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            target.recv_from(&mut rbuf),
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => break, // 空闲超时
+                        };
+                        let Ok((rn, rfrom)) = recv else { break };
+                        // 回包：[salt][chunk(socks addr + payload)]
+                        let mut plain = Vec::with_capacity(rn + 24);
+                        encode_socks_addr(&DstAddr::ip(rfrom.ip(), rfrom.port()), &mut plain);
+                        plain.extend_from_slice(&rbuf[..rn]);
+                        let mut salt = vec![0u8; cipher.salt_len()];
+                        vp_common::rand_bytes(&mut salt);
+                        let Ok(sub) = cipher.subkey(&key, &salt) else { continue };
+                        let Ok(mut codec) = AeadChunkCodec::new(&cipher, &sub) else { continue };
+                        let chunk = codec.seal_chunk(&plain);
+                        let mut dgram = salt;
+                        dgram.extend_from_slice(&chunk);
+                        let _ = sock2.send_to(&dgram, client).await;
+                    }
+                    nat2.lock().unwrap().remove(&client);
+                });
+            }
+
+            let dst_addr: std::net::SocketAddr = match &dst.host {
+                vp_common::Host::Ip(ip) => std::net::SocketAddr::new(*ip, dst.port),
+                vp_common::Host::Domain(d) => {
+                    match tokio::net::lookup_host((d.as_str(), dst.port)).await {
+                        Ok(mut it) => it
+                            .next()
+                            .unwrap_or(std::net::SocketAddr::new([127, 0, 0, 1].into(), dst.port)),
+                        Err(_) => continue,
+                    }
+                }
+            };
+            let _ = target.send_to(&payload, dst_addr).await;
+        }
     }
 
     async fn serve(
@@ -434,6 +529,20 @@ impl Inbound for SsInbound {
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
         let bound = listener.local_addr()?.port();
+        // UDP 监听（尽力而为：Windows 下与 TCP 同端口绑定可能被拒绝）
+        match tokio::net::UdpSocket::bind((self.bind.as_str(), bound)).await {
+            Ok(udp) => {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.serve_udp(udp).await {
+                        warn!("ss udp 入站结束: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("ss udp 入站绑定失败（UDP 不可用）: {e}");
+            }
+        }
         let this = self.clone();
         tokio::spawn(async move {
             loop {

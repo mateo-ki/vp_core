@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use vp_common::{DstAddr, Error, Result};
-use vp_core::{Outbound, ProxyStream, Session};
+use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupType {
@@ -406,6 +406,14 @@ impl Outbound for Group {
         } else {
             self.members.iter().any(|m| m.support_udp())
         }
+    }
+
+    async fn connect_packet(
+        &self,
+        sess: &Session,
+        dst: &DstAddr,
+    ) -> Result<Box<dyn PacketConn>> {
+        self.pick(sess).connect_packet(sess, dst).await
     }
 }
 

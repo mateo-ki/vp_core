@@ -147,9 +147,10 @@ async fn mixed_socks5_full_chain() {
 
 #[tokio::test]
 async fn mixed_http_connect_full_chain() {
+    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
     let (port, _router, echo_port) = build_core().await;
     let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!("CONNECT direct.test:{echo_port} HTTP/1.1\r\nHost: direct.test\r\n\r\n");
+    let req = format!("CONNECT localhost:{echo_port} HTTP/1.1\r\nHost: localhost\r\n\r\n");
     c.write_all(req.as_bytes()).await.unwrap();
     let mut head = Vec::new();
     let mut byte = [0u8; 1];

@@ -88,6 +88,8 @@ rand = "0.9"
 
 # 网络
 httparse = "1"
+h2 = "0.4"
+http = "1"
 tun = { version = "0.8", features = ["async"] }
 ipstack = "1.0"
 etherparse = "0.17"

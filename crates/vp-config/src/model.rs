@@ -176,6 +176,12 @@ impl ProxyKind {
 /// tls / server_name(aliases: servername, sni) / skip_cert_verify / network / ws_opts
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct GrpcOpts {
+    #[serde(alias = "grpc-service-name", alias = "grpc_service_name", default)]
+    pub grpc_service_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WsOpts {
     #[serde(default)]
     pub path: Option<String>,
@@ -217,6 +223,8 @@ pub struct VmessCfg {
     pub network: Option<String>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
+    #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
+    pub grpc_opts: Option<GrpcOpts>,
     #[serde(default)]
     pub udp: bool,
 }
@@ -242,6 +250,8 @@ pub struct VlessCfg {
     pub network: Option<String>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
+    #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
+    pub grpc_opts: Option<GrpcOpts>,
     #[serde(default)]
     pub udp: bool,
 }
@@ -261,6 +271,8 @@ pub struct TrojanCfg {
     pub network: Option<String>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
+    #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
+    pub grpc_opts: Option<GrpcOpts>,
     #[serde(default)]
     pub udp: bool,
 }

@@ -283,6 +283,7 @@ mod tests {
             skip_cert_verify: false,
             network: None,
             ws_opts: None,
+            grpc_opts: None,
             udp: false,
         })
         .unwrap();

@@ -1,5 +1,6 @@
 //! vp-transport：传输层（TCP / TLS / WebSocket）。
 
+pub mod grpc;
 pub mod tls;
 pub mod ws;
 
@@ -34,6 +35,8 @@ pub struct TransportConfig {
     pub skip_cert_verify: bool,
     /// network: "ws" 时启用 WebSocket
     pub ws: Option<WsConfig>,
+    /// network: "grpc" 时启用 gRPC（要求 TLS + ALPN h2）
+    pub grpc: Option<grpc::GrpcConfig>,
 }
 
 /// 拨号：TCP →（可选 WS）→（可选 TLS，TLS 在最外层）
@@ -55,6 +58,21 @@ pub async fn dial(
     })??;
     tune(&tcp);
 
+    if let Some(g) = &cfg.grpc {
+        // grpc 生态默认 TLS + ALPN h2
+        let tls = tls::tls_connect(
+            tcp,
+            server_host,
+            &tls::TlsClientConfig {
+                skip_cert_verify: cfg.skip_cert_verify,
+                server_name: cfg.server_name.clone(),
+                alpn: vec!["h2".into()],
+            },
+        )
+        .await?;
+        let s = grpc::grpc_connect(tls, server_host, g).await?;
+        return Ok(Box::new(s));
+    }
     if cfg.tls {
         let tls = tls::tls_connect(
             tcp,

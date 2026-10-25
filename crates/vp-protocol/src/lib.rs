@@ -110,18 +110,40 @@ pub fn transport_of(
     network: &Option<String>,
     ws_opts: &Option<WsOpts>,
 ) -> Result<TransportConfig> {
+    transport_of_full(tls, server_name, skip_cert_verify, network, ws_opts, &None)
+}
+
+pub fn transport_of_full(
+    tls: bool,
+    server_name: &Option<String>,
+    skip_cert_verify: bool,
+    network: &Option<String>,
+    ws_opts: &Option<WsOpts>,
+    grpc_opts: &Option<vp_config::GrpcOpts>,
+) -> Result<TransportConfig> {
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
         Some("ws") => Some(ws_config(ws_opts).unwrap_or_default()),
+        Some("grpc") => None,
         Some(other) => {
-            return Err(Error::Unsupported(format!("传输 {other:?} 将在 M3 里程碑提供")));
+            return Err(Error::Unsupported(format!("传输 {other:?} 暂不支持")));
         }
+    };
+    let grpc = match network.as_deref() {
+        Some("grpc") => Some(vp_transport::grpc::GrpcConfig {
+            service_name: grpc_opts
+                .as_ref()
+                .and_then(|g| g.grpc_service_name.clone())
+                .unwrap_or_else(|| "Turbo".into()),
+        }),
+        _ => None,
     };
     Ok(TransportConfig {
         tls,
         server_name: server_name.clone(),
         skip_cert_verify,
         ws,
+        grpc,
     })
 }
 

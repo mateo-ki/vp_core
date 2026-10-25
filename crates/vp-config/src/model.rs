@@ -151,6 +151,7 @@ pub enum ProxyKind {
     Vless(VlessCfg),
     Trojan(TrojanCfg),
     Socks5(SocksCfg),
+    Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
     Direct,
@@ -167,6 +168,7 @@ impl ProxyKind {
             ProxyKind::Trojan(_) => "trojan",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Hysteria2(_) => "hysteria2",
+            ProxyKind::Tuic(_) => "tuic",
             ProxyKind::Http(_) => "http",
             ProxyKind::Direct => "direct",
             ProxyKind::Reject => "reject",
@@ -292,6 +294,22 @@ pub struct Hysteria2Cfg {
     pub up: Option<u32>,
     #[serde(default)]
     pub down: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TuicCfg {
+    pub server: String,
+    pub port: u16,
+    pub uuid: String,
+    pub password: String,
+    #[serde(default)]
+    pub sni: Option<String>,
+    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    pub skip_cert_verify: bool,
+    #[serde(alias = "congestion-controller", alias = "congestion_controller", default)]
+    pub congestion_controller: Option<String>,
+    #[serde(default)]
+    pub udp_relay_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

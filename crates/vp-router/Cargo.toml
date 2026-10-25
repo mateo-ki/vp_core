@@ -17,3 +17,7 @@ async-trait.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 serde.workspace = true
+
+[features]
+default = ["geoip"]
+geoip = ["vp-rule/geoip"]

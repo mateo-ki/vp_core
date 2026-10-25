@@ -42,8 +42,8 @@ pub trait Outbound: Send + Sync {
         )))
     }
 
-    /// 节点服务器地址（展示/健康检查）
-    fn remote_host(&self) -> Option<&str> {
+    /// 节点服务器地址（Relay 链式与健康检查用）
+    fn remote_addr(&self) -> Option<(String, u16)> {
         None
     }
 }

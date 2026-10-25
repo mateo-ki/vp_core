@@ -12,6 +12,8 @@ vp-core.workspace = true
 vp-config.workspace = true
 vp-transport.workspace = true
 quinn.workspace = true
+boringtun.workspace = true
+smoltcp.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
 rustls-pemfile.workspace = true
@@ -41,6 +43,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]
+log = "0.4"
 tracing-subscriber.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

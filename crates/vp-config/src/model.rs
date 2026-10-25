@@ -182,6 +182,7 @@ pub enum ProxyKind {
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
+    Wireguard(WgCfg),
     Direct,
     Reject,
 }
@@ -198,6 +199,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
             ProxyKind::Http(_) => "http",
+            ProxyKind::Wireguard(_) => "wireguard",
             ProxyKind::Direct => "direct",
             ProxyKind::Reject => "reject",
         }
@@ -356,6 +358,40 @@ pub struct TuicCfg {
     pub congestion_controller: Option<String>,
     #[serde(default)]
     pub udp_relay_mode: Option<String>,
+}
+
+/// WireGuard 出站配置（Clash 语法）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WgCfg {
+    pub server: String,
+    pub port: u16,
+    #[serde(alias = "private-key", alias = "private_key")]
+    pub private_key: String,
+    #[serde(alias = "public-key", alias = "public_key")]
+    pub public_key: String,
+    #[serde(alias = "pre-shared-key", alias = "pre_shared_key", default)]
+    pub pre_shared_key: Option<String>,
+    #[serde(alias = "persistent-keepalive", alias = "persistent_keepalive", default)]
+    pub persistent_keepalive: Option<u16>,
+    /// 本机隧道 IPv4 地址（点对点）
+    pub ip: String,
+    /// 本机隧道 IPv6 地址（可选）
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub udp: bool,
+    #[serde(default)]
+    pub mtu: Option<u16>,
+}
+
+impl WgCfg {
+    pub fn local_v4(&self) -> Option<std::net::Ipv4Addr> {
+        self.ip.parse().ok()
+    }
+
+    pub fn local_v6(&self) -> Option<std::net::Ipv6Addr> {
+        self.ipv6.as_deref().and_then(|s| s.parse().ok())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

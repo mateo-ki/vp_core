@@ -21,6 +21,8 @@ use vp_core::session::Session;
 use vp_core::stream::UdpPacket;
 use vp_dns::{FakeIpPool, Resolver};
 
+pub mod auto_route;
+
 #[derive(Clone)]
 pub struct TunConfig {
     /// TUN 接口地址（如 198.18.0.1）

@@ -130,7 +130,7 @@ impl App {
             groups: cfg.proxy_groups.iter().map(group_spec).collect(),
             rules,
             mode: cfg.mode,
-            dns,
+            dns: dns.clone(),
             ipv6: cfg.ipv6,
         })?;
 
@@ -146,21 +146,71 @@ impl App {
             } else {
                 "127.0.0.1".to_string()
             };
+            let make_ctx = || InboundCtx {
+                router: router_handle.clone(),
+                stats: stats.clone(),
+                conns: conns.clone(),
+            };
             for (kind, port, tag) in [
                 (InboundKind::Mixed, cfg.mixed_port, "mixed"),
                 (InboundKind::Http, cfg.port, "http"),
                 (InboundKind::Socks5, cfg.socks_port, "socks5"),
             ] {
                 if let Some(p) = port {
-                    let ctx = InboundCtx {
-                        router: router_handle.clone(),
-                        stats: stats.clone(),
-                        conns: conns.clone(),
-                    };
                     let inb = build_inbound(kind, bind.clone(), p, tag);
-                    let bound = inb.clone().start(ctx).await?;
+                    let bound = inb.clone().start(make_ctx()).await?;
                     info!("{tag} 监听 {bind}:{bound}");
                     listen_ports.push((tag.to_string(), bound));
+                }
+            }
+
+            // TUN 模式
+            if let Some(tun_cfg) = &cfg.tun {
+                if tun_cfg.enable {
+                    let pool = vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range)
+                        .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range)))?;
+                    let dns_listen: std::net::SocketAddr = "0.0.0.0:53"
+                        .parse()
+                        .map_err(|e| Error::Config(format!("DNS 监听非法: {e}")))?;
+                    let dns_srv = vp_dns::DnsServer::new(
+                        dns_listen,
+                        dns.clone(),
+                        Some(Arc::new(pool.clone())),
+                        vec![],
+                        cfg.ipv6,
+                    );
+                    match dns_srv.spawn().await {
+                        Ok(bound) => info!("dns 服务器（fake-ip 劫持）监听 {bound}"),
+                        Err(e) => warn!("dns 服务器启动失败: {e}"),
+                    }
+                    let t = vp_tun::TunConfig {
+                        address: tun_cfg
+                            .address
+                            .parse()
+                            .map_err(|e| Error::Config(format!("tun 地址非法: {e}")))?,
+                        netmask: tun_cfg
+                            .netmask
+                            .parse()
+                            .map_err(|e| Error::Config(format!("tun 掩码非法: {e}")))?,
+                        mtu: tun_cfg.mtu,
+                        fake_ip_range: tun_cfg.fake_ip_range.clone(),
+                        dns_hijack: true,
+                    };
+                    let tun_in: Arc<dyn vp_core::Inbound> = Arc::new(vp_tun::TunInbound::new(t, "tun"));
+                    match tun_in.clone().start(make_ctx()).await {
+                        Ok(_) => {
+                            info!("TUN 模式已启动（{}）", tun_cfg.address);
+                            if tun_cfg.auto_route {
+                                match vp_tun::auto_route::enable(&tun_cfg.address, &tun_cfg.netmask) {
+                                    Ok(()) => info!("auto-route 已启用"),
+                                    Err(e) => warn!("auto-route 启用失败（需管理员权限）: {e}"),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("TUN 启动失败（需要管理员权限）: {e}");
+                        }
+                    }
                 }
             }
         }

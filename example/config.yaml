@@ -78,6 +78,15 @@ proxy-groups:
       - vless-示例
       - trojan-示例
 
+# TUN 透明代理模式（需管理员权限运行）
+# tun:
+#   enable: true
+#   address: 198.18.0.1
+#   netmask: 255.255.0.0
+#   mtu: 1500
+#   fake-ip-range: 198.18.0.0/16
+#   auto-route: true
+
 rule-providers:
   # 文本域名集（+.google.com 语法）；classical/ipcidr 行为同样支持
   # my-direct:

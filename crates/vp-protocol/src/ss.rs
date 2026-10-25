@@ -529,7 +529,7 @@ impl Inbound for SsInbound {
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
         // TCP 与 UDP 必须同端口；随机端口撞车（Windows 动态端口范围）时整体重试
         let mut last_err: Option<std::io::Error> = None;
-        for _ in 0..5 {
+        for attempt in 0..12 {
             let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
             let bound = listener.local_addr()?.port();
             match tokio::net::UdpSocket::bind((self.bind.as_str(), bound)).await {
@@ -565,6 +565,11 @@ impl Inbound for SsInbound {
                 }
                 Err(e) => {
                     last_err = Some(e);
+                    // 退避，降低并发测试时的连续撞车
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        5 + attempt as u64 * 10,
+                    ))
+                    .await;
                 }
             }
         }

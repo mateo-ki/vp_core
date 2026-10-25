@@ -1,6 +1,6 @@
 [package]
 name = "vp-tun"
-description = "TUN 设备抽象与用户态网络栈（M2 完整实现）"
+description = "TUN 设备与用户态网络栈（fake-ip 回射 / DNS 劫持 / 流量分发）"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,15 @@ license.workspace = true
 [dependencies]
 vp-common.workspace = true
 vp-core.workspace = true
+vp-dns.workspace = true
+vp-rule.workspace = true
 tokio.workspace = true
-tracing.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
+tracing.workspace = true
+tun.workspace = true
+ipstack.workspace = true
+etherparse.workspace = true
+
+[features]
+default = []

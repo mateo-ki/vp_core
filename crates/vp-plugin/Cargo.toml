@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 vp-common.workspace = true
 vp-core.workspace = true
+vp-plugin-sdk.workspace = true
 libloading.workspace = true
 tracing.workspace = true
 serde.workspace = true

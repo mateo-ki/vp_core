@@ -1,0 +1,11 @@
+[package]
+name = "xor_mask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vp-plugin-sdk.workspace = true

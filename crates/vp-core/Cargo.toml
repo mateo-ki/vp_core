@@ -1,0 +1,14 @@
+[package]
+name = "vp-core"
+description = "核心抽象：Session / Outbound / Inbound / Router 与双向转发引擎"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+tracing.workspace = true

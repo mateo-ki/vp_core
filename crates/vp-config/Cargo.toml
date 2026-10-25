@@ -1,0 +1,14 @@
+[package]
+name = "vp-config"
+description = "配置 IR 与 YAML/JSON 双前端解析、校验"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+json5.workspace = true

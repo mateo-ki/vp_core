@@ -1,0 +1,16 @@
+[package]
+name = "vp-common"
+description = "VP_Core 公共基础：错误、地址编解码、缓冲池、统计"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+serde = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+[features]
+default = ["rand", "serde"]
+serde = ["dep:serde"]

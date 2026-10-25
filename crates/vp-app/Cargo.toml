@@ -1,0 +1,29 @@
+[package]
+name = "vp-app"
+description = "应用组装：配置→运行时、外部控制器 API、热重载"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+vp-core.workspace = true
+vp-config.workspace = true
+vp-rule.workspace = true
+vp-router.workspace = true
+vp-dns.workspace = true
+vp-transport.workspace = true
+vp-protocol.workspace = true
+vp-plugin.workspace = true
+vp-tun.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+httparse.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

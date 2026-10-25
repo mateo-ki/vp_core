@@ -1,0 +1,18 @@
+[package]
+name = "vp-rule"
+description = "规则引擎：域名 trie / IP 区间树 / 端口 / 进程 / 逻辑规则 / rule-set / geosite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+maxminddb = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
+tracing.workspace = true
+
+[features]
+default = ["geoip", "regex-rules"]
+geoip = ["dep:maxminddb"]
+regex-rules = ["dep:regex"]

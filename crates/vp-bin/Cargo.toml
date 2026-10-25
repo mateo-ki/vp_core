@@ -1,0 +1,20 @@
+[package]
+name = "vp-bin"
+description = "vpcore CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vpcore"
+path = "src/main.rs"
+
+[dependencies]
+vp-common.workspace = true
+vp-app.workspace = true
+vp-config.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

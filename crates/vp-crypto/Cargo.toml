@@ -1,0 +1,21 @@
+[package]
+name = "vp-crypto"
+description = "协议密码套件聚合：AEAD 流封装、HKDF、密钥派生"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+blake3.workspace = true
+md-5.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+bytes.workspace = true
+rand.workspace = true
+base64.workspace = true

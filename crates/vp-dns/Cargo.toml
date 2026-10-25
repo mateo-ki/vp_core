@@ -1,0 +1,14 @@
+[package]
+name = "vp-dns"
+description = "DNS 客户端（UDP/TCP）与缓存"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+rand.workspace = true
+tracing.workspace = true

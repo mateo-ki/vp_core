@@ -8,6 +8,7 @@ pub mod h3_min;
 pub mod hysteria2;
 pub mod shadowtls;
 pub mod tuic;
+pub mod wireguard;
 pub mod redir;
 pub mod sub;
 pub mod inbound;
@@ -183,6 +184,11 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
                 },
             ))
         }
+        ProxyKind::Wireguard(wg) => Arc::new(wireguard::WgOutbound::new_named(
+            cfg.name.as_str(),
+            wg,
+            deps.dns.clone(),
+        )?),
         ProxyKind::Ss(ss) => build_ss(cfg.name.as_str(), ss)?,
         ProxyKind::Vmess(vm) => build_vmess(cfg.name.as_str(), vm)?,
         ProxyKind::Vless(vl) => build_vless(cfg.name.as_str(), vl)?,

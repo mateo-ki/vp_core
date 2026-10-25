@@ -95,6 +95,8 @@ tun = { version = "0.8", features = ["async"] }
 ipstack = "1.0"
 etherparse = "0.17"
 socket2 = "0.6"
+boringtun = { version = "0.6", default-features = false }
+smoltcp = { version = "0.11", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 maxminddb = "0.24"
 
 # CLI

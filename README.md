@@ -71,7 +71,7 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **M7（部分完成）**：**WireGuard 出站**——boringtun 噪声协议（握手维护/重协商 + keepalive）+ smoltcp 用户态 TCP 栈（每连接一个栈内 TCP 会话，数据经 mpsc 通道交换）；UDP IO 与栈轮询双任务架构避免高吞吐饿死轮询；点对点路由 + ephemeral 端口分配；自环测试覆盖完整噪声握手 + 栈内 TCP echo（16B～256KB 逐字节一致）+ UDP 数据报回显（源端口断言）。Clash 语法 `type: wireguard`（server/port/private-key/public-key/ip/ipv6/udp）；UDP over WG 同样实现（栈内 udp::Socket + 动态目标回包 NAT，自环测试覆盖）。WARP（masque 协议）节点的 key 为 DER 格式需自行转 raw 32 字节 base64 后使用
 - **hysteria2 QPACK 全兼容（已完成）**：解码端完整支持 RFC 9204 静态表（99 项）索引引用、literal-with-name-reference 与 Huffman 字符串（RFC 7541 附录 B 全 257 符号表，已知向量验证）；编码端补上此前缺失的 QPACK 头块前缀（insert count/base）——此前即使 literal-only 形式也无法被标准解码端解析。本端宣告动态表容量 0，对端动态表引用明确报错。官方 hysteria2 客户端/服务端现可互通
 - **UDP over TCP / UoT v1（已完成）**：与 Clash.Meta/mihomo/sing-box 互通的通用 UDP 隧道——任意流型出站（vmess/vless/trojan/ss/socks5/http）配置 `udp-over-tcp: true` 即获得 UDP 能力（客户端向魔法地址 `sp.udp-over-tcp.arpa` 建流，v1 每帧自带地址，天然多目标）；入站分发层识别魔法地址自动进入 UoT 中继（按目标懒建出站会话，回包帧化带源地址）。全链路 e2e：socks5 UDP 关联 → mixed → UoT 包装 ss 出站 → ss listener → direct → UDP echo（源端口断言）
-- **M7 剩余（计划）**：uTLS 指纹（需换 TLS 栈）
+- **uTLS 指纹（已完成）**：手写 Chrome 风格 TLS 1.3 客户端（零新增依赖，复用 rustls 已链接的 ring）——完整握手栈：自绘 ClientHello（Chrome 扩展顺序/套件表/sigalgs/x25519 key_share）+ 标准 TLS 1.3 状态机（SH/EE/CERT/CertificateVerify/Finished 全验、transcript 含握手头、密钥调度 Extract/Derive-Secret/ExpandLabel、记录层 AES-GCM/ChaCha20 双套件 + 16KB 分帧 + KeyUpdate/close_notify）+ 证书校验（webpki 链+SNI 或 ring 直验 CertificateVerify，覆盖 ECDSA P-256/P-384、RSA-PSS、Ed25519）。vmess/vless/trojan 配置 `client-fingerprint: chrome`（Clash 语法）即启用。仅 TLS 1.3（HRR/客户端证书/PSK 明确报错）。e2e：rustls 服务端 300KB 回显逐字节一致 + ALPN 协商
 - **长尾协议（计划）**：anytls/mieru/brook/ssh/naive、插件市场、热重载完善
 
 ## 插件开发

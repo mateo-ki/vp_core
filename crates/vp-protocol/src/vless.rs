@@ -132,6 +132,7 @@ impl VlessOutbound {
             cfg.skip_cert_verify,
             &cfg.network,
             &cfg.ws_opts,
+            &cfg.client_fingerprint,
         )?;
         Ok(VlessOutbound {
             name: name.unwrap_or("vless").into(),
@@ -357,6 +358,7 @@ mod tests {
             tls: false,
             server_name: None,
             skip_cert_verify: false,
+            client_fingerprint: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,

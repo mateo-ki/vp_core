@@ -274,6 +274,8 @@ pub struct VmessCfg {
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
+    #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
+    pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
@@ -301,6 +303,8 @@ pub struct VlessCfg {
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
+    #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
+    pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
@@ -322,6 +326,8 @@ pub struct TrojanCfg {
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
+    #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
+    pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]

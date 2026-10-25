@@ -117,10 +117,12 @@ pub fn transport_of(
     skip_cert_verify: bool,
     network: &Option<String>,
     ws_opts: &Option<WsOpts>,
+    fingerprint: &Option<String>,
 ) -> Result<TransportConfig> {
-    transport_of_full(tls, server_name, skip_cert_verify, network, ws_opts, &None)
+    transport_of_full(tls, server_name, skip_cert_verify, network, ws_opts, &None, fingerprint)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn transport_of_full(
     tls: bool,
     server_name: &Option<String>,
@@ -128,6 +130,7 @@ pub fn transport_of_full(
     network: &Option<String>,
     ws_opts: &Option<WsOpts>,
     grpc_opts: &Option<vp_config::GrpcOpts>,
+    fingerprint: &Option<String>,
 ) -> Result<TransportConfig> {
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
@@ -150,6 +153,7 @@ pub fn transport_of_full(
         tls,
         server_name: server_name.clone(),
         skip_cert_verify,
+        fingerprint: fingerprint.clone(),
         ws,
         grpc,
     })

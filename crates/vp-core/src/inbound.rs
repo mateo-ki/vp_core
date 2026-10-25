@@ -8,6 +8,7 @@ use crate::conn_table::ConnTable;
 use crate::router::Router;
 
 /// 入站启动所需的上下文
+#[derive(Clone)]
 pub struct InboundCtx {
     pub router: Arc<dyn Router>,
     pub stats: Arc<Stats>,

@@ -15,6 +15,7 @@ vp-crypto.workspace = true
 vp-dns.workspace = true
 vp-router.workspace = true
 vp-plugin.workspace = true
+vp-rule.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
@@ -33,6 +34,7 @@ rand.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 

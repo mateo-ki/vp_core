@@ -75,6 +75,28 @@ impl AnyAead {
         }
     }
 
+    /// 使用显式 12 字节 nonce
+    pub fn seal_nonce(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+        let n = Nonce::from(*nonce);
+        let payload = Payload { msg: plaintext, aad };
+        match self {
+            AnyAead::A128(a) => a.encrypt(&n, payload).unwrap(),
+            AnyAead::A256(a) => a.encrypt(&n, payload).unwrap(),
+            AnyAead::Chacha(a) => a.encrypt(&n, payload).unwrap(),
+        }
+    }
+
+    pub fn open_nonce(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+        let n = Nonce::from(*nonce);
+        let payload = Payload { msg: ciphertext, aad };
+        let r = match self {
+            AnyAead::A128(a) => a.decrypt(&n, payload),
+            AnyAead::A256(a) => a.decrypt(&n, payload),
+            AnyAead::Chacha(a) => a.decrypt(&n, payload),
+        };
+        r.map_err(|_| Error::Proto("AEAD 解密失败"))
+    }
+
     pub fn open(&self, nonce_counter: u64, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let nonce = nonce_from_counter(nonce_counter);
         let payload = Payload { msg: ciphertext, aad };

@@ -121,6 +121,11 @@ impl AeadChunkCodec {
         })
     }
 
+    /// 直接以现成 AEAD 构造（vmess body 用）
+    pub fn from_aead(aead: AnyAead) -> Self {
+        AeadChunkCodec { aead, counter: 0, tag_len: 16 }
+    }
+
     fn next_nonce(&mut self) -> u64 {
         let n = self.counter;
         self.counter += 1;

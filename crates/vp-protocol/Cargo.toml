@@ -55,3 +55,6 @@ vless = []
 trojan = []
 plugin = []
 geoip = ["vp-rule/geoip"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true

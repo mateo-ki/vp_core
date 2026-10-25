@@ -164,6 +164,23 @@ impl App {
                 }
             }
 
+            // redir/tproxy（仅 Linux；非 Linux 明确报错但不阻断启动）
+            for (port, tag) in [(cfg.redir_port, "redir"), (cfg.tproxy_port, "tproxy")] {
+                if let Some(p) = port {
+                    let inb: Arc<dyn vp_core::Inbound> =
+                        Arc::new(vp_protocol::redir::RedirInbound::new(&bind, p, tag));
+                    match inb.clone().start(make_ctx()).await {
+                        Ok(bound) => {
+                            info!("{tag} 监听 {bind}:{bound}");
+                            listen_ports.push((tag.to_string(), bound));
+                        }
+                        Err(e) => {
+                            warn!("{tag} 未启用: {e}");
+                        }
+                    }
+                }
+            }
+
             // TUN 模式
             if let Some(tun_cfg) = &cfg.tun {
                 if tun_cfg.enable {

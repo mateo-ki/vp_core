@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use vp_common::{DstAddr, Error, Host, Result};
 use vp_core::inbound::InboundCtx;
@@ -600,7 +600,7 @@ impl TuicInbound {
                     }
                 }
                 bi = conn.accept_bi() => {
-                    let Ok((mut send, mut recv)) = bi else { break };
+                    let Ok((send, mut recv)) = bi else { break };
                     let mut head = [0u8; 2];
                     if recv.read_exact(&mut head).await.is_err() {
                         continue;

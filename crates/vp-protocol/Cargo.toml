@@ -39,7 +39,7 @@ rcgen.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-default = ["socks5", "http", "ss", "vmess", "vless", "trojan", "plugin"]
+default = ["socks5", "http", "ss", "vmess", "vless", "trojan", "plugin", "geoip"]
 socks5 = []
 http = []
 ss = []
@@ -47,3 +47,4 @@ vmess = []
 vless = []
 trojan = []
 plugin = []
+geoip = ["vp-rule/geoip"]

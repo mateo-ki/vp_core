@@ -90,6 +90,8 @@ rand = "0.9"
 httparse = "1"
 h2 = "0.4"
 quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 http = "1"
 tun = { version = "0.8", features = ["async"] }
 ipstack = "1.0"

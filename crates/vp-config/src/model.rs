@@ -151,6 +151,7 @@ pub enum ProxyKind {
     Vless(VlessCfg),
     Trojan(TrojanCfg),
     Socks5(SocksCfg),
+    Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
     Direct,
     Reject,
@@ -165,6 +166,7 @@ impl ProxyKind {
             ProxyKind::Vless(_) => "vless",
             ProxyKind::Trojan(_) => "trojan",
             ProxyKind::Socks5(_) => "socks5",
+            ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Http(_) => "http",
             ProxyKind::Direct => "direct",
             ProxyKind::Reject => "reject",
@@ -275,6 +277,21 @@ pub struct TrojanCfg {
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(default)]
     pub udp: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Hysteria2Cfg {
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    #[serde(default)]
+    pub sni: Option<String>,
+    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub up: Option<u32>,
+    #[serde(default)]
+    pub down: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

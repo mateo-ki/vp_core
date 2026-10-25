@@ -502,6 +502,67 @@ rules:
         }
     }
 
+    /// vmess listener 数据面最小复现（修上轮挂起缺陷）
+    #[tokio::test]
+    async fn vmess_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let cfg = format!(
+            "listeners:\n  - name: srv-vm\n    type: vmess\n    port: 0\n    users: [\"{uuid}\"]\nrules: ['MATCH,DIRECT']\n"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let vm_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-vm")
+            .map(|(_, p)| *p)
+            .expect("vmess listener 应已监听");
+
+        let out = vp_protocol::vmess::VmessOutbound::new(&vp_config::VmessCfg {
+            server: "127.0.0.1".into(),
+            port: vm_port,
+            uuid: uuid.into(),
+            alter_id: 0,
+            cipher: "auto".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            udp: false,
+        })
+        .unwrap();
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            out.connect_stream(&sess, &dst),
+        )
+        .await
+        .expect("vmess 出站应完成")
+        .expect("vmess 出站应成功");
+        s.write_all(b"vm-e2e").await.unwrap();
+        let mut buf = [0u8; 6];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"vm-e2e");
+    }
+
     /// listeners 段端到端：trojan 服务端入站 ← TrojanOutbound ← echo
     #[tokio::test]
     async fn trojan_listener_e2e() {

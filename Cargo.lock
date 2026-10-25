@@ -2137,6 +2137,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "sha1",
  "sha2",

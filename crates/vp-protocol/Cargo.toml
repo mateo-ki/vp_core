@@ -15,6 +15,7 @@ quinn.workspace = true
 h3.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
+rustls-pemfile.workspace = true
 http.workspace = true
 h3-quinn.workspace = true
 vp-crypto.workspace = true

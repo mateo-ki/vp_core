@@ -227,10 +227,10 @@ impl Outbound for Hysteria2Outbound {
     }
 }
 
-/// QUIC 双向流包装（与 vp_transport::quic::QuicStream 同构，供本模块使用）
+/// QUIC 双向流包装（tuic 复用）
 pub struct QuicBiStream {
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
 }
 
 impl AsyncRead for QuicBiStream {

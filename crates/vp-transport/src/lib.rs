@@ -3,6 +3,7 @@
 pub mod grpc;
 pub mod quic;
 pub mod tls;
+pub mod utls;
 pub mod ws;
 
 pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
@@ -34,6 +35,8 @@ pub struct TransportConfig {
     pub tls: bool,
     pub server_name: Option<String>,
     pub skip_cert_verify: bool,
+    /// uTLS 指纹（"chrome"）：设置时 TLS 走手写指纹客户端
+    pub fingerprint: Option<String>,
     /// network: "ws" 时启用 WebSocket
     pub ws: Option<WsConfig>,
     /// network: "grpc" 时启用 gRPC（要求 TLS + ALPN h2）
@@ -75,17 +78,32 @@ pub async fn dial(
         return Ok(Box::new(s));
     }
     if cfg.tls {
-        let tls = tls::tls_connect(
-            tcp,
-            server_host,
-            &tls::TlsClientConfig {
-                skip_cert_verify: cfg.skip_cert_verify,
-                server_name: cfg.server_name.clone(),
-                alpn: Vec::new(),
-            },
-        )
-        .await?;
-        let tls = Box::new(tls) as Box<dyn ProxyStream>;
+        let tls: Box<dyn ProxyStream> = if let Some(fp) = &cfg.fingerprint {
+            let s = utls::utls_connect(
+                tcp,
+                server_host,
+                &utls::UtlsConfig {
+                    fingerprint: utls::Fingerprint::parse(fp)?,
+                    server_name: cfg.server_name.clone(),
+                    alpn: Vec::new(),
+                    skip_cert_verify: cfg.skip_cert_verify,
+                },
+            )
+            .await?;
+            Box::new(s)
+        } else {
+            let s = tls::tls_connect(
+                tcp,
+                server_host,
+                &tls::TlsClientConfig {
+                    skip_cert_verify: cfg.skip_cert_verify,
+                    server_name: cfg.server_name.clone(),
+                    alpn: Vec::new(),
+                },
+            )
+            .await?;
+            Box::new(s)
+        };
         if let Some(ws) = &cfg.ws {
             let ws_stream = ws::ws_handshake_client(tls, server_host, ws).await?;
             return Ok(Box::new(ws_stream));

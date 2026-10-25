@@ -98,6 +98,7 @@ proxies:
     cipher: auto
     tls: true
     servername: v.example.com
+    client-fingerprint: chrome
     network: ws
     ws-opts:
       path: /path
@@ -171,6 +172,7 @@ sub-rules:
                 assert_eq!(v.alter_id, 0);
                 assert!(v.tls);
                 assert_eq!(v.network.as_deref(), Some("ws"));
+                assert_eq!(v.client_fingerprint.as_deref(), Some("chrome"));
                 assert_eq!(v.ws_opts.as_ref().unwrap().path.as_deref(), Some("/path"));
                 assert_eq!(
                     v.ws_opts.as_ref().unwrap().headers.as_ref().unwrap()["Host"],

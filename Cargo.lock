@@ -1684,8 +1684,10 @@ dependencies = [
  "bytes",
  "rand 0.9.5",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "vp-common",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

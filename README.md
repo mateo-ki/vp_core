@@ -32,9 +32,11 @@ cargo build --release -p vp-bin
 | 传输 | TCP、TLS（rustls/ring，skip-cert-verify、SNI 覆盖）、WebSocket（手写 RFC6455） |
 | 规则 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX / IP-CIDR(6) / SRC-IP-CIDR / DST-PORT / SRC-PORT / PROCESS-NAME / NETWORK / GEOIP(mmdb) / GEOSITE(.dat) / RULE-SET(.list/.yaml，domain/ipcidr/classical) / AND-OR-NOT / SUB-RULE / MATCH |
 | 策略组 | select / url-test（EMA+容差滞回）/ fallback / load-balance（轮询+一致性哈希）/ relay（链式） |
-| DNS | UDP/TCP 解析器 + TTL 缓存（DoH/DoT/fake-ip 随 M2） |
+| DNS | UDP/TCP/DoT 解析器 + TTL 缓存 + **fake-ip 池** + **DNS 服务器**（A/AAAA/PTR/上游转发） |
 | 插件 | C-ABI 动态库宿主（transform 流变换），SDK + 示例插件见 `crates/examples/plugins/xor_mask` |
 | API | Clash 兼容 REST 控制器：/proxies、/rules、/connections、delay 测速、selector 切换、Bearer 鉴权 |
+| TUN | **TUN 透明代理**（tun+ipstack 用户态栈）：TCP/UDP 分发、fake-ip 回射、DNS 劫持、ICMP echo 应答、auto-route（需管理员权限） |
+| UDP | 全链路：socks5 ASSOCIATE+NAT、ss UDP（每包独立 salt）、socks5/ss 出站 PacketConn |
 | 其它 | 规则匹配零分配热路径、连接表（查询/关闭）、流量统计、热重载路由、每协议 cargo feature 裁剪 |
 
 ## 架构
@@ -58,8 +60,8 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 ## 里程碑
 
 - **M1（已完成）**：如上
-- **M2**：TUN 模式（wintun/tokio-tun + smoltcp 用户态栈 + fake-ip + auto-route）、UDP 全链路、redir/tproxy、DoH/DoT
-- **M3**：QUIC 系（hysteria2、TUIC、quic transport）、grpc/h2 传输、uTLS 指纹、shadowtls、WireGuard
+- **M2（已完成）**：TUN 透明代理（tun+ipstack + fake-ip + DNS 劫持 + auto-route）、UDP 全链路、DoT 上游。release 4.94 MB
+- **M3**：QUIC 系（hysteria2、TUIC、quic transport）、grpc/h2 传输、uTLS 指纹、shadowtls、WireGuard、DoH、redir/tproxy
 - **M4**：anytls/mieru/brook/ssh/naive、插件市场、热重载完善
 
 ## 插件开发

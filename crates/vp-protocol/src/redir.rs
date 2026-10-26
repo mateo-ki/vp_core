@@ -56,7 +56,6 @@ impl Inbound for RedirInbound {
         }
         #[cfg(target_os = "linux")]
         {
-            use tokio::io::AsyncWriteExt;
             let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
             let bound = listener.local_addr()?.port();
             let tag = self.tag.clone();

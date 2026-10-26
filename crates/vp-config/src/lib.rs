@@ -145,6 +145,15 @@ proxies:
     port: 8964
     username: alice
     password: mupw
+  - name: "nv1"
+    type: naive
+    server: n.example.com
+    port: 443
+    username: bob
+    password: nvpw
+    sni: n.example.com
+    client-fingerprint: chrome
+    udp: true
   - name: "sk1"
     type: socks5
     server: 127.0.0.1
@@ -187,7 +196,7 @@ sub-rules:
         assert_eq!(cfg.mixed_port, Some(7890));
         assert!(cfg.allow_lan);
         assert_eq!(cfg.mode, Mode::Rule);
-        assert_eq!(cfg.proxies.len(), 10);
+        assert_eq!(cfg.proxies.len(), 11);
         assert_eq!(cfg.proxy_groups.len(), 2);
         assert_eq!(cfg.rules.len(), 5);
         assert!(validate::validate(&cfg).is_ok());

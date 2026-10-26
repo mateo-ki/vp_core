@@ -98,6 +98,12 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_brook(rest)
     } else if let Some(rest) = line.strip_prefix("mieru://") {
         parse_mieru(rest)
+    } else if let Some(rest) = line.strip_prefix("naive+https://") {
+        parse_naive(rest, true)
+    } else if let Some(rest) = line.strip_prefix("naive+http://") {
+        parse_naive(rest, false)
+    } else if let Some(rest) = line.strip_prefix("naive://") {
+        parse_naive(rest, true)
     } else {
         Err(Error::Config(format!("无法识别的分享链接: {}", &line[..line.len().min(32)])))
     }
@@ -365,6 +371,55 @@ fn parse_mieru(rest: &str) -> Result<SubNode> {
     })
 }
 
+fn parse_naive(rest: &str, default_tls: bool) -> Result<SubNode> {
+    let (userinfo, host, port, p, name) = split_main(rest)?;
+    let (username, password) = match userinfo.split_once(':') {
+        Some((u, p)) => (u.to_string(), p.to_string()),
+        None => (userinfo, String::new()),
+    };
+    let tls = p
+        .get("tls")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(default_tls);
+    let sni = p
+        .get("sni")
+        .or_else(|| p.get("peer"))
+        .or_else(|| p.get("servername"))
+        .cloned();
+    let insecure = p
+        .get("insecure")
+        .map(|v| v == "1" || v == "true")
+        .or_else(|| p.get("allowInsecure").map(|v| v == "1" || v == "true"))
+        .unwrap_or(false);
+    let fp = p.get("fp").or_else(|| p.get("fingerprint")).cloned();
+    let udp = p.get("udp").map(|v| v == "1" || v == "true").unwrap_or(false);
+
+    let mut fields = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "naive".into()),
+        ("server".into(), host),
+        ("port".into(), port),
+        ("username".into(), q(&username)),
+        ("password".into(), q(&password)),
+    ];
+    if !tls {
+        fields.push(("tls".into(), "false".into()));
+    }
+    if let Some(s) = sni {
+        fields.push(("sni".into(), q(&s)));
+    }
+    if insecure {
+        fields.push(("skip-cert-verify".into(), "true".into()));
+    }
+    if let Some(f) = fp {
+        fields.push(("client-fingerprint".into(), q(&f)));
+    }
+    if udp {
+        fields.push(("udp".into(), "true".into()));
+    }
+    Ok(SubNode { fields })
+}
+
 fn parse_ss(rest: &str) -> Result<SubNode> {
     // ss://base64(method:pass)@host:port#name 或 SIP002
     // 兼容直接调用（可能仍带 ss:// 前缀）
@@ -571,6 +626,30 @@ mod tests {
         assert!(parse_uri("mieru://alice:pw@m.com:1?transport=udp#x").is_err());
         // 订阅打包
         let nodes = parse_subscription("mieru://alice:pw@m.com:443#n1");
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn naive_uri() {
+        let n = parse_uri("naive+https://bob:nvpw123@n.com:443?sni=n.com&insecure=1&udp=1&fp=chrome#nv1").unwrap();
+        assert_eq!(n.name(), "nv1");
+        let y = n.to_yaml();
+        assert!(y.contains("type: naive"), "{y}");
+        assert!(y.contains("username: \"bob\""), "{y}");
+        assert!(y.contains("password: \"nvpw123\""), "{y}");
+        assert!(y.contains("sni: \"n.com\""), "{y}");
+        assert!(y.contains("skip-cert-verify: true"), "{y}");
+        assert!(y.contains("udp: true"), "{y}");
+        assert!(y.contains("client-fingerprint: \"chrome\""), "{y}");
+
+        // naive+http://
+        let n2 = parse_uri("naive+http://user:pass@127.0.0.1:8080#nv2").unwrap();
+        assert_eq!(n2.name(), "nv2");
+        let y2 = n2.to_yaml();
+        assert!(y2.contains("tls: false"), "{y2}");
+
+        // 订阅打包
+        let nodes = parse_subscription("naive+https://u:p@n.com:443#n1");
         assert_eq!(nodes.len(), 1);
     }
 

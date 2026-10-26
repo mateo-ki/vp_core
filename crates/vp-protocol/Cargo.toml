@@ -19,6 +19,7 @@ ring.workspace = true
 webpki-roots.workspace = true
 rustls-pemfile.workspace = true
 http.workspace = true
+h2.workspace = true
 vp-crypto.workspace = true
 vp-dns.workspace = true
 vp-router.workspace = true

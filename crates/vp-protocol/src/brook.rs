@@ -631,7 +631,7 @@ impl BrookInbound {
 
     async fn serve(&self, mut io: tokio::net::TcpStream, src: SocketAddr, ctx: &InboundCtx) -> Result<()> {
         // tx：解客户端方向记录；rx：加密服务端方向记录
-        let (mut tx, mut rx, dst, mode) = self.accept(&mut io).await?;
+        let (mut tx, rx, dst, mode) = self.accept(&mut io).await?;
         let _ = ctx;
         // 读写半分离：客户端记录读取与目标回写分属两侧，避免 select
         // 丢弃半读记录（try_read_record 非取消安全）

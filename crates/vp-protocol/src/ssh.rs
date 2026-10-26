@@ -1043,6 +1043,7 @@ impl Outbound for SshOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::KeyPair;
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, Mutex};

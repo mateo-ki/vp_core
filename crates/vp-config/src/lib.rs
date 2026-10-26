@@ -133,6 +133,12 @@ proxies:
     port: 22
     username: root
     password: pw789
+  - name: "bk1"
+    type: brook
+    server: b.example.com
+    port: 9999
+    password: bkpw
+    udp: true
   - name: "sk1"
     type: socks5
     server: 127.0.0.1
@@ -175,7 +181,7 @@ sub-rules:
         assert_eq!(cfg.mixed_port, Some(7890));
         assert!(cfg.allow_lan);
         assert_eq!(cfg.mode, Mode::Rule);
-        assert_eq!(cfg.proxies.len(), 8);
+        assert_eq!(cfg.proxies.len(), 9);
         assert_eq!(cfg.proxy_groups.len(), 2);
         assert_eq!(cfg.rules.len(), 5);
         assert!(validate::validate(&cfg).is_ok());
@@ -208,6 +214,13 @@ sub-rules:
             ProxyKind::Ssh(sh) => {
                 assert_eq!(sh.username, "root");
                 assert_eq!(sh.password.as_deref(), Some("pw789"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &cfg.proxies[6].kind {
+            ProxyKind::Brook(b) => {
+                assert_eq!(b.password, "bkpw");
+                assert!(b.udp);
             }
             other => panic!("unexpected {other:?}"),
         }

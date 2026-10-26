@@ -4,6 +4,7 @@
 
 pub mod basic_out;
 pub mod anytls;
+pub mod brook;
 pub mod direct;
 pub mod h3_min;
 pub mod hysteria2;
@@ -28,7 +29,7 @@ pub mod vmess;
 use std::sync::Arc;
 
 use vp_common::{Error, Result};
-use vp_config::{AnytlsCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SshCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
+use vp_config::{AnytlsCfg, BrookCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SshCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_common::DstAddr;
 use vp_dns::Resolver;
@@ -202,12 +203,14 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Trojan(tr) => build_trojan(cfg.name.as_str(), tr)?,
         ProxyKind::Anytls(a) => build_anytls(cfg, a)?,
         ProxyKind::Ssh(sh) => Arc::new(ssh::SshOutbound::new_named(cfg.name.as_str(), sh)?),
+        ProxyKind::Brook(b) => Arc::new(brook::BrookOutbound::new_named(cfg.name.as_str(), b)?),
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     Ok(match cfg.kind {
         ProxyKind::Wireguard(_)
         | ProxyKind::Hysteria2(_)
         | ProxyKind::Tuic(_)
+        | ProxyKind::Brook(_)
         | ProxyKind::Direct
         | ProxyKind::Reject => o,
         _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o)),

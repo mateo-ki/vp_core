@@ -6,6 +6,7 @@ pub mod basic_out;
 pub mod anytls;
 pub mod brook;
 pub mod direct;
+pub mod mieru;
 pub mod h3_min;
 pub mod hysteria2;
 pub mod shadowtls;
@@ -29,7 +30,7 @@ pub mod vmess;
 use std::sync::Arc;
 
 use vp_common::{Error, Result};
-use vp_config::{AnytlsCfg, BrookCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SshCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
+use vp_config::{AnytlsCfg, BrookCfg, MieruCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SshCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_common::DstAddr;
 use vp_dns::Resolver;
@@ -204,6 +205,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Anytls(a) => build_anytls(cfg, a)?,
         ProxyKind::Ssh(sh) => Arc::new(ssh::SshOutbound::new_named(cfg.name.as_str(), sh)?),
         ProxyKind::Brook(b) => Arc::new(brook::BrookOutbound::new_named(cfg.name.as_str(), b)?),
+        ProxyKind::Mieru(m) => Arc::new(mieru::MieruOutbound::new_named(cfg.name.as_str(), m)?),
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     Ok(match cfg.kind {

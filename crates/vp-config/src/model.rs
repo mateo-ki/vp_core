@@ -184,6 +184,7 @@ pub enum ProxyKind {
     Anytls(AnytlsCfg),
     Ssh(SshCfg),
     Brook(BrookCfg),
+    Mieru(MieruCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
@@ -204,6 +205,7 @@ impl ProxyKind {
             ProxyKind::Anytls(_) => "anytls",
             ProxyKind::Ssh(_) => "ssh",
             ProxyKind::Brook(_) => "brook",
+            ProxyKind::Mieru(_) => "mieru",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
@@ -357,6 +359,15 @@ pub struct SshCfg {
     /// 期望的主机密钥（"SHA256:base64" 指纹或原始 blob base64）；None 不校验
     #[serde(alias = "host-key", alias = "host_key", default)]
     pub host_key: Option<String>,
+}
+
+/// mieru：enfein/mieru v3（PBKDF2 时间盐 + XChaCha20-Poly1305，TCP 传输）
+#[derive(Debug, Clone, Deserialize)]
+pub struct MieruCfg {
+    pub server: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
 }
 
 /// brook：txthinking/brook 原生协议（HKDF-SHA256 + AES-256-GCM 记录流）

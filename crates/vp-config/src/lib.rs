@@ -139,6 +139,12 @@ proxies:
     port: 9999
     password: bkpw
     udp: true
+  - name: "mu1"
+    type: mieru
+    server: m.example.com
+    port: 8964
+    username: alice
+    password: mupw
   - name: "sk1"
     type: socks5
     server: 127.0.0.1
@@ -181,7 +187,7 @@ sub-rules:
         assert_eq!(cfg.mixed_port, Some(7890));
         assert!(cfg.allow_lan);
         assert_eq!(cfg.mode, Mode::Rule);
-        assert_eq!(cfg.proxies.len(), 9);
+        assert_eq!(cfg.proxies.len(), 10);
         assert_eq!(cfg.proxy_groups.len(), 2);
         assert_eq!(cfg.rules.len(), 5);
         assert!(validate::validate(&cfg).is_ok());
@@ -221,6 +227,13 @@ sub-rules:
             ProxyKind::Brook(b) => {
                 assert_eq!(b.password, "bkpw");
                 assert!(b.udp);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &cfg.proxies[7].kind {
+            ProxyKind::Mieru(m) => {
+                assert_eq!(m.username, "alice");
+                assert_eq!(m.password, "mupw");
             }
             other => panic!("unexpected {other:?}"),
         }

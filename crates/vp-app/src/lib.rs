@@ -338,6 +338,14 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 "0.0.0.0", l.port, tag, &l.users,
             )?))
         }
+        "mieru" => {
+            if l.users.is_empty() {
+                return Err(Error::Config("mieru listener 需要 users（username:password）".into()));
+            }
+            Ok(Arc::new(vp_protocol::mieru::MieruInbound::new(
+                "0.0.0.0", l.port, tag, &l.users,
+            )?))
+        }
         "brook" => {
             if l.users.is_empty() {
                 return Err(Error::Config("brook listener 需要 users（密码）".into()));

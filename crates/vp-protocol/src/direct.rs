@@ -91,28 +91,29 @@ impl Outbound for DirectOutbound {
             }
         };
         sock.connect(target).await?;
-        Ok(Box::new(DirectPacket { sock }))
+        Ok(Box::new(DirectPacket { sock, target }))
     }
 }
 
 pub struct DirectPacket {
     sock: tokio::net::UdpSocket,
+    target: std::net::SocketAddr,
 }
 
 #[async_trait]
 impl PacketConn for DirectPacket {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
-        self.sock.send_to(&pkt.data, pkt.dst).await?;
+        self.sock.send(&pkt.data).await?;
         Ok(())
     }
 
     async fn recv(&mut self) -> Result<UdpPacket> {
         let mut buf = vec![0u8; 65535];
-        let (n, from) = self.sock.recv_from(&mut buf).await?;
+        let n = self.sock.recv(&mut buf).await?;
         buf.truncate(n);
         Ok(UdpPacket {
-            src: from,
-            dst: from,
+            src: self.target,
+            dst: self.target,
             data: buf.into(),
         })
     }

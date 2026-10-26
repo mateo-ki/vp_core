@@ -185,6 +185,7 @@ pub enum ProxyKind {
     Ssh(SshCfg),
     Brook(BrookCfg),
     Mieru(MieruCfg),
+    Naive(NaiveCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
@@ -206,6 +207,7 @@ impl ProxyKind {
             ProxyKind::Ssh(_) => "ssh",
             ProxyKind::Brook(_) => "brook",
             ProxyKind::Mieru(_) => "mieru",
+            ProxyKind::Naive(_) => "naive",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
@@ -393,6 +395,27 @@ pub struct AnytlsCfg {
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+/// naive：NaiveProxy 协议（基于 HTTP/2 CONNECT + 8 包 Padding）
+#[derive(Debug, Clone, Deserialize)]
+pub struct NaiveCfg {
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    pub server_name: Option<String>,
+    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    pub skip_cert_verify: bool,
+    #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
+    pub client_fingerprint: Option<String>,
+    #[serde(default = "default_true")]
+    pub tls: bool,
     #[serde(default)]
     pub udp: bool,
 }

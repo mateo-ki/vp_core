@@ -7,6 +7,7 @@ pub mod anytls;
 pub mod brook;
 pub mod direct;
 pub mod mieru;
+pub mod naive;
 pub mod h3_min;
 pub mod hysteria2;
 pub mod shadowtls;
@@ -30,7 +31,7 @@ pub mod vmess;
 use std::sync::Arc;
 
 use vp_common::{Error, Result};
-use vp_config::{AnytlsCfg, BrookCfg, MieruCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SshCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
+use vp_config::{AnytlsCfg, NaiveCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_common::DstAddr;
 use vp_dns::Resolver;
@@ -206,6 +207,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Ssh(sh) => Arc::new(ssh::SshOutbound::new_named(cfg.name.as_str(), sh)?),
         ProxyKind::Brook(b) => Arc::new(brook::BrookOutbound::new_named(cfg.name.as_str(), b)?),
         ProxyKind::Mieru(m) => Arc::new(mieru::MieruOutbound::new_named(cfg.name.as_str(), m)?),
+        ProxyKind::Naive(n) => build_naive(cfg, n)?,
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     Ok(match cfg.kind {
@@ -296,6 +298,15 @@ fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
     let base: Arc<dyn Outbound> = Arc::new(anytls::AnytlsOutbound::new_named(cfg.name.as_str(), a)?);
     // anytls 无原生 UDP：udp: true 时经 UoT 提供（显式 udp-over-tcp 标志避免双包装）
     if a.udp && !cfg.udp_over_tcp {
+        Ok(Arc::new(uot::UotOutbound::new(base)))
+    } else {
+        Ok(base)
+    }
+}
+
+fn build_naive(cfg: &ProxyCfg, n: &NaiveCfg) -> Result<Arc<dyn Outbound>> {
+    let base: Arc<dyn Outbound> = Arc::new(naive::NaiveOutbound::new_named(cfg.name.as_str(), n)?);
+    if n.udp && !cfg.udp_over_tcp {
         Ok(Arc::new(uot::UotOutbound::new(base)))
     } else {
         Ok(base)

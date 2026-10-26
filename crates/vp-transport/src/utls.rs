@@ -1462,7 +1462,6 @@ mod tests {
         let send_payload = payload.clone();
         let send_task = tokio::spawn(async move {
             wh.write_all(&send_payload).await.unwrap();
-            wh.shutdown().await.unwrap();
         });
         let mut got = Vec::with_capacity(payload.len());
         let mut rb = [0u8; 64 * 1024];

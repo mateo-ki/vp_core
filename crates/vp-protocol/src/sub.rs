@@ -94,6 +94,8 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_anytls(rest)
     } else if let Some(rest) = line.strip_prefix("ssh://") {
         parse_ssh(rest)
+    } else if let Some(rest) = line.strip_prefix("brook://") {
+        parse_brook(rest)
     } else {
         Err(Error::Config(format!("无法识别的分享链接: {}", &line[..line.len().min(32)])))
     }
@@ -279,6 +281,66 @@ fn parse_anytls(rest: &str) -> Result<SubNode> {
     Ok(SubNode { fields: f })
 }
 
+fn parse_brook(rest: &str) -> Result<SubNode> {
+    // 两种形式：
+    // 1. 官方 BrookLink：brook://server?server=host:port&password=xxx&udpovertcp=true
+    // 2. 常见订阅转换：brook://password@host:port?udp=1#name
+    let has_at = rest.split(['?', '#']).next().unwrap_or(rest).contains('@');
+    if !has_at {
+        // 官方形式
+        let (body, name) = match rest.split_once('#') {
+            Some((b, n)) => (b, urldecode(n)),
+            None => (rest, String::new()),
+        };
+        let (_kind, qs) = body.split_once('?').unwrap_or((body, ""));
+        let p: HashMap<String, String> = qs
+            .split('&')
+            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), urldecode(v))))
+            .collect();
+        let server = p
+            .get("server")
+            .ok_or(Error::Config("brook 链接缺少 server 参数".into()))?;
+        let password = p
+            .get("password")
+            .ok_or(Error::Config("brook 链接缺少 password 参数".into()))?;
+        let (host, port) = server
+            .rsplit_once(':')
+            .ok_or(Error::Config("brook server 缺少端口".into()))?;
+        let udp = p
+            .get("udpovertcp")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let mut f = vec![
+            ("name".into(), q(&name)),
+            ("type".into(), "brook".into()),
+            ("server".into(), host.to_string()),
+            ("port".into(), port.to_string()),
+            ("password".into(), q(password)),
+        ];
+        if udp {
+            f.push(("udp".into(), "true".into()));
+        }
+        return Ok(SubNode { fields: f });
+    }
+    // password@host:port 形式
+    let (password, host, port, p, name) = split_main(rest)?;
+    let udp = p
+        .get("udp")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut f = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "brook".into()),
+        ("server".into(), host),
+        ("port".into(), port),
+        ("password".into(), q(&password)),
+    ];
+    if udp {
+        f.push(("udp".into(), "true".into()));
+    }
+    Ok(SubNode { fields: f })
+}
+
 fn parse_ss(rest: &str) -> Result<SubNode> {
     // ss://base64(method:pass)@host:port#name 或 SIP002
     // 兼容直接调用（可能仍带 ss:// 前缀）
@@ -449,6 +511,28 @@ mod tests {
         assert!(y.contains("client-fingerprint: \"chrome\""));
         // 订阅打包不被 network 过滤丢弃
         let nodes = parse_subscription("anytls://pw@a.com:443#n1");
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn brook_uri() {
+        // 常见形式：brook://password@host:port?udp=1#name
+        let n = parse_uri("brook://pw123@b.com:9999?udp=1#bk1").unwrap();
+        assert_eq!(n.name(), "bk1");
+        let y = n.to_yaml();
+        assert!(y.contains("type: brook"), "{y}");
+        assert!(y.contains("password: \"pw123\""));
+        assert!(y.contains("udp: true"));
+        // 官方 BrookLink 形式：brook://server?server=host:port&password=xxx
+        let n = parse_uri("brook://server?server=b.com%3A9999&password=pw456&udpovertcp=true")
+            .unwrap();
+        let y = n.to_yaml();
+        assert!(y.contains("server: b.com"), "{y}");
+        assert!(y.contains("port: 9999"), "{y}");
+        assert!(y.contains("password: \"pw456\""), "{y}");
+        assert!(y.contains("udp: true"), "{y}");
+        // 订阅打包
+        let nodes = parse_subscription("brook://pw@b.com:443#n1");
         assert_eq!(nodes.len(), 1);
     }
 

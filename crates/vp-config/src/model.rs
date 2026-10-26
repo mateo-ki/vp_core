@@ -183,6 +183,7 @@ pub enum ProxyKind {
     Trojan(TrojanCfg),
     Anytls(AnytlsCfg),
     Ssh(SshCfg),
+    Brook(BrookCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
@@ -202,6 +203,7 @@ impl ProxyKind {
             ProxyKind::Trojan(_) => "trojan",
             ProxyKind::Anytls(_) => "anytls",
             ProxyKind::Ssh(_) => "ssh",
+            ProxyKind::Brook(_) => "brook",
             ProxyKind::Socks5(_) => "socks5",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
@@ -355,6 +357,17 @@ pub struct SshCfg {
     /// 期望的主机密钥（"SHA256:base64" 指纹或原始 blob base64）；None 不校验
     #[serde(alias = "host-key", alias = "host_key", default)]
     pub host_key: Option<String>,
+}
+
+/// brook：txthinking/brook 原生协议（HKDF-SHA256 + AES-256-GCM 记录流）
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrookCfg {
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    /// UDP over TCP（brook 原生 UoT 模式）
+    #[serde(default)]
+    pub udp: bool,
 }
 
 /// anytls：TLS 之上的多路复用流协议（sing-anytls v2）。协议本身强制 TLS。

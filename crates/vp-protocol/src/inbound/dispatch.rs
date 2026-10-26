@@ -39,15 +39,7 @@ pub async fn dispatch_stream(
         if let Some(src) = sess.src {
             let src = std::net::SocketAddr::from(src);
             let p = tokio::task::spawn_blocking(move || {
-                #[cfg(windows)]
-                {
-                    vp_rule::process::find_process_name(src)
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = src;
-                    None
-                }
+                vp_rule::process::find_process_name(src)
             })
             .await
             .ok()

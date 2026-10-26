@@ -4,7 +4,8 @@
 use std::sync::{Mutex, OnceLock};
 
 pub const BUF_SIZE: usize = 16 * 1024;
-const POOL_CAP: usize = 4096;
+/// 缓冲池上限：512 块 * 16KB = 8MB 常驻上限，兼顾高并发零分配与低内存嵌入式/路由器设备不 OOM
+const POOL_CAP: usize = 512;
 
 fn pool() -> &'static Mutex<Vec<Box<[u8; BUF_SIZE]>>> {
     static POOL: OnceLock<Mutex<Vec<Box<[u8; BUF_SIZE]>>>> = OnceLock::new();

@@ -14,12 +14,13 @@ members = [
     "crates/vp-plugin",
     "crates/vp-plugin-sdk",
     "crates/vp-app",
+    "crates/vp-ffi",
     "crates/vp-bin",
     "crates/examples/plugins/xor_mask",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

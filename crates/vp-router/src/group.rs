@@ -234,12 +234,28 @@ impl Group {
     }
 
     async fn probe_all(&self) {
-        let mut results = Vec::with_capacity(self.members.len());
+        let n = self.members.len();
+        if n == 0 {
+            return;
+        }
+        // 高并发测速池（信号量并发度 128，既能数十秒内跑完上万节点，又不会耗尽系统文件句柄）
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(128));
+        let mut tasks = Vec::with_capacity(n);
         for m in &self.members {
-            let started = std::time::Instant::now();
-            let ok = probe(m, &self.test_url).await.is_ok();
-            let ms = started.elapsed().as_millis() as u32;
-            results.push(if ok { Some(ms) } else { None });
+            let m = m.clone();
+            let sem = semaphore.clone();
+            let url = self.test_url.clone();
+            tasks.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.ok();
+                let started = std::time::Instant::now();
+                let ok = probe(&m, &url).await.is_ok();
+                let ms = started.elapsed().as_millis() as u32;
+                if ok { Some(ms) } else { None }
+            }));
+        }
+        let mut results = Vec::with_capacity(n);
+        for t in tasks {
+            results.push(t.await.unwrap_or(None));
         }
         self.apply_probe_results(&results);
     }
@@ -329,28 +345,22 @@ fn fnv_index(bytes: &[u8], n: usize) -> usize {
 
 /// 通过指定出站探测测试 URL，返回耗时
 async fn probe(o: &Arc<dyn Outbound>, url: &str) -> Result<Duration> {
-    let (host, port, path) = parse_test_url(url)?;
-    let dst = DstAddr::new(host.clone(), port);
-    let sess = Session::new_tcp("healthcheck".into(), None, dst.clone());
-    let started = std::time::Instant::now();
-    let mut stream = o.connect_stream(&sess, &dst).await?;
-    let req = format!(
-        "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).await?;
-    let mut byte = [0u8; 1];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await {
-        Ok(r) => {
-            r?;
-        }
-        Err(_) => {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "probe timeout",
-            )))
-        }
-    }
-    Ok(started.elapsed())
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (host, port, path) = parse_test_url(url)?;
+        let dst = DstAddr::new(host.clone(), port);
+        let sess = Session::new_tcp("healthcheck".into(), None, dst.clone());
+        let started = std::time::Instant::now();
+        let mut stream = o.connect_stream(&sess, &dst).await?;
+        let req = format!(
+            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await?;
+        let mut byte = [0u8; 1];
+        stream.read_exact(&mut byte).await?;
+        Ok(started.elapsed())
+    })
+    .await
+    .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timeout")))?
 }
 
 fn parse_test_url(url: &str) -> Result<(String, u16, String)> {

@@ -572,15 +572,15 @@ impl SnellInbound {
             filled += n;
         }
 
-        let (ver, nonce_len) = match peek_buf[0] {
-            VERSION_4 => (VERSION_4, 16),
-            VERSION_3 => (VERSION_3, 16),
-            _ => {
-                if self.version == VERSION_1 {
-                    (VERSION_1, 12)
-                } else {
-                    (VERSION_2, 16)
-                }
+        let (ver, nonce_len) = if self.version == VERSION_1 {
+            (VERSION_1, 12)
+        } else if self.version == VERSION_2 {
+            (VERSION_2, 16)
+        } else {
+            match peek_buf[0] {
+                VERSION_4 => (VERSION_4, 16),
+                VERSION_3 => (VERSION_3, 16),
+                _ => (self.version, 16),
             }
         };
 

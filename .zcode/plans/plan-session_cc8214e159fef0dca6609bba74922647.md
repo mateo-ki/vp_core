@@ -1,112 +1,161 @@
-# VP_Core 功能增强实施方案：REALITY 协议、热重载完善、Rule-Provider 在线刷新
+# VP_Core 4项重大特性联合实施方案
 
-针对用户的“1、2、4 都做，3（插件市场装配）先放一放”的要求，本方案系统性设计并规划这三大特性的实现与测试。
-
----
-
-## 一、特性 1：REALITY 协议扩展（VLESS / Trojan / 通用 TLS 客户端）
-
-### 1.1 核心线格式与规范（对标 Xray-core / sing-box）
-- **客户端密钥与参数**：
-  - `public_key` / `pbk`：服务端静态 Curve25519 公钥（32 字节，Base64 URL-safe / Hex 解码）；
-  - `short_id` / `sid`：服务端 short-id（0~8 字节 Hex，不足 8 字节补零）；
-  - `server_name` / `sni`：目标伪装域名（如 `www.apple.com`）；
-  - `spider_x` / `spx`：爬虫探测路径。
-- **握手认证机制**：
-  - 客户端生成临时 Curve25519 密钥对 `(client_eph_pri, client_eph_pub)`，将 `client_eph_pub` 写入 ClientHello `key_share`（group 0x001d）；
-  - 计算协商秘密：$\text{auth\_secret} = \text{X25519}(\text{client\_eph\_pri}, \text{server\_static\_pub})$；
-  - 派生认证密钥：$\text{aead\_key} = \text{HKDF-SHA256}(\text{auth\_secret}, \text{salt} = \text{random}[0..20], \text{info} = \text{"REALITY"}, \text{len} = 32)$；
-  - 组装 16 字节明文载荷：`[1, 8, 1, 0, unix_secs_be(4), short_id(8)]`；
-  - 使用 AES-256-GCM 加密载荷，`nonce = random[20..32]`，`AAD = ClientHello`（此时 `session_id` 填 32 个零字节）；
-  - 密文 16B + Tag 16B = 32B，写入 `ClientHello.legacy_session_id`。
-- **服务端响应与证书验签**：
-  - 服务端回送 ServerHello（包含临时 `server_eph_pub` 并 echo `session_id`）；
-  - 在后续 EncryptedHandshake 中，REALITY 服务端下发特殊 Ed25519 证书；
-  - 客户端提取证书中 32B Ed25519 公钥，验证签名是否等于 $\text{HMAC-SHA512}(\text{aead\_key}, \text{ed25519\_pubkey})$；
-  - 若匹配，则服务端通过认证，客户端跳过系统根证书 WebPKI 校验，完成 Finished 握手并进入应用数据流传输。
-
-### 1.2 涉及文件与修改内容
-1. `crates/vp-config/src/model.rs`：
-   - 新增 `RealityOpts` 结构体（`public_key`, `short_id`, `spider_x`）；
-   - 在 `VlessCfg` 与 `TrojanCfg` 中增加字段 `pub reality_opts: Option<RealityOpts>`（aliases: `reality-opts`, `reality_opts`）。
-2. `crates/vp-transport/src/lib.rs` & `crates/vp-transport/src/utls.rs`：
-   - 在 `TransportConfig` 中新增 `reality: Option<RealityConfig>`；
-   - 在 `utls.rs` 中扩展握手引擎：当 `reality` 启用时，执行 REALITY 认证流程并在解析服务端证书时校验 `HMAC-SHA512`；
-   - 密码学计算复用已有 `ring` 依赖（X25519 agreement、AES-256-GCM、HMAC-SHA512），零新增依赖。
-3. `crates/vp-protocol/src/vless.rs` & `crates/vp-protocol/src/trojan.rs` & `crates/vp-protocol/src/lib.rs`：
-   - 提取 `reality_opts` 并通过 `transport_of_full` 传入 `TransportConfig`；
-   - 更新 `crates/vp-protocol/src/sub.rs`：`parse_vless` 与 `parse_trojan` 支持 `security=reality`、`pbk=...`、`sid=...`、`spx=...`。
-4. **测试**：
-   - 构造最小 REALITY 服务端握手与客户端自环测试：验证正确密钥/short_id 成功通信，错误密钥/篡改证书阻断。
+本方案针对用户明确要求的 4 项重大特性进行系统性架构设计与分步实施规划：
+1. **Proxy-Provider 代理集合订阅与后台自动刷新**（对标 Clash.Meta / mihomo）
+2. **VLESS XTLS-rprx-vision 真实流控**（Vision 协议头、内层 TLS ClientHello 填充伪装与帧化直通）
+3. **Snell 协议出+入站**（v1 / v2 / v3 / v4，PSK 鉴权、ChaCha20-Poly1305 / AES-128-GCM、0-RTT 复用与 HTTP/TLS 混淆）
+4. **DNS 分流策略增强**（`nameserver-policy` 域名/GeoSite 专有分流 + `fallback-filter` GeoIP/CIDR 污染过滤）
 
 ---
 
-## 二、特性 2：热重载（Hot-Reload）完善
+## 一、特性 1：Proxy-Provider 代理集合订阅与后台自动刷新
 
-### 2.1 现有问题
-- 目前 `App::reload()` 仅使用内存中初次读取的配置字符串，修改磁盘文件后调用 reload 无法生效；
-- Windows 平台没有 Unix `SIGHUP` 信号，在控制台运行无平滑重载触发入口；
-- `api.rs` 的 `PUT /configs` 尚未解析 JSON 请求体中的 `{"path": "..."}`。
-
-### 2.2 解决方案与涉及文件
-1. `crates/vp-app/src/lib.rs`：
-   - 将 `config_text: RwLock<Option<(String, Format, PathBuf)>>` 升级为保留配置文件真实路径 `config_path: Option<PathBuf>` 的共享结构 `Arc<RwLock<ConfigMeta>>`；
-   - `App::reload(&self)`：若配置来源为文件，先从磁盘异步重读最新文本（`tokio::fs::read_to_string`）；
-   - 重新执行 `assemble_for_reload`，若校验或解析失败，保留当前路由器并报错，保证服务零中断；
-   - 若成功，调用 `router_handle.swap(...)` 平滑切换路由规则与出站表。
-2. `crates/vp-bin/src/main.rs`：
-   - 在 `Cmd::Run` 的主事件循环中，利用 `tokio::time::interval(1s)` 配合 `std::fs::metadata(&config).modified()` 监控配置文件修改时间（mtime）；
-   - **跨平台通用**（Windows、macOS、Linux 一致支持）：保存配置文件立即自动触发平滑热重载，无需按快捷键或重启进程；
-   - 同时保留 Unix 下的 `SIGHUP` 信号支持。
-3. `crates/vp-app/src/api.rs`：
-   - `PUT /configs` 增强：支持从请求体 JSON（`{"path": "..."}`）提取目标路径，若无参数则默认重新读取当前运行的配置文件磁盘内容。
-4. **测试**：
-   - 编写自动化测试：启动 App 后动态修改临时磁盘配置文件，断言 `app.reload()` 正确应用新增代理节点与路由规则。
-
----
-
-## 三、特性 4：Rule-Provider 在线订阅拉取与定时刷新
-
-### 3.1 现有问题
-- 目前 `load_providers` 仅支持同步读取本地存在的文件（必须配置 `path`），若配置 `url` 或 `interval` 会被忽略；
-- 如果每次更新 rule-provider 都完整重建 App，会导致已有的策略组、延时统计、Selector 手动选择被重置。
-
-### 3.2 解决方案与涉及文件
-1. `crates/vp-config/src/model.rs`：
-   - `RuleProviderCfg` 增加 `#[serde(rename = "type", default)] pub kind: Option<String>`（兼容 `type: http` / `type: file`）；
-   - 若配置了 `url` 且未提供 `path`，自动默认缓存路径为 `.cache/{name}.txt`。
-2. `crates/vp-app/src/lib.rs`（在线拉取与离线降级）：
-   - 在 `vp-app/Cargo.toml` 中引用已在 workspace 内声明的 `ureq.workspace = true`；
-   - 启动加载时，若包含 `url`，先发起 HTTP GET 拉取内容（带超时），并尝试用 `vp_rule::provider::load_payload` 校验；
-   - 校验成功后写入磁盘缓存文件，保证断网或重启离线时直接降级读取缓存；若拉取失败且缓存存在，打出 warn 日志并降级使用本地缓存。
-3. `crates/vp-router/src/lib.rs`（原子平滑规则替换）：
-   - 新增方法 `Router::clone_with_rules(&self, rules: RuleEngine) -> Arc<Router>`；
-   - 保持所有的 `groups`、`outbounds`、`dns` 不变，仅更新规则引擎，彻底保留节点的历史延时记录与手动 Selector 选择状态。
-4. `crates/vp-app/src/lib.rs`（后台定时刷新任务）：
-   - 对所有配置了 `interval > 0` 的 HTTP rule-provider，在 `start` 时启动后台定时协程；
-   - 定时从 `url` 拉取最新内容，若内容有变动且校验通过，写入磁盘缓存并重编译规则，调用 `router_handle.swap(...)` 实现零连接中断的规则热生效。
-5. **测试**：
-   - 模拟 HTTP 本地服务器返回 provider 内容，验证首次启动拉取、离线文件缓存降级、后台 interval 触发重编译和热替换生效。
+### 1.1 架构与设计
+- **配置模型**（`vp-config::model`）：
+  - 新增 `ProxyProviderCfg`：
+    ```rust
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    pub struct ProxyProviderCfg {
+        #[serde(rename = "type", default)]
+        pub kind: Option<String>,       // "http" 或 "file"
+        pub url: Option<String>,
+        pub path: Option<String>,       // 离线缓存路径或本地文件
+        pub interval: Option<u64>,      // 刷新周期（秒）
+        pub filter: Option<String>,     // 节点名正则表达式过滤
+        #[serde(alias = "health-check", alias = "health_check", default)]
+        pub health_check: Option<ProviderHealthCheckCfg>,
+    }
+    ```
+  - `Config` 新增字段：`pub proxy_providers: HashMap<String, ProxyProviderCfg>`（别名 `proxy-providers`）。
+  - `GroupCfg` 新增字段：`pub r#use: Vec<String>`（别名 `use`），支持通过引用 provider 名称动态汇入节点。
+  - `vp-config::validate` 放宽校验：若策略组配置了 `use: [...]`，允许 `proxies: [...]` 为空；校验所引用的 provider 是否已在 `proxy_providers` 中声明。
+- **订阅多格式解析与节点提取**（`vp-protocol::sub` / `vp-config`）：
+  - 支持两类返回载荷：
+    1. 标准 Clash YAML 文档（含 `proxies: [...]` 块）：由 `serde_yaml` 直接反序列化为 `Vec<ProxyCfg>`；
+    2. Base64 编码或换行分隔的节点分享链接（`vless://`、`vmess://`、`trojan://`、`ss://`、`snell://` 等）：通过 `vp_protocol::sub::parse_subscription` 解析为 `Vec<SubNode>` 并转换为 `ProxyCfg`。
+  - 支持 `filter` 正则过滤：仅保留匹配正则表达式的节点名称。
+- **在线拉取、离线缓存降级与热装配**（`vp-app`）：
+  - 启动时拉取远程 provider 文本（带 15s 超时与 `vpcore/proxy-provider` User-Agent）；
+  - 成功则写入本地缓存路径（缺省为 `.cache/{name}.yaml`）；网络异常或断网时自动降级加载本地缓存；
+  - 装配时将 provider 解析出的节点实例化为 `Arc<dyn Outbound>` 注册至全局 `outbounds` 表，并根据 `use: [...]` 将节点名称动态追加到对应策略组中；
+- **后台增量定时刷新协程**：
+  - 对配置了 `interval > 0` 的 HTTP provider，启动后台定时协程轮询拉取；
+  - 当节点列表发生变动时，平滑重新构建策略组与路由器，调用 `router_handle.swap(...)` 实现连接零中断的动态热替换。
 
 ---
 
-## 四、实施顺序
+## 二、特性 2：VLESS XTLS-rprx-vision 真实流控（Vision）
 
-1. **第 1 阶段（特性 2：热重载完善）**：
-   - 改造 `App` / `ApiState` 配置元数据，实现从磁盘重读配置文本；
-   - 在 `vp-bin` 中加入跨平台 mtime 文件轮询热重载与 Unix SIGHUP 统一；
-   - 完善 `PUT /configs` 接口；
-   - 运行测试并验证。
-2. **第 2 阶段（特性 4：Rule-Provider 在线拉取与定时刷新）**：
-   - `vp-config` 兼容字段与默认缓存路径；
-   - `vp-router` 增加 `clone_with_rules`；
-   - `vp-app` 实现 HTTP GET 拉取 + 离线缓存降级 + 后台 interval 自动热更新；
-   - 编写单测并验证。
-3. **第 3 阶段（特性 1：REALITY 协议扩展）**：
-   - `vp-config` 增加 `RealityOpts`；
-   - `vp-transport` / `utls.rs` 实现完整的 REALITY ClientHello 认证与 Ed25519 签名校验；
-   - `vp-protocol` 中接线 VLESS / Trojan / sub 订阅解析；
-   - 编写 REALITY 自环与认证拒绝测试。
-4. **第 4 阶段（全 Workspace 回归与 README）**：
-   - 运行全 workspace 单元测试与端到端测试；
-   - 更新 README 协议矩阵与功能说明，完成代码提交。
+### 2.1 架构与设计
+- **VLESS Addons Protobuf 线格式**：
+  - VLESS 握手请求头中包含 `addons` 字段：`[VERSION][UUID][Addons Len M][Addons Bytes...][CMD][Port][ATYP][Addr]`。
+  - 当 `flow == "xtls-rprx-vision"` 时，构造标准的 protobuf 结构：
+    `0x0A 0x10 0x78 0x74 0x6C 0x73 0x2D 0x72 0x70 0x72 0x78 0x2D 0x76 0x69 0x73 0x69 0x6F 0x6E`（Tag 1, String len 16, ASCII `"xtls-rprx-vision"`，共 18 字节）。
+  - 服务端握手响应：读取 `[ver 0x00][addon_len]` 并正确消费服务端下发的响应 addons。
+- **内层 TLS ClientHello 深度嗅探与长度填充伪装（Padding）**：
+  - 连接建立后，客户端嗅探来自本地连接的首包数据：
+    - 检查是否为 TLS 握手记录：`ContentType == 0x16`，版本 `0x03, 0x01..0x03`；
+    - 检查 Handshake Type 是否为 `0x01`（ClientHello），且 `supported_versions` 扩展中声明了 TLS 1.3（`0x0304`）。
+  - **Vision 握手帧化包装**：
+    - 帧格式：`[Command: 1B][ContentLength: 2B be][PaddingLength: 2B be][Content Data][Padding Zeros]`；
+    - `Command 0x00`（PaddingContinue）：对 ClientHello 添加伪随机填充（填充至 900~1200 字节特征区间），瓦解 DPI 对内层 ClientHello 长度指纹的识别；
+    - 服务端回传 ServerHello / Certificate 时同样解包该帧结构并剥离尾部零填充；
+    - 握手结束判定：当检测到客户端发送 Finished / ApplicationData（`0x17`）时，客户端发送带有 `Command 0x01`（PaddingEnd）的收尾帧。
+- **直通流（Splice / Direct Copy）零开销传输**：
+  - 双方完成 `PaddingEnd` 交换后，退出 Vision 帧化状态机，后续所有双向数据全部进入裸流直通（Direct Copy），消除任何重复分帧与封包损耗。
+- **订阅与配置互通**：
+  - `vp-protocol::sub` 中的 `parse_vless` 提取 `flow` 字段；
+  - `vp-protocol::vless` 完整接入 `VlessCfg.flow`。
+
+---
+
+## 三、特性 3：Snell 协议出+入站（v4 / v3 / v2 / v1）
+
+### 3.1 架构与设计
+- **协议兼容性**：
+  - 完整支持 Surge / Clash.Meta / mihomo 生态规范中的 Snell 协议（版本 v1、v2、v3、v4，缺省为 v4）。
+  - 支持 TCP 流代理与 UDP 数据报转发（原生 Snell UDP 机制）。
+- **密码学与密钥派生**（零新依赖，复用现有库）：
+  - 凭据为 PSK 字符串；
+  - v1/v2：HKDF-SHA256(psk, salt, "snell") / SHA256(psk)；
+  - v3/v4：采用 16 字节随机 ClientNonce，使用 HKDF-SHA256 派生会话密钥，对称加密采用 `ChaCha20-Poly1305` 与 `AES-128-GCM`。
+- **命令与地址格式**：
+  - 命令：`0x00` PING，`0x01` CONNECT（TCP），`0x02` UDP；
+  - 目标地址编码：`0x01` IPv4 (4B) + Port (2B be)，`0x03` Domain (1B 长度 + 域名) + Port (2B be)，`0x04` IPv6 (16B) + Port (2B be)。
+- **混淆层（Obfuscation）**：
+  - `obfs: http`：在底层 TCP 连接建立之初首发 HTTP GET/POST 伪装报头（带自定义 Host 与伪随机路径），服务端校验并回送 HTTP 响应头后切入 Snell 加密流；
+  - `obfs: tls`：在首包包裹 TLS 1.3 ClientHello 伪装头。
+- **组件实现**：
+  - `crates/vp-protocol/src/snell.rs`：实现 `SnellOutbound` 与 `SnellInbound`（自建与自环互测）；
+  - `crates/vp-config/src/model.rs`：新增 `SnellCfg` 与 `ProxyKind::Snell`；
+  - `crates/vp-protocol/src/sub.rs`：支持 `snell://psk@host:port?version=4&obfs=http&host=...#name` 格式解析。
+
+---
+
+## 四、特性 4：DNS 分流策略增强（nameserver-policy / fallback-filter）
+
+### 4.1 架构与设计
+- **配置模型**（`vp-config::model`）：
+  - `DnsConfig` 增加：
+    ```rust
+    #[serde(alias = "nameserver-policy", alias = "nameserver_policy", default)]
+    pub nameserver_policy: HashMap<String, serde_yaml::Value>,
+    #[serde(alias = "fallback-filter", alias = "fallback_filter", default)]
+    pub fallback_filter: Option<FallbackFilterConfig>,
+    ```
+  - `FallbackFilterConfig`：
+    ```rust
+    pub struct FallbackFilterConfig {
+        pub geoip: bool,             // 默认 true
+        pub geoip_code: String,      // 默认 "CN"
+        pub ipcidr: Vec<String>,     // 污染 IP / Bogon CIDR 列表
+        pub domain: Vec<String>,     // 强制走 fallback 的域名
+        pub geosite: Vec<String>,    // 强制走 fallback 的 geosite 标签（如 gfw）
+    }
+    ```
+- **Policy 编译与路由匹配引擎**（`vp-dns` & `vp-rule`）：
+  - 专有域名匹配器：利用 `vp-rule::DomainTrie` 编译 `*.google.com`、`domain:...` 前缀后缀与通配符，映射至专用 `Resolver` 实例；
+  - GeoSite 标签匹配器：利用 `vp-rule::CompiledSite` 编译 `geosite:cn`、`geosite:category-ads-all` 等标签，映射至专用 `Resolver` 实例；
+  - Upstream Bootstrap：利用 `default_nameserver`（纯 IP DNS）异步预解析 DoH / DoT 上游域名，消除原先调用系统阻塞 `ToSocketAddrs` 的隐患。
+- **查询与过滤执行流程**：
+  1. **Cache 检查**：命中且未过期直接返回；
+  2. **Policy 专有分流优先**：若域名命中 `nameserver-policy` 中的域名规则或 `geosite` 规则，仅向该策略指定的上游解析器发起查询；
+  3. **Fallback 强制分流**：若域名命中 `fallback-filter.domain` 或 `fallback-filter.geosite`，直接向 `fallback` 上游发起查询；
+  4. **Primary 结果过滤与污染剔除**：
+     - 若未命中上述特殊规则，向 `nameserver`（主解析器）发起查询；
+     - 检查返回的 IP 列表：
+       - 若任何 IP 落在 `fallback-filter.ipcidr`（如 `240.0.0.0/4`, `127.0.0.1/32` 等已知污染网段）；
+       - 或启用了 `geoip: true` 且 IP 归属地不属于 `geoip_code`（如国外域名被国内 DNS 劫持投毒至非 CN IP）；
+     - 则判定主解析器结果被污染，自动丢弃并降级使用 `fallback` 解析结果。
+
+---
+
+## 五、实施步骤规划
+
+1. **第一阶段：特性 1（Proxy-Provider 代理集订阅）**
+   - 在 `vp-config` 中增加 `ProxyProviderCfg` 与 `GroupCfg.r#use`，调整校验规则；
+   - 在 `vp-app` 中实现 HTTP 拉取、磁盘缓存降级与 YAML/Base64/URI 混合解析；
+   - 动态装配策略组成员，并启动后台周期定时刷新协程；
+   - 编写单元与集成测试验证。
+
+2. **第二阶段：特性 2（VLESS XTLS-rprx-vision 真实流控）**
+   - 在 `vp-protocol::vless` 中实现 Protobuf Addons 组装与 `flow: xtls-rprx-vision` 识别；
+   - 实现内层 TLS 1.3 ClientHello 嗅探、特征区间随机 Padding 填充、帧化封包与 `PaddingEnd` 直通状态机；
+   - 编写 Vision 帧布局、填充解包与端到端传输自环测试。
+
+3. **第三阶段：特性 3（Snell 协议出+入站 v1-v4）**
+   - 在 `vp-config` 中增加 `SnellCfg`；
+   - 在 `vp-protocol` 中实现 `snell.rs`（出站、入站、PSK 派生、AEAD 加解密、HTTP/TLS 混淆）；
+   - 在 `sub.rs` 中支持 `snell://` 链接解析；
+   - 编写大流量回显、错误密码拦截、混淆层互测等自环测试。
+
+4. **第四阶段：特性 4（DNS nameserver-policy 分流与 fallback 过滤）**
+   - 在 `vp-config` 中增加 `nameserver-policy` 与 `fallback-filter` 字段；
+   - 在 `vp-dns` 中实现策略路由结构（Trie + GeoSite），在 `vp-app` 中提前初始化 GeoSite/GeoIP 并接入 DNS；
+   - 实现主上游污染检测与 fallback 自动切换；
+   - 编写专有分流与污染拦截单测。
+
+5. **第五阶段：全工作区回归验证、README 更新与提交**
+   - 运行 `cargo test --workspace` 全量测试；
+   - 更新 README 说明文档；
+   - 检查工作区敏感文件与测试凭据，完成干净提交。

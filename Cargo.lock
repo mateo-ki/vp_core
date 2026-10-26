@@ -2553,7 +2553,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vp-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "vp-bin"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "tokio",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "vp-common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "rand 0.9.5",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "vp-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "json5",
  "serde",
@@ -2617,7 +2617,7 @@ dependencies = [
 
 [[package]]
 name = "vp-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "vp-crypto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "vp-dns"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "httparse",
@@ -2665,8 +2665,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vp-ffi"
+version = "1.0.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vp-app",
+ "vp-common",
+ "vp-config",
+ "vp-core",
+]
+
+[[package]]
 name = "vp-plugin"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libloading 0.8.9",
  "serde",
@@ -2680,11 +2693,11 @@ dependencies = [
 
 [[package]]
 name = "vp-plugin-sdk"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "vp-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2735,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "vp-router"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2751,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "vp-rule"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "maxminddb",
  "regex",
@@ -2764,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "vp-transport"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2792,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "vp-tun"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3092,7 +3105,7 @@ dependencies = [
 
 [[package]]
 name = "xor_mask"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",

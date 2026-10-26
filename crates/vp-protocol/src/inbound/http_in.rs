@@ -91,10 +91,31 @@ where
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
 
+    let mut user = None;
+    for l in text.split("\r\n") {
+        if let Some((k, v)) = l.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("proxy-authorization") {
+                if let Some(rest) = v.trim().strip_prefix("Basic ") {
+                    use base64::Engine;
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(rest.trim()) {
+                        if let Ok(cred) = String::from_utf8(decoded) {
+                            if let Some((u, _)) = cred.split_once(':') {
+                                user = Some(u.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if method.eq_ignore_ascii_case("CONNECT") {
         // CONNECT host:port
         let dst = DstAddr::parse(target)?;
-        let sess = Session::new_tcp(tag, Some(src), dst);
+        let mut sess = Session::new_tcp(tag, Some(src), dst);
+        if let Some(u) = user {
+            sess = sess.with_inbound_user(u);
+        }
         dispatch_stream(ctx, sess, Box::new(stream), ClientReply::Http("200 Connection established"))
             .await;
         return Ok(());
@@ -127,7 +148,10 @@ where
     }
 
     // absolute-form：响应由远端直接透传，不做本地应答
-    let sess = Session::new_tcp(tag, Some(src), dst);
+    let mut sess = Session::new_tcp(tag, Some(src), dst);
+    if let Some(u) = user {
+        sess = sess.with_inbound_user(u);
+    }
     let outbound = ctx.router.pick(&sess).await;
     match outbound.outbound.connect_stream(&sess, &sess.dst).await {
         Ok(mut remote) => {

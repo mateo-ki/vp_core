@@ -124,6 +124,21 @@ pub struct TunCfg {
     pub fd: Option<i32>,
 }
 
+impl Default for TunCfg {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            address: default_tun_addr(),
+            netmask: default_tun_mask(),
+            mtu: default_tun_mtu(),
+            fake_ip_range: default_fake_range(),
+            auto_route: false,
+            auto_redirect: None,
+            fd: None,
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }

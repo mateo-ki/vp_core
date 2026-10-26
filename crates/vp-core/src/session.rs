@@ -37,6 +37,10 @@ pub struct Session {
     pub dst: DstAddr,
     /// 命中的进程名（进程规则/展示用）
     pub process: Option<Arc<str>>,
+    /// 入站监听端口（IN-PORT 分流）
+    pub inbound_port: Option<u16>,
+    /// 入站认证用户名（IN-USER 分流）
+    pub inbound_user: Option<Arc<str>>,
 }
 
 impl Session {
@@ -48,6 +52,8 @@ impl Session {
             src,
             dst,
             process: None,
+            inbound_port: None,
+            inbound_user: None,
         }
     }
 
@@ -59,6 +65,18 @@ impl Session {
             src,
             dst,
             process: None,
+            inbound_port: None,
+            inbound_user: None,
         }
+    }
+
+    pub fn with_inbound_port(mut self, port: u16) -> Self {
+        self.inbound_port = Some(port);
+        self
+    }
+
+    pub fn with_inbound_user(mut self, user: impl Into<Arc<str>>) -> Self {
+        self.inbound_user = Some(user.into());
+        self
     }
 }

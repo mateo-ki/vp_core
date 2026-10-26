@@ -22,6 +22,7 @@ use vp_core::stream::UdpPacket;
 use vp_dns::{FakeIpPool, Resolver};
 
 pub mod auto_route;
+pub mod wintun_installer;
 
 #[derive(Clone)]
 pub struct TunConfig {
@@ -122,6 +123,22 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
     }
     tcfg.mtu(cfg.mtu);
     tcfg.up();
+
+    #[cfg(windows)]
+    {
+        match wintun_installer::windows::ensure_wintun_dll() {
+            Ok(dll_path) => {
+                info!("Windows TUN 加载 Wintun 驱动: {}", dll_path.display());
+                tcfg.platform_config(move |p| {
+                    p.wintun_file(dll_path);
+                });
+            }
+            Err(e) => {
+                warn!("Wintun 驱动准备提示: {e}");
+            }
+        }
+    }
+
     let dev = tun::create_as_async(&tcfg)
         .map_err(|e| Error::Other(format!("创建 TUN 设备失败（需要管理员权限）: {e}")))?;
 

@@ -1,0 +1,20 @@
+[package]
+name = "vp-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "VP_Core C-ABI FFI bridge for Android JNI, iOS Swift, and embedded platforms"
+
+[lib]
+name = "vpcore"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+vp-common = { workspace = true }
+vp-core = { workspace = true }
+vp-config = { workspace = true }
+vp-app = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

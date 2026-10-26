@@ -200,6 +200,8 @@ impl Router {
             },
             process: sess.process.as_deref(),
             inbound: &sess.inbound,
+            inbound_port: sess.inbound_port,
+            inbound_user: sess.inbound_user.as_deref(),
         }
     }
 }

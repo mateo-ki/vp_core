@@ -9,6 +9,12 @@ ipv6: false
 external-controller: 127.0.0.1:9090
 secret: ""
 
+# 性能与套接字参数调优（可显著提升跨洋高延迟和高带宽吞吐）
+tuning:
+  socket-buffer-size: 524288  # 512KB SO_RCVBUF / SO_SNDBUF
+  tcp-nodelay: true           # 禁用 Nagle 降低交互延迟
+  tcp-keepalive-secs: 60      # 保活探活周期 (秒)
+
 dns:
   enable: true
   # 留空则使用系统解析
@@ -89,6 +95,27 @@ proxies:
     password: "your-password"
     sni: t.example.com
     skip-cert-verify: false
+
+  # 链式代理跳板（中转落地机）
+  - name: "chained-trojan-示例"
+    type: trojan
+    server: landing.example.com
+    port: 443
+    password: "your-password"
+    sni: landing.example.com
+    dialer-proxy: "ss-示例"     # 流量通过前置 ss-示例 节点隧道转发
+
+  # smux 多路复用节点示例
+  - name: "vless-smux-示例"
+    type: vless
+    server: vl.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    smux:
+      enable: true
+      max-streams: 16
+      max-connections: 4
 
 # 代理集合提供者（对标 Clash.Meta / mihomo proxy-providers）
 # proxy-providers:

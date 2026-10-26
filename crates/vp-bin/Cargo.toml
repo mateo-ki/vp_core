@@ -15,6 +15,7 @@ vp-common.workspace = true
 vp-app.workspace = true
 vp-protocol.workspace = true
 vp-config.workspace = true
+vp-tun.workspace = true
 tokio.workspace = true
 clap.workspace = true
 ureq.workspace = true

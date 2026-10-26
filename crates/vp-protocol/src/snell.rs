@@ -356,13 +356,21 @@ impl SnellOutbound {
     }
 
     async fn dial_and_handshake(&self, dst: &DstAddr, cmd: u8) -> Result<Box<dyn ProxyStream>> {
-        let mut tcp = transport::dial(
+        let tcp = transport::dial(
             &self.server,
             self.port,
             &transport::TransportConfig::default(),
         )
         .await?;
+        self.handshake_over(tcp, dst, cmd).await
+    }
 
+    async fn handshake_over(
+        &self,
+        mut tcp: Box<dyn ProxyStream>,
+        dst: &DstAddr,
+        cmd: u8,
+    ) -> Result<Box<dyn ProxyStream>> {
         // 1. HTTP 混淆（若启用）
         if self.obfs_mode.as_deref() == Some("http") {
             let host = self.obfs_host.as_deref().unwrap_or(&self.server);
@@ -444,9 +452,9 @@ impl Outbound for SnellOutbound {
         &self,
         _sess: &Session,
         dst: &DstAddr,
-        _underlying: Box<dyn ProxyStream>,
+        underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        self.connect_stream(_sess, dst).await
+        self.handshake_over(underlying, dst, CMD_CONNECT).await
     }
 
     fn support_udp(&self) -> bool {

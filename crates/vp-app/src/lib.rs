@@ -61,6 +61,8 @@ pub struct App {
     pub controller: Option<String>,
     /// 重载用：配置元数据
     pub config_meta: Arc<RwLock<Option<ConfigMeta>>>,
+    /// TUN 路由守卫：持有并在 App Drop 时自动恢复路由表
+    pub _route_guard: Option<vp_tun::auto_route::AutoRouteGuard>,
 }
 
 impl App {
@@ -231,6 +233,14 @@ impl App {
             )));
         }
 
+        if let Some(tuning) = &cfg.tuning {
+            let rcv = tuning.so_rcvbuf.or(tuning.socket_buffer_size).unwrap_or(0);
+            let snd = tuning.so_sndbuf.or(tuning.socket_buffer_size).unwrap_or(0);
+            let nodelay = tuning.tcp_nodelay;
+            let ka_secs = tuning.tcp_keepalive_secs.unwrap_or(60);
+            vp_transport::set_global_tuning(rcv, snd, nodelay, ka_secs);
+        }
+
         let geosite = load_geosite(&base_dir, cfg.geosite_url.as_deref()).await;
         let geoip = load_geoip(&base_dir, cfg.geoip_url.as_deref()).await;
 
@@ -316,9 +326,25 @@ impl App {
             group_specs.push(gs);
         }
 
+        // 收集节点声明的 dialer-proxy / detour
+        let mut dialers = HashMap::new();
+        for p in &cfg.proxies {
+            if let Some(ref d) = p.dialer_proxy {
+                dialers.insert(p.name.clone(), d.clone());
+            }
+        }
+        for plist in proxy_providers.values() {
+            for p in plist {
+                if let Some(ref d) = p.dialer_proxy {
+                    dialers.insert(p.name.clone(), d.clone());
+                }
+            }
+        }
+
         let router = InnerRouter::build(RouterSpec {
             outbounds,
             groups: group_specs,
+            dialers,
             rules,
             mode: cfg.mode,
             dns: dns.clone(),
@@ -442,6 +468,7 @@ impl App {
 
         // 入站
         let mut listen_ports = Vec::new();
+        let mut tun_route_guard = None;
         if start_listeners {
             let bind = if cfg.allow_lan {
                 if cfg.bind_address == "*" {
@@ -542,13 +569,17 @@ impl App {
                     };
                     let tun_in: Arc<dyn vp_core::Inbound> =
                         Arc::new(vp_tun::TunInbound::new(t, "tun"));
+                    let mut route_guard = None;
                     match tun_in.clone().start(inb_ctx.clone()).await {
                         Ok(_) => {
                             info!("TUN 模式已启动（{}）", tun_cfg.address);
                             if tun_cfg.auto_route {
                                 match vp_tun::auto_route::enable(&tun_cfg.address, &tun_cfg.netmask)
                                 {
-                                    Ok(()) => info!("auto-route 已启用"),
+                                    Ok(guard) => {
+                                        info!("auto-route 已启用");
+                                        route_guard = Some(guard);
+                                    }
                                     Err(e) => warn!("auto-route 启用失败（需管理员权限）: {e}"),
                                 }
                             }
@@ -557,6 +588,7 @@ impl App {
                             warn!("TUN 启动失败（需要管理员权限）: {e}");
                         }
                     }
+                    tun_route_guard = route_guard;
                 }
             }
         }
@@ -592,6 +624,7 @@ impl App {
             listen_ports,
             controller,
             config_meta,
+            _route_guard: tun_route_guard,
         };
         Ok(Arc::new(app))
     }
@@ -974,14 +1007,36 @@ fn fetch_remote_binary(url: &str, ua: &str) -> std::result::Result<Vec<u8>, Stri
     Ok(bytes)
 }
 
+fn candidate_dirs(base_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    dirs.push(base_dir.to_path_buf());
+    if let Ok(cwd) = std::env::current_dir() {
+        if !dirs.contains(&cwd) {
+            dirs.push(cwd);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let pb = parent.to_path_buf();
+            if !dirs.contains(&pb) {
+                dirs.push(pb);
+            }
+        }
+    }
+    dirs
+}
+
 async fn load_geosite(base_dir: &Path, url: Option<&str>) -> Option<GeoSiteDb> {
-    for name in ["geosite.dat", "GeoSite.dat"] {
-        let p = base_dir.join(name);
-        if p.exists() {
-            if let Ok(bytes) = std::fs::read(&p) {
-                if let Ok(db) = GeoSiteDb::load(&bytes) {
-                    info!("geosite 已加载: {}", p.display());
-                    return Some(db);
+    let dirs = candidate_dirs(base_dir);
+    for d in &dirs {
+        for name in ["geosite.dat", "GeoSite.dat"] {
+            let p = d.join(name);
+            if p.exists() {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if let Ok(db) = GeoSiteDb::load(&bytes) {
+                        info!("geosite 已加载: {}", p.display());
+                        return Some(db);
+                    }
                 }
             }
         }
@@ -1000,16 +1055,26 @@ async fn load_geosite(base_dir: &Path, url: Option<&str>) -> Option<GeoSiteDb> {
             }
         }
     }
+    info!("未找到 geosite 数据库文件 (geosite.dat)，相关 GEOSITE 规则将优雅跳过");
     None
 }
 
 async fn load_geoip(base_dir: &Path, url: Option<&str>) -> Option<vp_rule::geoip::GeoIpDb> {
-    for name in ["geoip.metadb", "Country.mmdb", "geoip.mmdb"] {
-        let p = base_dir.join(name);
-        if p.exists() {
-            if let Ok(db) = vp_rule::geoip::GeoIpDb::load(&p) {
-                info!("geoip 已加载: {}", p.display());
-                return Some(db);
+    let dirs = candidate_dirs(base_dir);
+    for d in &dirs {
+        for name in [
+            "geoip.metadb",
+            "Country.mmdb",
+            "geoip.dat",
+            "GeoIP.dat",
+            "geoip.mmdb",
+        ] {
+            let p = d.join(name);
+            if p.exists() {
+                if let Ok(db) = vp_rule::geoip::GeoIpDb::load(&p) {
+                    info!("geoip 已加载: {}", p.display());
+                    return Some(db);
+                }
             }
         }
     }
@@ -1027,6 +1092,7 @@ async fn load_geoip(base_dir: &Path, url: Option<&str>) -> Option<vp_rule::geoip
             }
         }
     }
+    info!("未找到 geoip 数据库文件 (geoip.metadb / Country.mmdb)，相关 GEOIP 规则将优雅跳过");
     None
 }
 
@@ -1778,5 +1844,44 @@ rules:
         );
 
         let _ = tokio::fs::remove_file(&cache_file).await;
+    }
+
+    #[tokio::test]
+    async fn app_handles_subscription_rules_without_databases() {
+        // 模拟 vpn-parser 在全新临时目录中传入包含 GEOIP,CN / GEOIP,GOOGLE / GEOSITE 的典型订阅规则
+        let temp_dir = std::env::temp_dir().join(format!("vp_sub_test_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let cfg = r#"
+mode: rule
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - GEOIP,CN,DIRECT,no-resolve
+  - GEOIP,GOOGLE,PROXY
+  - GEOSITE,cn,DIRECT
+  - GEOSITE,google,PROXY
+  - MATCH,PROXY
+"#;
+        // 在没有 Country.mmdb 或 geosite.dat 的情况下，应当 100% 优雅降级并启动成功，绝不报错退出
+        let app = App::start(cfg, Format::Yaml, &temp_dir, false)
+            .await
+            .expect("包含 GEOIP 与 GEOSITE 的订阅规则在缺少数据库时应优雅降级并成功启动");
+
+        let sess = vp_core::Session::new_tcp(
+            "test".into(),
+            None,
+            vp_common::DstAddr::new("example.com", 80),
+        );
+        let res = app.router.current().pick(&sess).await;
+        // 优雅跳过缺少数据库的规则，命中兜底 MATCH
+        assert_eq!(res.rule.as_ref().unwrap().target, "PROXY");
+        assert_eq!(res.rule.as_ref().unwrap().rule, "MATCH,PROXY");
+        assert_eq!(&*res.via, "DIRECT");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

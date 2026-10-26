@@ -57,6 +57,8 @@ pub enum LogicOp {
 #[derive(Clone)]
 pub enum Matcher {
     MatchAll,
+    /// 永不匹配（用于缺少 geoip/geosite 数据库或不支持类别时的优雅降级，防止进程崩溃）
+    NeverMatch,
     /// 精确域名
     Domain(Arc<DomainTrie>),
     /// 后缀域名
@@ -95,6 +97,7 @@ impl Matcher {
     fn r#match(&self, ctx: &MatchCtx) -> bool {
         match self {
             Matcher::MatchAll => true,
+            Matcher::NeverMatch => false,
             Matcher::Domain(t) => ctx.host.is_some_and(|h| t.is_exact_match(h)),
             Matcher::DomainSuffix(t) => ctx.host.is_some_and(|h| t.is_match(h)),
             Matcher::DomainKeyword(k) => ctx
@@ -431,30 +434,45 @@ fn parse_plain_rule(
         "GEOIP" => {
             #[cfg(feature = "geoip")]
             {
-                let db = env
-                    .geoip
-                    .as_ref()
-                    .ok_or_else(|| format!("GEOIP 规则需要 geoip 数据库: {full:?}"))?;
-                let m = db
-                    .matcher(payload.to_ascii_lowercase())
-                    .ok_or_else(|| format!("GEOIP 类别非法: {payload:?}"))?;
+                let db = match env.geoip.as_ref() {
+                    Some(db) => db,
+                    None => {
+                        tracing::warn!("未加载 GeoIP 数据库，GEOIP 规则将被跳过: {full:?}");
+                        return Ok(Matcher::NeverMatch);
+                    }
+                };
+                let m = match db.matcher(payload.to_ascii_lowercase()) {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!("GeoIP 类别非法或未找到，规则将被跳过: {payload:?}");
+                        return Ok(Matcher::NeverMatch);
+                    }
+                };
                 Ok(Matcher::GeoIp(Arc::new(m)))
             }
             #[cfg(not(feature = "geoip"))]
             {
                 let _ = (payload, env);
-                Err(format!("此构建未启用 geoip 支持: {full:?}"))
+                tracing::warn!("此构建未启用 geoip 支持，规则将被跳过: {full:?}");
+                Ok(Matcher::NeverMatch)
             }
         }
         "GEOSITE" => {
-            let db = env
-                .geosite
-                .as_ref()
-                .ok_or_else(|| format!("GEOSITE 规则需要 geosite 数据库: {full:?}"))?;
+            let db = match env.geosite.as_ref() {
+                Some(db) => db,
+                None => {
+                    tracing::warn!("未加载 GeoSite 数据库，GEOSITE 规则将被跳过: {full:?}");
+                    return Ok(Matcher::NeverMatch);
+                }
+            };
             let tag = payload.to_ascii_lowercase();
-            let site = db
-                .compile(&tag)
-                .ok_or_else(|| format!("GEOSITE 中没有类别 {payload:?}"))?;
+            let site = match db.compile(&tag) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!("GEOSITE 中没有类别 {payload:?}，规则将被跳过");
+                    return Ok(Matcher::NeverMatch);
+                }
+            };
             Ok(Matcher::GeoSite(Arc::new(site)))
         }
         "DST-PORT" | "SRC-PORT" => {
@@ -826,5 +844,23 @@ mod tests {
 
         c.inbound = "other";
         assert_eq!(e.r#match(&c).unwrap().target, "REJECT");
+    }
+
+    #[test]
+    fn geoip_and_geosite_graceful_degradation() {
+        // 在未加载 geoip/geosite 数据库的情况下，规则不应报错崩溃，而应优雅降级跳过
+        let e = engine(&[
+            "GEOIP,CN,DIRECT,no-resolve",
+            "GEOIP,GOOGLE,PROXY",
+            "GEOSITE,category-ads-all,REJECT",
+            "MATCH,PROXY",
+        ]);
+        // 访问任意 IP 或域名，跳过未加载的规则，命中兜底规则
+        assert_eq!(
+            e.r#match(&ctx(Some("google.com"), Some("8.8.8.8".parse().unwrap())))
+                .unwrap()
+                .target,
+            "PROXY"
+        );
     }
 }

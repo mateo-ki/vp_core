@@ -338,4 +338,24 @@ sub-rules:
         assert_eq!(cfg.mode, Mode::Rule);
         assert!(!cfg.dns.enable);
     }
+
+    #[test]
+    fn parse_production_configs() {
+        // 验证根目录 config.yaml
+        if let Ok(content) = std::fs::read_to_string("../../config.yaml") {
+            let cfg = parse(&content, Format::Yaml).expect("根目录 config.yaml 语法解析失败");
+            validate::validate(&cfg).expect("根目录 config.yaml 业务规则校验失败");
+            assert!(cfg.tuning.is_some());
+            let t = cfg.tuning.as_ref().unwrap();
+            assert_eq!(t.socket_buffer_size, Some(524288));
+            assert!(t.tcp_nodelay);
+        }
+
+        // 验证 example/config.yaml
+        if let Ok(content) = std::fs::read_to_string("../../example/config.yaml") {
+            let cfg = parse(&content, Format::Yaml).expect("example/config.yaml 语法解析失败");
+            validate::validate(&cfg).expect("example/config.yaml 业务规则校验失败");
+            assert!(cfg.tuning.is_some());
+        }
+    }
 }

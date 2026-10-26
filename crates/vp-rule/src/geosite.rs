@@ -81,21 +81,21 @@ fn parse_site(msg: &[u8]) -> Result<RawSite, String> {
     Ok(RawSite { code, entries })
 }
 
-struct PbReader<'a> {
+pub(crate) struct PbReader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> PbReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         PbReader { buf, pos: 0 }
     }
 
-    fn eof(&self) -> bool {
+    pub(crate) fn eof(&self) -> bool {
         self.pos >= self.buf.len()
     }
 
-    fn varint(&mut self) -> Result<u64, String> {
+    pub(crate) fn varint(&mut self) -> Result<u64, String> {
         let mut result: u64 = 0;
         let mut shift = 0;
         loop {
@@ -116,7 +116,7 @@ impl<'a> PbReader<'a> {
     }
 
     /// 返回 (field_number, wire_type)
-    fn next_tag(&mut self) -> Result<Option<(u64, u8)>, String> {
+    pub(crate) fn next_tag(&mut self) -> Result<Option<(u64, u8)>, String> {
         if self.eof() {
             return Ok(None);
         }
@@ -124,7 +124,7 @@ impl<'a> PbReader<'a> {
         Ok(Some((tag >> 3, (tag & 0x7) as u8)))
     }
 
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
+    pub(crate) fn bytes(&mut self) -> Result<&'a [u8], String> {
         let len = self.varint()? as usize;
         if self.pos + len > self.buf.len() {
             return Err("protobuf: 长度字段越界".into());
@@ -134,7 +134,7 @@ impl<'a> PbReader<'a> {
         Ok(out)
     }
 
-    fn skip(&mut self, wire: u8) -> Result<(), String> {
+    pub(crate) fn skip(&mut self, wire: u8) -> Result<(), String> {
         match wire {
             0 => {
                 self.varint()?;
@@ -153,7 +153,7 @@ impl<'a> PbReader<'a> {
         Ok(())
     }
 
-    fn take(&mut self, n: usize) -> Result<(), String> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<(), String> {
         if self.pos + n > self.buf.len() {
             return Err("protobuf: 定长字段截断".into());
         }

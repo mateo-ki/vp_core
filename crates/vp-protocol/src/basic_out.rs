@@ -154,6 +154,9 @@ pub struct HttpOutbound {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub tls: bool,
+    pub skip_cert_verify: bool,
+    pub sni: Option<String>,
 }
 
 impl HttpOutbound {
@@ -203,8 +206,18 @@ impl Outbound for HttpOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io: Box<dyn ProxyStream> =
-            Box::new(TcpStream::connect((self.server.as_str(), self.port)).await?);
+        let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let io: Box<dyn ProxyStream> = if self.tls {
+            vp_transport::tls::connect_tls(
+                tcp,
+                &self.server,
+                self.skip_cert_verify,
+                self.sni.as_deref(),
+            )
+            .await?
+        } else {
+            Box::new(tcp)
+        };
         self.connect_handshake(io, dst).await
     }
 
@@ -214,7 +227,18 @@ impl Outbound for HttpOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        self.connect_handshake(underlying, dst).await
+        let io: Box<dyn ProxyStream> = if self.tls {
+            vp_transport::tls::connect_tls(
+                underlying,
+                &self.server,
+                self.skip_cert_verify,
+                self.sni.as_deref(),
+            )
+            .await?
+        } else {
+            underlying
+        };
+        self.connect_handshake(io, dst).await
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -259,6 +283,9 @@ mod tests {
             port: addr.port(),
             username: None,
             password: None,
+            tls: false,
+            skip_cert_verify: false,
+            sni: None,
         };
         let dst = DstAddr::new("target.example", 443);
         let mut s = out

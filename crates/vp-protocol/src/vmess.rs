@@ -645,7 +645,8 @@ impl Outbound for VmessOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        self.handshake(underlying, dst).await
+        let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
+        self.handshake(io, dst).await
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {

@@ -11,18 +11,52 @@ pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
 pub use tls::{TlsClientConfig, connect_tls, tls_acceptor, tls_connect};
 pub use ws::{WsConfig, WsStream, ws_handshake_client, ws_handshake_server};
 
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use vp_common::Result;
 use vp_core::ProxyStream;
 
+static GLOBAL_SO_RCVBUF: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_SO_SNDBUF: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_TCP_NODELAY: AtomicBool = AtomicBool::new(true);
+static GLOBAL_TCP_KEEPALIVE_SECS: AtomicU64 = AtomicU64::new(60);
+
+/// 全局配置套接字发送与接收缓冲区及 TCP 调优参数
+pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_keepalive_secs: u64) {
+    GLOBAL_SO_RCVBUF.store(rcvbuf, Ordering::Relaxed);
+    GLOBAL_SO_SNDBUF.store(sndbuf, Ordering::Relaxed);
+    GLOBAL_TCP_NODELAY.store(tcp_nodelay, Ordering::Relaxed);
+    GLOBAL_TCP_KEEPALIVE_SECS.store(
+        if tcp_keepalive_secs == 0 {
+            60
+        } else {
+            tcp_keepalive_secs
+        },
+        Ordering::Relaxed,
+    );
+}
+
 /// 套接字调优：内核持有的所有 TCP 连接统一设置。
 /// - TCP_NODELAY：关闭 Nagle，交互流量不被合并延迟（流畅的关键）
+/// - SO_RCVBUF / SO_SNDBUF：高带宽时延积 (BDP) 窗口放大
 /// - TCP keepalive：探测对端僵死连接，避免句柄泄漏（稳定的保障）
 pub fn tune(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
-    let _ = sock.set_tcp_nodelay(true);
+    let nodelay = GLOBAL_TCP_NODELAY.load(Ordering::Relaxed);
+    let _ = sock.set_tcp_nodelay(nodelay);
+
+    let rcv = GLOBAL_SO_RCVBUF.load(Ordering::Relaxed);
+    if rcv > 0 {
+        let _ = sock.set_recv_buffer_size(rcv);
+    }
+    let snd = GLOBAL_SO_SNDBUF.load(Ordering::Relaxed);
+    if snd > 0 {
+        let _ = sock.set_send_buffer_size(snd);
+    }
+
+    let keepalive_secs = GLOBAL_TCP_KEEPALIVE_SECS.load(Ordering::Relaxed);
     let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))
+        .with_time(Duration::from_secs(keepalive_secs))
         .with_interval(Duration::from_secs(15));
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let ka = ka.with_retries(3);
@@ -128,29 +162,16 @@ pub struct TransportConfig {
     pub reality: Option<RealityConfig>,
 }
 
-/// 拨号：TCP →（可选 WS）→（可选 TLS，TLS 在最外层）
-pub async fn dial(
+/// 在任意底层流之上层叠传输层封装（gRPC / TLS / uTLS / REALITY / WebSocket）
+pub async fn wrap_transport(
+    stream: Box<dyn ProxyStream>,
     server_host: &str,
-    server_port: u16,
     cfg: &TransportConfig,
 ) -> Result<Box<dyn ProxyStream>> {
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(8),
-        tokio::net::TcpStream::connect((server_host, server_port)),
-    )
-    .await
-    .map_err(|_| {
-        vp_common::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("连接 {server_host}:{server_port} 超时"),
-        ))
-    })??;
-    tune(&tcp);
-
     if let Some(g) = &cfg.grpc {
         // grpc 生态默认 TLS + ALPN h2
         let tls = tls::tls_connect(
-            tcp,
+            stream,
             server_host,
             &tls::TlsClientConfig {
                 skip_cert_verify: cfg.skip_cert_verify,
@@ -166,7 +187,7 @@ pub async fn dial(
         let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() || cfg.fingerprint.is_some() {
             let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
             let s = utls::utls_connect(
-                tcp,
+                stream,
                 server_host,
                 &utls::UtlsConfig {
                     fingerprint: utls::Fingerprint::parse(fp)?,
@@ -180,7 +201,7 @@ pub async fn dial(
             Box::new(s)
         } else {
             let s = tls::tls_connect(
-                tcp,
+                stream,
                 server_host,
                 &tls::TlsClientConfig {
                     skip_cert_verify: cfg.skip_cert_verify,
@@ -198,10 +219,31 @@ pub async fn dial(
         return Ok(tls);
     }
     if let Some(ws) = &cfg.ws {
-        let ws_stream = ws::ws_handshake_client(tcp, server_host, ws).await?;
+        let ws_stream = ws::ws_handshake_client(stream, server_host, ws).await?;
         return Ok(Box::new(ws_stream));
     }
-    Ok(Box::new(tcp))
+    Ok(stream)
+}
+
+/// 拨号：TCP → 传输层封装（wrap_transport）
+pub async fn dial(
+    server_host: &str,
+    server_port: u16,
+    cfg: &TransportConfig,
+) -> Result<Box<dyn ProxyStream>> {
+    let tcp = tokio::time::timeout(
+        Duration::from_secs(8),
+        tokio::net::TcpStream::connect((server_host, server_port)),
+    )
+    .await
+    .map_err(|_| {
+        vp_common::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("连接 {server_host}:{server_port} 超时"),
+        ))
+    })??;
+    tune(&tcp);
+    wrap_transport(Box::new(tcp), server_host, cfg).await
 }
 
 #[cfg(test)]

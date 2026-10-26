@@ -47,6 +47,17 @@ pub async fn dispatch_stream(
         }
     }
 
+    // 协议嗅探：若目标为 IP 且客户端先发言（无协议前置回写需求），窥探 SNI / HTTP Host
+    if matches!(sess.dst.host, vp_common::Host::Ip(_)) && matches!(reply, ClientReply::None) {
+        let (sniffed, peeked) =
+            crate::sniff::sniff_stream(client, std::time::Duration::from_millis(100)).await;
+        client = peeked;
+        if let Some(domain) = sniffed {
+            debug!("sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+            sess.dst.host = vp_common::Host::Domain(domain);
+        }
+    }
+
     let res = ctx.router.pick(&sess).await;
     let outbound = res.outbound.clone();
 

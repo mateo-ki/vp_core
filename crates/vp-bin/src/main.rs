@@ -46,6 +46,8 @@ enum Cmd {
         #[arg(short, long, default_value_t = 7890)]
         port: u16,
     },
+    /// 应急清理所有系统 TUN 历史残留路由（恢复网络）
+    CleanRoutes,
 }
 
 /// HTTP GET 拉取（ureq 默认跟随重定向）
@@ -248,7 +250,13 @@ async fn main() {
                     }
                 }
             }
+            // 正常退出清理：确保所有动态添加的 TUN 路由被完整移除，防止机器断网
+            let _ = vp_tun::auto_route::clean_all_routes();
             println!("bye");
         }
+        Cmd::CleanRoutes => match vp_tun::auto_route::clean_all_routes() {
+            Ok(()) => println!("✓ 已清理所有系统 TUN 历史残留路由，网络已自愈恢复"),
+            Err(e) => eprintln!("✗ 清理路由失败: {e}"),
+        },
     }
 }

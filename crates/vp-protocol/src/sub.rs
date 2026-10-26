@@ -96,6 +96,8 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_ssh(rest)
     } else if let Some(rest) = line.strip_prefix("brook://") {
         parse_brook(rest)
+    } else if let Some(rest) = line.strip_prefix("mieru://") {
+        parse_mieru(rest)
     } else {
         Err(Error::Config(format!("无法识别的分享链接: {}", &line[..line.len().min(32)])))
     }
@@ -341,6 +343,28 @@ fn parse_brook(rest: &str) -> Result<SubNode> {
     Ok(SubNode { fields: f })
 }
 
+fn parse_mieru(rest: &str) -> Result<SubNode> {
+    // mieru://username:password@host:port?transport=tcp#name
+    let (userinfo, host, port, p, name) = split_main(rest)?;
+    let (username, password) = userinfo
+        .split_once(':')
+        .ok_or(Error::Config("mieru 链接缺少 username:password".into()))?;
+    let transport = p.get("transport").cloned().unwrap_or_else(|| "tcp".into());
+    if transport != "tcp" {
+        return Err(Error::Config("mieru 仅支持 tcp 传输".into()));
+    }
+    Ok(SubNode {
+        fields: vec![
+            ("name".into(), q(&name)),
+            ("type".into(), "mieru".into()),
+            ("server".into(), host),
+            ("port".into(), port),
+            ("username".into(), q(&username)),
+            ("password".into(), q(&password)),
+        ],
+    })
+}
+
 fn parse_ss(rest: &str) -> Result<SubNode> {
     // ss://base64(method:pass)@host:port#name 或 SIP002
     // 兼容直接调用（可能仍带 ss:// 前缀）
@@ -533,6 +557,20 @@ mod tests {
         assert!(y.contains("udp: true"), "{y}");
         // 订阅打包
         let nodes = parse_subscription("brook://pw@b.com:443#n1");
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn mieru_uri() {
+        let n = parse_uri("mieru://alice:pw123@m.com:8964?transport=tcp#mu1").unwrap();
+        assert_eq!(n.name(), "mu1");
+        let y = n.to_yaml();
+        assert!(y.contains("type: mieru"), "{y}");
+        assert!(y.contains("username: \"alice\""), "{y}");
+        assert!(y.contains(&format!("password: {}", q("pw123"))), "{y}");
+        assert!(parse_uri("mieru://alice:pw@m.com:1?transport=udp#x").is_err());
+        // 订阅打包
+        let nodes = parse_subscription("mieru://alice:pw@m.com:443#n1");
         assert_eq!(nodes.len(), 1);
     }
 

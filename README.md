@@ -75,7 +75,8 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **anytls 出+入站（已完成）**：sing-anytls v2 协议完整实现——TLS 流上多路复用（帧 `[cmd][sid][len][data]`，cmd 0 waste/1 SYN/2 PSH/3 FIN/4 settings/6 scheme 更新/7 SYNACK/8+9 心跳/10 server-settings），密码 = sha256 前导 32 字节认证；**padding scheme 全套**（参考实现默认 scheme、按包号 waste 帧填充、双端 md5 不一致时服务端下发更新、握手 padding）对抗 TLS-in-TLS 流量分析；settings 缺失/密码错误服务端拒接（Alert）。Clash 语法 `type: anytls`（password/sni/skip-cert-verify/client-fingerprint/udp——UDP 经 UoT 提供），listener `type: anytls`（users 密码列表 + `padding_scheme` 自定义），订阅 `anytls://password@host:port?sni&insecure&udp&fp#name`。自环测试：300KB 回显逐字节一致（跨 PSH 分帧+waste 混入）/错误密码拒绝/自定义 scheme 互通/裸协议缺 settings 收 Alert
 - **ssh 出站（已完成）**：SSH-2.0 最小客户端栈——kex `curve25519-sha256` + 主机密钥 `ssh-ed25519` + 加密 `chacha20-poly1305@openssh.com`（手写 djb 版 chacha20 + poly1305，与 RustCrypto 差分对照 + RFC 8439 已知向量验证），密码或未加密 OpenSSH 格式 ed25519 私钥认证，direct-tcpip 通道含窗口流控（WINDOW_ADJUST/EOF/CLOSE）。Clash 语法 `type: ssh`（server/port/username/password/private-key/host-key——host-key 支持 SHA256: 指纹校验），订阅 `ssh://user:pass@host:port#name`。自环测试（最小 SSH 服务端）：300KB 回显逐字节一致/错误密码拒绝/主机密钥不匹配拒绝/publickey 认证（服务端真实验签）/openssh-key-v1 私钥解析。rekey/严格 KEX/加密私钥明确报错
 - **brook 出+入站（已完成）**：txthinking/brook 原生协议（master 线格式）——客户端 12B 随机 ClientNonce 明文首发，密钥 = HKDF-SHA256(ikm=password, salt=nonce, info="brook") 派生 AES-256-GCM；双向记录流 `GCM(len u16be) + GCM(frag)`（AAD 空，每记录耗两个 nonce，nonce 前 8 字节按 LE u64 递增）；首 fragment = u32be 时间戳 + SOCKS 地址，奇偶区分 TCP / UDP-over-TCP，60s 重放窗口；TCP 记录总长 ≤ 2048、UoT ≤ 65507。Clash 语法 `type: brook`（server/port/password/udp——UDP 经 brook 原生 UoT 模式），listener `type: brook`（users 密码列表，多密码逐一试解），订阅 `brook://password@host:port?udp=1#name` 与官方 `brook://server?server=host:port&password=xxx&udpovertcp=true` 双形式。自环测试：300KB 回显逐字节一致 / 错误密码拒绝 / 过期时间戳拒绝 / UoT 数据报往返 ×8；nonce 递增 / RFC 5869 HKDF 向量 / 记录 roundtrip + nonce 滚动 + 篡改检测单测。边界：原生 UDP 数据报（packetclient）未实现；ws/wss/quic 传输变体未实现
-- **长尾协议（计划）**：mieru/naive、插件市场、热重载完善
+- **mieru 出+入站（已完成，TCP 最小实现）**：enfein/mieru v3 会话协议——密钥链 hashedPassword = SHA256(password‖0x00‖username)、timeSalt = SHA256(u64be(unix 按 2 分钟取整))、key = PBKDF2-HMAC-SHA256(hashed, salt, 64 轮)（手写 PBKDF2，RFC 7914 双向量验证；客户端用当前盐，服务端试 ±2 分钟共 3 盐，容忍 4 分钟时差）；XChaCha20-Poly1305 隐式 nonce 模式（首段带 24B nonce，末 4 字节 = SHA256(username‖nonce[0..16])[..4] 用户提示，此后每加密操作 nonce 自末字节进位）；32B 元数据（sessionStruct/dataAckStruct）+ 16B tag，段含可选 padding（本实现恒 0）；会话载荷为 SOCKS5 流量（greeting + CONNECT 搭载于 openSessionRequest，≤1024B），服务端内嵌 SOCKS5 处理器。Clash 语法 `type: mieru`（server/port/username/password），listener `type: mieru`（users 为 username:password 列表），订阅 `mieru://user:pass@host:port?transport=tcp#name`。自环测试：300KB 回显逐字节一致（跨段分帧）/错误密码发现失败/多用户列表非首位用户命中；PBKDF2 向量/nonce 进位/用户提示单测。边界：单会话单 underlay（无多路复用）、无低熵编码、UDP packet 传输不支持；对真实 mieru 服务端（官方 CLI）应可互通，对端启用 multiplexing 的客户端无法接入本入站
+- **长尾协议（计划）**：naive、插件市场、热重载完善
 
 ## 插件开发
 
@@ -96,4 +97,4 @@ vp_transform_plugin!(MyPlugin);
 
 ## 测试
 
-173 项单测/集成测试（`cargo test --workspace`）：协议编解码 roundtrip、各协议出入站自环、规则引擎、策略组状态机、转发引擎（半关闭/计数）、TLS/WS 传输、垂直 e2e（mixed→规则→组→出站）、控制器 API、C-ABI 插件往返。
+180 项单测/集成测试（`cargo test --workspace`）：协议编解码 roundtrip、各协议出入站自环、规则引擎、策略组状态机、转发引擎（半关闭/计数）、TLS/WS 传输、垂直 e2e（mixed→规则→组→出站）、控制器 API、C-ABI 插件往返。

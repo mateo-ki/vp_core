@@ -40,6 +40,8 @@ pub struct MatchCtx<'a> {
     pub network: Net,
     pub process: Option<&'a str>,
     pub inbound: &'a str,
+    pub inbound_port: Option<u16>,
+    pub inbound_user: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +78,8 @@ pub enum Matcher {
     ProcessName(Arc<str>),
     ProcessPath(Arc<str>),
     Inbound(Arc<str>),
+    InPort(Arc<Vec<(u16, u16)>>),
+    InUser(Arc<str>),
     Network(Net),
     Logic {
         op: LogicOp,
@@ -112,6 +116,8 @@ impl Matcher {
             Matcher::ProcessName(n) => ctx.process.is_some_and(|p| p.eq_ignore_ascii_case(n)),
             Matcher::ProcessPath(p) => ctx.process.is_some_and(|x| x.eq_ignore_ascii_case(p)),
             Matcher::Inbound(n) => ctx.inbound == &**n,
+            Matcher::InPort(ranges) => ctx.inbound_port.is_some_and(|p| ranges.iter().any(|&(lo, hi)| p >= lo && p <= hi)),
+            Matcher::InUser(u) => ctx.inbound_user.is_some_and(|user| user.eq_ignore_ascii_case(u)),
             Matcher::Network(n) => ctx.network == *n,
             Matcher::Logic { op, subs } => match op {
                 LogicOp::And => subs.iter().all(|m| m.r#match(ctx)),
@@ -430,7 +436,15 @@ fn parse_plain_rule(s: &str, env: &CompileEnv, _depth: usize, full: &str) -> Res
         }
         "PROCESS-PATH" => Ok(Matcher::ProcessPath(payload.into())),
         "PROCESS-NAME" => Ok(Matcher::ProcessName(payload.into())),
-        "IN-NAME" => Ok(Matcher::Inbound(payload.into())),
+        "IN-NAME" | "IN-TAG" | "IN-TYPE" => Ok(Matcher::Inbound(payload.into())),
+        "IN-USER" => Ok(Matcher::InUser(payload.into())),
+        "IN-PORT" => {
+            let mut ranges = Vec::new();
+            for p in payload.split('/') {
+                ranges.push(provider::parse_port_range(p.trim())?);
+            }
+            Ok(Matcher::InPort(Arc::new(ranges)))
+        }
         "NETWORK" => {
             let n = match payload.to_ascii_uppercase().as_str() {
                 "TCP" => Net::Tcp,
@@ -586,6 +600,8 @@ mod tests {
             network: Net::Tcp,
             process: Some("chrome.exe"),
             inbound: "mixed-1",
+            inbound_port: Some(7890),
+            inbound_user: Some("alice"),
         }
     }
 
@@ -696,5 +712,29 @@ mod tests {
         u.process = None;
         u.network = Net::Udp;
         assert_eq!(e.r#match(&u).unwrap().target, "PROXY");
+    }
+
+    #[test]
+    fn inbound_features_rules() {
+        let e = engine(&[
+            "IN-PORT,7890,PROXY",
+            "IN-USER,alice,DIRECT",
+            "IN-NAME,mixed-1,PROXY",
+            "MATCH,REJECT",
+        ]);
+        let mut c = ctx(Some("a.com"), None);
+        c.inbound_port = Some(7890);
+        assert_eq!(e.r#match(&c).unwrap().target, "PROXY");
+
+        c.inbound_port = Some(8080);
+        c.inbound_user = Some("alice");
+        assert_eq!(e.r#match(&c).unwrap().target, "DIRECT");
+
+        c.inbound_user = Some("bob");
+        c.inbound = "mixed-1";
+        assert_eq!(e.r#match(&c).unwrap().target, "PROXY");
+
+        c.inbound = "other";
+        assert_eq!(e.r#match(&c).unwrap().target, "REJECT");
     }
 }

@@ -36,7 +36,21 @@ impl Outbound for DirectOutbound {
         "DIRECT"
     }
 
-    async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
+    async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
+        // 防止意外将流量直连回环到自身入站端口形成死循环
+        if let Some(in_port) = sess.inbound_port {
+            if dst.port == in_port {
+                match &dst.host {
+                    Host::Ip(ip) if ip.is_loopback() => {
+                        return Err(Error::Proto("检测到直接回环死循环 (loopback to inbound)"));
+                    }
+                    Host::Domain(d) if d.eq_ignore_ascii_case("localhost") || d == "127.0.0.1" || d == "::1" => {
+                        return Err(Error::Proto("检测到直接回环死循环 (loopback to inbound)"));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let addrs = self.resolve(dst).await?;
         let mut last = Error::Addr(format!("无法解析 {dst}"));
         for a in addrs {

@@ -1,0 +1,216 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-desktop:
+    name: Build Desktop (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: vpcore.exe
+            archive_format: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin_name: vpcore
+            archive_format: tar.gz
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            bin_name: vpcore
+            archive_format: tar.gz
+            use_cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin_name: vpcore
+            archive_format: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin_name: vpcore
+            archive_format: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: matrix.os == 'ubuntu-latest' && !matrix.use_cross
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross (if needed)
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build CLI Binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p vp-bin
+          else
+            cargo build --release --target ${{ matrix.target }} -p vp-bin
+          fi
+        shell: bash
+
+      - name: Prepare Artifact Package
+        id: package
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME:-snapshot}"
+          PKG_NAME="vpcore-${TAG_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${PKG_NAME}"
+
+          BIN_PATH="target/${{ matrix.target }}/release/${{ matrix.bin_name }}"
+          cp "${BIN_PATH}" "dist/${PKG_NAME}/"
+          cp README.md "dist/${PKG_NAME}/" 2>/dev/null || true
+          cp LICENSE "dist/${PKG_NAME}/" 2>/dev/null || true
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            curl -sL https://www.wintun.net/builds/wintun-0.14.1.zip -o wintun.zip
+            7z e wintun.zip wintun/bin/amd64/wintun.dll -o"dist/${PKG_NAME}/" -y
+          fi
+
+          cd dist
+          if [ "${{ matrix.archive_format }}" = "zip" ]; then
+            7z a "${PKG_NAME}.zip" "${PKG_NAME}"
+            echo "archive=${PKG_NAME}.zip" >> $GITHUB_OUTPUT
+          else
+            tar -czvf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+            echo "archive=${PKG_NAME}.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload Desktop Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/${{ steps.package.outputs.archive }}
+
+  build-mobile-ffi:
+    name: Build Mobile FFI (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            os: ubuntu-latest
+          - platform: ios
+            os: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # ---------------- Android NDK 编译 ----------------
+      - name: Set up Android NDK & targets
+        if: matrix.platform == 'android'
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo install cargo-ndk
+
+      - name: Build Android Shared Libraries (.so)
+        if: matrix.platform == 'android'
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o dist/android/jniLibs build --release -p vp-ffi
+          mkdir -p dist/android/include
+          cp crates/vp-ffi/include/vpcore.h dist/android/include/
+          cd dist
+          tar -czvf vpcore-android-ffi.tar.gz android/
+
+      - name: Upload Android FFI Artifact
+        if: matrix.platform == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-android
+          path: dist/vpcore-android-ffi.tar.gz
+
+      # ---------------- Apple iOS / macOS Universal Framework ----------------
+      - name: Set up iOS targets
+        if: matrix.platform == 'ios'
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Build iOS Static Libraries
+        if: matrix.platform == 'ios'
+        run: |
+          cargo build --release --target aarch64-apple-ios -p vp-ffi
+          cargo build --release --target aarch64-apple-ios-sim -p vp-ffi
+          cargo build --release --target x86_64-apple-ios -p vp-ffi
+
+          mkdir -p dist/ios/include
+          cp crates/vp-ffi/include/vpcore.h dist/ios/include/
+
+          # 创建 iOS 模拟器通用库
+          mkdir -p dist/ios/sim
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libvpcore.a \
+            target/x86_64-apple-ios/release/libvpcore.a \
+            -output dist/ios/sim/libvpcore.a
+
+          # 创建 iOS 真机库
+          mkdir -p dist/ios/device
+          cp target/aarch64-apple-ios/release/libvpcore.a dist/ios/device/
+
+          # 打包 XCFramework
+          xcodebuild -create-xcframework \
+            -library dist/ios/device/libvpcore.a -headers dist/ios/include \
+            -library dist/ios/sim/libvpcore.a -headers dist/ios/include \
+            -output dist/VPCore.xcframework
+
+          cd dist
+          zip -r vpcore-ios-xcframework.zip VPCore.xcframework
+
+      - name: Upload iOS FFI Artifact
+        if: matrix.platform == 'ios'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffi-ios
+          path: dist/vpcore-ios-xcframework.zip
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [ build-desktop, build-mobile-ffi ]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Generate Checksums
+        run: |
+          cd release_assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release_assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

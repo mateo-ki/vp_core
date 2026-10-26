@@ -69,7 +69,26 @@ impl App {
         base_dir: &Path,
         start_listeners: bool,
     ) -> Result<Arc<App>> {
-        let app = Self::assemble(text.to_string(), fmt, base_dir.to_path_buf(), start_listeners, None).await?;
+        Self::start_with_tun_fd(text, fmt, base_dir, start_listeners, None).await
+    }
+
+    /// 从配置文本与可选 TUN 文件描述符构建并启动（移动端 FFI 用）
+    pub async fn start_with_tun_fd(
+        text: &str,
+        fmt: Format,
+        base_dir: &Path,
+        start_listeners: bool,
+        tun_fd: Option<i32>,
+    ) -> Result<Arc<App>> {
+        let app = Self::assemble(
+            text.to_string(),
+            fmt,
+            base_dir.to_path_buf(),
+            start_listeners,
+            None,
+            tun_fd,
+        )
+        .await?;
         if start_listeners {
             app.start_background_tasks();
         }
@@ -86,7 +105,7 @@ impl App {
             .map_err(|e| Error::Config(format!("读取 {} 失败: {e}", config_path.display())))?;
         let fmt = Format::from_path(&config_path.to_string_lossy());
         let base_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let app = Self::assemble(text, fmt, base_dir, start_listeners, Some(config_path.to_path_buf())).await?;
+        let app = Self::assemble(text, fmt, base_dir, start_listeners, Some(config_path.to_path_buf()), None).await?;
         if start_listeners {
             app.start_background_tasks();
         }
@@ -99,7 +118,7 @@ impl App {
         fmt: vp_config::Format,
         base_dir: &Path,
     ) -> Result<Arc<App>> {
-        Self::assemble(text.to_string(), fmt, base_dir.to_path_buf(), false, None).await
+        Self::assemble(text.to_string(), fmt, base_dir.to_path_buf(), false, None, None).await
     }
 
     pub async fn reload(&self) -> Result<()> {
@@ -122,7 +141,7 @@ impl App {
             (meta.text, meta.fmt, meta.base_dir)
         };
 
-        let new_app = Self::assemble(new_text.clone(), new_fmt, new_dir.clone(), false, meta.path.clone()).await?;
+        let new_app = Self::assemble(new_text.clone(), new_fmt, new_dir.clone(), false, meta.path.clone(), None).await?;
         self.router.swap(new_app.router.current());
 
         *self.config_meta.write().unwrap() = Some(ConfigMeta {
@@ -136,14 +155,51 @@ impl App {
         Ok(())
     }
 
+    pub async fn reload_with_text(&self, new_text: &str) -> Result<()> {
+        let meta = self
+            .config_meta
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or(Error::Config("无可重载配置".into()))?;
+
+        let new_app = Self::assemble(
+            new_text.to_string(),
+            meta.fmt,
+            meta.base_dir.clone(),
+            false,
+            meta.path.clone(),
+            None,
+        )
+        .await?;
+        self.router.swap(new_app.router.current());
+
+        *self.config_meta.write().unwrap() = Some(ConfigMeta {
+            path: meta.path,
+            text: new_text.to_string(),
+            fmt: meta.fmt,
+            base_dir: meta.base_dir,
+        });
+
+        info!("配置已通过文本平滑热重载");
+        Ok(())
+    }
+
     async fn assemble(
         text: String,
         fmt: Format,
         base_dir: PathBuf,
         start_listeners: bool,
         config_path: Option<std::path::PathBuf>,
+        tun_fd: Option<i32>,
     ) -> Result<Arc<App>> {
-        let cfg: vp_config::Config = vp_config::parse(&text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
+        let mut cfg: vp_config::Config = vp_config::parse(&text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
+        if let Some(fd) = tun_fd {
+            let mut tun = cfg.tun.take().unwrap_or_default();
+            tun.enable = true;
+            tun.fd = Some(fd);
+            cfg.tun = Some(tun);
+        }
         if let Err(errs) = vp_config::validate::validate(&cfg) {
             return Err(Error::Config(format!("配置校验失败:\n  - {}", errs.join("\n  - "))));
         }
@@ -541,6 +597,11 @@ impl App {
                                 Ok(Ok(new_text)) => {
                                     if let Err(e) = vp_protocol::sub::parse_provider_proxies(&new_text, filter.as_deref()) {
                                         warn!("proxy-provider {name} 定时拉取内容校验未通过: {e}");
+                                        continue;
+                                    }
+                                    let is_unchanged = tokio::fs::read_to_string(&cache_path).await.ok().as_deref() == Some(&new_text);
+                                    if is_unchanged {
+                                        tracing::debug!("proxy-provider {name} 内容未发生变更，跳过写入与重载");
                                         continue;
                                     }
                                     if let Some(parent) = cache_path.parent() {

@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(b.open_body(&rec2[HDR_LEN..]).unwrap(), b"second");
         // 篡改载荷 → 解密失败
         let mut rec3 = a.seal(b"tamper");
-        let l3 = b.open_len(rec3[..HDR_LEN].try_into().unwrap()).unwrap();
+        let _l3 = b.open_len(rec3[..HDR_LEN].try_into().unwrap()).unwrap();
         let n = rec3.len();
         rec3[n - 1] ^= 1;
         assert!(b.open_body(&rec3[HDR_LEN..]).is_err());

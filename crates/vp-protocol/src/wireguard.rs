@@ -42,6 +42,7 @@ const SESSION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(120)
 const CHAN_CAP: usize = 256;
 
 /// WG 包类型字节（boringtun wire 格式首 4 字节前缀）
+#[allow(dead_code)]
 const WG_TYPE_DATA: u32 = 4;
 
 static WG_INDEX_SEQ: AtomicU32 = AtomicU32::new(1);
@@ -162,6 +163,7 @@ struct Sess {
 pub struct WgCore {
     cmd_tx: mpsc::Sender<Cmd>,
     local_v4: Ipv4Addr,
+    #[allow(dead_code)]
     local_v6: Option<Ipv6Addr>,
     server: String,
     port: u16,
@@ -806,6 +808,7 @@ impl AsyncWrite for WgTcpStream {
 pub struct WgOutbound {
     name: Arc<str>,
     core: Arc<WgCore>,
+    #[allow(dead_code)]
     resolver: Arc<Resolver>,
     direct: Arc<DirectOutbound>,
     udp: bool,
@@ -945,7 +948,7 @@ mod tests {
     async fn wg_server_task(
         udp: UdpSocket,
         mut tunn: ServerTunn,
-        client_pub: PublicKey,
+        _client_pub: PublicKey,
     ) {
         let q = Arc::new(SharedQueues {
             rx: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -1066,7 +1069,7 @@ mod tests {
     async fn wg_e2e_loopback() {
         init_log();
         // 密钥对
-        let (server_priv, server_pub, server_priv_b64, server_pub_b64) = gen_keypair();
+        let (server_priv, _server_pub, _server_priv_b64, server_pub_b64) = gen_keypair();
         let (client_priv, client_pub, client_priv_b64, client_pub_b64) = gen_keypair();
         let _ = (server_priv, client_priv);
 
@@ -1133,7 +1136,6 @@ mod tests {
         s.write_all(&big[..half]).await.unwrap();
         let mut echo = vec![0u8; big.len()];
         let mut got = 0;
-        let mut wpos = half;
         // 边写边读：先读一半再写另一半，避免缓冲死锁
         s.write_all(&big[half..]).await.unwrap();
         while got < big.len() {
@@ -1162,7 +1164,7 @@ mod tests {
             .unwrap();
         assert_eq!(pong.data.as_ref(), b"wg-udp-ping");
         assert_eq!(pong.src.port(), 5353, "回包源端口应为 5353");
-        let _ = (client_pub_b64, server_pub, wpos);
+        let _ = client_pub_b64;
     }
 }
 

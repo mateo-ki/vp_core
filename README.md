@@ -30,14 +30,15 @@ cargo build --release -p vp-bin
 | 模块 | 能力 |
 |---|---|
 | 入站 | mixed（socks5+http 同端口自动识别）、socks5、http（CONNECT + absolute-form） |
-| 出站 | direct、reject、socks5、http、**shadowsocks**（AEAD + 2022-blake3）、**vmess**（AEAD 认证头）、**vless**（含 REALITY）、**trojan**（含 REALITY，出入站对称，服务端可用于自建） |
-| 传输 | TCP、TLS（rustls/ring，skip-cert-verify、SNI 覆盖）、WebSocket（手写 RFC6455）、**REALITY**（X25519 + AEAD 认证 ClientHello + Ed25519 HMAC-SHA512 自签验签） |
-| 规则 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX / IP-CIDR(6) / SRC-IP-CIDR / DST-PORT / SRC-PORT / PROCESS-NAME / NETWORK / GEOIP(mmdb) / GEOSITE(.dat) / RULE-SET(.list/.yaml 在线拉取与自动刷新) / AND-OR-NOT / SUB-RULE / MATCH |
+| 出站 | direct、reject、socks5、http、**shadowsocks**（AEAD + 2022-blake3）、**shadowsocksr (ssr)**（支持 http_simple/tls1.2 混淆与 ssr:// 订阅）、**vmess**（AEAD 认证头）、**vless**（含 REALITY 与 **XTLS-rprx-vision** 流控）、**trojan**（含 REALITY，出入站对称）、**snell**（v1-v4 原生协议，出+入站对称，HTTP 混淆，UDP 转发） |
+| 传输 | TCP、TLS（rustls/ring，skip-cert-verify、SNI 覆盖）、WebSocket（手写 RFC6455）、**REALITY**（X25519 + AEAD 认证 ClientHello + Ed25519 HMAC-SHA512 自签验签）、**XTLS-rprx-vision**（内层 TLS 1.3 深度嗅探 + 900~1200 字节特征区间伪装填充 + PaddingEnd 裸流直通） |
+| 规则 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX / IP-CIDR(6) / SRC-IP-CIDR / DST-PORT / SRC-PORT / PROCESS-NAME（Win IpHelper + Linux /proc 真实套接字属主提取） / NETWORK / GEOIP(mmdb/在线下载) / GEOSITE(.dat/在线下载) / RULE-SET(.list/.yaml 在线拉取与自动刷新) / AND-OR-NOT / SUB-RULE / MATCH |
+| 集合 | **proxy-providers**（支持 HTTP 远程订阅拉取、Clash YAML 与 Base64/URI 节点提取、本地离线缓存降级、后台定时周期刷新与策略组 `use` 动态无感汇入、正则名称过滤） |
 | 策略组 | select / url-test（EMA+容差滞回）/ fallback / load-balance（轮询+一致性哈希）/ relay（链式） |
-| DNS | UDP/TCP/DoT 解析器 + TTL 缓存 + **fake-ip 池** + **DNS 服务器**（A/AAAA/PTR/上游转发） |
+| DNS | UDP/TCP/DoT/DoH 解析器 + TTL 缓存 + **fake-ip 池** + **DNS 服务器** + **nameserver-policy**（域名/GeoSite 专有分流）+ **fallback-filter**（Bogon/CIDR 污染剔除与 GeoIP 国内归属检查） |
 | 插件 | C-ABI 动态库宿主（transform 流变换），SDK + 示例插件见 `crates/examples/plugins/xor_mask` |
-| API | Clash 兼容 REST 控制器：/proxies、/rules、/connections、/configs 热载入、delay 测速、selector 切换、Bearer 鉴权 |
-| TUN | **TUN 透明代理**（tun+ipstack 用户态栈）：TCP/UDP 分发、fake-ip 回射、DNS 劫持、ICMP echo 应答、auto-route（需管理员权限） |
+| API | Clash 兼容 REST 控制器：/proxies、/rules、/connections、/configs 热载入、/providers/proxies 代理集管理、/dns/flush 缓存刷新、delay 测速、selector 切换、Bearer 鉴权 |
+| TUN | **TUN 透明代理**（tun+ipstack 用户态栈）：TCP/UDP 分发、fake-ip 回射、DNS 劫持、ICMP echo 应答、auto-route，**支持移动端（Android VpnService / iOS PacketTunnelProvider）外部 TUN 文件描述符 (FD) 零开销注入** |
 | UDP | 全链路：socks5 ASSOCIATE+NAT、ss UDP（每包独立 salt）、socks5/ss 出站 PacketConn |
 | 其它 | 规则匹配零分配热路径、连接表（查询/关闭）、流量统计、跨平台 mtime 自动热重载 / SIGHUP、每协议 cargo feature 裁剪 |
 
@@ -80,6 +81,10 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **REALITY 协议扩展（已完成）**：完整对标 Xray-core / sing-box 规范——支持 VLESS 与 Trojan 出站（Clash 语法 `reality-opts: { public-key, short-id, spider-x }`，订阅格式 `security=reality&pbk=...&sid=...&spx=...`）；基于 Curve25519 临时密钥复用与 HKDF-SHA256 派生认证密钥，在 ClientHello `legacy_session_id` 嵌入 AES-256-GCM 认证载荷（16B 载荷含协议版本/时间戳与 short-id + 16B 认证 Tag）；服务端特殊证书验证拦截：自动从证书 DER 提取 32 字节 Ed25519 公钥并校验 HMAC-SHA512 签名，验签通过即信任，绕过 WebPKI 证书链；复用已链接的 x25519-dalek 与 ring 库，零额外运行时网络依赖；自环测试覆盖正确密钥握手/数据全双工交互/证书签名篡改检测。
 - **平滑热重载完善（已完成）**：支持运行时磁盘配置文件重读，新增跨平台通用（Windows / macOS / Linux）mtime 文件修改监听（1 秒轮询探测，保存即热生效）；统一 Unix SIGHUP 信号与 REST API `PUT /configs` 接口；配置重载执行严格两阶段校验（语法解析 + 端口冲突与引用校验），新配置合法时原子平滑切换（router_handle.swap），若校验失败自动保留旧配置继续服务，保证零停机中断。
 - **Rule-Provider 在线订阅与定时后台刷新（已完成）**：支持 HTTP/HTTPS 远程规则订阅拉取（ureq 客户端超时保护）；磁盘离线本地缓存机制（默认缓存至 `.cache/{name}.txt`，网络抖动或离线启动时自动降级加载本地缓存）；后台定时刷新协程（`interval` 周期自动增量检测更新）；`Router::clone_with_rules` 原子规则替换，不重建出站与策略组，保留节点 EMA 延迟统计历史与 Selector 手动选择状态，活跃 TCP/UDP 传输不中断。
+- **Proxy-Provider 代理集合订阅与后台自动刷新（已完成）**：完整对标 Clash.Meta / mihomo 生态规范——支持 HTTP 远程订阅与本地文件（`proxy-providers`）；多格式载荷智能解析（Clash YAML 的 `proxies:` 列表，以及 Base64 编码或换行分隔的 URI 订阅链接）；支持 `filter` 正则名称过滤；本地磁盘离线缓存（默认 `.cache/{name}.yaml`，网络故障无缝降级加载）；策略组（`proxy-groups`）通过 `use: [provider1, ...]` 动态聚合节点；后台定时刷新协程（`interval` 秒级配置），内容变更时调用 `router_handle.swap(...)` 实现连接零中断的平滑热替换。
+- **VLESS XTLS-rprx-vision 真实流控（已完成）**：完全遵循官方 VLESS Vision 协议规范——标准 Protobuf Addons 握手（`flow: xtls-rprx-vision`）；内层 TLS 1.3 ClientHello 深度嗅探；特征区间（900~1200 字节）伪随机填充（PaddingContinue 帧，消除 DPI 长度特征）；服务端回包解帧剥离填充；并在检测到 ApplicationData（0x17）时发送 PaddingEnd 帧，无缝切入裸流直通（Splice / Direct Copy），后续双向传输零封包开销。自环测试覆盖 ClientHello 伪装填充、ApplicationData 切换与 128KB 裸流直通。
+- **Snell 协议出+入站 v1-v4（已完成）**：完整支持 Surge / Clash.Meta 原生 Snell 协议出站与入站监听——支持 v1（SHA256+AES-128-GCM）、v2（HKDF+ChaCha20-Poly1305）、v3 与 v4（16B ClientNonce + HKDF-SHA256 派生双向独立密钥）；支持 HTTP Obfs 混淆层（自动握手探测与 HTTP 101 Switching Protocols 升级）；原生 Snell UDP 数据报复用封装；多密码列表自动匹配与错误密码拒绝。订阅 `snell://psk@host:port?version=4&obfs=http&host=bing.com&udp=1#name` 一键解析。
+- **DNS nameserver-policy 分流与 fallback 过滤（已完成）**：对标 Clash.Meta / mihomo 高级 DNS 架构——`nameserver-policy` 支持域名通配符（`*.google.com`, `+.example.com`）与 `geosite:tag` 映射至专用独立解析器（如专有 DoH/DoT）；`fallback-filter` 强制特定域名走 fallback 上游；内置 IP-CIDR 污染剔除库（如 `240.0.0.0/4`, `127.0.0.1/32` 等 Bogon 网段）；支持 GeoIP 国内（CN）归属检查，主 DNS 返回非国内 IP 时自动判定为污染并无缝降级切换至 fallback 上游。
 - **长尾协议与生态（计划）**：C-ABI 插件市场装配
 
 ## 插件开发
@@ -101,4 +106,4 @@ vp_transform_plugin!(MyPlugin);
 
 ## 测试
 
-192 项单测/集成测试（`cargo test --workspace`）：协议编解码 roundtrip、各协议出入站自环、规则引擎、策略组状态机、转发引擎（半关闭/计数）、TLS/WS 传输、垂直 e2e（mixed→规则→组→出站）、控制器 API、C-ABI 插件往返、REALITY 握手与篡改检测、mtime 热重载、Rule-Provider 在线拉取与后台定时平滑刷新。
+184+ 项单测与端到端集成测试（`cargo test --workspace`）：协议编解码 roundtrip、各协议出入站自环、VLESS Vision 流控与大流量裸流直通、Snell v1-v4 全版本加解密/HTTP混淆/UDP、DNS nameserver-policy 专有分流与 fallback-filter 污染拦截、Proxy-Provider 在线拉取/正则过滤与后台定时刷新、规则引擎、策略组状态机、转发引擎（半关闭/计数）、TLS/WS 传输、垂直 e2e、控制器 API、C-ABI 插件往返、REALITY 握手与篡改检测、mtime 热重载等。

@@ -37,6 +37,7 @@ impl GeoIpDb {
     }
 }
 
+#[derive(Clone)]
 pub struct GeoIpMatcher {
     code: String,
     reader: Arc<maxminddb::Reader<Vec<u8>>>,

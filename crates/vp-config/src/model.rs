@@ -58,12 +58,18 @@ pub struct Config {
     pub proxies: Vec<ProxyCfg>,
     #[serde(alias = "proxy-groups", alias = "proxy_groups", default, deserialize_with = "null_to_default")]
     pub proxy_groups: Vec<GroupCfg>,
+    #[serde(alias = "proxy-providers", alias = "proxy_providers", default, deserialize_with = "null_to_default")]
+    pub proxy_providers: HashMap<String, ProxyProviderCfg>,
     #[serde(default, deserialize_with = "null_to_default")]
     pub rules: Vec<String>,
     #[serde(alias = "sub-rules", alias = "sub_rules", default, deserialize_with = "null_to_default")]
     pub sub_rules: HashMap<String, Vec<String>>,
     #[serde(alias = "rule-providers", alias = "rule_providers", default, deserialize_with = "null_to_default")]
     pub rule_providers: HashMap<String, RuleProviderCfg>,
+    #[serde(alias = "geosite-url", alias = "geosite_url", default)]
+    pub geosite_url: Option<String>,
+    #[serde(alias = "geoip-url", alias = "geoip_url", default)]
+    pub geoip_url: Option<String>,
     #[serde(default)]
     pub tun: Option<TunCfg>,
     /// 协议服务端入站（自建服务器场景）
@@ -113,6 +119,9 @@ pub struct TunCfg {
     pub auto_route: bool,
     #[serde(default)]
     pub auto_redirect: Option<bool>,
+    /// 移动端 (Android / iOS) 外部注入的文件描述符
+    #[serde(default)]
+    pub fd: Option<i32>,
 }
 
 fn default_true() -> bool {
@@ -161,6 +170,28 @@ pub struct DnsConfig {
     pub fallback: Vec<String>,
     #[serde(alias = "fake-ip-range", alias = "fake_ip_range", default)]
     pub fake_ip_range: Option<String>,
+    #[serde(alias = "nameserver-policy", alias = "nameserver_policy", default)]
+    pub nameserver_policy: HashMap<String, serde_yaml::Value>,
+    #[serde(alias = "fallback-filter", alias = "fallback_filter", default)]
+    pub fallback_filter: Option<FallbackFilterConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct FallbackFilterConfig {
+    #[serde(default = "default_true")]
+    pub geoip: bool,
+    #[serde(alias = "geoip-code", alias = "geoip_code", default = "default_geoip_code")]
+    pub geoip_code: String,
+    #[serde(default)]
+    pub ipcidr: Vec<String>,
+    #[serde(default)]
+    pub domain: Vec<String>,
+    #[serde(default)]
+    pub geosite: Vec<String>,
+}
+
+fn default_geoip_code() -> String {
+    "CN".into()
 }
 
 /// 节点定义：name + 扁平化协议参数
@@ -178,9 +209,11 @@ pub struct ProxyCfg {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProxyKind {
     Ss(SsCfg),
+    Ssr(SsrCfg),
     Vmess(VmessCfg),
     Vless(VlessCfg),
     Trojan(TrojanCfg),
+    Snell(SnellCfg),
     Anytls(AnytlsCfg),
     Ssh(SshCfg),
     Brook(BrookCfg),
@@ -200,9 +233,11 @@ impl ProxyKind {
     pub fn type_name(&self) -> &'static str {
         match self {
             ProxyKind::Ss(_) => "ss",
+            ProxyKind::Ssr(_) => "ssr",
             ProxyKind::Vmess(_) => "vmess",
             ProxyKind::Vless(_) => "vless",
             ProxyKind::Trojan(_) => "trojan",
+            ProxyKind::Snell(_) => "snell",
             ProxyKind::Anytls(_) => "anytls",
             ProxyKind::Ssh(_) => "ssh",
             ProxyKind::Brook(_) => "brook",
@@ -397,6 +432,65 @@ pub struct BrookCfg {
     pub udp: bool,
 }
 
+/// snell：Surge / Clash.Meta 原生协议（v1-v4，HKDF-SHA256 + ChaCha20-Poly1305 / AES-128-GCM）
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SnellObfsOpts {
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SnellCfg {
+    pub server: String,
+    pub port: u16,
+    pub psk: String,
+    #[serde(default = "default_snell_version")]
+    pub version: u8,
+    #[serde(default)]
+    pub obfs: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(alias = "obfs-opts", alias = "obfs_opts", default)]
+    pub obfs_opts: Option<SnellObfsOpts>,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+fn default_snell_version() -> u8 {
+    4
+}
+
+/// ssr：ShadowsocksR 协议
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SsrCfg {
+    pub server: String,
+    pub port: u16,
+    pub password: String,
+    pub cipher: String,
+    #[serde(default = "default_ssr_protocol")]
+    pub protocol: String,
+    #[serde(alias = "protocol-param", alias = "protocol_param", default)]
+    pub protocol_param: Option<String>,
+    #[serde(default = "default_ssr_obfs")]
+    pub obfs: String,
+    #[serde(alias = "obfs-param", alias = "obfs_param", default)]
+    pub obfs_param: Option<String>,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+fn default_ssr_protocol() -> String {
+    "origin".into()
+}
+
+fn default_ssr_obfs() -> String {
+    "plain".into()
+}
+
 /// anytls：TLS 之上的多路复用流协议（sing-anytls v2）。协议本身强制 TLS。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnytlsCfg {
@@ -530,7 +624,10 @@ pub struct GroupCfg {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: GroupKind,
+    #[serde(default)]
     pub proxies: Vec<String>,
+    #[serde(alias = "use", default)]
+    pub r#use: Vec<String>,
     #[serde(default)]
     pub url: Option<String>,
     /// 健康检查间隔（秒）
@@ -555,6 +652,31 @@ pub enum GroupKind {
     Fallback,
     LoadBalance,
     Relay,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct ProviderHealthCheckCfg {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub interval: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProxyProviderCfg {
+    /// http / file
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub url: Option<String>,
+    pub path: Option<String>,
+    #[serde(default)]
+    pub interval: Option<u64>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(alias = "health-check", alias = "health_check", default)]
+    pub health_check: Option<ProviderHealthCheckCfg>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

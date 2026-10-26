@@ -19,11 +19,16 @@ pub mod sub;
 pub mod inbound;
 #[cfg(feature = "ss")]
 pub mod ss;
+pub mod ssr;
 #[cfg(feature = "trojan")]
 pub mod trojan;
+#[cfg(feature = "snell")]
+pub mod snell;
 pub mod udp_out;
 #[cfg(feature = "vless")]
 pub mod vless;
+#[cfg(feature = "vless")]
+pub mod vless_vision;
 pub mod uot;
 #[cfg(feature = "vmess")]
 pub mod vmess;
@@ -210,9 +215,14 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
             deps.dns.clone(),
         )?),
         ProxyKind::Ss(ss) => build_ss(cfg.name.as_str(), ss)?,
+        ProxyKind::Ssr(s) => Arc::new(ssr::SsrOutbound::new_named(cfg.name.as_str(), s, deps.dns.clone())?),
         ProxyKind::Vmess(vm) => build_vmess(cfg.name.as_str(), vm)?,
         ProxyKind::Vless(vl) => build_vless(cfg.name.as_str(), vl)?,
         ProxyKind::Trojan(tr) => build_trojan(cfg.name.as_str(), tr)?,
+        #[cfg(feature = "snell")]
+        ProxyKind::Snell(sn) => Arc::new(snell::SnellOutbound::new_named(cfg.name.as_str(), sn)?),
+        #[cfg(not(feature = "snell"))]
+        ProxyKind::Snell(_) => return Err(Error::Unsupported("snell 特性未编译".into())),
         ProxyKind::Anytls(a) => build_anytls(cfg, a)?,
         ProxyKind::Ssh(sh) => Arc::new(ssh::SshOutbound::new_named(cfg.name.as_str(), sh)?),
         ProxyKind::Brook(b) => Arc::new(brook::BrookOutbound::new_named(cfg.name.as_str(), b)?),

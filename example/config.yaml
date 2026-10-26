@@ -15,6 +15,23 @@ dns:
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
+  # 兜底 DNS（nameserver 被污染或解析异常时使用）
+  # fallback:
+  #   - 1.1.1.1
+  #   - 8.8.8.8
+  # nameserver-policy 专有分流策略（域名通配符或 geosite 映射至独立上游）
+  # nameserver-policy:
+  #   "*.google.com,+.youtube.com": "https://dns.google/dns-query"
+  #   "geosite:cn": "223.5.5.5"
+  # fallback-filter 污染过滤与国外域名防污染
+  # fallback-filter:
+  #   geoip: true
+  #   geoip-code: CN
+  #   ipcidr:
+  #     - 240.0.0.0/4
+  #     - 127.0.0.1/32
+  #   domain:
+  #     - "+.twitter.com"
 
 proxies:
   # Shadowsocks（AEAD 与 2022 系均支持）
@@ -42,14 +59,27 @@ proxies:
       headers:
         Host: v.example.com
 
-  # VLESS
+  # VLESS（支持 flow: xtls-rprx-vision 真实流控）
   - name: "vless-示例"
     type: vless
     server: vl.example.com
     port: 443
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     tls: true
+    flow: xtls-rprx-vision
     network: tcp
+
+  # Snell（Surge / Clash.Meta 原生协议，支持 v1-v4、HTTP 混淆、UDP）
+  - name: "snell-示例"
+    type: snell
+    server: sn.example.com
+    port: 1234
+    psk: "your-snell-psk"
+    version: 4
+    obfs-opts:
+      mode: http
+      host: www.bing.com
+    udp: true
 
   # Trojan
   - name: "trojan-示例"
@@ -60,12 +90,30 @@ proxies:
     sni: t.example.com
     skip-cert-verify: false
 
+# 代理集合提供者（对标 Clash.Meta / mihomo proxy-providers）
+# proxy-providers:
+#   airport-sub:
+#     type: http
+#     url: "https://example.com/api/v1/client/subscribe?token=xxx"
+#     path: ./proxy_provider/airport.yaml
+#     interval: 3600
+#     filter: "^(HK|TW|SG|JP)"
+#     health-check:
+#       enable: true
+#       url: http://www.gstatic.com/generate_204
+#       interval: 300
+
 proxy-groups:
   - name: PROXY
     type: select
+    # 支持 use 动态汇入 proxy-providers 中的全部节点
+    # use:
+    #   - airport-sub
     proxies:
       - 自动选择
       - ss-示例
+      - vless-示例
+      - snell-示例
       - DIRECT
 
   - name: 自动选择
@@ -76,6 +124,7 @@ proxy-groups:
     proxies:
       - vmess-示例
       - vless-示例
+      - snell-示例
       - trojan-示例
 
 # TUN 透明代理模式（需管理员权限运行）
@@ -87,12 +136,16 @@ proxy-groups:
 #   fake-ip-range: 198.18.0.0/16
 #   auto-route: true
 
-# 自建服务器：协议服务端入站（trojan/vmess/vless/ss）
+# 自建服务器：协议服务端入站（trojan/vmess/vless/ss/snell）
 # listeners:
 #   - name: srv-trojan
 #     type: trojan
 #     port: 10443
 #     users: ["your-password"]
+#   - name: srv-snell
+#     type: snell
+#     port: 10445
+#     users: ["snell-password"]
 #   - name: srv-ss-stls
 #     type: ss
 #     port: 10444

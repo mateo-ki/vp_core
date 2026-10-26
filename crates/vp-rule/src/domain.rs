@@ -11,7 +11,7 @@ pub enum HitKind {
     SuffixSub,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Node {
     children: Vec<(Box<str>, Node)>,
     exact: bool,
@@ -19,7 +19,7 @@ struct Node {
     suffix_sub: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DomainTrie {
     root: Node,
     size: usize,

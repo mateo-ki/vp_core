@@ -207,6 +207,7 @@ impl GeoSiteDb {
     }
 }
 
+#[derive(Clone)]
 pub struct CompiledSite {
     pub trie: DomainTrie,
     pub keywords: Vec<Box<str>>,

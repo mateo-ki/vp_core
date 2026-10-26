@@ -3,7 +3,7 @@
 pub mod api;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -69,7 +69,11 @@ impl App {
         base_dir: &Path,
         start_listeners: bool,
     ) -> Result<Arc<App>> {
-        Self::assemble(text, fmt, base_dir, start_listeners, None).await
+        let app = Self::assemble(text.to_string(), fmt, base_dir.to_path_buf(), start_listeners, None).await?;
+        if start_listeners {
+            app.start_background_tasks();
+        }
+        Ok(app)
     }
 
     /// 从配置文件路径构建并启动
@@ -81,8 +85,12 @@ impl App {
             .await
             .map_err(|e| Error::Config(format!("读取 {} 失败: {e}", config_path.display())))?;
         let fmt = Format::from_path(&config_path.to_string_lossy());
-        let base_dir = config_path.parent().unwrap_or(Path::new("."));
-        Self::assemble(&text, fmt, base_dir, start_listeners, Some(config_path.to_path_buf())).await
+        let base_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let app = Self::assemble(text, fmt, base_dir, start_listeners, Some(config_path.to_path_buf())).await?;
+        if start_listeners {
+            app.start_background_tasks();
+        }
+        Ok(app)
     }
 
     /// 热重载用：仅重建（不启动监听），返回新 App 供 router 替换
@@ -91,7 +99,7 @@ impl App {
         fmt: vp_config::Format,
         base_dir: &Path,
     ) -> Result<Arc<App>> {
-        Self::assemble(text, fmt, base_dir, false, None).await
+        Self::assemble(text.to_string(), fmt, base_dir.to_path_buf(), false, None).await
     }
 
     pub async fn reload(&self) -> Result<()> {
@@ -114,7 +122,7 @@ impl App {
             (meta.text, meta.fmt, meta.base_dir)
         };
 
-        let new_app = Self::assemble(&new_text, new_fmt, &new_dir, false, meta.path.clone()).await?;
+        let new_app = Self::assemble(new_text.clone(), new_fmt, new_dir.clone(), false, meta.path.clone()).await?;
         self.router.swap(new_app.router.current());
 
         *self.config_meta.write().unwrap() = Some(ConfigMeta {
@@ -129,19 +137,31 @@ impl App {
     }
 
     async fn assemble(
-        text: &str,
+        text: String,
         fmt: Format,
-        base_dir: &Path,
+        base_dir: PathBuf,
         start_listeners: bool,
         config_path: Option<std::path::PathBuf>,
     ) -> Result<Arc<App>> {
-        let cfg: vp_config::Config = vp_config::parse(text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
+        let cfg: vp_config::Config = vp_config::parse(&text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
         if let Err(errs) = vp_config::validate::validate(&cfg) {
             return Err(Error::Config(format!("配置校验失败:\n  - {}", errs.join("\n  - "))));
         }
 
-        let dns = Arc::new(if cfg.dns.enable && !cfg.dns.nameserver.is_empty() {
-            Resolver::new(cfg.dns.nameserver.clone())
+        let geosite = load_geosite(&base_dir, cfg.geosite_url.as_deref()).await;
+        let geoip = load_geoip(&base_dir, cfg.geoip_url.as_deref()).await;
+
+        let dns = Arc::new(if cfg.dns.enable {
+            let policies = vp_dns::compile_nameserver_policy(&cfg.dns.nameserver_policy, geosite.as_ref());
+            let fallback_filter = cfg.dns.fallback_filter.as_ref().map(|ff| {
+                vp_dns::compile_fallback_filter(ff, geosite.as_ref(), geoip.as_ref())
+            });
+            Resolver::build(
+                cfg.dns.nameserver.clone(),
+                cfg.dns.fallback.clone(),
+                policies,
+                fallback_filter,
+            )
         } else {
             Resolver::system()
         });
@@ -158,27 +178,51 @@ impl App {
             let ob = build_outbound(p, &deps).map_err(|e| Error::Config(format!("节点 {:?}: {e}", p.name)))?;
             outbounds.insert(p.name.clone(), ob);
         }
+
+        // 代理集合提供者 (proxy-providers)
+        let (proxy_providers, _proxy_provider_texts) = load_proxy_providers(&cfg, &base_dir).await?;
+        for plist in proxy_providers.values() {
+            for p in plist {
+                let ob = build_outbound(p, &deps).map_err(|e| Error::Config(format!("节点 {:?}: {e}", p.name)))?;
+                outbounds.insert(p.name.clone(), ob);
+            }
+        }
         let outbound_names: Vec<String> = outbounds.keys().cloned().collect();
 
         // 规则
-        let providers = load_providers(&cfg, base_dir).await?;
-        let geosite = load_geosite(base_dir);
-        let geoip = load_geoip(base_dir);
+        let providers = load_providers(&cfg, &base_dir).await?;
         let known: Vec<String> = outbound_names.iter().cloned().chain(cfg.proxy_groups.iter().map(|g| g.name.clone())).collect();
-        let is_known = |t: &str| known.iter().any(|k| k == t) || vp_config::is_builtin(t);
-        let env = CompileEnv {
-            is_known_target: &is_known,
-            geosite: &geosite,
-            geoip: &geoip,
-            providers: &providers,
-            sub_rules: &cfg.sub_rules,
+        let rules = {
+            let is_known = |t: &str| known.iter().any(|k| k == t) || vp_config::is_builtin(t);
+            let env = CompileEnv {
+                is_known_target: &is_known,
+                geosite: &geosite,
+                geoip: &geoip,
+                providers: &providers,
+                sub_rules: &cfg.sub_rules,
+            };
+            vp_rule::compile(&cfg.rules, &env)
+                .map_err(|errs| Error::Config(format!("规则编译失败:\n  - {}", errs.join("\n  - "))))?
         };
-        let rules = vp_rule::compile(&cfg.rules, &env)
-            .map_err(|errs| Error::Config(format!("规则编译失败:\n  - {}", errs.join("\n  - "))))?;
+
+        let mut group_specs = Vec::new();
+        for g in &cfg.proxy_groups {
+            let mut gs = group_spec(g);
+            for u in &g.r#use {
+                if let Some(plist) = proxy_providers.get(u) {
+                    for p in plist {
+                        if !gs.members.contains(&p.name) {
+                            gs.members.push(p.name.clone());
+                        }
+                    }
+                }
+            }
+            group_specs.push(gs);
+        }
 
         let router = InnerRouter::build(RouterSpec {
             outbounds,
-            groups: cfg.proxy_groups.iter().map(group_spec).collect(),
+            groups: group_specs,
             rules,
             mode: cfg.mode,
             dns: dns.clone(),
@@ -226,7 +270,7 @@ impl App {
                                 ticker.tick().await;
                                 let u = url.clone();
                                 let fetch_res =
-                                    tokio::task::spawn_blocking(move || fetch_remote_provider(&u)).await;
+                                    tokio::task::spawn_blocking(move || fetch_remote_provider(&u, "vpcore/rule-provider")).await;
                                 match fetch_res {
                                     Ok(Ok(new_text)) => {
                                         let is_same = {
@@ -304,7 +348,7 @@ impl App {
             } else {
                 "127.0.0.1".to_string()
             };
-            let make_ctx = || InboundCtx {
+            let inb_ctx = InboundCtx {
                 router: router_handle.clone(),
                 stats: stats.clone(),
                 conns: conns.clone(),
@@ -316,7 +360,7 @@ impl App {
             ] {
                 if let Some(p) = port {
                     let inb = build_inbound(kind, bind.clone(), p, tag);
-                    let bound = inb.clone().start(make_ctx()).await?;
+                    let bound = inb.clone().start(inb_ctx.clone()).await?;
                     info!("{tag} 监听 {bind}:{bound}");
                     listen_ports.push((tag.to_string(), bound));
                 }
@@ -327,7 +371,7 @@ impl App {
                 if let Some(p) = port {
                     let inb: Arc<dyn vp_core::Inbound> =
                         Arc::new(vp_protocol::redir::RedirInbound::new(&bind, p, tag));
-                    match inb.clone().start(make_ctx()).await {
+                    match inb.clone().start(inb_ctx.clone()).await {
                         Ok(bound) => {
                             info!("{tag} 监听 {bind}:{bound}");
                             listen_ports.push((tag.to_string(), bound));
@@ -348,7 +392,7 @@ impl App {
                         continue;
                     }
                 };
-                match inb.clone().start(make_ctx()).await {
+                match inb.clone().start(inb_ctx.clone()).await {
                     Ok(bound) => {
                         info!("listener {} [{}] 监听 {bind}:{bound}", l.name, l.kind);
                         listen_ports.push((l.name.clone(), bound));
@@ -388,9 +432,10 @@ impl App {
                         mtu: tun_cfg.mtu,
                         fake_ip_range: tun_cfg.fake_ip_range.clone(),
                         dns_hijack: true,
+                        fd: tun_cfg.fd,
                     };
                     let tun_in: Arc<dyn vp_core::Inbound> = Arc::new(vp_tun::TunInbound::new(t, "tun"));
-                    match tun_in.clone().start(make_ctx()).await {
+                    match tun_in.clone().start(inb_ctx.clone()).await {
                         Ok(_) => {
                             info!("TUN 模式已启动（{}）", tun_cfg.address);
                             if tun_cfg.auto_route {
@@ -456,6 +501,67 @@ impl App {
             }
         }
     }
+
+    /// 启动 proxy-providers 后台定时自动刷新任务
+    pub fn start_background_tasks(self: &Arc<Self>) {
+        let meta = match self.config_meta.read().unwrap().clone() {
+            Some(m) => m,
+            None => return,
+        };
+        let cfg: vp_config::Config = match vp_config::parse(&meta.text, meta.fmt) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let app_weak = Arc::downgrade(self);
+        for (name, p) in cfg.proxy_providers {
+            if let Some(url) = p.url {
+                let interval = p.interval.unwrap_or(0);
+                if interval > 0 {
+                    let name = name.clone();
+                    let filter = p.filter.clone();
+                    let cache_path = p
+                        .path
+                        .as_ref()
+                        .map(|p| meta.base_dir.join(p))
+                        .unwrap_or_else(|| meta.base_dir.join(".cache").join(format!("{name}.yaml")));
+                    let app_weak = app_weak.clone();
+
+                    tokio::spawn(async move {
+                        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
+                        ticker.tick().await; // 消耗初始即刻 tick
+                        loop {
+                            ticker.tick().await;
+                            let app = match app_weak.upgrade() {
+                                Some(a) => a,
+                                None => break, // App 实例已释放，终止任务
+                            };
+                            let u = url.clone();
+                            let fetch_res = tokio::task::spawn_blocking(move || fetch_remote_provider(&u, "vpcore/proxy-provider")).await;
+                            match fetch_res {
+                                Ok(Ok(new_text)) => {
+                                    if let Err(e) = vp_protocol::sub::parse_provider_proxies(&new_text, filter.as_deref()) {
+                                        warn!("proxy-provider {name} 定时拉取内容校验未通过: {e}");
+                                        continue;
+                                    }
+                                    if let Some(parent) = cache_path.parent() {
+                                        let _ = tokio::fs::create_dir_all(parent).await;
+                                    }
+                                    let _ = tokio::fs::write(&cache_path, &new_text).await;
+                                    if let Err(e) = app.reload().await {
+                                        warn!("proxy-provider {name} 重载失败: {e}");
+                                    } else {
+                                        info!("proxy-provider {name} 定时刷新完成，节点与路由已平滑替换");
+                                    }
+                                }
+                                Ok(Err(e)) => warn!("proxy-provider {name} 定时拉取失败: {e}"),
+                                Err(e) => warn!("proxy-provider {name} 任务异常: {e}"),
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// 构建 listeners 段的服务端入站（trojan/vmess/vless/ss）
@@ -510,6 +616,14 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 "0.0.0.0", l.port, tag, &l.users,
             )?))
         }
+        "snell" => {
+            if l.users.is_empty() {
+                return Err(Error::Config("snell listener 需要 users（psk 凭据）".into()));
+            }
+            Ok(Arc::new(vp_protocol::snell::SnellInbound::new(
+                "0.0.0.0", l.port, tag, &l.users, vp_protocol::snell::VERSION_4,
+            )?))
+        }
         "naive" => {
             if l.users.is_empty() {
                 return Err(Error::Config("naive listener 需要 users（username:password）".into()));
@@ -547,10 +661,10 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
     }
 }
 
-fn fetch_remote_provider(url: &str) -> std::result::Result<String, String> {
+fn fetch_remote_provider(url: &str, ua: &str) -> std::result::Result<String, String> {
     let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(15))
-        .set("User-Agent", "vpcore/rule-provider")
+        .set("User-Agent", ua)
         .call()
         .map_err(|e| format!("{e}"))?;
     let mut body = String::new();
@@ -560,6 +674,69 @@ fn fetch_remote_provider(url: &str) -> std::result::Result<String, String> {
         .read_to_string(&mut body)
         .map_err(|e| format!("{e}"))?;
     Ok(body)
+}
+
+async fn load_proxy_providers(
+    cfg: &vp_config::Config,
+    base_dir: &Path,
+) -> Result<(HashMap<String, Vec<vp_config::ProxyCfg>>, HashMap<String, String>)> {
+    let mut out_proxies = HashMap::new();
+    let mut out_texts = HashMap::new();
+
+    for (name, p) in &cfg.proxy_providers {
+        let cache_path = p
+            .path
+            .as_ref()
+            .map(|p| base_dir.join(p))
+            .unwrap_or_else(|| base_dir.join(".cache").join(format!("{name}.yaml")));
+
+        let text = if let Some(ref url) = p.url {
+            let u = url.clone();
+            let filter = p.filter.clone();
+            let res = tokio::task::spawn_blocking(move || fetch_remote_provider(&u, "vpcore/proxy-provider"))
+                .await
+                .map_err(|e| Error::Config(format!("proxy-provider 拉取任务失败: {e}")))?;
+            match res {
+                Ok(t) if vp_protocol::sub::parse_provider_proxies(&t, filter.as_deref()).is_ok() => {
+                    if let Some(parent) = cache_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&cache_path, &t);
+                    info!("proxy-provider {name:?} 在线拉取成功并已写入缓存");
+                    t
+                }
+                other => {
+                    let err_msg = match other {
+                        Ok(_) => "在线拉取内容格式校验未通过".to_string(),
+                        Err(e) => e,
+                    };
+                    if cache_path.exists() {
+                        warn!(
+                            "proxy-provider {name:?} 在线拉取失败 ({err_msg})，降级使用本地缓存: {}",
+                            cache_path.display()
+                        );
+                        std::fs::read_to_string(&cache_path)
+                            .map_err(|e| Error::Config(format!("proxy-provider {name:?} 缓存读取失败: {e}")))?
+                    } else {
+                        return Err(Error::Config(format!(
+                            "proxy-provider {name:?} 在线拉取失败且无可用本地缓存: {err_msg}"
+                        )));
+                    }
+                }
+            }
+        } else {
+            std::fs::read_to_string(&cache_path)
+                .map_err(|e| Error::Config(format!("proxy-provider {name:?} 读取失败: {e}")))?
+        };
+
+        let proxies = vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref())
+            .map_err(|e| Error::Config(format!("proxy-provider {name:?} 解析失败: {e}")))?;
+
+        out_texts.insert(name.clone(), text);
+        out_proxies.insert(name.clone(), proxies);
+    }
+
+    Ok((out_proxies, out_texts))
 }
 
 async fn load_providers(
@@ -585,7 +762,7 @@ async fn load_providers(
         let text = if let Some(ref url) = p.url {
             // 在线拉取尝试
             let u = url.clone();
-            let res = tokio::task::spawn_blocking(move || fetch_remote_provider(&u))
+            let res = tokio::task::spawn_blocking(move || fetch_remote_provider(&u, "vpcore/rule-provider"))
                 .await
                 .map_err(|e| Error::Config(format!("拉取任务失败: {e}")))?;
             match res {
@@ -627,39 +804,70 @@ async fn load_providers(
     Ok(out)
 }
 
-fn load_geosite(base_dir: &Path) -> Option<GeoSiteDb> {
+fn fetch_remote_binary(url: &str, ua: &str) -> std::result::Result<Vec<u8>, String> {
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .set("User-Agent", ua)
+        .call()
+        .map_err(|e| format!("{e}"))?;
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    resp.into_reader()
+        .take(128 << 20)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{e}"))?;
+    Ok(bytes)
+}
+
+async fn load_geosite(base_dir: &Path, url: Option<&str>) -> Option<GeoSiteDb> {
     for name in ["geosite.dat", "GeoSite.dat"] {
         let p = base_dir.join(name);
         if p.exists() {
-            match std::fs::read(&p) {
-                Ok(bytes) => match GeoSiteDb::load(&bytes) {
-                    Ok(db) => {
-                        info!("geosite 已加载: {}", p.display());
-                        return Some(db);
-                    }
-                    Err(e) => warn!("geosite 解析失败: {e}"),
-                },
-                Err(e) => warn!("geosite 读取失败: {e}"),
+            if let Ok(bytes) = std::fs::read(&p) {
+                if let Ok(db) = GeoSiteDb::load(&bytes) {
+                    info!("geosite 已加载: {}", p.display());
+                    return Some(db);
+                }
+            }
+        }
+    }
+    if let Some(u) = url {
+        let u = u.to_string();
+        let target = base_dir.join("geosite.dat");
+        info!("正在从远程拉取 geosite: {u}");
+        let res = tokio::task::spawn_blocking(move || fetch_remote_binary(&u, "vpcore/geosite")).await;
+        if let Ok(Ok(bytes)) = res {
+            if let Ok(db) = GeoSiteDb::load(&bytes) {
+                let _ = std::fs::write(&target, &bytes);
+                info!("geosite 远程拉取成功并已写入: {}", target.display());
+                return Some(db);
             }
         }
     }
     None
 }
 
-fn load_geoip(base_dir: &Path) -> Option<vp_rule::geoip::GeoIpDb> {
+async fn load_geoip(base_dir: &Path, url: Option<&str>) -> Option<vp_rule::geoip::GeoIpDb> {
     for name in ["geoip.metadb", "Country.mmdb", "geoip.mmdb"] {
         let p = base_dir.join(name);
         if p.exists() {
-            return match vp_rule::geoip::GeoIpDb::load(&p) {
-                Ok(db) => {
-                    info!("geoip 已加载: {}", p.display());
-                    Some(db)
-                }
-                Err(e) => {
-                    warn!("geoip 解析失败: {e}");
-                    None
-                }
-            };
+            if let Ok(db) = vp_rule::geoip::GeoIpDb::load(&p) {
+                info!("geoip 已加载: {}", p.display());
+                return Some(db);
+            }
+        }
+    }
+    if let Some(u) = url {
+        let u = u.to_string();
+        let target = base_dir.join("geoip.metadb");
+        info!("正在从远程拉取 geoip: {u}");
+        let res = tokio::task::spawn_blocking(move || fetch_remote_binary(&u, "vpcore/geoip")).await;
+        if let Ok(Ok(bytes)) = res {
+            let _ = std::fs::write(&target, &bytes);
+            if let Ok(db) = vp_rule::geoip::GeoIpDb::load(&target) {
+                info!("geoip 远程拉取成功并已写入: {}", target.display());
+                return Some(db);
+            }
         }
     }
     None
@@ -1285,6 +1493,103 @@ rules:
         // 验证定时更新后：youtube.com 命中 PROXY！
         let res3 = app.router.current().pick(&sess2).await;
         assert_eq!(res3.outbound.name(), "PROXY", "定时更新后 youtube.com 应命中 RULE-SET");
+
+        let _ = tokio::fs::remove_file(&cache_file).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_provider_online_fetch_and_refresh() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let srv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+
+        // 简易 HTTP 订阅服务器：第 1 次返回 HK-01 与 US-01；第 2 次返回 HK-01 与 HK-02
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = call_count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = srv.accept().await else { break };
+                let count = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    let _ = s.read(&mut b).await;
+                    let body = if count == 0 {
+                        r#"
+proxies:
+  - name: "HK-01"
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+  - name: "US-01"
+    type: socks5
+    server: 127.0.0.1
+    port: 1082
+"#
+                    } else {
+                        r#"
+proxies:
+  - name: "HK-01"
+    type: socks5
+    server: 127.0.0.1
+    port: 1081
+  - name: "HK-02"
+    type: socks5
+    server: 127.0.0.1
+    port: 1083
+"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+
+        let temp_dir = std::env::temp_dir();
+        let cache_file = temp_dir.join(format!("vp_pprov_{}.yaml", std::process::id()));
+        let cfg = format!(
+            r#"
+mode: rule
+proxy-providers:
+  test-nodes:
+    type: http
+    url: http://127.0.0.1:{srv_port}/proxies.yaml
+    path: {}
+    interval: 1
+    filter: "^HK"
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    use: [test-nodes]
+rules:
+  - MATCH,PROXY
+"#,
+            cache_file.to_string_lossy().replace('\\', "/")
+        );
+
+        let app = App::start(&cfg, Format::Yaml, &temp_dir, true).await.unwrap();
+
+        // 验证初始状态：filter 过滤生效，HK-01 存在，US-01 被过滤
+        assert!(app.router.current().outbound("HK-01").is_some(), "HK-01 应被加载");
+        assert!(app.router.current().outbound("US-01").is_none(), "US-01 属于非 HK，应被 filter 过滤");
+        let group = app.router.current().get_group("PROXY").expect("PROXY 组应存在");
+        assert_eq!(&*group.selected_name(), "HK-01");
+
+        // 缓存文件已写入磁盘
+        assert!(cache_file.exists(), "proxy-provider 离线缓存文件应已生成");
+
+        // 等待后台 interval 触发定时更新（interval 设为 1 秒，等待 1.5 秒）
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // 验证定时更新后：新节点 HK-02 已动态汇入
+        assert!(
+            app.router.current().outbound("HK-02").is_some(),
+            "定时更新后 HK-02 应出现在路由表中"
+        );
 
         let _ = tokio::fs::remove_file(&cache_file).await;
     }

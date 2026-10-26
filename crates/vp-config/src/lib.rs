@@ -151,6 +151,16 @@ proxies:
     port: 8964
     username: alice
     password: mupw
+  - name: "sn1"
+    type: snell
+    server: sn.example.com
+    port: 1234
+    psk: secretpsk
+    version: 4
+    obfs-opts:
+      mode: http
+      host: www.bing.com
+    udp: true
   - name: "nv1"
     type: naive
     server: n.example.com
@@ -202,10 +212,24 @@ sub-rules:
         assert_eq!(cfg.mixed_port, Some(7890));
         assert!(cfg.allow_lan);
         assert_eq!(cfg.mode, Mode::Rule);
-        assert_eq!(cfg.proxies.len(), 11);
+        assert_eq!(cfg.proxies.len(), 12);
         assert_eq!(cfg.proxy_groups.len(), 2);
         assert_eq!(cfg.rules.len(), 5);
         assert!(validate::validate(&cfg).is_ok());
+
+        let snell = cfg.proxies.iter().find(|p| p.name == "sn1").unwrap();
+        match &snell.kind {
+            ProxyKind::Snell(s) => {
+                assert_eq!(s.server, "sn.example.com");
+                assert_eq!(s.port, 1234);
+                assert_eq!(s.psk, "secretpsk");
+                assert_eq!(s.version, 4);
+                assert_eq!(s.obfs_opts.as_ref().unwrap().mode.as_deref(), Some("http"));
+                assert_eq!(s.obfs_opts.as_ref().unwrap().host.as_deref(), Some("www.bing.com"));
+                assert!(s.udp);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
 
         match &cfg.proxies[1].kind {
             ProxyKind::Vmess(v) => {

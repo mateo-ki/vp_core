@@ -14,15 +14,21 @@ use vp_core::{Inbound, Outbound, ProxyStream};
 use vp_crypto::vmess_kdf::parse_uuid;
 
 use crate::direct::DirectOutbound;
+use crate::vless_vision::{VisionStream, VISION_FLOW_BYTES};
 use vp_dns::Resolver;
 use vp_transport as transport;
 
 const VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
 
-fn encode_addr(dst: &DstAddr, out: &mut Vec<u8>) {
+fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
     // [addons len][cmd][port][atyp][addr]（版本与 UUID 由调用方前置）
-    out.push(0); // addons len
+    if is_vision {
+        out.push(VISION_FLOW_BYTES.len() as u8);
+        out.extend_from_slice(VISION_FLOW_BYTES);
+    } else {
+        out.push(0); // addons len
+    }
     out.push(CMD_TCP);
     out.extend_from_slice(&dst.port.to_be_bytes());
     match &dst.host {
@@ -42,7 +48,7 @@ fn encode_addr(dst: &DstAddr, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, usize)> {
+fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
     if buf.len() < 3 + 16 + 1 + 1 + 2 + 1 {
         return Err(Error::Proto("vless 请求头过短"));
     }
@@ -52,7 +58,17 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, usize)> {
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&buf[1..17]);
     let addons_len = buf[17] as usize;
-    let mut i = 18 + addons_len;
+    let mut i = 18;
+    let mut is_vision = false;
+    if addons_len > 0 {
+        if buf.len() < i + addons_len {
+            return Err(Error::Proto("vless 请求头截断"));
+        }
+        if &buf[i..i + addons_len] == VISION_FLOW_BYTES {
+            is_vision = true;
+        }
+        i += addons_len;
+    }
     if buf.len() < i + 4 {
         return Err(Error::Proto("vless 请求头截断"));
     }
@@ -100,7 +116,7 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, usize)> {
         }
         _ => return Err(Error::Proto("vless atyp 非法")),
     };
-    Ok((uuid, DstAddr { host, port }, i))
+    Ok((uuid, DstAddr { host, port }, is_vision, i))
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +128,7 @@ pub struct VlessOutbound {
     server: String,
     port: u16,
     uuid: [u8; 16],
+    flow: Option<String>,
     transport: transport::TransportConfig,
 }
 
@@ -141,6 +158,7 @@ impl VlessOutbound {
             server: cfg.server.clone(),
             port: cfg.port,
             uuid,
+            flow: cfg.flow.clone(),
             transport: t,
         })
     }
@@ -149,8 +167,14 @@ impl VlessOutbound {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let is_vision = self
+            .flow
+            .as_deref()
+            .map(|f| f.eq_ignore_ascii_case("xtls-rprx-vision"))
+            .unwrap_or(false);
+
         let mut req = Vec::with_capacity(48);
-        encode_addr(dst, &mut req);
+        encode_addr(dst, is_vision, &mut req);
         let mut full = Vec::with_capacity(1 + 16 + req.len());
         full.push(VERSION);
         full.extend_from_slice(&self.uuid);
@@ -167,7 +191,12 @@ impl VlessOutbound {
             let mut skip = vec![0u8; addon_len];
             io.read_exact(&mut skip).await?;
         }
-        Ok(Box::new(io))
+
+        if is_vision {
+            Ok(Box::new(VisionStream::new(io)))
+        } else {
+            Ok(Box::new(io))
+        }
     }
 }
 
@@ -245,15 +274,20 @@ impl VlessInbound {
             }
             filled += n;
             match decode_request(&buf[..filled]) {
-                Ok((uuid, dst, used)) => {
+                Ok((uuid, dst, is_vision, used)) => {
                     if !self.uuids.contains(&uuid) {
                         return Err(Error::Proto("vless: 用户认证失败"));
                     }
                     let extra = filled - used;
                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
                     let remote = self.direct.connect_stream(&sess, &dst).await?;
-                    // 响应：[ver=0][addon_len=0] + 回填额外数据
-                    stream.write_all(&[VERSION, 0]).await?;
+                    // 响应：如果启用了 vision，回送 [VERSION, 18, VISION_FLOW_BYTES]
+                    if is_vision {
+                        stream.write_all(&[VERSION, VISION_FLOW_BYTES.len() as u8]).await?;
+                        stream.write_all(VISION_FLOW_BYTES).await?;
+                    } else {
+                        stream.write_all(&[VERSION, 0]).await?;
+                    }
                     if extra > 0 {
                         stream.write_all(&buf[used..filled]).await?;
                     }
@@ -274,7 +308,11 @@ impl VlessInbound {
                         meta: Some(meta),
                         stats: Some(ctx.stats.clone()),
                     };
-                    let client: Box<dyn ProxyStream> = Box::new(stream);
+                    let client: Box<dyn ProxyStream> = if is_vision {
+                        Box::new(VisionStream::new_server(stream))
+                    } else {
+                        Box::new(stream)
+                    };
                     tokio::spawn(async move {
                         let _ = relay(client, remote, hook).await;
                     });
@@ -375,5 +413,85 @@ mod tests {
         let mut buf = [0u8; 10];
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping-vless");
+    }
+
+    #[tokio::test]
+    async fn vless_vision_handshake_and_direct_splice() {
+        // echo 回显服务器
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 8192];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let server = VlessInbound::new("127.0.0.1", 0, "vl-vision-srv", &[uuid.clone()]).unwrap();
+        let port = Arc::new(server).start(ctx).await.unwrap();
+
+        // 构造配置了 flow: xtls-rprx-vision 的出站
+        let out = VlessOutbound::new(&VlessCfg {
+            server: "127.0.0.1".into(),
+            port,
+            uuid,
+            flow: Some("xtls-rprx-vision".into()),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            reality_opts: None,
+            udp: false,
+        })
+        .unwrap();
+
+        let dst = DstAddr::new("127.0.0.1", echo_addr.port());
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out.connect_stream(&sess, &dst).await.unwrap();
+
+        // 1. 发送伪造的内层 TLS 1.3 ClientHello（触发布局伪装与填充）
+        let mut client_hello = vec![0x16, 0x03, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0xfc];
+        client_hello.resize(256, 0xaa);
+        s.write_all(&client_hello).await.unwrap();
+
+        let mut recv_ch = vec![0u8; client_hello.len()];
+        s.read_exact(&mut recv_ch).await.unwrap();
+        assert_eq!(recv_ch, client_hello, "ClientHello 内容经 Vision 填充/剥离后应完全一致");
+
+        // 2. 发送 ApplicationData（0x17），触发 PaddingEnd 并切换到裸流直通
+        let mut app_data = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+        app_data.extend_from_slice(b"secret-application-data-content!");
+        s.write_all(&app_data).await.unwrap();
+
+        let mut recv_ad = vec![0u8; app_data.len()];
+        s.read_exact(&mut recv_ad).await.unwrap();
+        assert_eq!(recv_ad, app_data);
+
+        // 3. 大流量（128 KB）直通传输测试（验证 Splice / Direct 状态零分帧损耗）
+        let large_payload = vec![0x42u8; 128 * 1024];
+        let mut recv_large = vec![0u8; large_payload.len()];
+        let (mut rh, mut wh) = tokio::io::split(s);
+        let write_fut = async move {
+            wh.write_all(&large_payload).await.unwrap();
+        };
+        let read_fut = async {
+            rh.read_exact(&mut recv_large).await.unwrap();
+        };
+        tokio::join!(write_fut, read_fut);
+        assert_eq!(recv_large, vec![0x42u8; 128 * 1024]);
     }
 }

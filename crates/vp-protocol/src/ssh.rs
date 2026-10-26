@@ -1184,7 +1184,7 @@ mod tests {
 
     async fn serve_ssh(
         mut io: tokio::net::TcpStream,
-        echo_port: u16,
+        _echo_port: u16,
         k_s: &[u8],
         host_seed: &[u8; 32],
         passwords: &[String],
@@ -1545,7 +1545,7 @@ mod tests {
         put_string(&mut sec, b"ssh-ed25519");
         put_string(&mut sec, &seed);
         put_string(&mut sec, b"");
-        let mut der = b"openssh-key-v1 ".to_vec();
+        let mut der = b"openssh-key-v1\0".to_vec();
         put_string(&mut der, b"none");
         put_string(&mut der, b"none");
         put_string(&mut der, b"");

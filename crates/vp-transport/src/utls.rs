@@ -1092,6 +1092,7 @@ where
         rx: rx_dir,
         raw: BytesMut::with_capacity(16 * 1024),
         plaintext: BytesMut::with_capacity(16 * 1024),
+        tx_buf: BytesMut::with_capacity(16 * 1024),
         state: RxState::Header { need: 5, got: 0 },
         hdr: [0; 5],
         rx_closed: false,
@@ -1116,6 +1117,7 @@ pub struct UtlsStream<S> {
     rx: Direction,
     raw: BytesMut,
     plaintext: BytesMut,
+    tx_buf: BytesMut,
     state: RxState,
     hdr: [u8; 5],
     rx_closed: bool,
@@ -1259,58 +1261,96 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for UtlsStream<S> {
                 "utls: 已关闭",
             )));
         }
-        // 16KB 分帧加密后一次性写出
-        let mut out = Vec::with_capacity(buf.len() + 64);
-        let mut offset = 0;
-        while offset < buf.len() {
-            let end = (offset + 16 * 1024).min(buf.len());
-            let mut content = BytesMut::from(&buf[offset..end]);
-            content.put_u8(REC_APPDATA); // inner type
-            let clen = content.len() + 16;
-            let mut rec = [REC_APPDATA, 0x03, 0x03, 0, 0];
-            rec[3] = (clen >> 8) as u8;
-            rec[4] = clen as u8;
-            this.tx
-                .seal(&rec, &mut content)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            out.extend_from_slice(&rec);
-            out.extend_from_slice(&content);
-            offset = end;
-        }
-        if buf.is_empty() {
-            let mut content = BytesMut::new();
-            content.put_u8(REC_APPDATA);
-            let clen = content.len() + 16;
-            let mut rec = [REC_APPDATA, 0x03, 0x03, 0, 0];
-            rec[3] = (clen >> 8) as u8;
-            rec[4] = clen as u8;
-            this.tx
-                .seal(&rec, &mut content)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            out.extend_from_slice(&rec);
-            out.extend_from_slice(&content);
-        }
-        let mut off = 0usize;
-        while off < out.len() {
-            let n = std::task::ready!(Pin::new(&mut this.conn).poll_write(cx, &out[off..]))?;
-            if n == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "utls: 写入 0 字节",
-                )));
+
+        // 1. 如果缓冲区中有待发数据，先尝试写出
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.conn).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "utls: 写入 0 字节",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.tx_buf.advance(n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            off += n;
         }
-        Poll::Ready(Ok(buf.len()))
+
+        // 2. 如果入参为空，直接返回 0
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        // 3. 一次封装最多 16KB 明文（TLS 1.3 规范单个记录上限）
+        let take = buf.len().min(16 * 1024);
+        let mut content = BytesMut::from(&buf[..take]);
+        content.put_u8(REC_APPDATA); // inner type
+        let clen = content.len() + 16;
+        let mut rec = [REC_APPDATA, 0x03, 0x03, 0, 0];
+        rec[3] = (clen >> 8) as u8;
+        rec[4] = clen as u8;
+        this.tx
+            .seal(&rec, &mut content)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        this.tx_buf.extend_from_slice(&rec);
+        this.tx_buf.extend_from_slice(&content);
+
+        // 4. 尽力写到底层 socket（写不完保留在 tx_buf 中，由后续 poll_write/poll_flush 继续发）
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.conn).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "utls: 写入 0 字节",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.tx_buf.advance(n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
+            }
+        }
+
+        Poll::Ready(Ok(take))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.as_mut().get_mut().conn).poll_flush(cx)
+        let this = self.as_mut().get_mut();
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.conn).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "utls: 写入 0 字节",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => {
+                    this.tx_buf.advance(n);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut this.conn).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
-        // 发 close_notify：inner type 21，payload [1, 0]（尽力而为，一次）
+        // 1. 先排空 tx_buf
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.conn).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(0)) => break,
+                Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        // 2. 发 close_notify：inner type 21，payload [1, 0]（尽力而为，一次）
         if !this.tx_closed {
             this.tx_closed = true;
             let mut content = BytesMut::from(&[0x01u8, 0x00][..]);
@@ -1319,18 +1359,18 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for UtlsStream<S> {
             let mut rec = [REC_APPDATA, 0x03, 0x03, 0, 0];
             rec[3] = (clen >> 8) as u8;
             rec[4] = clen as u8;
-            let mut out = Vec::new();
             if this.tx.seal(&rec, &mut content).is_ok() {
-                out.extend_from_slice(&rec);
-                out.extend_from_slice(&content);
+                this.tx_buf.extend_from_slice(&rec);
+                this.tx_buf.extend_from_slice(&content);
             }
-            let mut off = 0usize;
-            while off < out.len() {
-                let n = std::task::ready!(Pin::new(&mut this.conn).poll_write(cx, &out[off..]))?;
-                if n == 0 {
-                    break;
-                }
-                off += n;
+        }
+        // 3. 尽力排空 close_notify
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.conn).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(0)) => break,
+                Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
         }
         Pin::new(&mut this.conn).poll_shutdown(cx)
@@ -1413,19 +1453,11 @@ mod tests {
                 let Ok((s, _)) = l.accept().await else { break };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    let Ok(mut tls) = acceptor.accept(s).await else {
+                    let Ok(tls) = acceptor.accept(s).await else {
                         return;
                     };
-                    let mut b = vec![0u8; 32 * 1024];
-                    loop {
-                        let n = match tls.read(&mut b).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => n,
-                        };
-                        if tls.write_all(&b[..n]).await.is_err() {
-                            break;
-                        }
-                    }
+                    let (mut r_tls, mut w_tls) = tokio::io::split(tls);
+                    let _ = tokio::io::copy(&mut r_tls, &mut w_tls).await;
                 });
             }
         });
@@ -1462,11 +1494,15 @@ mod tests {
         let send_payload = payload.clone();
         let send_task = tokio::spawn(async move {
             wh.write_all(&send_payload).await.unwrap();
+            wh.flush().await.unwrap();
         });
         let mut got = Vec::with_capacity(payload.len());
         let mut rb = [0u8; 64 * 1024];
         while got.len() < payload.len() {
-            let n = rh.read(&mut rb).await.unwrap();
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), rh.read(&mut rb))
+                .await
+                .expect("读取回显超时")
+                .unwrap();
             assert!(n > 0, "对端提前关闭");
             got.extend_from_slice(&rb[..n]);
         }

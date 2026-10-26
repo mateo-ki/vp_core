@@ -184,7 +184,11 @@ pub async fn wrap_transport(
         return Ok(Box::new(s));
     }
     if cfg.tls || cfg.reality.is_some() {
-        let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() || cfg.fingerprint.is_some() {
+        // uTLS（浏览器指纹）只在 REALITY 握手认证时使用：REALITY 依赖 uTLS ClientHello
+        // 里的 auth 载荷。普通 TLS 站点（尤其 CDN 前置的 ws/grpc 节点）实测与手写 uTLS
+        // 存在互操作缺陷（服务端 TLS 栈半卡：ws 帧头可达、payload 永不到达），一律走
+        // rustls 标准栈——Mihomo 的 Go TLS 同样不是真 uTLS，指纹差异不影响可用性。
+        let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() {
             let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
             let s = utls::utls_connect(
                 stream,

@@ -1157,11 +1157,18 @@ impl<S: tokio::io::AsyncRead + Unpin> UtlsStream<S> {
                 Ok(false)
             }
             REC_ALERT => {
+                // 告警载荷可能只有 1 字节（截断/非标实现），一律安全取字节
                 if data.len() >= 2 && data[1] == 0 {
                     self.rx_closed = true;
                     Ok(false)
                 } else {
-                    Err(Error::ProtoMsg(format!("utls: 对端告警 {}", data[1])))
+                    let code = data.get(1).copied().unwrap_or(data.first().copied().unwrap_or(0));
+                    if data.is_empty() {
+                        self.rx_closed = true;
+                        Ok(false)
+                    } else {
+                        Err(Error::ProtoMsg(format!("utls: 对端告警 {code}")))
+                    }
                 }
             }
             t => Err(Error::ProtoMsg(format!("utls: 记录内类型 {t}"))),

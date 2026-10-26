@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -22,9 +22,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use vp_common::{DstAddr, Error, Result};
 use vp_config::SshCfg;
+use vp_core::Outbound;
 use vp_core::session::Session;
 use vp_core::stream::ProxyStream;
-use vp_core::Outbound;
 
 use vp_transport as transport;
 
@@ -175,13 +175,11 @@ fn qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 }
 
 fn chacha20_xor(key: &[u8; 32], counter: u64, nonce: &[u8; 8], data: &mut [u8]) {
-    let mut ctr = counter;
-    for chunk in data.chunks_mut(64) {
+    for (ctr, chunk) in (counter..).zip(data.chunks_mut(64)) {
         let ks = chacha20_block(key, ctr, nonce);
         for (b, k) in chunk.iter_mut().zip(ks.iter()) {
             *b ^= k;
         }
-        ctr += 1;
     }
 }
 
@@ -290,7 +288,7 @@ async fn read_plain_packet<R: AsyncRead + Unpin>(io: &mut R) -> Result<Vec<u8>> 
     let mut l = [0u8; 4];
     io.read_exact(&mut l).await?;
     let len = u32::from_be_bytes(l) as usize;
-    if len > MAX_PACKET || len < 2 {
+    if !(2..=MAX_PACKET).contains(&len) {
         return Err(Error::ProtoMsg(format!("ssh: 明文包长度非法 {len}")));
     }
     let mut body = vec![0u8; len];
@@ -309,7 +307,10 @@ async fn write_plain_packet<W: AsyncWrite + Unpin>(io: &mut W, payload: &[u8]) -
 }
 
 /// 加密阶段读（async；握手尾声与服务端共用）
-async fn read_cipher_packet<R: AsyncRead + Unpin>(io: &mut R, rx: &mut SshCipher) -> Result<Vec<u8>> {
+async fn read_cipher_packet<R: AsyncRead + Unpin>(
+    io: &mut R,
+    rx: &mut SshCipher,
+) -> Result<Vec<u8>> {
     let mut enc_len = [0u8; 4];
     io.read_exact(&mut enc_len).await?;
     let len = rx.open_len(&enc_len)?;
@@ -328,7 +329,11 @@ async fn read_cipher_packet<R: AsyncRead + Unpin>(io: &mut R, rx: &mut SshCipher
     Ok(body[1..body.len() - pad].to_vec())
 }
 
-async fn write_cipher_packet<W: AsyncWrite + Unpin>(io: &mut W, tx: &mut SshCipher, payload: &[u8]) -> Result<()> {
+async fn write_cipher_packet<W: AsyncWrite + Unpin>(
+    io: &mut W,
+    tx: &mut SshCipher,
+    payload: &[u8],
+) -> Result<()> {
     io.write_all(&tx.seal(payload)).await?;
     io.flush().await?;
     Ok(())
@@ -345,15 +350,15 @@ fn kexinit_payload() -> Vec<u8> {
     p.extend_from_slice(&cookie);
     for list in [
         "curve25519-sha256,curve25519-sha256@libssh.org", // kex
-        "ssh-ed25519",                                     // hostkey
-        "chacha20-poly1305@openssh.com",                   // enc c2s
-        "chacha20-poly1305@openssh.com",                   // enc s2c
-        "",                                                // mac c2s（AEAD 内置）
-        "",                                                // mac s2c
-        "none",                                            // comp c2s
-        "none",                                            // comp s2c
-        "",                                                // lang c2s
-        "",                                                // lang s2c
+        "ssh-ed25519",                                    // hostkey
+        "chacha20-poly1305@openssh.com",                  // enc c2s
+        "chacha20-poly1305@openssh.com",                  // enc s2c
+        "",                                               // mac c2s（AEAD 内置）
+        "",                                               // mac s2c
+        "none",                                           // comp c2s
+        "none",                                           // comp s2c
+        "",                                               // lang c2s
+        "",                                               // lang s2c
     ] {
         put_string(&mut p, list.as_bytes());
     }
@@ -385,7 +390,10 @@ fn derive_key(k_mpint: &[u8], h: &[u8], ch: u8, session_id: &[u8], need: usize) 
 
 fn hostkey_fingerprint(ks: &[u8]) -> String {
     use base64::Engine;
-    format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(sha256(ks)))
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(sha256(ks))
+    )
 }
 
 /// 解析未加密 OpenSSH 格式 ed25519 私钥（openssh-key-v1，kdf=none）
@@ -400,7 +408,9 @@ fn parse_ed25519_private_key(pem: &str) -> Result<(Vec<u8>, [u8; 32])> {
         .decode(body.as_bytes())
         .map_err(|_| Error::Config("ssh: 私钥 base64 解码失败".into()))?;
     if !der.starts_with(b"openssh-key-v1\x00") {
-        return Err(Error::Config("ssh: 仅支持 OpenSSH 格式（openssh-key-v1）ed25519 私钥".into()));
+        return Err(Error::Config(
+            "ssh: 仅支持 OpenSSH 格式（openssh-key-v1）ed25519 私钥".into(),
+        ));
     }
     let mut c = Cur::new(&der);
     c.take(15)?;
@@ -414,7 +424,9 @@ fn parse_ed25519_private_key(pem: &str) -> Result<(Vec<u8>, [u8; 32])> {
     let pubkey = c.string()?.to_vec();
     let section = c.string()?;
     if cipher != b"none" {
-        return Err(Error::Config("ssh: 私钥已加密（bcrypt KDF），请提供无口令私钥".into()));
+        return Err(Error::Config(
+            "ssh: 私钥已加密（bcrypt KDF），请提供无口令私钥".into(),
+        ));
     }
     let mut s = Cur::new(section);
     let check1 = s.u32()?;
@@ -475,11 +487,16 @@ impl SshOutbound {
     }
 
     async fn connect_io(&self, dst: &DstAddr) -> Result<SshStream<Box<dyn ProxyStream>>> {
-        let mut io: Box<dyn ProxyStream> =
-            transport::dial(&self.server, self.port, &transport::TransportConfig::default()).await?;
+        let mut io: Box<dyn ProxyStream> = transport::dial(
+            &self.server,
+            self.port,
+            &transport::TransportConfig::default(),
+        )
+        .await?;
 
         // 1. 版本交换
-        io.write_all(format!("{CLIENT_BANNER}\r\n").as_bytes()).await?;
+        io.write_all(format!("{CLIENT_BANNER}\r\n").as_bytes())
+            .await?;
         let mut v_s = String::new();
         for _ in 0..16 {
             let mut line = Vec::with_capacity(64);
@@ -517,8 +534,9 @@ impl SshOutbound {
 
         // 3. ECDH
         let rng = ring::rand::SystemRandom::new();
-        let priv_key = ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
-            .map_err(|_| Error::Proto("ssh: x25519 生成失败"))?;
+        let priv_key =
+            ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
+                .map_err(|_| Error::Proto("ssh: x25519 生成失败"))?;
         let pk = priv_key
             .compute_public_key()
             .map_err(|_| Error::Proto("ssh: x25519 公钥失败"))?;
@@ -589,7 +607,10 @@ impl SshOutbound {
 
         match (&self.password, &self.private_key) {
             (Some(pw), _) => self.auth_password(&mut io, &mut tx, &mut rx, pw).await?,
-            (None, Some(key)) => self.auth_publickey(&mut io, &mut tx, &mut rx, key, &session_id).await?,
+            (None, Some(key)) => {
+                self.auth_publickey(&mut io, &mut tx, &mut rx, key, &session_id)
+                    .await?
+            }
             (None, None) => unreachable!(),
         }
 
@@ -649,7 +670,10 @@ impl SshOutbound {
         match reply.first() {
             Some(&MSG_USERAUTH_SUCCESS) => Ok(()),
             Some(&MSG_USERAUTH_FAILURE) => Err(Error::Proto("ssh: 密码认证被拒绝")),
-            _ => { eprintln!("[dbg] auth reply: {reply:02x?}"); Err(Error::Proto("ssh: 认证应答异常")) }
+            _ => {
+                eprintln!("[dbg] auth reply: {reply:02x?}");
+                Err(Error::Proto("ssh: 认证应答异常"))
+            }
         }
     }
 
@@ -699,7 +723,9 @@ fn check_server_algos(i_s: &[u8]) -> Result<()> {
     let mut c = Cur::new(&i_s[1..]);
     c.take(16)?;
     let kex = c.string()?;
-    if !namelist_has(kex, b"curve25519-sha256") && !namelist_has(kex, b"curve25519-sha256@libssh.org") {
+    if !namelist_has(kex, b"curve25519-sha256")
+        && !namelist_has(kex, b"curve25519-sha256@libssh.org")
+    {
         return Err(Error::Proto("ssh: 服务端不支持 curve25519-sha256"));
     }
     let hk = c.string()?;
@@ -824,7 +850,9 @@ impl<S> SshStream<S> {
             }
             MSG_CHANNEL_WINDOW_ADJUST => {
                 let mut c = Cur::new(&payload[1..]);
-                let (Ok(recipient), Ok(n)) = (c.u32(), c.u32()) else { return false };
+                let (Ok(recipient), Ok(n)) = (c.u32(), c.u32()) else {
+                    return false;
+                };
                 if recipient == self.our_ch {
                     self.remote_window = self.remote_window.saturating_add(n);
                 }
@@ -852,8 +880,13 @@ impl<S> SshStream<S> {
                 ));
                 false
             }
-            MSG_IGNORE | MSG_DEBUG | MSG_UNIMPLEMENTED | MSG_EXT_INFO | MSG_GLOBAL_REQUEST
-            | MSG_CHANNEL_REQUEST | MSG_CHANNEL_EXTENDED_DATA => false,
+            MSG_IGNORE
+            | MSG_DEBUG
+            | MSG_UNIMPLEMENTED
+            | MSG_EXT_INFO
+            | MSG_GLOBAL_REQUEST
+            | MSG_CHANNEL_REQUEST
+            | MSG_CHANNEL_EXTENDED_DATA => false,
             _ => false,
         }
     }
@@ -931,7 +964,10 @@ impl<S> SshStream<S> {
         while let Some(cur) = self.outq.front() {
             match Pin::new(&mut self.io).poll_write(cx, &cur[self.opos..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "ssh: 写端关闭")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "ssh: 写端关闭",
+                    )));
                 }
                 Poll::Ready(Ok(n)) => {
                     self.opos += n;
@@ -967,7 +1003,7 @@ impl<S: ProxyStream + Unpin> AsyncRead for SshStream<S> {
                 return Poll::Ready(Ok(()));
             }
             if let Some(msg) = this.fatal.take() {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, msg)));
+                return Poll::Ready(Err(io::Error::other(msg)));
             }
             if this.eof {
                 return Poll::Ready(Ok(()));
@@ -985,7 +1021,10 @@ impl<S: ProxyStream + Unpin> AsyncWrite for SshStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if this.closed {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "ssh: 通道已关闭")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "ssh: 通道已关闭",
+            )));
         }
         if !this.outq.is_empty() {
             ready!(this.drive_out(cx))?;
@@ -996,7 +1035,10 @@ impl<S: ProxyStream + Unpin> AsyncWrite for SshStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let n = buf.len().min(CHANNEL_MAX_PACKET as usize).min(this.remote_window as usize);
+        let n = buf
+            .len()
+            .min(CHANNEL_MAX_PACKET as usize)
+            .min(this.remote_window as usize);
         let mut pkt = vec![MSG_CHANNEL_DATA];
         put_u32(&mut pkt, this.their_ch);
         put_string(&mut pkt, &buf[..n]);
@@ -1046,8 +1088,8 @@ mod tests {
     use ring::signature::KeyPair;
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::{mpsc, Mutex};
-    use tokio::time::{timeout, Duration};
+    use tokio::sync::{Mutex, mpsc};
+    use tokio::time::{Duration, timeout};
 
     // ------------------------------------------------------------------
     // 密码学已知向量
@@ -1168,12 +1210,16 @@ mod tests {
 
         tokio::spawn(async move {
             loop {
-                let Ok((io, _)) = listener.accept().await else { break };
+                let Ok((io, _)) = listener.accept().await else {
+                    break;
+                };
                 let k_s = k_s.clone();
                 let passwords = passwords.clone();
                 let pubkeys = pubkeys.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_ssh(io, echo_port, &k_s, &seed, &passwords, &pubkeys).await {
+                    if let Err(e) =
+                        serve_ssh(io, echo_port, &k_s, &seed, &passwords, &pubkeys).await
+                    {
                         tracing::debug!("ssh test server 会话结束: {e}");
                     }
                 });
@@ -1220,8 +1266,9 @@ mod tests {
         let e = c.string()?.to_vec();
 
         let rng = ring::rand::SystemRandom::new();
-        let priv_key = ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
-            .map_err(|_| Error::Proto("ssh-srv: x25519 生成失败"))?;
+        let priv_key =
+            ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
+                .map_err(|_| Error::Proto("ssh-srv: x25519 生成失败"))?;
         let pk = priv_key
             .compute_public_key()
             .map_err(|_| Error::Proto("ssh-srv: x25519 公钥失败"))?;
@@ -1268,7 +1315,10 @@ mod tests {
 
         // 双向写共享一个 tx 密码器（序号连续）
         let (mut r, w) = io.into_split();
-        let writer = Arc::new(Mutex::new(ServerWriter { io: w, tx: SshCipher::new(&s2c) }));
+        let writer = Arc::new(Mutex::new(ServerWriter {
+            io: w,
+            tx: SshCipher::new(&s2c),
+        }));
         let mut channels: HashMap<u32, mpsc::Sender<Vec<u8>>> = HashMap::new();
         let mut ch_counter: u32 = 0;
         let mut authed = false;
@@ -1310,8 +1360,11 @@ mod tests {
                         // blob = string(alg) + string(raw 32B key)；ring 需要裸公钥
                         let raw_key = &key[key.len().saturating_sub(32)..];
                         let key_ok = pubkeys.iter().any(|pk| pk.as_slice() == key.as_slice());
-                        let ver = ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, raw_key)
-                            .verify(&signed, sval);
+                        let ver = ring::signature::UnparsedPublicKey::new(
+                            &ring::signature::ED25519,
+                            raw_key,
+                        )
+                        .verify(&signed, sval);
                         key_ok && ver.is_ok()
                     } else {
                         false
@@ -1442,7 +1495,9 @@ mod tests {
         let l2 = l.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = l2.accept().await else { break };
+                let Ok((mut s, _)) = l2.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut b = vec![0u8; 65536];
                     loop {
@@ -1483,7 +1538,9 @@ mod tests {
         assert_eq!(&buf, b"ping-ssh");
 
         // 大回显（跨 CHANNEL_DATA 分帧，逐字节一致）
-        let big: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(40503) >> 3) as u8).collect();
+        let big: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(40503) >> 3) as u8)
+            .collect();
         let mut rb = vec![0u8; big.len()];
         let (mut rr, mut rw) = tokio::io::split(s);
         let big2 = big.clone();
@@ -1561,8 +1618,7 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(&der)
         );
 
-        let srv = start_ssh_server_with_keys(&[], &[pub_blob.clone()], echo_port)
-            .await;
+        let srv = start_ssh_server_with_keys(&[], &[pub_blob.clone()], echo_port).await;
         let out = SshOutbound::new(&SshCfg {
             server: "127.0.0.1".into(),
             port: srv.port,

@@ -40,10 +40,7 @@ enum WriteState {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ReadState {
     /// 正在读取 5 字节帧头 [cmd, content_len(2B), pad_len(2B)]
-    Header {
-        buf: [u8; 5],
-        filled: usize,
-    },
+    Header { buf: [u8; 5], filled: usize },
     /// 正在向调用方输出帧内容数据
     Content {
         cmd: u8,
@@ -51,10 +48,7 @@ enum ReadState {
         pad_len: usize,
     },
     /// 正在丢弃尾部填充字节
-    Padding {
-        cmd: u8,
-        remaining_pad: usize,
-    },
+    Padding { cmd: u8, remaining_pad: usize },
     /// 已接收到 PaddingEnd，进入裸流直通阶段
     Direct,
 }
@@ -111,7 +105,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
                 ReadState::Direct => {
                     return Pin::new(&mut this.io).poll_read(cx, buf);
                 }
-                ReadState::Header { buf: mut hdr_buf, mut filled } => {
+                ReadState::Header {
+                    buf: mut hdr_buf,
+                    mut filled,
+                } => {
                     while filled < 5 {
                         let mut read_slice = [0u8; 5];
                         let mut temp_buf = ReadBuf::new(&mut read_slice[..5 - filled]);
@@ -131,7 +128,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
                                 filled += n;
                             }
                             Poll::Pending => {
-                                this.read_state = ReadState::Header { buf: hdr_buf, filled };
+                                this.read_state = ReadState::Header {
+                                    buf: hdr_buf,
+                                    filled,
+                                };
                                 return Poll::Pending;
                             }
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -240,10 +240,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VisionStream<S> {
                                 remaining_pad = remaining_pad.saturating_sub(n);
                             }
                             Poll::Pending => {
-                                this.read_state = ReadState::Padding {
-                                    cmd,
-                                    remaining_pad,
-                                };
+                                this.read_state = ReadState::Padding { cmd, remaining_pad };
                                 return Poll::Pending;
                             }
                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -287,9 +284,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
         this.write_offset = 0;
 
         match this.write_state {
-            WriteState::Direct => {
-                Pin::new(&mut this.io).poll_write(cx, buf)
-            }
+            WriteState::Direct => Pin::new(&mut this.io).poll_write(cx, buf),
             WriteState::Initial => {
                 if buf.is_empty() {
                     return Poll::Ready(Ok(0));
@@ -326,7 +321,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
                     this.write_buf.push(CMD_PADDING_END);
                     this.write_buf.extend_from_slice(&content_len.to_be_bytes());
                     this.write_buf.extend_from_slice(&[0, 0]); // pad_len = 0
-                    this.write_buf.extend_from_slice(&buf[..content_len as usize]);
+                    this.write_buf
+                        .extend_from_slice(&buf[..content_len as usize]);
 
                     this.write_state = WriteState::Direct;
                 }
@@ -355,7 +351,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
                 this.write_buf.push(CMD_PADDING_END);
                 this.write_buf.extend_from_slice(&content_len.to_be_bytes());
                 this.write_buf.extend_from_slice(&[0, 0]); // pad_len = 0
-                this.write_buf.extend_from_slice(&buf[..content_len as usize]);
+                this.write_buf
+                    .extend_from_slice(&buf[..content_len as usize]);
 
                 this.write_state = WriteState::Direct;
 

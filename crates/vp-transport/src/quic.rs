@@ -17,7 +17,9 @@ pub struct QuicConfig {
 
 impl Default for QuicConfig {
     fn default() -> Self {
-        QuicConfig { alpn: "vpcore".into() }
+        QuicConfig {
+            alpn: "vpcore".into(),
+        }
     }
 }
 
@@ -39,7 +41,9 @@ fn client_config(skip_verify: bool, alpn: &str) -> quinn::ClientConfig {
             .set_certificate_verifier(Arc::new(NoVerify));
     }
     crypto.alpn_protocols = vec![alpn.as_bytes().to_vec()];
-    let mut cfg = quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client config")));
+    let mut cfg = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic client config"),
+    ));
     cfg.transport_config(Arc::new(transport_config()));
     cfg
 }
@@ -153,17 +157,11 @@ impl AsyncWrite for QuicStream {
         AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf)
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         AsyncWrite::poll_flush(Pin::new(&mut self.send), cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         AsyncWrite::poll_shutdown(Pin::new(&mut self.send), cx)
     }
 }
@@ -177,9 +175,12 @@ mod tests {
     async fn quic_loopback() {
         let _ = tracing_subscriber::fmt::try_init();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let sconfig =
-            server_config(cert.cert.der().to_vec(), cert.key_pair.serialize_der(), "vpcore")
-                .unwrap();
+        let sconfig = server_config(
+            cert.cert.der().to_vec(),
+            cert.key_pair.serialize_der(),
+            "vpcore",
+        )
+        .unwrap();
         let endpoint = quinn::Endpoint::server(sconfig, "127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = endpoint.local_addr().unwrap();
 

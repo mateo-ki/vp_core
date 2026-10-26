@@ -11,7 +11,7 @@ use vp_common::{DstAddr, Error, Result};
 use vp_config::TrojanCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, ProxyStream};
 
 use crate::direct::DirectOutbound;
@@ -64,14 +64,22 @@ impl TrojanOutbound {
         })
     }
 
-    async fn handshake<S>(&self, mut io: S, dst: &DstAddr, initial: Option<&[u8]>) -> Result<Box<dyn ProxyStream>>
+    async fn handshake<S>(
+        &self,
+        mut io: S,
+        dst: &DstAddr,
+        initial: Option<&[u8]>,
+    ) -> Result<Box<dyn ProxyStream>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut req = Vec::with_capacity(96);
         // hex(sha224) 56 字符
         req.extend_from_slice(
-            format!("{}", self.hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+            self.hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
                 .as_bytes(),
         );
         req.extend_from_slice(b"\r\n");
@@ -150,7 +158,8 @@ impl TrojanInbound {
         // [56B hex hash][CRLF][cmd][atyp addr port][CRLF]
         let mut head = [0u8; 58];
         stream.read_exact(&mut head).await?;
-        let hex = std::str::from_utf8(&head[..56]).map_err(|_| Error::Proto("trojan 密码非 ascii"))?;
+        let hex =
+            std::str::from_utf8(&head[..56]).map_err(|_| Error::Proto("trojan 密码非 ascii"))?;
         if !self.passwords.iter().any(|h| {
             let expect: String = h.iter().map(|b| format!("{b:02x}")).collect();
             expect == hex

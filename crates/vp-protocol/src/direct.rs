@@ -24,7 +24,10 @@ impl DirectOutbound {
             Host::Ip(ip) => Ok(vec![std::net::SocketAddr::new(*ip, dst.port)]),
             Host::Domain(domain) => {
                 let ips = self.dns.resolve_domain(domain, self.ipv6).await?;
-                Ok(ips.iter().map(|ip| std::net::SocketAddr::new(*ip, dst.port)).collect())
+                Ok(ips
+                    .iter()
+                    .map(|ip| std::net::SocketAddr::new(*ip, dst.port))
+                    .collect())
             }
         }
     }
@@ -44,7 +47,11 @@ impl Outbound for DirectOutbound {
                     Host::Ip(ip) if ip.is_loopback() => {
                         return Err(Error::Proto("检测到直接回环死循环 (loopback to inbound)"));
                     }
-                    Host::Domain(d) if d.eq_ignore_ascii_case("localhost") || d == "127.0.0.1" || d == "::1" => {
+                    Host::Domain(d)
+                        if d.eq_ignore_ascii_case("localhost")
+                            || d == "127.0.0.1"
+                            || d == "::1" =>
+                    {
                         return Err(Error::Proto("检测到直接回环死循环 (loopback to inbound)"));
                     }
                     _ => {}

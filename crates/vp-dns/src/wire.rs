@@ -32,7 +32,11 @@ pub fn build_query(id: u16, domain: &str, qtype: QType) -> Vec<u8> {
     out.extend_from_slice(&[0x00, 0x00]); // an
     out.extend_from_slice(&[0x00, 0x00]); // ns
     out.extend_from_slice(&[0x00, 0x00]); // ar
-    for label in domain.trim_end_matches('.').split('.').filter(|s| !s.is_empty()) {
+    for label in domain
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|s| !s.is_empty())
+    {
         out.push(label.len() as u8);
         out.extend_from_slice(label.as_bytes());
     }
@@ -192,7 +196,11 @@ pub fn build_ptr_response(query: &[u8], domain: &str) -> Vec<u8> {
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     // rdata: 域名标签
     let mut rdata = Vec::new();
-    for label in domain.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
+    for label in domain
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|l| !l.is_empty())
+    {
         rdata.push(label.len() as u8);
         rdata.extend_from_slice(label.as_bytes());
     }
@@ -254,12 +262,7 @@ pub fn parse_response(buf: &[u8]) -> Option<Message> {
         let rdlen = r.u16()? as usize;
         let rdata_start = r.pos;
         let data = match rtype {
-            TYPE_A if rdlen == 4 => RData::A(Ipv4Addr::new(
-                r.u8()?,
-                r.u8()?,
-                r.u8()?,
-                r.u8()?,
-            )),
+            TYPE_A if rdlen == 4 => RData::A(Ipv4Addr::new(r.u8()?, r.u8()?, r.u8()?, r.u8()?)),
             TYPE_AAAA if rdlen == 16 => {
                 let mut o = [0u8; 16];
                 for b in o.iter_mut() {
@@ -275,7 +278,12 @@ pub fn parse_response(buf: &[u8]) -> Option<Message> {
         };
         // 对齐到 rdata 末尾（name() 可能未消费完整 rdata）
         r.pos = rdata_start + rdlen;
-        answers.push(Answer { name, rtype, ttl, data });
+        answers.push(Answer {
+            name,
+            rtype,
+            ttl,
+            data,
+        });
     }
     Some(Message { id, rcode, answers })
 }
@@ -330,9 +338,13 @@ mod tests {
         m.extend_from_slice(&[0, 1, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0]);
         m.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
         // CNAME a.com -> b.com
-        m.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 30, 0, 7, 1, b'b', 3, b'c', b'o', b'm', 0]);
+        m.extend_from_slice(&[
+            0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 30, 0, 7, 1, b'b', 3, b'c', b'o', b'm', 0,
+        ]);
         // A b.com -> 9.9.9.9
-        m.extend_from_slice(&[1, b'b', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 9, 9, 9, 9]);
+        m.extend_from_slice(&[
+            1, b'b', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 9, 9, 9, 9,
+        ]);
         let msg = parse_response(&m).unwrap();
         assert_eq!(msg.answers.len(), 2);
         assert!(matches!(msg.answers[0].data, RData::Cname(ref c) if c == "b.com"));

@@ -14,7 +14,7 @@ use vp_common::{DstAddr, Error, Result};
 use vp_config::SsCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::ss::{AeadChunkCodec, Cipher};
 
@@ -42,7 +42,12 @@ pub struct SsCryptoStream<S> {
 
 impl<S> SsCryptoStream<S> {
     /// 客户端：立即发送自身 salt + 首块（目标地址），接收方向等待对端 salt
-    pub fn new_client(inner: S, cipher: Cipher, key: Vec<u8>, first_payload: Vec<u8>) -> Result<Self> {
+    pub fn new_client(
+        inner: S,
+        cipher: Cipher,
+        key: Vec<u8>,
+        first_payload: Vec<u8>,
+    ) -> Result<Self> {
         let mut salt = vec![0u8; cipher.salt_len()];
         vp_common::rand_bytes(&mut salt);
         let sub = cipher.subkey(&key, &salt)?;
@@ -101,7 +106,7 @@ impl<S> SsCryptoStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "ss: 写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(n)) => self.out.advance(n),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -260,9 +265,10 @@ impl SsOutbound {
                     .host
                     .clone()
                     .ok_or_else(|| Error::Config("shadow-tls plugin-opts 缺少 host".into()))?;
-                let password = o.password.clone().ok_or_else(|| {
-                    Error::Config("shadow-tls plugin-opts 缺少 password".into())
-                })?;
+                let password = o
+                    .password
+                    .clone()
+                    .ok_or_else(|| Error::Config("shadow-tls plugin-opts 缺少 password".into()))?;
                 Some(crate::shadowtls::ShadowTlsDial {
                     host,
                     port: o.port.unwrap_or(443),
@@ -320,8 +326,12 @@ impl Outbound for SsOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let tcp = transport::dial(&self.server, self.port, &transport::TransportConfig::default())
-            .await?;
+        let tcp = transport::dial(
+            &self.server,
+            self.port,
+            &transport::TransportConfig::default(),
+        )
+        .await?;
         let io = match &self.shadow_tls {
             Some(st) => {
                 Box::new(crate::shadowtls::client_handshake(tcp, &st.password, &st.host).await?)
@@ -346,9 +356,13 @@ impl Outbound for SsOutbound {
     }
 
     async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        let conn =
-            crate::udp_out::SsUdpConn::bind(&self.server, self.port, self.cipher.clone(), self.key.clone())
-                .await?;
+        let conn = crate::udp_out::SsUdpConn::bind(
+            &self.server,
+            self.port,
+            self.cipher.clone(),
+            self.key.clone(),
+        )
+        .await?;
         Ok(Box::new(conn))
     }
 
@@ -406,15 +420,25 @@ impl SsInbound {
         let nat: Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, Arc<tokio::net::UdpSocket>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
         loop {
-            let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                continue;
+            };
             let salt_len = self.cipher.salt_len();
             if n <= salt_len {
                 continue;
             }
-            let Ok(sub) = self.cipher.subkey(&self.key, &buf[..salt_len]) else { continue };
-            let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) else { continue };
-            let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else { continue };
-            let Ok((dst, used)) = decode_socks_addr(&plain) else { continue };
+            let Ok(sub) = self.cipher.subkey(&self.key, &buf[..salt_len]) else {
+                continue;
+            };
+            let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) else {
+                continue;
+            };
+            let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else {
+                continue;
+            };
+            let Ok((dst, used)) = decode_socks_addr(&plain) else {
+                continue;
+            };
             let payload = plain[used..].to_vec();
 
             // 客户端 → 目标 socket（每客户端一个，惰性创建；锁内不做 await）
@@ -460,8 +484,12 @@ impl SsInbound {
                         plain.extend_from_slice(&rbuf[..rn]);
                         let mut salt = vec![0u8; cipher.salt_len()];
                         vp_common::rand_bytes(&mut salt);
-                        let Ok(sub) = cipher.subkey(&key, &salt) else { continue };
-                        let Ok(mut codec) = AeadChunkCodec::new(&cipher, &sub) else { continue };
+                        let Ok(sub) = cipher.subkey(&key, &salt) else {
+                            continue;
+                        };
+                        let Ok(mut codec) = AeadChunkCodec::new(&cipher, &sub) else {
+                            continue;
+                        };
                         let chunk = codec.seal_chunk(&plain);
                         let mut dgram = salt;
                         dgram.extend_from_slice(&chunk);
@@ -542,7 +570,8 @@ impl SsInbound {
         let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
         let remote = self.direct.connect_stream(&sess, &dst).await?;
 
-        let client = SsCryptoStream::new_server(stream, self.cipher.clone(), self.key.clone(), dec, raw)?;
+        let client =
+            SsCryptoStream::new_server(stream, self.cipher.clone(), self.key.clone(), dec, raw)?;
         let meta = vp_core::conn_table::ConnMeta {
             id: sess.id,
             inbound: self.tag.clone(),
@@ -637,16 +666,14 @@ impl Inbound for SsInbound {
                 Err(e) => {
                     last_err = Some(e);
                     // 退避，降低并发测试时的连续撞车
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        5 + attempt as u64 * 10,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5 + attempt as u64 * 10))
+                        .await;
                 }
             }
         }
-        Err(vp_common::Error::Io(
-            last_err.unwrap_or_else(|| std::io::Error::other("udp bind 重试耗尽")),
-        ))
+        Err(vp_common::Error::Io(last_err.unwrap_or_else(|| {
+            std::io::Error::other("udp bind 重试耗尽")
+        })))
     }
 }
 

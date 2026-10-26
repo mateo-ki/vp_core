@@ -61,7 +61,12 @@ impl ConnTable {
         let down = Arc::new(AtomicU64::new(0));
         self.inner.lock().unwrap().insert(
             id,
-            ConnEntry { meta, up: up.clone(), down: down.clone(), aborts: Vec::new() },
+            ConnEntry {
+                meta,
+                up: up.clone(),
+                down: down.clone(),
+                aborts: Vec::new(),
+            },
         );
         RegisteredConn { id, up, down }
     }

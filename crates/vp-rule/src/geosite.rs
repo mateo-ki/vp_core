@@ -203,7 +203,11 @@ impl GeoSiteDb {
                 }
             }
         }
-        Some(CompiledSite { trie, keywords, regexes })
+        Some(CompiledSite {
+            trie,
+            keywords,
+            regexes,
+        })
     }
 }
 
@@ -234,12 +238,12 @@ mod tests {
     /// 手工构造一个最小 .dat
     fn build_dat() -> Vec<u8> {
         // Domain { type=Full(3), value="example.com" }
-        let mut d1 = vec![(1u8 << 3) | 0, 3]; // field1 varint 3
+        let mut d1 = vec![1u8 << 3, 3]; // field1 varint 3
         d1.push((2 << 3) | 2); // field2 len-delim
         d1.push(b"example.com".len() as u8);
         d1.extend_from_slice(b"example.com");
         // Domain { type=Root(2), value="root.com" }
-        let mut d2 = vec![(1u8 << 3) | 0, 2];
+        let mut d2 = vec![1u8 << 3, 2];
         d2.push((2 << 3) | 2);
         d2.push(b"root.com".len() as u8);
         d2.extend_from_slice(b"root.com");

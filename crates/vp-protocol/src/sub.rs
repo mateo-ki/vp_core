@@ -47,8 +47,10 @@ impl SubNode {
             let port_line = if port.is_empty() {
                 String::new()
             } else {
-                format!("
-      port: {port}")
+                format!(
+                    "
+      port: {port}"
+                )
             };
             out.push_str(&format!(
                 "
@@ -72,9 +74,7 @@ impl SubNode {
         }
         // reality-opts 块（若存在）
         if let Some((_, pbk)) = self.fields.iter().find(|(k, _)| k == "__reality_pbk") {
-            out.push_str(&format!(
-                "\n    reality-opts:\n      public-key: {pbk}"
-            ));
+            out.push_str(&format!("\n    reality-opts:\n      public-key: {pbk}"));
             if let Some((_, sid)) = self.fields.iter().find(|(k, _)| k == "__reality_sid") {
                 if !sid.is_empty() {
                     out.push_str(&format!("\n      short-id: {sid}"));
@@ -125,11 +125,16 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
     } else if let Some(rest) = line.strip_prefix("naive://") {
         parse_naive(rest, true)
     } else {
-        Err(Error::Config(format!("无法识别的分享链接: {}", &line[..line.len().min(32)])))
+        Err(Error::Config(format!(
+            "无法识别的分享链接: {}",
+            &line[..line.len().min(32)]
+        )))
     }
 }
 
-fn split_main(rest: &str) -> Result<(String, String, String, HashMap<String, String>, String)> {
+type UriParts = (String, String, String, HashMap<String, String>, String);
+
+fn split_main(rest: &str) -> Result<UriParts> {
     // userinfo@host:port?params#name
     let (body, name) = match rest.split_once('#') {
         Some((b, n)) => (b, urldecode(n)),
@@ -147,9 +152,19 @@ fn split_main(rest: &str) -> Result<(String, String, String, HashMap<String, Str
                 .map(|(k, v)| (k.to_string(), urldecode(v)))
         })
         .collect();
-    let (userinfo, hostport) = main.rsplit_once('@').ok_or(Error::Config("缺少 @".into()))?;
-    let (host, port) = hostport.rsplit_once(':').ok_or(Error::Config("缺少端口".into()))?;
-    Ok((userinfo.to_string(), host.to_string(), port.to_string(), params, name))
+    let (userinfo, hostport) = main
+        .rsplit_once('@')
+        .ok_or(Error::Config("缺少 @".into()))?;
+    let (host, port) = hostport
+        .rsplit_once(':')
+        .ok_or(Error::Config("缺少端口".into()))?;
+    Ok((
+        userinfo.to_string(),
+        host.to_string(),
+        port.to_string(),
+        params,
+        name,
+    ))
 }
 
 fn parse_vless(rest: &str) -> Result<SubNode> {
@@ -188,7 +203,11 @@ fn parse_vless(rest: &str) -> Result<SubNode> {
         if let Some(spx) = p.get("spx").or_else(|| p.get("spiderX")) {
             f.push(("__reality_spx".into(), q(spx)));
         }
-        let fp = p.get("fp").or_else(|| p.get("fingerprint")).cloned().unwrap_or_else(|| "chrome".into());
+        let fp = p
+            .get("fp")
+            .or_else(|| p.get("fingerprint"))
+            .cloned()
+            .unwrap_or_else(|| "chrome".into());
         f.push(("client-fingerprint".into(), fp));
     }
     f.push(("network".into(), network.clone()));
@@ -221,15 +240,15 @@ fn parse_vmess(rest: &str) -> Result<SubNode> {
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(rest.trim())
-        .or_else(|_| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(rest.trim())
-        })
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(rest.trim()))
         .map_err(|_| Error::Config("vmess base64 解码失败".into()))?;
-    let j: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|e| Error::Config(format!("vmess json: {e}")))?;
+    let j: serde_json::Value =
+        serde_json::from_slice(&decoded).map_err(|e| Error::Config(format!("vmess json: {e}")))?;
     let get = |k: &str| j[k].as_str().unwrap_or("").to_string();
     let host = get("add");
-    let port = j["port"].as_u64().unwrap_or_else(|| get("port").parse().unwrap_or(443));
+    let port = j["port"]
+        .as_u64()
+        .unwrap_or_else(|| get("port").parse().unwrap_or(443));
     let mut f = vec![
         ("name".into(), q(&get("ps"))),
         ("type".into(), "vmess".into()),
@@ -237,8 +256,18 @@ fn parse_vmess(rest: &str) -> Result<SubNode> {
         ("port".into(), port.to_string()),
         ("uuid".into(), get("id")),
         ("alterId".into(), j["aid"].as_u64().unwrap_or(0).to_string()),
-        ("cipher".into(), get("scy").is_empty().then(|| "auto".into()).unwrap_or_else(|| get("scy"))),
-        ("tls".into(), get("tls").eq_ignore_ascii_case("tls").to_string()),
+        (
+            "cipher".into(),
+            if get("scy").is_empty() {
+                "auto".into()
+            } else {
+                get("scy")
+            },
+        ),
+        (
+            "tls".into(),
+            get("tls").eq_ignore_ascii_case("tls").to_string(),
+        ),
     ];
     let net = get("net");
     if !get("sni").is_empty() {
@@ -251,7 +280,10 @@ fn parse_vmess(rest: &str) -> Result<SubNode> {
         f.push(("__ws_path".into(), q(&get("path"))));
         f.push(("__ws_host".into(), q(&get("host"))));
     } else if net == "grpc" {
-        f.push(("grpc-opts".into(), format!("{{grpc-service-name: {}}}", get("path"))));
+        f.push((
+            "grpc-opts".into(),
+            format!("{{grpc-service-name: {}}}", get("path")),
+        ));
     }
     Ok(SubNode { fields: f })
 }
@@ -287,13 +319,23 @@ fn parse_trojan(rest: &str) -> Result<SubNode> {
         if let Some(spx) = p.get("spx").or_else(|| p.get("spiderX")) {
             f.push(("__reality_spx".into(), q(spx)));
         }
-        let fp = p.get("fp").or_else(|| p.get("fingerprint")).cloned().unwrap_or_else(|| "chrome".into());
+        let fp = p
+            .get("fp")
+            .or_else(|| p.get("fingerprint"))
+            .cloned()
+            .unwrap_or_else(|| "chrome".into());
         f.push(("client-fingerprint".into(), fp));
     }
     f.push(("network".into(), network.clone()));
     if network == "ws" {
-        f.push(("__ws_path".into(), q(&p.get("path").cloned().unwrap_or_else(|| "/".into()))));
-        f.push(("__ws_host".into(), q(&p.get("host").cloned().unwrap_or_default())));
+        f.push((
+            "__ws_path".into(),
+            q(&p.get("path").cloned().unwrap_or_else(|| "/".into())),
+        ));
+        f.push((
+            "__ws_host".into(),
+            q(&p.get("host").cloned().unwrap_or_default()),
+        ));
     }
     Ok(SubNode { fields: f })
 }
@@ -339,7 +381,10 @@ fn parse_anytls(rest: &str) -> Result<SubNode> {
     if insecure {
         f.push(("skip-cert-verify".into(), "true".into()));
     }
-    if p.get("udp").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+    if p.get("udp")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
         f.push(("udp".into(), "true".into()));
     }
     if let Some(fp) = p.get("fp").or_else(|| p.get("client-fingerprint")) {
@@ -362,7 +407,10 @@ fn parse_brook(rest: &str) -> Result<SubNode> {
         let (_kind, qs) = body.split_once('?').unwrap_or((body, ""));
         let p: HashMap<String, String> = qs
             .split('&')
-            .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), urldecode(v))))
+            .filter_map(|kv| {
+                kv.split_once('=')
+                    .map(|(k, v)| (k.to_string(), urldecode(v)))
+            })
             .collect();
         let server = p
             .get("server")
@@ -424,8 +472,8 @@ fn parse_mieru(rest: &str) -> Result<SubNode> {
             ("type".into(), "mieru".into()),
             ("server".into(), host),
             ("port".into(), port),
-            ("username".into(), q(&username)),
-            ("password".into(), q(&password)),
+            ("username".into(), q(username)),
+            ("password".into(), q(password)),
         ],
     })
 }
@@ -440,7 +488,11 @@ fn parse_snell(rest: &str) -> Result<SubNode> {
         ("port".into(), port),
         ("psk".into(), q(&psk)),
     ];
-    let version = p.get("version").or_else(|| p.get("v")).cloned().unwrap_or_else(|| "4".into());
+    let version = p
+        .get("version")
+        .or_else(|| p.get("v"))
+        .cloned()
+        .unwrap_or_else(|| "4".into());
     f.push(("version".into(), version));
     if let Some(obfs) = p.get("obfs").or_else(|| p.get("mode")) {
         f.push(("obfs".into(), q(obfs)));
@@ -448,7 +500,10 @@ fn parse_snell(rest: &str) -> Result<SubNode> {
     if let Some(h) = p.get("host").or_else(|| p.get("obfs-host")) {
         f.push(("host".into(), q(h)));
     }
-    if p.get("udp").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+    if p.get("udp")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
         f.push(("udp".into(), "true".into()));
     }
     Ok(SubNode { fields: f })
@@ -542,7 +597,7 @@ fn parse_ssr(rest: &str) -> Result<SubNode> {
     if let Some(pp) = proto_param {
         f.push(("protocol-param".into(), q(&pp)));
     }
-    if params.get("udpport").is_some() || params.get("uot").map(|v| *v == "1").unwrap_or(false) {
+    if params.contains_key("udpport") || params.get("uot").map(|v| *v == "1").unwrap_or(false) {
         f.push(("udp".into(), "true".into()));
     }
 
@@ -570,7 +625,10 @@ fn parse_naive(rest: &str, default_tls: bool) -> Result<SubNode> {
         .or_else(|| p.get("allowInsecure").map(|v| v == "1" || v == "true"))
         .unwrap_or(false);
     let fp = p.get("fp").or_else(|| p.get("fingerprint")).cloned();
-    let udp = p.get("udp").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let udp = p
+        .get("udp")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
 
     let mut fields = vec![
         ("name".into(), q(&name)),
@@ -607,11 +665,15 @@ fn parse_ss(rest: &str) -> Result<SubNode> {
         None => (rest, String::new()),
     };
     let (main, qs) = body.split_once('?').unwrap_or((body, ""));
-    let (encoded, hostport) = main.rsplit_once('@').ok_or(Error::Config("ss 缺少 @".into()))?;
+    let (encoded, hostport) = main
+        .rsplit_once('@')
+        .ok_or(Error::Config("ss 缺少 @".into()))?;
     // SIP002: plugin=shadow-tls;mode=v3;host=xx;password=yy（urlencoded）
     let mut stls: Option<Vec<(String, String)>> = None;
     for kv in qs.split('&') {
-        let Some((k, v)) = kv.split_once('=') else { continue };
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
         if urldecode(k) != "plugin" {
             continue;
         }
@@ -619,7 +681,10 @@ fn parse_ss(rest: &str) -> Result<SubNode> {
         let mut parts = p.split(';');
         let name = parts.next().unwrap_or_default().to_string();
         let opts: Vec<(String, String)> = parts
-            .filter_map(|o| o.split_once('=').map(|(a, b)| (a.to_string(), b.to_string())))
+            .filter_map(|o| {
+                o.split_once('=')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+            })
             .collect();
         if name.contains("shadow-tls") {
             stls = Some(opts);
@@ -634,7 +699,9 @@ fn parse_ss(rest: &str) -> Result<SubNode> {
     let (method, password) = userinfo
         .split_once(':')
         .ok_or(Error::Config("ss userinfo 格式".into()))?;
-    let (host, port) = hostport.rsplit_once(':').ok_or(Error::Config("ss 缺端口".into()))?;
+    let (host, port) = hostport
+        .rsplit_once(':')
+        .ok_or(Error::Config("ss 缺端口".into()))?;
     let mut fields = vec![
         ("name".into(), q(&name)),
         ("type".into(), "ss".into()),
@@ -732,7 +799,9 @@ pub fn parse_subscription(text: &str) -> Vec<SubNode> {
 /// 生成完整可运行配置
 pub fn build_config(nodes: &[SubNode], port: u16) -> String {
     let mut out = String::new();
-    out.push_str(&format!("mixed-port: {port}\nmode: rule\nlog-level: info\n\nproxies:\n"));
+    out.push_str(&format!(
+        "mixed-port: {port}\nmode: rule\nlog-level: info\n\nproxies:\n"
+    ));
     for n in nodes {
         // ws-opts 展开已在 SubNode::to_yaml 内完成
         out.push_str(&n.to_yaml());
@@ -745,7 +814,13 @@ pub fn build_config(nodes: &[SubNode], port: u16) -> String {
     }
     out.push_str("]\n");
     out.push_str("  - name: 自动选择\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies: [");
-    out.push_str(&names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", "));
+    out.push_str(
+        &names
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     out.push_str("]\n");
     out.push_str("\nrules:\n  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve\n  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve\n  - MATCH,PROXY\n");
     out
@@ -787,8 +862,8 @@ pub fn parse_provider_proxies(
     if let Some(f) = filter {
         let trimmed = f.trim();
         if !trimmed.is_empty() {
-            let re = regex::Regex::new(trimmed)
-                .map_err(|e| format!("无效的 filter 正则表达式: {e}"))?;
+            let re =
+                regex::Regex::new(trimmed).map_err(|e| format!("无效的 filter 正则表达式: {e}"))?;
             proxies.retain(|p| re.is_match(&p.name));
         }
     }
@@ -802,7 +877,8 @@ mod tests {
 
     #[test]
     fn anytls_uri() {
-        let n = parse_uri("anytls://pw123@a.com:8388?sni=a.com&insecure=1&udp=1&fp=chrome#at1").unwrap();
+        let n = parse_uri("anytls://pw123@a.com:8388?sni=a.com&insecure=1&udp=1&fp=chrome#at1")
+            .unwrap();
         assert_eq!(n.name(), "at1");
         let y = n.to_yaml();
         assert!(y.contains("type: anytls"), "{y}");
@@ -826,8 +902,8 @@ mod tests {
         assert!(y.contains("password: \"pw123\""));
         assert!(y.contains("udp: true"));
         // 官方 BrookLink 形式：brook://server?server=host:port&password=xxx
-        let n = parse_uri("brook://server?server=b.com%3A9999&password=pw456&udpovertcp=true")
-            .unwrap();
+        let n =
+            parse_uri("brook://server?server=b.com%3A9999&password=pw456&udpovertcp=true").unwrap();
         let y = n.to_yaml();
         assert!(y.contains("server: b.com"), "{y}");
         assert!(y.contains("port: 9999"), "{y}");
@@ -854,7 +930,8 @@ mod tests {
 
     #[test]
     fn snell_uri() {
-        let n = parse_uri("snell://psk123@s.com:8388?version=4&obfs=http&host=bing.com&udp=1#sn1").unwrap();
+        let n = parse_uri("snell://psk123@s.com:8388?version=4&obfs=http&host=bing.com&udp=1#sn1")
+            .unwrap();
         assert_eq!(n.name(), "sn1");
         let y = n.to_yaml();
         assert!(y.contains("type: snell"), "{y}");
@@ -889,7 +966,10 @@ mod tests {
 
     #[test]
     fn naive_uri() {
-        let n = parse_uri("naive+https://bob:nvpw123@n.com:443?sni=n.com&insecure=1&udp=1&fp=chrome#nv1").unwrap();
+        let n = parse_uri(
+            "naive+https://bob:nvpw123@n.com:443?sni=n.com&insecure=1&udp=1&fp=chrome#nv1",
+        )
+        .unwrap();
         assert_eq!(n.name(), "nv1");
         let y = n.to_yaml();
         assert!(y.contains("type: naive"), "{y}");
@@ -966,7 +1046,10 @@ mod tests {
         assert!(y.contains("servername: www.apple.com"), "{y}");
         assert!(y.contains("client-fingerprint: chrome"), "{y}");
         assert!(y.contains("reality-opts:"), "{y}");
-        assert!(y.contains("public-key: \"1111222233334444555566667777888899990000111\""), "{y}");
+        assert!(
+            y.contains("public-key: \"1111222233334444555566667777888899990000111\""),
+            "{y}"
+        );
         assert!(y.contains("short-id: \"0123456789abcdef\""), "{y}");
         assert!(y.contains("spider-x: \"/\""), "{y}");
 

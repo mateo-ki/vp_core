@@ -24,7 +24,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
 use hkdf::Hkdf;
@@ -242,22 +242,26 @@ impl Outbound for BrookOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let mut io = transport::dial(&self.server, self.port, &transport::TransportConfig::default())
-            .await?;
+        let mut io = transport::dial(
+            &self.server,
+            self.port,
+            &transport::TransportConfig::default(),
+        )
+        .await?;
         let (tx, rx) = client_handshake(&mut io, &self.password, dst, Mode::Tcp).await?;
         Ok(Box::new(BrookStream::new(io, tx, rx, false)))
     }
 
-    async fn connect_packet(
-        &self,
-        _sess: &Session,
-        dst: &DstAddr,
-    ) -> Result<Box<dyn PacketConn>> {
+    async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         if !self.udp {
-            return Err(Error::Proto("brook: 该节点未启用 udp".into()));
+            return Err(Error::Proto("brook: 该节点未启用 udp"));
         }
-        let mut io = transport::dial(&self.server, self.port, &transport::TransportConfig::default())
-            .await?;
+        let mut io = transport::dial(
+            &self.server,
+            self.port,
+            &transport::TransportConfig::default(),
+        )
+        .await?;
         let (tx, rx) = client_handshake(&mut io, &self.password, dst, Mode::Uot).await?;
         // 域名目标：回包源地址未知，用 0.0.0.0:port 占位
         let addr = dst_to_socket(dst);
@@ -527,9 +531,10 @@ pub struct BrookPacketConn<S> {
 fn dst_to_socket(dst: &DstAddr) -> SocketAddr {
     match &dst.host {
         vp_common::Host::Ip(ip) => SocketAddr::new(*ip, dst.port),
-        vp_common::Host::Domain(_) => {
-            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), dst.port)
-        }
+        vp_common::Host::Domain(_) => SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            dst.port,
+        ),
     }
 }
 
@@ -549,7 +554,7 @@ impl<S: ProxyStream> PacketConn for BrookPacketConn<S> {
         let mut io = self.io.lock().await;
         let data = try_read_record(&mut *io, &mut self.rx)
             .await?
-            .ok_or_else(|| Error::Proto("brook: UoT 对端关闭"))?;
+            .ok_or(Error::Proto("brook: UoT 对端关闭"))?;
         Ok(UdpPacket {
             src: self.default_src,
             dst: self.default_dst,
@@ -629,7 +634,12 @@ impl BrookInbound {
         Ok((c, rx, dst, mode))
     }
 
-    async fn serve(&self, mut io: tokio::net::TcpStream, src: SocketAddr, ctx: &InboundCtx) -> Result<()> {
+    async fn serve(
+        &self,
+        mut io: tokio::net::TcpStream,
+        src: SocketAddr,
+        ctx: &InboundCtx,
+    ) -> Result<()> {
         // tx：解客户端方向记录；rx：加密服务端方向记录
         let (mut tx, rx, dst, mode) = self.accept(&mut io).await?;
         let _ = ctx;
@@ -644,14 +654,9 @@ impl BrookInbound {
                 // 读任务：客户端记录 → 通道；写任务：通道明文 → 加密记录
                 let (rec_tx, mut rec_rx) = mpsc::channel::<Vec<u8>>(64);
                 let reader = tokio::spawn(async move {
-                    loop {
-                        match try_read_record(&mut rh, &mut tx).await {
-                            Ok(Some(data)) => {
-                                if rec_tx.send(data).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(None) | Err(_) => break,
+                    while let Ok(Some(data)) = try_read_record(&mut rh, &mut tx).await {
+                        if rec_tx.send(data).await.is_err() {
+                            break;
                         }
                     }
                 });
@@ -715,7 +720,12 @@ impl BrookInbound {
                 SocketAddr::new(ips[0], dst.port)
             }
         };
-        let sock = tokio::net::UdpSocket::bind(if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }).await?;
+        let sock = tokio::net::UdpSocket::bind(if target.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        })
+        .await?;
         sock.connect(target).await?;
         let sock = std::sync::Arc::new(sock);
         let writer = {
@@ -734,14 +744,9 @@ impl BrookInbound {
                 }
             })
         };
-        loop {
-            match try_read_record(&mut rh, &mut tx).await? {
-                Some(data) => {
-                    if !data.is_empty() && sock.send(&data).await.is_err() {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(data) = try_read_record(&mut rh, &mut tx).await? {
+            if !data.is_empty() && sock.send(&data).await.is_err() {
+                break;
             }
         }
         writer.abort();
@@ -787,7 +792,7 @@ impl Inbound for BrookInbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn outbound_plain(server: &str, port: u16, password: &str) -> BrookOutbound {
         BrookOutbound::new(&BrookCfg {
@@ -800,13 +805,13 @@ mod tests {
     }
 
     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {
-        let l = std::sync::Arc::new(
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let l2 = l.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = l2.accept().await else { break };
+                let Ok((mut s, _)) = l2.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut b = vec![0u8; 65536];
                     loop {
@@ -857,9 +862,9 @@ mod tests {
         assert_eq!(
             okm[..32],
             [
-                0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a, 0x90, 0x43, 0x4f, 0x64, 0xd0,
-                0x36, 0x2f, 0x2a, 0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c, 0x5d, 0xb0,
-                0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
+                0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a, 0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36,
+                0x2f, 0x2a, 0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c, 0x5d, 0xb0, 0x2d, 0x56,
+                0xec, 0xc4, 0xc5, 0xbf,
             ]
         );
     }
@@ -891,9 +896,8 @@ mod tests {
     async fn brook_loopback() {
         let echo = echo_server().await;
         let echo_port = echo.local_addr().unwrap().port();
-        let server = Arc::new(
-            BrookInbound::new("127.0.0.1", 0, "bk-srv", &["pw123".to_string()]).unwrap(),
-        );
+        let server =
+            Arc::new(BrookInbound::new("127.0.0.1", 0, "bk-srv", &["pw123".to_string()]).unwrap());
         let port = server.clone().start(test_ctx()).await.unwrap();
 
         let out = outbound_plain("127.0.0.1", port, "pw123");
@@ -914,7 +918,9 @@ mod tests {
         assert_eq!(&buf, b"ping-brook");
 
         // 大回显（跨记录分帧，逐字节一致）
-        let big: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2654435761) >> 3) as u8).collect();
+        let big: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 3) as u8)
+            .collect();
         let mut rb = vec![0u8; big.len()];
         let (mut rr, mut rw) = tokio::io::split(s);
         let big2 = big.clone();
@@ -946,7 +952,9 @@ mod tests {
             Err(_) => {} // 服务端认证失败关闭：握手读失败
             Ok(mut s) => {
                 let mut b = [0u8; 16];
-                let r = timeout(Duration::from_secs(5), s.read(&mut b)).await.unwrap();
+                let r = timeout(Duration::from_secs(5), s.read(&mut b))
+                    .await
+                    .unwrap();
                 assert!(matches!(r, Ok(0) | Err(_)), "错误密码不应收到数据: {r:?}");
             }
         }
@@ -973,7 +981,9 @@ mod tests {
             assert!(now_ts() - ts > REPLAY_WINDOW, "测试时间戳应已过期");
         });
 
-        let mut io = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut io = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let mut cn = [0u8; 12];
         vp_common::rand_bytes(&mut cn);
         io.write_all(&cn).await.unwrap();
@@ -994,9 +1004,8 @@ mod tests {
     #[tokio::test]
     async fn brook_uot_loopback() {
         // 经 BrookInbound 的 UoT 中继发收 UDP 数据报
-        let server = Arc::new(
-            BrookInbound::new("127.0.0.1", 0, "bk-srv", &["pw123".to_string()]).unwrap(),
-        );
+        let server =
+            Arc::new(BrookInbound::new("127.0.0.1", 0, "bk-srv", &["pw123".to_string()]).unwrap());
         let port = server.clone().start(test_ctx()).await.unwrap();
 
         // 真实 UDP 回显服务
@@ -1004,14 +1013,9 @@ mod tests {
         let udp_port = udp.local_addr().unwrap().port();
         tokio::spawn(async move {
             let mut b = vec![0u8; 65536];
-            loop {
-                match udp.recv_from(&mut b).await {
-                    Ok((n, from)) => {
-                        if udp.send_to(&b[..n], from).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok((n, from)) = udp.recv_from(&mut b).await {
+                if udp.send_to(&b[..n], from).await.is_err() {
+                    break;
                 }
             }
         });
@@ -1025,15 +1029,26 @@ mod tests {
             .unwrap();
 
         for i in 0..8u16 {
-            let payload: Vec<u8> = (0..1000u32).map(|j| ((u32::from(i) * 131 + j) % 251) as u8).collect();
+            let payload: Vec<u8> = (0..1000u32)
+                .map(|j| ((u32::from(i) * 131 + j) % 251) as u8)
+                .collect();
             conn.send(&UdpPacket {
-                src: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40000 + i),
-                dst: SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), udp_port),
+                src: SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    40000 + i,
+                ),
+                dst: SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    udp_port,
+                ),
                 data: bytes::Bytes::from(payload.clone()),
             })
             .await
             .unwrap();
-            let pkt = timeout(Duration::from_secs(5), conn.recv()).await.unwrap().unwrap();
+            let pkt = timeout(Duration::from_secs(5), conn.recv())
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(pkt.data.as_ref(), payload.as_slice());
         }
     }

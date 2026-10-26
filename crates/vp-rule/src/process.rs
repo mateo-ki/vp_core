@@ -41,7 +41,13 @@ pub fn find_process_name(src: SocketAddr) -> Option<String> {
     if c.map.len() >= CACHE_CAP {
         c.map.clear(); // 简单粗暴的容量控制
     }
-    c.map.insert(src, CacheEntry { name: name.clone(), at: now });
+    c.map.insert(
+        src,
+        CacheEntry {
+            name: name.clone(),
+            at: now,
+        },
+    );
     name
 }
 
@@ -49,8 +55,8 @@ pub fn find_process_name(src: SocketAddr) -> Option<String> {
 fn find_process_name_uncached(src: SocketAddr) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
 
     unsafe {
@@ -84,7 +90,11 @@ fn tcp_row_pid(src: SocketAddr) -> Option<u32> {
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
     unsafe {
-        let family: u32 = if src.is_ipv4() { AF_INET as u32 } else { AF_INET6 as u32 };
+        let family: u32 = if src.is_ipv4() {
+            AF_INET as u32
+        } else {
+            AF_INET6 as u32
+        };
         let mut size: u32 = 0;
         // 第一次调用取大小
         GetExtendedTcpTable(
@@ -119,7 +129,10 @@ fn tcp_row_pid(src: SocketAddr) -> Option<u32> {
         let (want_addr, want_port): (u32, u32) = match src {
             SocketAddr::V4(v4) => {
                 let o = v4.ip().octets();
-                (u32::from_be_bytes([o[0], o[1], o[2], o[3]]), (v4.port() as u32) << 16)
+                (
+                    u32::from_be_bytes([o[0], o[1], o[2], o[3]]),
+                    (v4.port() as u32) << 16,
+                )
             }
             SocketAddr::V6(_) => return None, // v6 表行结构不同，M1 先支持 v4
         };
@@ -159,7 +172,10 @@ fn find_socket_inode_linux(src: SocketAddr) -> Option<u64> {
             let p3 = u32::from_ne_bytes([o[8], o[9], o[10], o[11]]);
             let p4 = u32::from_ne_bytes([o[12], o[13], o[14], o[15]]);
             let port = v6.port();
-            ("/proc/net/tcp6", format!("{p1:08X}{p2:08X}{p3:08X}{p4:08X}:{port:04X}"))
+            (
+                "/proc/net/tcp6",
+                format!("{p1:08X}{p2:08X}{p3:08X}{p4:08X}:{port:04X}"),
+            )
         }
     };
 

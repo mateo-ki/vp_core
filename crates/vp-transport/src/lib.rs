@@ -8,8 +8,8 @@ pub mod ws;
 
 pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
 
-pub use tls::{connect_tls, tls_acceptor, tls_connect, TlsClientConfig};
-pub use ws::{ws_handshake_client, ws_handshake_server, WsConfig, WsStream};
+pub use tls::{TlsClientConfig, connect_tls, tls_acceptor, tls_connect};
+pub use ws::{WsConfig, WsStream, ws_handshake_client, ws_handshake_server};
 
 use std::time::Duration;
 use vp_common::Result;
@@ -47,17 +47,22 @@ pub fn parse_reality_config(
 ) -> Result<RealityConfig> {
     let clean_pk = public_key_str.trim();
     let pk_bytes = if clean_pk.len() == 64 && clean_pk.chars().all(|c| c.is_ascii_hexdigit()) {
-        hex_decode(clean_pk)
-            .map_err(|e| vp_common::Error::Config(format!("REALITY public_key 十六进制解码失败: {e}")))?
+        hex_decode(clean_pk).map_err(|e| {
+            vp_common::Error::Config(format!("REALITY public_key 十六进制解码失败: {e}"))
+        })?
     } else {
-        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
         use base64::Engine;
+        use base64::engine::general_purpose::{
+            STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
+        };
         URL_SAFE_NO_PAD
             .decode(clean_pk)
             .or_else(|_| URL_SAFE.decode(clean_pk))
             .or_else(|_| STANDARD_NO_PAD.decode(clean_pk))
             .or_else(|_| STANDARD.decode(clean_pk))
-            .map_err(|e| vp_common::Error::Config(format!("REALITY public_key base64解码失败: {e}")))?
+            .map_err(|e| {
+                vp_common::Error::Config(format!("REALITY public_key base64解码失败: {e}"))
+            })?
     };
     if pk_bytes.len() != 32 {
         return Err(vp_common::Error::Config(format!(
@@ -72,8 +77,9 @@ pub fn parse_reality_config(
     if let Some(sid) = short_id_str {
         let clean_sid = sid.trim();
         if !clean_sid.is_empty() {
-            let decoded = hex_decode(clean_sid)
-                .map_err(|e| vp_common::Error::Config(format!("REALITY short_id 十六进制解码失败: {e}")))?;
+            let decoded = hex_decode(clean_sid).map_err(|e| {
+                vp_common::Error::Config(format!("REALITY short_id 十六进制解码失败: {e}"))
+            })?;
             if decoded.len() > 8 {
                 return Err(vp_common::Error::Config(format!(
                     "REALITY short_id 最长 8 字节 (16 字符)，当前 {} 字节",
@@ -226,18 +232,25 @@ mod tests {
 
     #[test]
     fn parse_reality_config_formats() {
-        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
         use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
         let raw_pk = [42u8; 32];
-        let b64_url = URL_SAFE_NO_PAD.encode(&raw_pk);
-        let b64_std = STANDARD.encode(&raw_pk);
-        let hex_pk = raw_pk.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let b64_url = URL_SAFE_NO_PAD.encode(raw_pk);
+        let b64_std = STANDARD.encode(raw_pk);
+        let hex_pk = raw_pk
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
 
         // 1. URL_SAFE_NO_PAD (Xray / sing-box 标准)
-        let cfg1 = parse_reality_config(&b64_url, Some("0123456789abcdef"), Some("/".into())).unwrap();
+        let cfg1 =
+            parse_reality_config(&b64_url, Some("0123456789abcdef"), Some("/".into())).unwrap();
         assert_eq!(cfg1.public_key, raw_pk);
-        assert_eq!(cfg1.short_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        assert_eq!(
+            cfg1.short_id,
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
         assert_eq!(cfg1.spider_x.as_deref(), Some("/"));
 
         // 2. STANDARD Base64

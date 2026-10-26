@@ -83,7 +83,9 @@ impl Group {
             selected: AtomicUsize::new(0),
             alive: Mutex::new(vec![false; n]),
             delay_ms: Mutex::new(vec![None; n]),
-            test_url: spec.test_url.unwrap_or_else(|| "http://www.gstatic.com/generate_204".into()),
+            test_url: spec
+                .test_url
+                .unwrap_or_else(|| "http://www.gstatic.com/generate_204".into()),
             interval: spec.interval.max(30),
             tolerance: spec.tolerance,
             lazy: spec.lazy,
@@ -290,7 +292,10 @@ impl Group {
                         None => true,
                     };
                     if switch {
-                        debug!("组 {} url-test 切换 -> {}", self.name, self.member_names[bi]);
+                        debug!(
+                            "组 {} url-test 切换 -> {}",
+                            self.name, self.member_names[bi]
+                        );
                         self.selected.store(bi, Ordering::Relaxed);
                     }
                 }
@@ -301,7 +306,10 @@ impl Group {
                 let target = results.iter().position(|r| r.is_some());
                 if let Some(ti) = target {
                     if ti != cur {
-                        debug!("组 {} fallback 切换 -> {}", self.name, self.member_names[ti]);
+                        debug!(
+                            "组 {} fallback 切换 -> {}",
+                            self.name, self.member_names[ti]
+                        );
                         self.selected.store(ti, Ordering::Relaxed);
                     }
                 }
@@ -364,7 +372,9 @@ async fn probe(o: &Arc<dyn Outbound>, url: &str) -> Result<Duration> {
 }
 
 fn parse_test_url(url: &str) -> Result<(String, u16, String)> {
-    let (scheme, rest) = url.split_once("://").ok_or(Error::Config("测速 URL 非法".into()))?;
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or(Error::Config("测速 URL 非法".into()))?;
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -418,11 +428,7 @@ impl Outbound for Group {
         }
     }
 
-    async fn connect_packet(
-        &self,
-        sess: &Session,
-        dst: &DstAddr,
-    ) -> Result<Box<dyn PacketConn>> {
+    async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         self.pick(sess).connect_packet(sess, dst).await
     }
 }
@@ -623,8 +629,14 @@ mod tests {
     #[test]
     fn test_url_parse() {
         let (h, p, path) = parse_test_url("http://www.gstatic.com/generate_204").unwrap();
-        assert_eq!((h.as_str(), p, path.as_str()), ("www.gstatic.com", 80, "/generate_204"));
+        assert_eq!(
+            (h.as_str(), p, path.as_str()),
+            ("www.gstatic.com", 80, "/generate_204")
+        );
         let (h, p, path) = parse_test_url("https://example.com:8443/x?a=1").unwrap();
-        assert_eq!((h.as_str(), p, path.as_str()), ("example.com", 8443, "/x?a=1"));
+        assert_eq!(
+            (h.as_str(), p, path.as_str()),
+            ("example.com", 8443, "/x?a=1")
+        );
     }
 }

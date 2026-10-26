@@ -19,11 +19,11 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -104,7 +104,8 @@ impl NaiveStream {
                 if self.read_pending.len() < 3 {
                     break;
                 }
-                let data_len = u16::from_be_bytes([self.read_pending[0], self.read_pending[1]]) as usize;
+                let data_len =
+                    u16::from_be_bytes([self.read_pending[0], self.read_pending[1]]) as usize;
                 let pad_len = self.read_pending[2] as usize;
                 let total = 3 + data_len + pad_len;
                 if self.read_pending.len() < total {
@@ -209,7 +210,10 @@ impl AsyncWrite for NaiveStream {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.closed {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "naive: 已关闭")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "naive: 已关闭",
+            )));
         }
         ready!(self.flush_pending(cx))?;
 
@@ -330,7 +334,10 @@ impl NaiveOutbound {
             .map_err(|e| Error::ProtoMsg(format!("naive 握手响应失败: {e}")))?;
 
         if resp.status() != http::StatusCode::OK {
-            return Err(Error::ProtoMsg(format!("naive 代理拒绝: 状态码 {}", resp.status())));
+            return Err(Error::ProtoMsg(format!(
+                "naive 代理拒绝: 状态码 {}",
+                resp.status()
+            )));
         }
 
         let recv_stream = resp.into_body();
@@ -398,7 +405,8 @@ impl NaiveInbound {
             .map_err(|e| Error::Io(io::Error::other(format!("naive 服务端 h2 握手失败: {e}"))))?;
 
         while let Some(res) = server.accept().await {
-            let (req, mut respond) = res.map_err(|e| Error::ProtoMsg(format!("naive accept 失败: {e}")))?;
+            let (req, mut respond) =
+                res.map_err(|e| Error::ProtoMsg(format!("naive accept 失败: {e}")))?;
 
             if req.method() != http::Method::CONNECT {
                 let resp = http::Response::builder()
@@ -447,11 +455,11 @@ impl NaiveInbound {
                 .and_then(|v| v.to_str().ok())
                 .or_else(|| req.uri().authority().map(|a| a.as_str()))
                 .or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()))
-                .ok_or_else(|| Error::Proto("naive: 缺少目标地址"))?;
+                .ok_or(Error::Proto("naive: 缺少目标地址"))?;
 
             let (host, port_str) = target_str
                 .rsplit_once(':')
-                .ok_or_else(|| Error::Proto("naive: 目标地址缺少端口"))?;
+                .ok_or(Error::Proto("naive: 目标地址缺少端口"))?;
             let port = port_str
                 .parse::<u16>()
                 .map_err(|_| Error::Proto("naive: 目标端口非法"))?;
@@ -534,7 +542,7 @@ impl Inbound for NaiveInbound {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn test_ctx() -> InboundCtx {
         InboundCtx {
@@ -549,7 +557,9 @@ mod tests {
         let l2 = l.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = l2.accept().await else { break };
+                let Ok((mut s, _)) = l2.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut b = vec![0u8; 65536];
                     loop {
@@ -669,7 +679,9 @@ mod tests {
 
         let dst = DstAddr::new("127.0.0.1", echo_port);
         let sess = Session::new_tcp("t".into(), None, dst.clone());
-        let res = timeout(Duration::from_secs(5), out.connect_stream(&sess, &dst)).await.unwrap();
+        let res = timeout(Duration::from_secs(5), out.connect_stream(&sess, &dst))
+            .await
+            .unwrap();
         assert!(res.is_err(), "错误密码应被拒绝: {:?}", res.as_ref().err());
     }
 
@@ -680,7 +692,9 @@ mod tests {
         );
         let srv_port = server.clone().start(test_ctx()).await.unwrap();
 
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", srv_port)).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", srv_port))
+            .await
+            .unwrap();
         let (mut client, conn) = h2::client::handshake(tcp).await.unwrap();
         tokio::spawn(async move {
             let _ = conn.await;
@@ -690,12 +704,19 @@ mod tests {
         let req = http::Request::builder()
             .method(http::Method::CONNECT)
             .uri("https://127.0.0.1:80")
-            .header("proxy-authorization", format!("Basic {}", BASE64.encode("user1:pass1")))
+            .header(
+                "proxy-authorization",
+                format!("Basic {}", BASE64.encode("user1:pass1")),
+            )
             .body(())
             .unwrap();
 
         let (resp_fut, _) = client.send_request(req, false).unwrap();
         let resp = resp_fut.await.unwrap();
-        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST, "缺少 padding 必须返回 400");
+        assert_eq!(
+            resp.status(),
+            http::StatusCode::BAD_REQUEST,
+            "缺少 padding 必须返回 400"
+        );
     }
 }

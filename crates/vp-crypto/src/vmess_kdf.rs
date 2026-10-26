@@ -48,7 +48,9 @@ impl GoHash for Sha256Go {
 type Shared = Rc<RefCell<dyn GoHash>>;
 
 /// hash2{parent}：Write/Sum 均转发给父对象
-struct Hash2 { parent: Shared }
+struct Hash2 {
+    parent: Shared,
+}
 
 impl GoHash for Hash2 {
     fn write(&mut self, data: &[u8]) {
@@ -75,7 +77,10 @@ impl GoHmac {
             ipad[i] ^= *b;
             opad[i] ^= *b;
         }
-        let h = GoHmac { outer: factory(), inner: factory() };
+        let h = GoHmac {
+            outer: factory(),
+            inner: factory(),
+        };
         GoHash::write(&mut *h.inner.borrow_mut(), &ipad);
         GoHash::write(&mut *h.outer.borrow_mut(), &opad);
         Rc::new(RefCell::new(h))
@@ -101,7 +106,11 @@ fn kdf_go(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
     );
     for p in paths {
         let parent = hmacf.clone();
-        let factory = move || -> Shared { Rc::new(RefCell::new(Hash2 { parent: parent.clone() })) };
+        let factory = move || -> Shared {
+            Rc::new(RefCell::new(Hash2 {
+                parent: parent.clone(),
+            }))
+        };
         hmacf = GoHmac::new_with_factory(&factory, p);
     }
     hmacf.borrow_mut().write(key);

@@ -58,7 +58,10 @@ impl DstAddr {
     }
 
     pub fn ip(ip: IpAddr, port: u16) -> Self {
-        DstAddr { host: Host::Ip(ip), port }
+        DstAddr {
+            host: Host::Ip(ip),
+            port,
+        }
     }
 
     /// 解析 "host:port" 或 "[v6]:port" 形式（端口必填）
@@ -154,7 +157,10 @@ pub fn decode_socks_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
                 .to_ascii_lowercase();
             let port = u16::from_be_bytes([buf[2 + len], buf[3 + len]]);
             Ok((
-                DstAddr { host: Host::Domain(domain), port },
+                DstAddr {
+                    host: Host::Domain(domain),
+                    port,
+                },
                 2 + len + 2,
             ))
         }

@@ -21,7 +21,11 @@ pub struct MixedInbound {
 
 impl MixedInbound {
     pub fn new(bind: String, port: u16, tag: &str) -> Self {
-        MixedInbound { bind, port, tag: tag.into() }
+        MixedInbound {
+            bind,
+            port,
+            tag: tag.into(),
+        }
     }
 }
 
@@ -73,7 +77,11 @@ async fn serve_mixed(
     let mut first = [0u8; 1];
     stream.read_exact(&mut first).await?;
     // 回填：包装流
-    let stream = PrefixedStream { inner: stream, prefix: first[0], consumed: false };
+    let stream = PrefixedStream {
+        inner: stream,
+        prefix: first[0],
+        consumed: false,
+    };
 
     if first[0] == 0x05 {
         serve_socks5(stream, src, tag, ctx).await
@@ -98,7 +106,11 @@ pub struct PrefixedStream<S> {
 impl<S> PrefixedStream<S> {
     #[allow(dead_code)]
     pub fn new(inner: S, prefix: u8) -> Self {
-        PrefixedStream { inner, prefix, consumed: false }
+        PrefixedStream {
+            inner,
+            prefix,
+            consumed: false,
+        }
     }
 }
 
@@ -143,5 +155,3 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedStream<
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
-
-

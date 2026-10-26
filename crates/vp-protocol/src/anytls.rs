@@ -17,13 +17,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use vp_common::addr::{decode_socks_addr, encode_socks_addr};
 use vp_common::{DstAddr, Error, Result};
@@ -87,7 +87,10 @@ fn push_waste(out: &mut Vec<u8>, len: usize) {
 fn parse_settings(data: &[u8]) -> Vec<(String, String)> {
     String::from_utf8_lossy(data)
         .lines()
-        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+        .filter_map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
         .collect()
 }
 
@@ -128,7 +131,7 @@ impl PaddingFactory {
             .iter()
             .find(|(k, _)| k == "stop")
             .and_then(|(_, v)| v.trim().parse::<i64>().ok())
-            .ok_or_else(|| Error::Proto("anytls: padding scheme 缺少 stop"))?;
+            .ok_or(Error::Proto("anytls: padding scheme 缺少 stop"))?;
         if stop < 0 {
             return Err(Error::Proto("anytls: padding scheme stop 非法"));
         }
@@ -138,11 +141,17 @@ impl PaddingFactory {
             let mut ranges = Vec::new();
             for item in v.split(',') {
                 if item.trim() == "c" {
-                    ranges.push(PaddingRange { min: CHECK_MARK, max: CHECK_MARK });
+                    ranges.push(PaddingRange {
+                        min: CHECK_MARK,
+                        max: CHECK_MARK,
+                    });
                     continue;
                 }
-                let Some((a, b)) = item.split_once('-') else { continue };
-                let (Ok(mut mn), Ok(mut mx)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>()) else {
+                let Some((a, b)) = item.split_once('-') else {
+                    continue;
+                };
+                let (Ok(mut mn), Ok(mut mx)) = (a.trim().parse::<i64>(), b.trim().parse::<i64>())
+                else {
                     continue;
                 };
                 if mn > mx {
@@ -166,7 +175,9 @@ impl PaddingFactory {
     }
 
     fn generate_sizes(&self, pkt: u32) -> Vec<i64> {
-        let Some(ranges) = self.records.get(&pkt) else { return Vec::new() };
+        let Some(ranges) = self.records.get(&pkt) else {
+            return Vec::new();
+        };
         ranges
             .iter()
             .map(|r| {
@@ -201,7 +212,11 @@ struct Padder {
 
 impl Padder {
     fn new(factory: PaddingFactory) -> Self {
-        Padder { factory, send_padding: true, packet_count: 0 }
+        Padder {
+            factory,
+            send_padding: true,
+            packet_count: 0,
+        }
     }
 
     fn segment(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
@@ -311,7 +326,10 @@ impl AnytlsOutbound {
 
         let mut st = AnytlsStream::new(io, 1, Padder::new(factory));
         // settings + SYN + 首个 PSH（目标地址）合并为一个写包（packet 1）
-        let settings = format!("client=\npadding-md5={}\nv={PROTOCOL_VERSION}", st.padder.factory.md5);
+        let settings = format!(
+            "client=\npadding-md5={}\nv={PROTOCOL_VERSION}",
+            st.padder.factory.md5
+        );
         let mut pkt = frame(CMD_SETTINGS, 0, settings.as_bytes());
         pkt.extend_from_slice(&frame(CMD_SYN, st.sid, &[]));
         let mut addr = Vec::with_capacity(280);
@@ -507,7 +525,10 @@ impl<S> AnytlsStream<S> {
         while let Some(cur) = self.outq.front() {
             match Pin::new(&mut self.io).poll_write(cx, &cur[self.opos..]) {
                 Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "anytls: 写端关闭")));
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "anytls: 写端关闭",
+                    )));
                 }
                 Poll::Ready(Ok(n)) => {
                     self.opos += n;
@@ -543,7 +564,7 @@ impl<S: ProxyStream + Unpin> AsyncRead for AnytlsStream<S> {
                 return Poll::Ready(Ok(()));
             }
             if let Some(msg) = this.fatal.take() {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, msg)));
+                return Poll::Ready(Err(io::Error::other(msg)));
             }
             if this.eof {
                 return Poll::Ready(Ok(()));
@@ -561,7 +582,10 @@ impl<S: ProxyStream + Unpin> AsyncWrite for AnytlsStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if this.fin_sent {
-            return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "anytls: 流已关闭")));
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "anytls: 流已关闭",
+            )));
         }
         if !this.outq.is_empty() {
             ready!(this.drive_out(cx))?;
@@ -708,13 +732,21 @@ impl AnytlsInbound {
                 CMD_SYN => {
                     if !settings_received {
                         let msg = b"client did not send its settings";
-                        let _ = writer.lock().await.write_packet(&frame(CMD_ALERT, 0, msg)).await;
+                        let _ = writer
+                            .lock()
+                            .await
+                            .write_packet(&frame(CMD_ALERT, 0, msg))
+                            .await;
                         return Err(Error::Proto("anytls: 客户端未发 settings"));
                     }
-                    streams.entry(sid).or_insert(StreamState::Pending(Vec::new()));
+                    streams
+                        .entry(sid)
+                        .or_insert(StreamState::Pending(Vec::new()));
                 }
                 CMD_PSH => {
-                    let Some(state) = streams.get_mut(&sid) else { continue };
+                    let Some(state) = streams.get_mut(&sid) else {
+                        continue;
+                    };
                     match state {
                         StreamState::Open(tx) => {
                             if tx.send(body).await.is_err() {
@@ -757,7 +789,11 @@ impl AnytlsInbound {
                     streams.remove(&sid);
                 }
                 CMD_HEART_REQ => {
-                    writer.lock().await.write_packet(&frame(CMD_HEART_RESP, sid, &[])).await?;
+                    writer
+                        .lock()
+                        .await
+                        .write_packet(&frame(CMD_HEART_RESP, sid, &[]))
+                        .await?;
                 }
                 _ => {}
             }
@@ -815,7 +851,11 @@ async fn pump_stream(
         }
     };
     if peer_version >= PROTOCOL_VERSION {
-        let _ = writer.lock().await.write_packet(&frame(CMD_SYNACK, sid, &[])).await;
+        let _ = writer
+            .lock()
+            .await
+            .write_packet(&frame(CMD_SYNACK, sid, &[]))
+            .await;
     }
     if !initial.is_empty() && remote.write_all(&initial).await.is_err() {
         return;
@@ -919,7 +959,7 @@ impl Inbound for AnytlsInbound {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn outbound_plain(server: &str, port: u16, password: &str) -> AnytlsOutbound {
         let cfg = AnytlsCfg {
@@ -937,13 +977,13 @@ mod tests {
     }
 
     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {
-        let l = std::sync::Arc::new(
-            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
-        );
+        let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
         let l2 = l.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = l2.accept().await else { break };
+                let Ok((mut s, _)) = l2.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut b = vec![0u8; 65536];
                     loop {
@@ -1015,9 +1055,8 @@ mod tests {
     async fn anytls_loopback() {
         let echo = echo_server().await;
         let echo_port = echo.local_addr().unwrap().port();
-        let server = Arc::new(
-            AnytlsInbound::new("127.0.0.1", 0, "at-srv", &["pw123".to_string()]).unwrap(),
-        );
+        let server =
+            Arc::new(AnytlsInbound::new("127.0.0.1", 0, "at-srv", &["pw123".to_string()]).unwrap());
         let port = server.clone().start(test_ctx()).await.unwrap();
 
         let out = outbound_plain("127.0.0.1", port, "pw123");
@@ -1038,7 +1077,9 @@ mod tests {
         assert_eq!(&buf, b"ping-anytls");
 
         // 大回显（跨 PSH 分帧 + waste 混入，逐字节一致）
-        let big: Vec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(2654435761) >> 3) as u8).collect();
+        let big: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 3) as u8)
+            .collect();
         let mut rb = vec![0u8; big.len()];
         let (mut rr, mut rw) = tokio::io::split(s);
         let big2 = big.clone();
@@ -1071,7 +1112,9 @@ mod tests {
             Ok(mut s) => {
                 // 连接成功但首读必然 EOF/错误（服务端认证失败即断开）
                 let mut b = [0u8; 16];
-                let r = timeout(Duration::from_secs(5), s.read(&mut b)).await.unwrap();
+                let r = timeout(Duration::from_secs(5), s.read(&mut b))
+                    .await
+                    .unwrap();
                 assert!(matches!(r, Ok(0) | Err(_)), "错误密码不应收到数据: {r:?}");
             }
         }
@@ -1113,13 +1156,14 @@ mod tests {
 
     #[tokio::test]
     async fn anytls_missing_settings_alert() {
-        let server = Arc::new(
-            AnytlsInbound::new("127.0.0.1", 0, "at-srv", &["pw123".to_string()]).unwrap(),
-        );
+        let server =
+            Arc::new(AnytlsInbound::new("127.0.0.1", 0, "at-srv", &["pw123".to_string()]).unwrap());
         let port = server.clone().start(test_ctx()).await.unwrap();
 
         // 裸协议：密码正确但直接发 SYN（无 settings 帧）→ 服务端回 Alert 并断开
-        let mut t = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut t = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let hash: [u8; PASSWORD_LEN] = Sha256::digest(b"pw123").into();
         let mut prologue = hash.to_vec();
         prologue.extend_from_slice(&0u16.to_be_bytes());

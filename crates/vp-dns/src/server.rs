@@ -13,9 +13,9 @@ use tracing::warn;
 
 use vp_common::{Error, Result};
 
+use crate::Resolver;
 use crate::fakeip::FakeIpPool;
 use crate::wire;
-use crate::Resolver;
 
 pub struct DnsServer {
     pub listen: SocketAddr,
@@ -37,17 +37,18 @@ impl DnsServer {
         fake_ip_filter: Vec<String>,
         ipv6: bool,
     ) -> Self {
-        DnsServer { listen, resolver, fake_ip, fake_ip_filter, ipv6 }
+        DnsServer {
+            listen,
+            resolver,
+            fake_ip,
+            fake_ip_filter,
+            ipv6,
+        }
     }
 
     /// 启动 UDP 监听，返回实际绑定地址
     pub async fn spawn(self) -> Result<SocketAddr> {
-        let bind = if self.listen.ip().is_unspecified() {
-            self.listen
-        } else {
-            self.listen
-        };
-        let sock = Arc::new(UdpSocket::bind(bind).await?);
+        let sock = Arc::new(UdpSocket::bind(self.listen).await?);
         let bound = sock.local_addr()?;
         let this = Arc::new(self);
         let resolver = this.resolver.clone();
@@ -61,9 +62,7 @@ impl DnsServer {
                         let sock = sock.clone();
                         let resolver = resolver.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                this.handle(&sock, &pkt, from, &resolver).await
-                            {
+                            if let Err(e) = this.handle(&sock, &pkt, from, &resolver).await {
                                 warn!("dns 查询处理失败: {e}");
                             }
                         });
@@ -128,9 +127,9 @@ impl DnsServer {
 
     fn filtered(&self, domain: &str) -> bool {
         let d = domain.to_ascii_lowercase();
-        self.fake_ip_filter
-            .iter()
-            .any(|f| d == f.to_ascii_lowercase() || d.ends_with(&format!(".{}", f.to_ascii_lowercase())))
+        self.fake_ip_filter.iter().any(|f| {
+            d == f.to_ascii_lowercase() || d.ends_with(&format!(".{}", f.to_ascii_lowercase()))
+        })
     }
 
     async fn forward(
@@ -183,10 +182,14 @@ mod tests {
     use super::*;
 
     async fn query(sock: &UdpSocket, server: SocketAddr, domain: &str, qtype: u16) -> Vec<u8> {
-        let q = wire::build_query(0x1234, domain, match qtype {
-            QTYPE_A => wire::QType::A,
-            _ => wire::QType::Aaaa,
-        });
+        let q = wire::build_query(
+            0x1234,
+            domain,
+            match qtype {
+                QTYPE_A => wire::QType::A,
+                _ => wire::QType::Aaaa,
+            },
+        );
         sock.send_to(&q, server).await.unwrap();
         let mut buf = vec![0u8; 1500];
         let n = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))

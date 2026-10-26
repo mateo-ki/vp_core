@@ -23,10 +23,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use vp_common::{DstAddr, Error, Host, Result};
+use vp_core::Outbound;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::stream::{PacketConn, ProxyStream, UdpPacket};
-use vp_core::Outbound;
 
 pub const MAGIC_HOST_V1: &str = "sp.udp-over-tcp.arpa";
 pub const MAGIC_HOST_V2: &str = "sp.v2.udp-over-tcp.arpa";
@@ -90,12 +90,18 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<(DstAddr, Byt
         ATYP_V4 => {
             let b = read_n(r, 6).await?;
             let oct: [u8; 4] = b[0..4].try_into().unwrap();
-            (Host::Ip(IpAddr::V4(oct.into())), u16::from_be_bytes([b[4], b[5]]))
+            (
+                Host::Ip(IpAddr::V4(oct.into())),
+                u16::from_be_bytes([b[4], b[5]]),
+            )
         }
         ATYP_V6 => {
             let b = read_n(r, 18).await?;
             let oct: [u8; 16] = b[0..16].try_into().unwrap();
-            (Host::Ip(IpAddr::V6(oct.into())), u16::from_be_bytes([b[16], b[17]]))
+            (
+                Host::Ip(IpAddr::V6(oct.into())),
+                u16::from_be_bytes([b[16], b[17]]),
+            )
         }
         ATYP_DOMAIN => {
             let n = read_n(r, 1).await?[0] as usize;
@@ -189,11 +195,7 @@ impl Outbound for UotOutbound {
         self.inner.name()
     }
 
-    async fn connect_stream(
-        &self,
-        sess: &Session,
-        dst: &DstAddr,
-    ) -> Result<Box<dyn ProxyStream>> {
+    async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         self.inner.connect_stream(sess, dst).await
     }
 
@@ -210,11 +212,7 @@ impl Outbound for UotOutbound {
         true
     }
 
-    async fn connect_packet(
-        &self,
-        sess: &Session,
-        dst: &DstAddr,
-    ) -> Result<Box<dyn PacketConn>> {
+    async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         // 魔法地址流；回包 dst 用调用方目标（仅展示用，实际按帧源地址）
         let stream = self.inner.connect_stream(sess, &magic_dst()).await?;
         let default_dst = dst_to_socket(dst).unwrap_or_else(|_| {
@@ -260,10 +258,7 @@ pub async fn serve_client(
         let _ = tx
             .send(UdpPacket {
                 src: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
-                dst: dst_to_socket(&dst).map_err(|e| {
-                    // 帧内域名目标：终止（明确不支持）
-                    e
-                })?,
+                dst: dst_to_socket(&dst)?,
                 data,
             })
             .await;

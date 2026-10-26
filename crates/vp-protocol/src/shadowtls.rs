@@ -19,8 +19,8 @@ use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, BytesMut};
 use hmac::{Hmac, Mac};
-use sha2::Digest as _;
 use sha1::Sha1;
+use sha2::Digest as _;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -41,9 +41,8 @@ const REC_HANDSHAKE: u8 = 22;
 const REC_APP: u8 = 23;
 /// HelloRetryRequest 的固定 ServerRandom
 const HRR_RANDOM: [u8; 32] = [
-    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
-    0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
-    0x33, 0x9C,
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -177,8 +176,8 @@ pub fn build_client_hello(password: &[u8], sni: &str) -> Vec<u8> {
     body.extend_from_slice(&sid);
     // cipher_suites（Chrome 常用集合，14 个）
     let suites: [u8; 28] = [
-        0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30,
-        0xc0, 0x13, 0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
+        0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30, 0xc0,
+        0x13, 0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
     ];
     body.extend_from_slice(&((suites.len() / 2) as u16).to_be_bytes());
     body.extend_from_slice(&suites);
@@ -209,8 +208,8 @@ pub fn build_client_hello(password: &[u8], sni: &str) -> Vec<u8> {
     exts.extend_from_slice(&[0x01, 0x00]);
     // signature_algorithms
     let sigs = [
-        0x04u8, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06,
-        0x06, 0x01, 0x02, 0x01,
+        0x04u8, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06,
+        0x01, 0x02, 0x01,
     ];
     exts.extend_from_slice(&13u16.to_be_bytes());
     exts.extend_from_slice(&((sigs.len() + 2) as u16).to_be_bytes());
@@ -280,7 +279,7 @@ pub fn verify_client_hello(frame: &[u8], password: &[u8]) -> bool {
     mac.update(&[0u8; HMAC_SIZE]);
     mac.update(&frame[hmac_idx + HMAC_SIZE..]);
     let tag = mac.finalize().into_bytes();
-    &tag[..HMAC_SIZE] == &frame[hmac_idx..hmac_idx + HMAC_SIZE]
+    tag[..HMAC_SIZE] == frame[hmac_idx..hmac_idx + HMAC_SIZE]
 }
 
 /// 从 ServerHello 记录提取 (server_random, 是否 TLS1.3, 是否 HRR)。
@@ -424,7 +423,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ShadowTlsStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "shadowtls: 写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(n)) => self.out.advance(n),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -559,7 +558,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
                         "shadowtls: 握手期收到 alert（traffic hijacked）",
-                    ))
+                    ));
                 }
                 REC_APP => {
                     if f.len() <= FRAME_HDR_HMAC {
@@ -597,10 +596,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
         .await
         .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "shadowtls: 客户端握手超时",
-            )
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "shadowtls: 客户端握手超时")
         })?
 }
 
@@ -648,7 +644,9 @@ pub async fn server_handshake(
     let pw = password.as_bytes();
     let inner = async {
         let mut client = client;
-        let ch = read_frame(&mut client).await.map_err(ServerHandshakeError::Io)?;
+        let ch = read_frame(&mut client)
+            .await
+            .map_err(ServerHandshakeError::Io)?;
         let authed = verify_client_hello(&ch, pw);
         let mut cam = TcpStream::connect((cam_host, cam_port))
             .await
@@ -787,10 +785,12 @@ pub async fn server_handshake(
     };
     tokio::time::timeout(HANDSHAKE_TIMEOUT, inner)
         .await
-        .map_err(|_| ServerHandshakeError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "shadowtls: 服务端握手超时",
-        )))?
+        .map_err(|_| {
+            ServerHandshakeError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "shadowtls: 服务端握手超时",
+            ))
+        })?
 }
 
 #[cfg(test)]
@@ -851,7 +851,9 @@ mod tests {
             s.write_all(&fake_server_hello()).await.unwrap();
             for i in 0..n_appdata {
                 let payload = format!("camouflage-flight-{i}");
-                s.write_all(&fake_appdata(payload.as_bytes())).await.unwrap();
+                s.write_all(&fake_appdata(payload.as_bytes()))
+                    .await
+                    .unwrap();
             }
             // 保持连接（不关闭），等待对端关闭
             let mut b = [0u8; 64];
@@ -959,17 +961,14 @@ mod tests {
         let srv_addr = srv.local_addr().unwrap();
         tokio::spawn(async move {
             let (s, _) = srv.accept().await.unwrap();
-            match server_handshake(s, PW, &cam_host, cam_port).await {
-                Ok(mut st) => {
-                    // 读客户端数据后篡改内容再回写（破坏 S 链）
-                    let mut b = [0u8; 128];
-                    let _ = st.read(&mut b).await;
-                    let mut tampered = b"tampered!!".to_vec();
-                    tampered[0] ^= 0xFF; // 直接写裸字节绕过 seal（模拟链失效）
-                    use tokio::io::AsyncWriteExt;
-                    let _ = st.inner_mut().write_all(&fake_appdata(&tampered)).await;
-                }
-                Err(_) => {}
+            if let Ok(mut st) = server_handshake(s, PW, &cam_host, cam_port).await {
+                // 读客户端数据后篡改内容再回写（破坏 S 链）
+                let mut b = [0u8; 128];
+                let _ = st.read(&mut b).await;
+                let mut tampered = b"tampered!!".to_vec();
+                tampered[0] ^= 0xFF; // 直接写裸字节绕过 seal（模拟链失效）
+                use tokio::io::AsyncWriteExt;
+                let _ = st.inner_mut().write_all(&fake_appdata(&tampered)).await;
             }
         });
         let c = TcpStream::connect(srv_addr).await.unwrap();
@@ -977,6 +976,9 @@ mod tests {
         cl.write_all(b"ping").await.unwrap();
         let mut b = [0u8; 64];
         let r = cl.read(&mut b).await;
-        assert!(r.is_err() || matches!(r, Ok(0)), "篡改帧应触发校验失败/关闭");
+        assert!(
+            r.is_err() || matches!(r, Ok(0)),
+            "篡改帧应触发校验失败/关闭"
+        );
     }
 }

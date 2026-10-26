@@ -2,63 +2,49 @@
 //!
 //! M1：direct / reject / socks5 / http / shadowsocks / vmess / vless / trojan（出+入对称）
 
-pub mod basic_out;
 pub mod anytls;
+pub mod basic_out;
 pub mod brook;
 pub mod direct;
-pub mod mieru;
-pub mod naive;
 pub mod h3_min;
 pub mod hysteria2;
-pub mod shadowtls;
-pub mod ssh;
-pub mod tuic;
-pub mod wireguard;
-pub mod redir;
-pub mod sub;
 pub mod inbound;
-#[cfg(feature = "ss")]
-pub mod ss;
-pub mod ssr;
-#[cfg(feature = "trojan")]
-pub mod trojan;
+pub mod mieru;
+pub mod naive;
+pub mod redir;
+pub mod shadowtls;
 #[cfg(feature = "snell")]
 pub mod snell;
+#[cfg(feature = "ss")]
+pub mod ss;
+pub mod ssh;
+pub mod ssr;
+pub mod sub;
+#[cfg(feature = "trojan")]
+pub mod trojan;
+pub mod tuic;
 pub mod udp_out;
+pub mod uot;
 #[cfg(feature = "vless")]
 pub mod vless;
 #[cfg(feature = "vless")]
 pub mod vless_vision;
-pub mod uot;
 #[cfg(feature = "vmess")]
 pub mod vmess;
+pub mod wireguard;
 
 use std::sync::Arc;
 
-use vp_common::{Error, Result};
-use vp_config::{AnytlsCfg, NaiveCfg, GroupCfg, GroupKind, HttpCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg, TrojanCfg, VlessCfg, VmessCfg, WsOpts};
-use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_common::DstAddr;
+use vp_common::{Error, Result};
+use vp_config::{
+    AnytlsCfg, GroupCfg, GroupKind, HttpCfg, NaiveCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg,
+    TrojanCfg, VlessCfg, VmessCfg, WsOpts,
+};
+use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_dns::Resolver;
 use vp_router::{GroupSpec, GroupType, LbStrategy};
 use vp_transport::{TransportConfig, WsConfig};
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use async_trait::async_trait;
-    
-    use vp_core::{Resolution, Router as RouterTrait, Session};
-
-    pub struct NoopRouter();
-
-    #[async_trait]
-    impl RouterTrait for NoopRouter {
-        async fn pick(&self, _sess: &Session) -> Resolution {
-            unreachable!("noop router")
-        }
-    }
-
-}
 
 pub use basic_out::{HttpOutbound, RejectOutbound, Socks5Outbound};
 
@@ -70,7 +56,10 @@ pub struct NamedOutbound<T> {
 
 impl<T> NamedOutbound<T> {
     pub fn new_named(name: &str, inner: T) -> Self {
-        NamedOutbound { name: name.into(), inner }
+        NamedOutbound {
+            name: name.into(),
+            inner,
+        }
     }
 }
 
@@ -101,7 +90,7 @@ impl<T: Outbound> Outbound for NamedOutbound<T> {
     }
 }
 pub use direct::DirectOutbound;
-pub use inbound::{build_inbound, dispatch_stream, InboundKind};
+pub use inbound::{InboundKind, build_inbound, dispatch_stream};
 
 /// 出站构建依赖
 pub struct OutboundDeps {
@@ -129,7 +118,16 @@ pub fn transport_of(
     ws_opts: &Option<WsOpts>,
     fingerprint: &Option<String>,
 ) -> Result<TransportConfig> {
-    transport_of_full(tls, server_name, skip_cert_verify, network, ws_opts, &None, fingerprint, &None)
+    transport_of_full(
+        tls,
+        server_name,
+        skip_cert_verify,
+        network,
+        ws_opts,
+        &None,
+        fingerprint,
+        &None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,36 +184,49 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Reject => Arc::new(RejectOutbound),
         ProxyKind::Hysteria2(h) => Arc::new(hysteria2::Hysteria2Outbound::new(h)?),
         ProxyKind::Tuic(t) => Arc::new(tuic::TuicOutbound::new(t)?),
-        ProxyKind::Socks5(SocksCfg { server, port, username, password, udp, .. }) => {
-            Arc::new(NamedOutbound::new_named(
-                &cfg.name,
-                Socks5Outbound {
-                    server: server.clone(),
-                    port: *port,
-                    username: username.clone(),
-                    password: password.clone(),
-                    udp: *udp,
-                },
-            ))
-        }
-        ProxyKind::Http(HttpCfg { server, port, username, password, .. }) => {
-            Arc::new(NamedOutbound::new_named(
-                &cfg.name,
-                HttpOutbound {
-                    server: server.clone(),
-                    port: *port,
-                    username: username.clone(),
-                    password: password.clone(),
-                },
-            ))
-        }
+        ProxyKind::Socks5(SocksCfg {
+            server,
+            port,
+            username,
+            password,
+            udp,
+            ..
+        }) => Arc::new(NamedOutbound::new_named(
+            &cfg.name,
+            Socks5Outbound {
+                server: server.clone(),
+                port: *port,
+                username: username.clone(),
+                password: password.clone(),
+                udp: *udp,
+            },
+        )),
+        ProxyKind::Http(HttpCfg {
+            server,
+            port,
+            username,
+            password,
+            ..
+        }) => Arc::new(NamedOutbound::new_named(
+            &cfg.name,
+            HttpOutbound {
+                server: server.clone(),
+                port: *port,
+                username: username.clone(),
+                password: password.clone(),
+            },
+        )),
         ProxyKind::Wireguard(wg) => Arc::new(wireguard::WgOutbound::new_named(
             cfg.name.as_str(),
             wg,
             deps.dns.clone(),
         )?),
         ProxyKind::Ss(ss) => build_ss(cfg.name.as_str(), ss)?,
-        ProxyKind::Ssr(s) => Arc::new(ssr::SsrOutbound::new_named(cfg.name.as_str(), s, deps.dns.clone())?),
+        ProxyKind::Ssr(s) => Arc::new(ssr::SsrOutbound::new_named(
+            cfg.name.as_str(),
+            s,
+            deps.dns.clone(),
+        )?),
         ProxyKind::Vmess(vm) => build_vmess(cfg.name.as_str(), vm)?,
         ProxyKind::Vless(vl) => build_vless(cfg.name.as_str(), vl)?,
         ProxyKind::Trojan(tr) => build_trojan(cfg.name.as_str(), tr)?,
@@ -315,7 +326,8 @@ fn build_trojan(_name: &str, _tr_cfg: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
 }
 
 fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
-    let base: Arc<dyn Outbound> = Arc::new(anytls::AnytlsOutbound::new_named(cfg.name.as_str(), a)?);
+    let base: Arc<dyn Outbound> =
+        Arc::new(anytls::AnytlsOutbound::new_named(cfg.name.as_str(), a)?);
     // anytls 无原生 UDP：udp: true 时经 UoT 提供（显式 udp-over-tcp 标志避免双包装）
     if a.udp && !cfg.udp_over_tcp {
         Ok(Arc::new(uot::UotOutbound::new(base)))
@@ -330,5 +342,21 @@ fn build_naive(cfg: &ProxyCfg, n: &NaiveCfg) -> Result<Arc<dyn Outbound>> {
         Ok(Arc::new(uot::UotOutbound::new(base)))
     } else {
         Ok(base)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use async_trait::async_trait;
+
+    use vp_core::{Resolution, Router as RouterTrait, Session};
+
+    pub struct NoopRouter();
+
+    #[async_trait]
+    impl RouterTrait for NoopRouter {
+        async fn pick(&self, _sess: &Session) -> Resolution {
+            unreachable!("noop router")
+        }
     }
 }

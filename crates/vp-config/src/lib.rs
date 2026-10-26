@@ -225,7 +225,10 @@ sub-rules:
                 assert_eq!(s.psk, "secretpsk");
                 assert_eq!(s.version, 4);
                 assert_eq!(s.obfs_opts.as_ref().unwrap().mode.as_deref(), Some("http"));
-                assert_eq!(s.obfs_opts.as_ref().unwrap().host.as_deref(), Some("www.bing.com"));
+                assert_eq!(
+                    s.obfs_opts.as_ref().unwrap().host.as_deref(),
+                    Some("www.bing.com")
+                );
                 assert!(s.udp);
             }
             other => panic!("unexpected {other:?}"),
@@ -320,7 +323,8 @@ sub-rules:
     #[test]
     fn error_has_field_path() {
         // 缺 password
-        let y = "proxies:\n  - name: a\n    type: ss\n    server: x\n    port: 1\n    cipher: aes\n";
+        let y =
+            "proxies:\n  - name: a\n    type: ss\n    server: x\n    port: 1\n    cipher: aes\n";
         let err = parse(y, Format::Yaml).unwrap_err();
         assert!(err.to_string().contains("password"), "{err}");
     }

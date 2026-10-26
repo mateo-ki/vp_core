@@ -3,3 +3,5 @@ Cargo.lock.orig
 *.log
 .vscode/
 .idea/
+.zcode/
+.agents/

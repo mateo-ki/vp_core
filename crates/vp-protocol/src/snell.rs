@@ -10,12 +10,12 @@
 //! - 命令：0x00 PING，0x01 CONNECT (TCP)，0x02 UDP
 //! - 混淆：obfs: http 伪装握手（自动识别并回复 101 Switching Protocols）
 
+use async_trait::async_trait;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use async_trait::async_trait;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use vp_common::addr::{decode_socks_addr, encode_socks_addr};
@@ -23,7 +23,7 @@ use vp_common::{DstAddr, Error, Result};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::stream::UdpPacket;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::ss::AeadChunkCodec;
 use vp_crypto::{AeadKind, AnyAead};
@@ -59,7 +59,10 @@ pub fn derive_snell_codecs(
             let hash = hasher.finalize();
             let c2s = AnyAead::new(AeadKind::Aes128Gcm, &hash[..16])?;
             let s2c = AnyAead::new(AeadKind::Aes128Gcm, &hash[..16])?;
-            Ok((AeadChunkCodec::from_aead(c2s), AeadChunkCodec::from_aead(s2c)))
+            Ok((
+                AeadChunkCodec::from_aead(c2s),
+                AeadChunkCodec::from_aead(s2c),
+            ))
         }
         VERSION_2 => {
             let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(nonce_or_salt), psk.as_bytes());
@@ -68,7 +71,10 @@ pub fn derive_snell_codecs(
                 .map_err(|_| Error::Proto("HKDF expand 失败"))?;
             let c2s = AnyAead::new(AeadKind::ChaCha20Poly1305, &key)?;
             let s2c = AnyAead::new(AeadKind::ChaCha20Poly1305, &key)?;
-            Ok((AeadChunkCodec::from_aead(c2s), AeadChunkCodec::from_aead(s2c)))
+            Ok((
+                AeadChunkCodec::from_aead(c2s),
+                AeadChunkCodec::from_aead(s2c),
+            ))
         }
         VERSION_3 => {
             let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(nonce_or_salt), psk.as_bytes());
@@ -80,7 +86,10 @@ pub fn derive_snell_codecs(
                 .map_err(|_| Error::Proto("HKDF expand server 失败"))?;
             let c2s = AnyAead::new(AeadKind::ChaCha20Poly1305, &c_key)?;
             let s2c = AnyAead::new(AeadKind::ChaCha20Poly1305, &s_key)?;
-            Ok((AeadChunkCodec::from_aead(c2s), AeadChunkCodec::from_aead(s2c)))
+            Ok((
+                AeadChunkCodec::from_aead(c2s),
+                AeadChunkCodec::from_aead(s2c),
+            ))
         }
         _ => {
             // v4（默认）
@@ -93,7 +102,10 @@ pub fn derive_snell_codecs(
                 .map_err(|_| Error::Proto("HKDF expand server 失败"))?;
             let c2s = AnyAead::new(AeadKind::ChaCha20Poly1305, &c_key)?;
             let s2c = AnyAead::new(AeadKind::ChaCha20Poly1305, &s_key)?;
-            Ok((AeadChunkCodec::from_aead(c2s), AeadChunkCodec::from_aead(s2c)))
+            Ok((
+                AeadChunkCodec::from_aead(c2s),
+                AeadChunkCodec::from_aead(s2c),
+            ))
         }
     }
 }
@@ -142,7 +154,7 @@ impl<S> SnellStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "snell: 写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(n)) => self.out.advance(n),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -762,7 +774,9 @@ impl SnellInbound {
                             break;
                         }
                         full_addr.extend_from_slice(&addr_rest);
-                        let Ok((dst, _)) = decode_socks_addr(&full_addr) else { break };
+                        let Ok((dst, _)) = decode_socks_addr(&full_addr) else {
+                            break;
+                        };
 
                         let mut len_b = [0u8; 2];
                         if client_stream.read_exact(&mut len_b).await.is_err() {
@@ -772,7 +786,11 @@ impl SnellInbound {
                         if datalen > ubuf.len() {
                             break;
                         }
-                        if client_stream.read_exact(&mut ubuf[..datalen]).await.is_err() {
+                        if client_stream
+                            .read_exact(&mut ubuf[..datalen])
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
 
@@ -909,9 +927,8 @@ mod tests {
 
         // 2. 启动 Snell 服务端
         let psk = "vpcore-secret-psk-123456";
-        let inb = Arc::new(
-            SnellInbound::new("127.0.0.1", 0, "sn-in", &[psk.into()], version).unwrap(),
-        );
+        let inb =
+            Arc::new(SnellInbound::new("127.0.0.1", 0, "sn-in", &[psk.into()], version).unwrap());
         let ctx = InboundCtx {
             router: Arc::new(crate::test_support::NoopRouter()),
             stats: Arc::new(vp_common::Stats::default()),
@@ -926,7 +943,11 @@ mod tests {
             psk: psk.into(),
             version,
             obfs: if http_obfs { Some("http".into()) } else { None },
-            host: if http_obfs { Some("www.bing.com".into()) } else { None },
+            host: if http_obfs {
+                Some("www.bing.com".into())
+            } else {
+                None
+            },
             obfs_opts: None,
             udp: false,
         })

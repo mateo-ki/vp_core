@@ -49,8 +49,7 @@ mod tests {
 
     #[test]
     fn converts_nested() {
-        let y: serde_yaml::Value =
-            serde_yaml::from_str("a: [1, two, {b: true, c: null}]").unwrap();
+        let y: serde_yaml::Value = serde_yaml::from_str("a: [1, two, {b: true, c: null}]").unwrap();
         let j = yaml_to_json(y).unwrap();
         assert_eq!(
             j,

@@ -67,7 +67,9 @@ impl ClassicalSet {
                 return true;
             }
         }
-        self.ports.iter().any(|&(lo, hi)| dst_port >= lo && dst_port <= hi)
+        self.ports
+            .iter()
+            .any(|&(lo, hi)| dst_port >= lo && dst_port <= hi)
     }
 }
 
@@ -81,16 +83,15 @@ pub fn load_payload(text: &str, behavior: Behavior) -> Result<ProviderPayload, S
             for line in lines {
                 insert_domain_line(&mut trie, &mut keywords, &line)?;
             }
-            Ok(ProviderPayload::Domain(Box::new(DomainSet { trie, keywords })))
+            Ok(ProviderPayload::Domain(Box::new(DomainSet {
+                trie,
+                keywords,
+            })))
         }
         Behavior::IpCidr => {
             let mut b = IpIntervalSetBuilder::new();
             for line in lines {
-                let cidr = line
-                    .split(',')
-                    .next()
-                    .unwrap_or("")
-                    .trim();
+                let cidr = line.split(',').next().unwrap_or("").trim();
                 b.insert_cidr(cidr)?;
             }
             Ok(ProviderPayload::Ip(Box::new(b.build())))

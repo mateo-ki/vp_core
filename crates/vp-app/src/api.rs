@@ -94,9 +94,14 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
     if !body.is_empty() {
         stream.read_exact(&mut body).await.ok()?;
     }
-    Some(Req { method, path, query, body, auth })
+    Some(Req {
+        method,
+        path,
+        query,
+        body,
+        auth,
+    })
 }
-
 
 /// 热重载：重建 Router 并替换（失败保留旧配置）
 async fn reload_into(
@@ -163,7 +168,13 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             .and_then(|a| a.strip_prefix("Bearer "))
             .is_some_and(|t| t == secret);
         if !ok {
-            reply(&mut stream, 401, "Unauthorized", &json!({"message": "unauthorized"})).await;
+            reply(
+                &mut stream,
+                401,
+                "Unauthorized",
+                &json!({"message": "unauthorized"}),
+            )
+            .await;
             return Ok(());
         }
     }
@@ -172,9 +183,14 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
 
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["version"]) => {
-            reply(&mut stream, 200, "OK", &json!({
-                "meta": true, "version": env!("CARGO_PKG_VERSION"), "premium": false
-            }))
+            reply(
+                &mut stream,
+                200,
+                "OK",
+                &json!({
+                    "meta": true, "version": env!("CARGO_PKG_VERSION"), "premium": false
+                }),
+            )
             .await;
         }
         ("GET", ["proxies"]) => {
@@ -216,7 +232,13 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 )
                 .await;
             } else {
-                reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await;
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": "not found"}),
+                )
+                .await;
             }
         }
         ("PUT", ["proxies", name]) => {
@@ -239,7 +261,13 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                     }
                 }
                 None => {
-                    reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "not found"}),
+                    )
+                    .await
                 }
             }
         }
@@ -256,27 +284,22 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                     };
                     match ms {
                         Ok(ms) => {
-                            reply(
-                                &mut stream,
-                                200,
-                                "OK",
-                                &json!({"delay": ms, "url": url}),
-                            )
-                            .await
+                            reply(&mut stream, 200, "OK", &json!({"delay": ms, "url": url})).await
                         }
                         Err(_) => {
-                            reply(
-                                &mut stream,
-                                408,
-                                "Timeout",
-                                &json!({"message": "测速失败"}),
-                            )
-                            .await
+                            reply(&mut stream, 408, "Timeout", &json!({"message": "测速失败"}))
+                                .await
                         }
                     }
                 }
                 None => {
-                    reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "not found"}),
+                    )
+                    .await
                 }
             }
         }
@@ -353,7 +376,13 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             match hit {
                 Some(c) => reply(&mut stream, 200, "OK", &json!({"connection": c})).await,
                 None => {
-                    reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "not found"}),
+                    )
+                    .await
                 }
             }
         }
@@ -398,7 +427,10 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                             match tokio::fs::read_to_string(path).await {
                                 Ok(t) => {
                                     let fmt = vp_config::Format::from_path(&path.to_string_lossy());
-                                    let dir = path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                                    let dir = path
+                                        .parent()
+                                        .unwrap_or(std::path::Path::new("."))
+                                        .to_path_buf();
                                     (t, fmt, dir)
                                 }
                                 Err(e) => {
@@ -409,7 +441,9 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                         } else {
                             (meta.text, meta.fmt, meta.base_dir)
                         };
-                        reload_into(st, meta.path, &new_text, new_fmt, new_dir).await.is_ok()
+                        reload_into(st, meta.path, &new_text, new_fmt, new_dir)
+                            .await
+                            .is_ok()
                     }
                     None => false,
                 }
@@ -433,11 +467,17 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
                     for (name, p) in cfg.proxy_providers {
                         let mut proxy_list = Vec::new();
-                        let cache_path = p.path.as_ref()
+                        let cache_path = p
+                            .path
+                            .as_ref()
                             .map(|p| meta.base_dir.join(p))
-                            .unwrap_or_else(|| meta.base_dir.join(".cache").join(format!("{name}.yaml")));
+                            .unwrap_or_else(|| {
+                                meta.base_dir.join(".cache").join(format!("{name}.yaml"))
+                            });
                         if let Ok(text) = std::fs::read_to_string(&cache_path) {
-                            if let Ok(proxies) = vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref()) {
+                            if let Ok(proxies) =
+                                vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref())
+                            {
                                 for pr in proxies {
                                     proxy_list.push(json!({
                                         "name": pr.name,
@@ -446,22 +486,31 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                                 }
                             }
                         }
-                        providers_map.insert(name.clone(), json!({
-                            "name": name,
-                            "type": "Proxy",
-                            "vehicleType": p.kind.unwrap_or_else(|| "HTTP".into()),
-                            "proxies": proxy_list,
-                            "updatedAt": vp_core::conn_table::iso8601(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis() as u64,
-                            ),
-                        }));
+                        providers_map.insert(
+                            name.clone(),
+                            json!({
+                                "name": name,
+                                "type": "Proxy",
+                                "vehicleType": p.kind.unwrap_or_else(|| "HTTP".into()),
+                                "proxies": proxy_list,
+                                "updatedAt": vp_core::conn_table::iso8601(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                ),
+                            }),
+                        );
                     }
                 }
             }
-            reply(&mut stream, 200, "OK", &json!({ "providers": providers_map })).await;
+            reply(
+                &mut stream,
+                200,
+                "OK",
+                &json!({ "providers": providers_map }),
+            )
+            .await;
         }
         ("GET", ["providers", "proxies", name]) => {
             let meta = st.config_meta.read().unwrap().clone();
@@ -470,11 +519,17 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
                     if let Some(p) = cfg.proxy_providers.get(*name) {
                         let mut proxy_list = Vec::new();
-                        let cache_path = p.path.as_ref()
+                        let cache_path = p
+                            .path
+                            .as_ref()
                             .map(|p| meta.base_dir.join(p))
-                            .unwrap_or_else(|| meta.base_dir.join(".cache").join(format!("{name}.yaml")));
+                            .unwrap_or_else(|| {
+                                meta.base_dir.join(".cache").join(format!("{name}.yaml"))
+                            });
                         if let Ok(text) = std::fs::read_to_string(&cache_path) {
-                            if let Ok(proxies) = vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref()) {
+                            if let Ok(proxies) =
+                                vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref())
+                            {
                                 for pr in proxies {
                                     proxy_list.push(json!({
                                         "name": pr.name,
@@ -500,32 +555,68 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             }
             match found {
                 Some(val) => reply(&mut stream, 200, "OK", &val).await,
-                None => reply(&mut stream, 404, "Not Found", &json!({"message": "provider not found"})).await,
+                None => {
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "provider not found"}),
+                    )
+                    .await
+                }
             }
         }
         ("PUT", ["providers", "proxies", name]) => {
             let cur = st.config_meta.read().unwrap().clone();
             match cur {
                 Some(meta) => {
-                    let reloaded = reload_into(st, meta.path, &meta.text, meta.fmt, meta.base_dir).await.is_ok();
+                    let reloaded = reload_into(st, meta.path, &meta.text, meta.fmt, meta.base_dir)
+                        .await
+                        .is_ok();
                     if reloaded {
                         reply(&mut stream, 204, "No Content", &json!({})).await;
                     } else {
-                        reply(&mut stream, 500, "Internal Server Error", &json!({"message": format!("刷新 {name} 失败")})).await;
+                        reply(
+                            &mut stream,
+                            500,
+                            "Internal Server Error",
+                            &json!({"message": format!("刷新 {name} 失败")}),
+                        )
+                        .await;
                     }
                 }
-                None => reply(&mut stream, 404, "Not Found", &json!({"message": "no config loaded"})).await,
+                None => {
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "no config loaded"}),
+                    )
+                    .await
+                }
             }
         }
         ("POST", ["dns", "flush"]) | ("PUT", ["dns", "flush"]) => {
-            reply(&mut stream, 200, "OK", &json!({"message": "dns cache flushed"})).await;
+            reply(
+                &mut stream,
+                200,
+                "OK",
+                &json!({"message": "dns cache flushed"}),
+            )
+            .await;
         }
         ("GET", ["traffic"]) => {
             // WebSocket /traffic：每秒推送 {"up":..,"down":..}
-            serve_traffic_ws(stream, &st).await;
+            serve_traffic_ws(stream, st).await;
         }
         _ => {
-            reply(&mut stream, 404, "Not Found", &json!({"message": "not found"})).await;
+            reply(
+                &mut stream,
+                404,
+                "Not Found",
+                &json!({"message": "not found"}),
+            )
+            .await;
         }
     }
     Ok(())
@@ -534,11 +625,7 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
 fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
-        if k == key {
-            Some(url_decode(v))
-        } else {
-            None
-        }
+        if k == key { Some(url_decode(v)) } else { None }
     })
 }
 
@@ -684,7 +771,8 @@ rules: ['MATCH,PROXY']
         let auth = secret
             .map(|t| format!("Authorization: Bearer {t}\r\n"))
             .unwrap_or_default();
-        let req = format!("DELETE {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
+        let req =
+            format!("DELETE {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\n\r\n");
         s.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await.unwrap();
@@ -703,12 +791,7 @@ rules: ['MATCH,PROXY']
         parse_http(&buf)
     }
 
-    async fn http_put(
-        addr: &str,
-        path: &str,
-        secret: Option<&str>,
-        body: &str,
-    ) -> (u16, String) {
+    async fn http_put(addr: &str, path: &str, secret: Option<&str>, body: &str) -> (u16, String) {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let auth = secret
             .map(|t| format!("Authorization: Bearer {t}\r\n"))

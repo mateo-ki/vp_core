@@ -8,9 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use vp_common::{Error, Result};
-use vp_core::inbound::InboundCtx;
 use vp_core::Inbound;
-
+use vp_core::inbound::InboundCtx;
 
 pub struct RedirInbound {
     #[allow(dead_code)]
@@ -22,7 +21,11 @@ pub struct RedirInbound {
 
 impl RedirInbound {
     pub fn new(bind: &str, port: u16, tag: &str) -> Self {
-        RedirInbound { bind: bind.into(), port, tag: tag.into() }
+        RedirInbound {
+            bind: bind.into(),
+            port,
+            tag: tag.into(),
+        }
     }
 }
 

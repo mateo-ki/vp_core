@@ -211,7 +211,10 @@ impl RouterTrait for Router {
     async fn pick(&self, sess: &Session) -> Resolution {
         let (outbound, rule) = match self.mode {
             Mode::Direct => (
-                self.outbounds.get("DIRECT").cloned().unwrap_or(self.global_outbound.clone()),
+                self.outbounds
+                    .get("DIRECT")
+                    .cloned()
+                    .unwrap_or(self.global_outbound.clone()),
                 None,
             ),
             Mode::Global => (self.global_outbound.clone(), None),
@@ -219,8 +222,10 @@ impl RouterTrait for Router {
                 let ctx = self.match_context(sess).await;
                 match self.rules.r#match(&ctx) {
                     Some(m) => {
-                        let hit =
-                            RuleHit { rule: m.rule.to_string(), target: m.target.to_string() };
+                        let hit = RuleHit {
+                            rule: m.rule.to_string(),
+                            target: m.target.to_string(),
+                        };
                         let ob = self
                             .outbounds
                             .get(m.target)
@@ -236,7 +241,11 @@ impl RouterTrait for Router {
             }
         };
         let via = self.resolve_via(&outbound, sess);
-        Resolution { outbound, via, rule }
+        Resolution {
+            outbound,
+            via,
+            rule,
+        }
     }
 }
 

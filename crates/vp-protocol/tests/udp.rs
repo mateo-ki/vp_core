@@ -12,7 +12,7 @@ use vp_common::Stats;
 use vp_core::{ConnTable, Inbound, InboundCtx, Outbound as _};
 use vp_dns::Resolver;
 use vp_protocol::direct::DirectOutbound;
-use vp_protocol::{build_inbound, InboundKind};
+use vp_protocol::{InboundKind, build_inbound};
 use vp_router::{GroupSpec, GroupType, LbStrategy, Router, RouterSpec};
 
 async fn spawn_udp_echo() -> SocketAddr {
@@ -22,7 +22,9 @@ async fn spawn_udp_echo() -> SocketAddr {
     tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         loop {
-            let Ok((n, from)) = s.recv_from(&mut buf).await else { break };
+            let Ok((n, from)) = s.recv_from(&mut buf).await else {
+                break;
+            };
             let mut resp = b"echo:".to_vec();
             resp.extend_from_slice(&buf[..n]);
             let _ = s.send_to(&resp, from).await;
@@ -89,7 +91,9 @@ async fn build_udp_router_with(
 /// 手写 socks5 UDP ASSOCIATE 客户端：返回 (中继地址, 控制连接)
 async fn udp_associate(port: u16) -> (SocketAddr, tokio::net::TcpStream) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut b = [0u8; 2];
     s.read_exact(&mut b).await.unwrap();
@@ -148,7 +152,9 @@ fn socks_udp_packet(dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn socks5_inbound_udp_relay_via_direct() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
     let echo = spawn_udp_echo().await;
     let (_router, ctx) = build_udp_router_with(vec![]).await;
     let mixed = build_inbound(InboundKind::Mixed, "127.0.0.1".into(), 0, "m");
@@ -157,7 +163,9 @@ async fn socks5_inbound_udp_relay_via_direct() {
     let (relay, _ctrl) = udp_associate(port).await;
     eprintln!("[t] relay = {relay}");
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    sock.send_to(&socks_udp_packet(echo, b"hello-udp"), relay).await.unwrap();
+    sock.send_to(&socks_udp_packet(echo, b"hello-udp"), relay)
+        .await
+        .unwrap();
     let mut buf = [0u8; 1500];
     let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
         .await
@@ -194,7 +202,11 @@ async fn ss_udp_loopback() {
     })
     .unwrap();
     assert!(out.support_udp());
-    let sess = vp_core::Session::new_udp("t".into(), None, vp_common::DstAddr::ip(echo.ip(), echo.port()));
+    let sess = vp_core::Session::new_udp(
+        "t".into(),
+        None,
+        vp_common::DstAddr::ip(echo.ip(), echo.port()),
+    );
     let mut conn = out
         .connect_packet(&sess, &vp_common::DstAddr::ip(echo.ip(), echo.port()))
         .await
@@ -230,7 +242,9 @@ async fn ss_udp_loopback() {
 
 #[tokio::test]
 async fn socks5_outbound_udp_via_mixed() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
     use vp_protocol::basic_out::Socks5Outbound;
     let echo = spawn_udp_echo().await;
     let (_router, ctx) = build_udp_router_with(vec![]).await;
@@ -245,7 +259,11 @@ async fn socks5_outbound_udp_via_mixed() {
         udp: true,
     };
     assert!(out.support_udp());
-    let sess = vp_core::Session::new_udp("t".into(), None, vp_common::DstAddr::ip(echo.ip(), echo.port()));
+    let sess = vp_core::Session::new_udp(
+        "t".into(),
+        None,
+        vp_common::DstAddr::ip(echo.ip(), echo.port()),
+    );
     let mut conn = out
         .connect_packet(&sess, &vp_common::DstAddr::ip(echo.ip(), echo.port()))
         .await

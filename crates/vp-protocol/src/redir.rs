@@ -6,10 +6,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(target_os = "linux")]
+use tokio::net::TcpListener;
+#[cfg(target_os = "linux")]
+use tracing::{debug, warn};
 
+#[cfg(target_os = "linux")]
+use vp_common::addr::DstAddr;
 use vp_common::{Error, Result};
 use vp_core::Inbound;
+#[cfg(target_os = "linux")]
+use vp_core::Session;
 use vp_core::inbound::InboundCtx;
+
+#[cfg(target_os = "linux")]
+use crate::inbound::dispatch::dispatch_stream;
 
 pub struct RedirInbound {
     #[allow(dead_code)]

@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use base64::Engine;
@@ -122,9 +122,7 @@ enum Cmd {
         reply: SessionReply,
     },
     ConnectUdp {
-        reply: tokio::sync::oneshot::Sender<
-            Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)>,
-        >,
+        reply: tokio::sync::oneshot::Sender<Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)>>,
     },
 }
 
@@ -141,8 +139,13 @@ pub enum DownMsg {
 }
 
 enum SessKind {
-    Tcp { handle: SocketHandle, pending: Option<Vec<u8>> },
-    Udp { handle: SocketHandle },
+    Tcp {
+        handle: SocketHandle,
+        pending: Option<Vec<u8>>,
+    },
+    Udp {
+        handle: SocketHandle,
+    },
 }
 
 struct Sess {
@@ -191,9 +194,8 @@ impl WgCore {
                 .decode(s.trim())
                 .map_err(|e| Error::Config(format!("wireguard {what} base64: {e}")))?;
             let n = v.len();
-            v.try_into().map_err(|_| {
-                Error::Config(format!("wireguard {what} 长度应为 32 字节，得到 {n}"))
-            })
+            v.try_into()
+                .map_err(|_| Error::Config(format!("wireguard {what} 长度应为 32 字节，得到 {n}")))
         };
         let sk = StaticSecret::from(decode32(private_key_b64, "private-key")?);
         let peer = PublicKey::from(decode32(peer_public_key_b64, "public-key")?);
@@ -307,7 +309,7 @@ async fn wire_task(
             _ = tick.tick() => {
                 let now = std::time::Instant::now();
                 // 握手维护
-                let needs_hs = handshake_at.map_or(true, |t| now.duration_since(t) > SESSION_MAX_AGE);
+                let needs_hs = handshake_at.is_none_or(|t| now.duration_since(t) > SESSION_MAX_AGE);
                 if needs_hs {
                     let mut buf = [0u8; 148];
                     let to_send = {
@@ -654,12 +656,14 @@ fn pump_sessions(
 /// smoltcp IpEndpoint → std SocketAddr
 fn endpoint_to_std(ep: smoltcp::wire::IpEndpoint) -> SocketAddr {
     match ep.addr {
-        IpAddress::Ipv4(v4) => {
-            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.0)), ep.port)
-        }
-        IpAddress::Ipv6(v6) => {
-            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.0)), ep.port)
-        }
+        IpAddress::Ipv4(v4) => SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.0)),
+            ep.port,
+        ),
+        IpAddress::Ipv6(v6) => SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.0)),
+            ep.port,
+        ),
     }
 }
 
@@ -708,7 +712,7 @@ pub struct WgTcpStream {
     up_rx: Pin<Box<mpsc::Receiver<UpMsg>>>,
     down_tx: Pin<Box<mpsc::Sender<DownMsg>>>,
     /// 满时的 reserve future（慢路径缓存）
-        cur: Option<Bytes>,
+    cur: Option<Bytes>,
     eof: bool,
     err: Option<std::io::Error>,
 }
@@ -816,9 +820,8 @@ pub struct WgOutbound {
 
 impl WgOutbound {
     pub fn new_named(name: &str, cfg: &WgCfg, resolver: Arc<Resolver>) -> Result<Self> {
-        let _ = tokio::runtime::Handle::try_current().map_err(|_| {
-            Error::Config("wireguard 出站必须在 tokio 运行时内构建".to_string())
-        })?;
+        let _ = tokio::runtime::Handle::try_current()
+            .map_err(|_| Error::Config("wireguard 出站必须在 tokio 运行时内构建".to_string()))?;
         let core = WgCore::connect_udp(
             &cfg.server,
             cfg.port,
@@ -826,9 +829,8 @@ impl WgOutbound {
             &cfg.public_key,
             cfg.pre_shared_key.as_deref(),
             cfg.persistent_keepalive,
-            cfg.local_v4().ok_or_else(|| {
-                Error::Config("wireguard ip 字段必须是合法 IPv4".into())
-            })?,
+            cfg.local_v4()
+                .ok_or_else(|| Error::Config("wireguard ip 字段必须是合法 IPv4".into()))?,
             cfg.local_v6(),
         )?;
         Ok(WgOutbound {
@@ -856,11 +858,7 @@ impl Outbound for WgOutbound {
         &self.name
     }
 
-    async fn connect_stream(
-        &self,
-        _sess: &Session,
-        dst: &DstAddr,
-    ) -> Result<Box<dyn ProxyStream>> {
+    async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         let saddr = self.resolve(dst).await?;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<SessionInner>();
         self.core
@@ -870,18 +868,14 @@ impl Outbound for WgOutbound {
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| Error::Proto("wireguard 隧道任务已退出".into()))?;
+            .map_err(|_| Error::Proto("wireguard 隧道任务已退出"))?;
         let (up_rx, down_tx) = reply_rx
             .await
-            .map_err(|_| Error::Proto("wireguard 隧道任务已退出".into()))??;
+            .map_err(|_| Error::Proto("wireguard 隧道任务已退出"))??;
         Ok(Box::new(WgTcpStream::new(up_rx, down_tx)))
     }
 
-    async fn connect_packet(
-        &self,
-        _sess: &Session,
-        _dst: &DstAddr,
-    ) -> Result<Box<dyn PacketConn>> {
+    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<
             Result<(mpsc::Receiver<UpMsg>, mpsc::Sender<DownMsg>)>,
         >();
@@ -896,10 +890,7 @@ impl Outbound for WgOutbound {
         Ok(Box::new(WgUdpConn {
             up_rx,
             down_tx,
-            local: SocketAddr::new(
-                std::net::IpAddr::V4(self.core.local_v4),
-                0,
-            ),
+            local: SocketAddr::new(std::net::IpAddr::V4(self.core.local_v4), 0),
         }))
     }
 
@@ -924,8 +915,7 @@ mod tests {
             meta.level() <= log::Level::Trace
         }
         fn log(&self, record: &log::Record) {
-            if record.target().contains("smoltcp") {
-            }
+            if record.target().contains("smoltcp") {}
         }
         fn flush(&self) {}
     }
@@ -945,11 +935,7 @@ mod tests {
     const ECHO_PORT: u16 = 9091;
 
     /// WG 服务端任务：UDP ↔ Tunn(服务端角色) ↔ smoltcp 栈 TCP echo。
-    async fn wg_server_task(
-        udp: UdpSocket,
-        mut tunn: ServerTunn,
-        _client_pub: PublicKey,
-    ) {
+    async fn wg_server_task(udp: UdpSocket, mut tunn: ServerTunn, _client_pub: PublicKey) {
         let q = Arc::new(SharedQueues {
             rx: std::sync::Mutex::new(std::collections::VecDeque::new()),
             tx: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -983,10 +969,7 @@ mod tests {
             tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
         );
         echo.set_nagle_enabled(false);
-        echo
-            .listen(ECHO_PORT)
-            .map_err(|_| ())
-            .expect("listen");
+        echo.listen(ECHO_PORT).map_err(|_| ()).expect("listen");
         let echo_handle = sockets.add(echo);
 
         let mut tick = tokio::time::interval(TICK);
@@ -1059,10 +1042,13 @@ mod tests {
         vp_common::rand_bytes(&mut priv_bytes);
         let secret = StaticSecret::from(priv_bytes);
         let public = PublicKey::from(&secret);
-        let b64 = |v: &[u8]| {
-            base64::engine::general_purpose::STANDARD.encode(v)
-        };
-        (priv_bytes, *public.as_bytes(), b64(&priv_bytes), b64(public.as_bytes()))
+        let b64 = |v: &[u8]| base64::engine::general_purpose::STANDARD.encode(v);
+        (
+            priv_bytes,
+            *public.as_bytes(),
+            b64(&priv_bytes),
+            b64(public.as_bytes()),
+        )
     }
 
     #[tokio::test]
@@ -1091,7 +1077,11 @@ mod tests {
             Some(rate_limiter),
         )
         .unwrap();
-        tokio::spawn(wg_server_task(udp, server_tunn, PublicKey::from(client_pub)));
+        tokio::spawn(wg_server_task(
+            udp,
+            server_tunn,
+            PublicKey::from(client_pub),
+        ));
 
         // 客户端出站
         let cfg = WgCfg {
@@ -1121,13 +1111,10 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         s.write_all(b"wg-e2e-ping-16b!").await.unwrap();
         let mut buf = [0u8; 16];
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            s.read_exact(&mut buf),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), s.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf, b"wg-e2e-ping-16b!");
 
         // 大数据往返（256KB，分块写）
@@ -1139,10 +1126,11 @@ mod tests {
         // 边写边读：先读一半再写另一半，避免缓冲死锁
         s.write_all(&big[half..]).await.unwrap();
         while got < big.len() {
-            let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut echo[got..]))
-                .await
-                .unwrap()
-                .unwrap();
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut echo[got..]))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert!(n > 0, "echo 中断于 {got}");
             got += n;
         }
@@ -1150,7 +1138,10 @@ mod tests {
 
         // UDP 往返
         assert!(out.support_udp());
-        let mut conn = out.connect_packet(&sess, &dst).await.expect("wg UDP 应可用");
+        let mut conn = out
+            .connect_packet(&sess, &dst)
+            .await
+            .expect("wg UDP 应可用");
         conn.send(&vp_core::stream::UdpPacket {
             src: "0.0.0.0:0".parse().unwrap(),
             dst: SocketAddr::new(SERVER_TUN_IP.into(), 5353),
@@ -1167,4 +1158,3 @@ mod tests {
         let _ = client_pub_b64;
     }
 }
-

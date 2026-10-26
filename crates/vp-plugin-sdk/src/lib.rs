@@ -59,11 +59,8 @@ macro_rules! vp_transform_plugin {
             let cfg = if cfg_json.is_null() || cfg_len == 0 {
                 "{}"
             } else {
-                ::std::str::from_utf8(::std::slice::from_raw_parts(
-                    cfg_json as *const u8,
-                    cfg_len,
-                ))
-                .unwrap_or("{}")
+                ::std::str::from_utf8(::std::slice::from_raw_parts(cfg_json as *const u8, cfg_len))
+                    .unwrap_or("{}")
             };
             match <$ty>::create(cfg) {
                 Ok(h) => Box::into_raw(Box::new(h)) as *mut ::std::os::raw::c_void,

@@ -4,14 +4,14 @@ use std::sync::Arc;
 
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use tokio_rustls::rustls::client::WebPkiServerVerifier;
+use tokio_rustls::rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
-use tokio_rustls::{client::TlsConnector, server::TlsAcceptor, rustls::ServerConfig};
+use tokio_rustls::{client::TlsConnector, rustls::ServerConfig, server::TlsAcceptor};
 use vp_common::{Error, Result};
-
-
 
 /// 允许任意自签/过期证书的验证器
 #[derive(Debug)]
@@ -69,16 +69,11 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
+#[derive(Default)]
 pub struct TlsClientConfig {
     pub skip_cert_verify: bool,
     pub server_name: Option<String>,
     pub alpn: Vec<String>,
-}
-
-impl Default for TlsClientConfig {
-    fn default() -> Self {
-        TlsClientConfig { skip_cert_verify: false, server_name: None, alpn: Vec::new() }
-    }
 }
 
 fn root_store() -> RootCertStore {
@@ -97,7 +92,9 @@ pub async fn tls_connect(
         .with_root_certificates(root_store())
         .with_no_client_auth();
     if cfg.skip_cert_verify {
-        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store())).build().unwrap();
+        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store()))
+            .build()
+            .unwrap();
         let _ = verifier; // 仅为 NoVerify 构造签名方案
         config
             .dangerous()
@@ -108,8 +105,8 @@ pub async fn tls_connect(
     }
     let connector = TlsConnector::from(Arc::new(config));
     let sni = cfg.server_name.clone().unwrap_or_else(|| host.to_string());
-    let name = ServerName::try_from(sni.clone())
-        .map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;
+    let name =
+        ServerName::try_from(sni.clone()).map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;
     let stream = connector
         .connect(name, tcp)
         .await
@@ -175,7 +172,10 @@ mod tests {
         let mut client = tls_connect(
             tcp,
             "localhost",
-            &TlsClientConfig { skip_cert_verify: true, ..Default::default() },
+            &TlsClientConfig {
+                skip_cert_verify: true,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

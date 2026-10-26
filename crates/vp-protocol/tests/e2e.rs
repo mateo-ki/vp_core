@@ -9,7 +9,7 @@ use vp_config::Mode;
 use vp_core::{ConnTable, InboundCtx};
 use vp_dns::Resolver;
 use vp_protocol::direct::DirectOutbound;
-use vp_protocol::{build_inbound, InboundKind};
+use vp_protocol::{InboundKind, build_inbound};
 use vp_router::{GroupSpec, GroupType, LbStrategy, Router, RouterSpec};
 
 async fn spawn_echo() -> u16 {
@@ -17,7 +17,9 @@ async fn spawn_echo() -> u16 {
     let port = l.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
-            let Ok((mut s, _)) = l.accept().await else { break };
+            let Ok((mut s, _)) = l.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 let mut b = [0u8; 2048];
                 loop {
@@ -56,8 +58,8 @@ async fn build_core() -> (u16 /*mixed port*/, Arc<Router>, u16 /*echo port*/) {
     );
 
     let rules_text = vec![
-        format!("DOMAIN,localhost,PROXY"),
-        format!("IP-CIDR,127.0.0.0/8,DIRECT"),
+        "DOMAIN,localhost,PROXY".to_string(),
+        "IP-CIDR,127.0.0.0/8,DIRECT".to_string(),
         "MATCH,PROXY".to_string(),
     ];
     let env = vp_rule::CompileEnv {
@@ -100,7 +102,9 @@ async fn build_core() -> (u16 /*mixed port*/, Arc<Router>, u16 /*echo port*/) {
 
 /// 手写 socks5 客户端握手
 async fn socks5_connect(port: u16, host: &str, dst_port: u16) -> tokio::net::TcpStream {
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
     let mut b = [0u8; 2];
     s.read_exact(&mut b).await.unwrap();
@@ -147,9 +151,13 @@ async fn mixed_socks5_full_chain() {
 
 #[tokio::test]
 async fn mixed_http_connect_full_chain() {
-    let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
     let (port, _router, echo_port) = build_core().await;
-    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let req = format!("CONNECT localhost:{echo_port} HTTP/1.1\r\nHost: localhost\r\n\r\n");
     c.write_all(req.as_bytes()).await.unwrap();
     let mut head = Vec::new();
@@ -161,7 +169,10 @@ async fn mixed_http_connect_full_chain() {
             break;
         }
     }
-    assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"), "{head:?}");
+    assert!(
+        String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"),
+        "{head:?}"
+    );
     c.write_all(b"HTTP-CONNECT-OK").await.unwrap();
     let mut buf = [0u8; 15];
     c.read_exact(&mut buf).await.unwrap();

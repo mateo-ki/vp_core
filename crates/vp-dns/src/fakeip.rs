@@ -40,7 +40,11 @@ impl FakeIpPool {
             return None;
         }
         let base = u32::from(ip) & mask_of(plen);
-        let size = if plen == 0 { u32::MAX } else { 1u32 << (32 - plen) };
+        let size = if plen == 0 {
+            u32::MAX
+        } else {
+            1u32 << (32 - plen)
+        };
         let usable = size.saturating_sub(2);
         Some(FakeIpPool {
             base,
@@ -148,7 +152,10 @@ mod tests {
         // 第三次触发重置后重新分配
         let c = pool.allocate("c.com");
         assert!(c.is_some());
-        assert_eq!(pool.reverse(IpAddr::V4(c.unwrap())).as_deref(), Some("c.com"));
+        assert_eq!(
+            pool.reverse(IpAddr::V4(c.unwrap())).as_deref(),
+            Some("c.com")
+        );
     }
 
     #[test]

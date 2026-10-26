@@ -7,17 +7,17 @@
 //!   `[u32 BE session][u16 BE pkt][u8 frag][u8 frag_total][varint |addr|][addr][payload]`
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use vp_common::{DstAddr, Error, Result};
-use vp_core::session::Session;
 use vp_core::inbound::InboundCtx;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::session::Session;
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
 
 const TCP_REQUEST_ID: u64 = 0x401;
@@ -205,7 +205,11 @@ impl Outbound for Hysteria2Outbound {
         let (conn, _ep) = self.connect_quic().await?;
         self.auth(&conn).await?;
         let session = self.udp_session.fetch_add(1, Ordering::Relaxed);
-        Ok(Box::new(Hy2UdpConn { conn, session, pkt_id: 1 }))
+        Ok(Box::new(Hy2UdpConn {
+            conn,
+            session,
+            pkt_id: 1,
+        }))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -278,11 +282,10 @@ impl PacketConn for Hy2UdpConn {
 
     async fn recv(&mut self) -> Result<UdpPacket> {
         loop {
-            let dgram = self
-                .conn
-                .read_datagram()
-                .await
-                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 read_datagram: {e}"))))?;
+            let dgram =
+                self.conn.read_datagram().await.map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("hy2 read_datagram: {e}")))
+                })?;
             if dgram.len() < 8 {
                 continue;
             }
@@ -295,7 +298,9 @@ impl PacketConn for Hy2UdpConn {
             if dgram[7] != 1 {
                 continue;
             }
-            let Some((alen, used)) = read_varint(&dgram[8..]) else { continue };
+            let Some((alen, used)) = read_varint(&dgram[8..]) else {
+                continue;
+            };
             let start = 8 + used;
             let end = start + alen as usize;
             if dgram.len() < end {
@@ -375,7 +380,6 @@ impl rustls::client::danger::ServerCertVerifier for Hy2NoVerify {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // 入站（服务端）
 // ---------------------------------------------------------------------------
@@ -435,9 +439,11 @@ impl Inbound for Hysteria2Inbound {
         t.datagram_receive_buffer_size(Some(1 << 20));
         scfg.transport_config(Arc::new(t));
 
-        let bind_addr: SocketAddr = format!("{}:{}", self.bind, self.port).parse().unwrap_or_else(|_| {
-            SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.port)
-        });
+        let bind_addr: SocketAddr = format!("{}:{}", self.bind, self.port)
+            .parse()
+            .unwrap_or_else(|_| {
+                SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.port)
+            });
         let endpoint = quinn::Endpoint::server(scfg, bind_addr)?;
         let bound = endpoint.local_addr()?.port();
         let this = self.clone();
@@ -593,7 +599,11 @@ impl Hysteria2Inbound {
         }
         let _ = crate::h3_min::write_response_headers(
             &mut send,
-            &[(":status", "233"), ("hysteria-udp", "true"), ("hysteria-cc-rx", "0")],
+            &[
+                (":status", "233"),
+                ("hysteria-udp", "true"),
+                ("hysteria-cc-rx", "0"),
+            ],
         )
         .await;
         let _ = send.finish();
@@ -612,8 +622,12 @@ impl Hysteria2Inbound {
                 Some((alen, used)) if addr_buf.len() >= used + alen as usize => {
                     let s = std::str::from_utf8(&addr_buf[used..used + alen as usize])
                         .unwrap_or("127.0.0.1:0");
-                    let s = s.strip_prefix('[').map(|x| x.trim_end_matches(']')).unwrap_or(s);
-                    break DstAddr::parse(s).unwrap_or_else(|_| DstAddr::ip([127, 0, 0, 1].into(), 0));
+                    let s = s
+                        .strip_prefix('[')
+                        .map(|x| x.trim_end_matches(']'))
+                        .unwrap_or(s);
+                    break DstAddr::parse(s)
+                        .unwrap_or_else(|_| DstAddr::ip([127, 0, 0, 1].into(), 0));
                 }
                 _ => {
                     let mut b = [0u8; 1];
@@ -653,7 +667,8 @@ impl Hysteria2Inbound {
             let _ = recv.read_exact(&mut skip).await;
         }
         let sess = Session::new_tcp(self.tag.clone(), None, dst.clone());
-        let direct = crate::direct::DirectOutbound::new(Arc::new(vp_dns::Resolver::system()), false);
+        let direct =
+            crate::direct::DirectOutbound::new(Arc::new(vp_dns::Resolver::system()), false);
         match direct.connect_stream(&sess, &dst).await {
             Ok(remote) => {
                 // TCPResponse: [0x00][varint 0][varint 0]
@@ -748,7 +763,17 @@ mod tests {
 
     #[test]
     fn varint_roundtrip() {
-        for v in [0u64, 1, 63, 64, 0x3fff, 0x4000, 0x401, u32::MAX as u64, 0x3fff_ffff_ffff] {
+        for v in [
+            0u64,
+            1,
+            63,
+            64,
+            0x3fff,
+            0x4000,
+            0x401,
+            u32::MAX as u64,
+            0x3fff_ffff_ffff,
+        ] {
             let mut buf = Vec::new();
             write_varint(&mut buf, v);
             let (got, used) = read_varint(&buf).unwrap();
@@ -802,7 +827,9 @@ mod tests {
         tokio::spawn(async move {
             let mut b = [0u8; 2048];
             loop {
-                let Ok((n, from)) = udp.recv_from(&mut b).await else { break };
+                let Ok((n, from)) = udp.recv_from(&mut b).await else {
+                    break;
+                };
                 let mut r = b"echo:".to_vec();
                 r.extend_from_slice(&b[..n]);
                 let _ = udp.send_to(&r, from).await;
@@ -891,7 +918,10 @@ mod tests {
         msg.extend_from_slice(addr.as_bytes());
         msg.extend_from_slice(b"");
         // 解析（与 Hy2UdpConn::recv 相同布局）
-        assert_eq!(u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]), 0xdead_beef);
+        assert_eq!(
+            u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]),
+            0xdead_beef
+        );
         let (alen, used) = read_varint(&msg[8..]).unwrap();
         assert_eq!(
             std::str::from_utf8(&msg[8 + used..8 + used + alen as usize]).unwrap(),

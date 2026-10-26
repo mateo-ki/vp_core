@@ -9,8 +9,8 @@ pub mod udp_nat;
 pub use dispatch::dispatch_stream;
 pub use http_in::HttpInbound;
 pub use mixed::MixedInbound;
-pub use udp_nat::UdpNat;
 pub use socks5_in::Socks5Inbound;
+pub use udp_nat::UdpNat;
 
 use std::sync::Arc;
 use vp_common::Result;

@@ -24,11 +24,14 @@ impl IpIntervalSetBuilder {
     pub fn insert_cidr(&mut self, cidr: &str) -> Result<(), String> {
         let (ip, plen) = match cidr.split_once('/') {
             Some((ip, plen)) => (
-                ip.parse::<IpAddr>().map_err(|e| format!("非法 IP {ip:?}: {e}"))?,
-                plen.parse::<u8>().map_err(|_| format!("非法前缀长度 {plen:?}"))?,
+                ip.parse::<IpAddr>()
+                    .map_err(|e| format!("非法 IP {ip:?}: {e}"))?,
+                plen.parse::<u8>()
+                    .map_err(|_| format!("非法前缀长度 {plen:?}"))?,
             ),
             None => (
-                cidr.parse::<IpAddr>().map_err(|e| format!("非法 IP {cidr:?}: {e}"))?,
+                cidr.parse::<IpAddr>()
+                    .map_err(|e| format!("非法 IP {cidr:?}: {e}"))?,
                 match cidr.parse::<IpAddr>() {
                     Ok(IpAddr::V4(_)) => 32,
                     _ => 128,
@@ -54,7 +57,11 @@ impl IpIntervalSetBuilder {
                 if plen > 128 {
                     return Err(format!("前缀长度超限: {cidr}"));
                 }
-                let mask = if plen == 0 { 0 } else { u128::MAX << (128 - plen) };
+                let mask = if plen == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - plen)
+                };
                 let base = v & mask;
                 self.v6.push((base, base | !mask));
             }
@@ -64,7 +71,11 @@ impl IpIntervalSetBuilder {
     }
 
     fn push_v4(&mut self, v: u32, plen: u8) {
-        let mask = if plen == 0 { 0 } else { u32::MAX << (32 - plen) };
+        let mask = if plen == 0 {
+            0
+        } else {
+            u32::MAX << (32 - plen)
+        };
         let base = v & mask;
         self.v4.push((base, base | !mask));
     }
@@ -73,13 +84,13 @@ impl IpIntervalSetBuilder {
         self.v4.sort_unstable();
         self.v6.sort_unstable();
         IpIntervalSet {
-            v4: merge(&mut self.v4),
-            v6: merge(&mut self.v6),
+            v4: merge(&self.v4),
+            v6: merge(&self.v6),
         }
     }
 }
 
-fn merge<T: Copy + Ord>(sorted: &mut Vec<(T, T)>) -> Vec<(T, T)> {
+fn merge<T: Copy + Ord>(sorted: &[(T, T)]) -> Vec<(T, T)> {
     let mut out: Vec<(T, T)> = Vec::with_capacity(sorted.len());
     for &(lo, hi) in sorted.iter() {
         match out.last_mut() {
@@ -127,7 +138,7 @@ impl IpIntervalSet {
 }
 
 fn contains_in<T: Copy + Ord>(set: &[(T, T)], n: T) -> bool {
-    match set.binary_search_by(|&(lo, hi)| {
+    set.binary_search_by(|&(lo, hi)| {
         if n < lo {
             std::cmp::Ordering::Greater
         } else if n > hi {
@@ -135,10 +146,8 @@ fn contains_in<T: Copy + Ord>(set: &[(T, T)], n: T) -> bool {
         } else {
             std::cmp::Ordering::Equal
         }
-    }) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    })
+    .is_ok()
 }
 
 #[cfg(test)]

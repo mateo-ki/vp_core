@@ -10,7 +10,7 @@ use vp_core::conn_table::ConnMeta;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::stream::ProxyStream;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 
 /// 出站连接失败时向客户端回写的错误（尽力而为）
 pub enum ClientReply<'a> {
@@ -37,13 +37,10 @@ pub async fn dispatch_stream(
     // 进程归属（Windows 查表 + 缓存；其它平台 None）
     if sess.process.is_none() {
         if let Some(src) = sess.src {
-            let src = std::net::SocketAddr::from(src);
-            let p = tokio::task::spawn_blocking(move || {
-                vp_rule::process::find_process_name(src)
-            })
-            .await
-            .ok()
-            .flatten();
+            let p = tokio::task::spawn_blocking(move || vp_rule::process::find_process_name(src))
+                .await
+                .ok()
+                .flatten();
             if let Some(p) = p {
                 sess.process = Some(Arc::from(p));
             }
@@ -61,19 +58,30 @@ pub async fn dispatch_stream(
         dst_port: sess.dst.port,
         src: sess.src.map(|s| s.to_string()),
         process: sess.process.clone(),
-        rule: res.rule.as_ref().map(|r| format!("{} => {}", r.rule, r.target)),
+        rule: res
+            .rule
+            .as_ref()
+            .map(|r| format!("{} => {}", r.rule, r.target)),
         chain: Some(res.via.clone()),
         start: now_millis(),
     };
 
-    debug!("{} -> {} via {} ({})", sess.dst, outbound.name(), res.via, sess.inbound);
+    debug!(
+        "{} -> {} via {} ({})",
+        sess.dst,
+        outbound.name(),
+        res.via,
+        sess.inbound
+    );
 
     match outbound.connect_stream(&sess, &sess.dst).await {
         Ok(remote) => {
             // 成功应答
             match reply {
                 ClientReply::Socks5(rep) => {
-                    let _ = client.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                    let _ = client
+                        .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
                 }
                 ClientReply::Http(status) => {
                     let _ = client

@@ -1,7 +1,7 @@
 //! ShadowsocksR (SSR) 协议出站与混淆支持。
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 use vp_common::{DstAddr, Error, Host, Result};
@@ -125,7 +125,9 @@ impl Outbound for SsrOutbound {
             aead_name if Cipher::parse(aead_name).is_ok() => {
                 let cipher = Cipher::parse(aead_name)?;
                 let master_key = cipher.derive_key(&self.password)?;
-                let salt: Vec<u8> = (0..cipher.salt_len()).map(|_| rand::random::<u8>()).collect();
+                let salt: Vec<u8> = (0..cipher.salt_len())
+                    .map(|_| rand::random::<u8>())
+                    .collect();
                 let subkey = cipher.subkey(&master_key, &salt)?;
                 let mut enc = vp_crypto::ss::AeadChunkCodec::new(&cipher, &subkey)?;
 
@@ -154,7 +156,9 @@ impl Outbound for SsrOutbound {
     }
 
     async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        Err(Error::Unsupported("SSR 原生 UDP 请开启 udp-over-tcp: true".into()))
+        Err(Error::Unsupported(
+            "SSR 原生 UDP 请开启 udp-over-tcp: true".into(),
+        ))
     }
 }
 

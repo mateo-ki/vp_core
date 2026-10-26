@@ -13,8 +13,8 @@
 //! ALPN：`tuic`
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,7 +22,7 @@ use bytes::Bytes;
 use vp_common::{DstAddr, Error, Host, Result};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
 
 const VER: u8 = 0x05;
@@ -72,7 +72,13 @@ fn decode_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
                 .map_err(|_| Error::Proto("tuic: 域名非 utf8"))?
                 .to_ascii_lowercase();
             let port = u16::from_be_bytes([buf[2 + n], buf[3 + n]]);
-            Ok((DstAddr { host: Host::Domain(d), port }, 2 + n + 2))
+            Ok((
+                DstAddr {
+                    host: Host::Domain(d),
+                    port,
+                },
+                2 + n + 2,
+            ))
         }
         0x01 => {
             if buf.len() < 7 {
@@ -80,7 +86,12 @@ fn decode_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
             }
             let port = u16::from_be_bytes([buf[5], buf[6]]);
             Ok((
-                DstAddr { host: Host::Ip(std::net::IpAddr::V4([buf[1], buf[2], buf[3], buf[4]].into())), port },
+                DstAddr {
+                    host: Host::Ip(std::net::IpAddr::V4(
+                        [buf[1], buf[2], buf[3], buf[4]].into(),
+                    )),
+                    port,
+                },
                 7,
             ))
         }
@@ -91,7 +102,13 @@ fn decode_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
             let mut o = [0u8; 16];
             o.copy_from_slice(&buf[1..17]);
             let port = u16::from_be_bytes([buf[17], buf[18]]);
-            Ok((DstAddr { host: Host::Ip(std::net::IpAddr::V6(o.into())), port }, 19))
+            Ok((
+                DstAddr {
+                    host: Host::Ip(std::net::IpAddr::V6(o.into())),
+                    port,
+                },
+                19,
+            ))
         }
         other => Err(Error::ProtoMsg(format!("tuic: 地址类型 {other:#x} 非法"))),
     }
@@ -272,7 +289,9 @@ impl PacketConn for TuicPacketConn {
             }
             match stream[1] {
                 T_PACKET => {
-                    let Some(pkt) = parse_packet_opt(&stream[2..]) else { continue };
+                    let Some(pkt) = parse_packet_opt(&stream[2..]) else {
+                        continue;
+                    };
                     if pkt.assoc != self.assoc {
                         continue;
                     }
@@ -407,7 +426,14 @@ impl TuicInbound {
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
     ) -> Self {
-        TuicInbound { bind: bind.into(), port, tag: tag.into(), users, cert_pem, key_pem }
+        TuicInbound {
+            bind: bind.into(),
+            port,
+            tag: tag.into(),
+            users,
+            cert_pem,
+            key_pem,
+        }
     }
 }
 
@@ -437,9 +463,10 @@ impl Inbound for TuicInbound {
         t.datagram_receive_buffer_size(Some(1 << 20));
         scfg.transport_config(Arc::new(t));
 
-        let endpoint = quinn::Endpoint::server(scfg, (self.bind.as_str(), self.port).to_socket_addrs_dyn())
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic bind: {e}"))))?;
-        let bound = endpoint.local_addr().map_err(|e| Error::Io(e))?.port();
+        let endpoint =
+            quinn::Endpoint::server(scfg, (self.bind.as_str(), self.port).to_socket_addrs_dyn())
+                .map_err(|e| Error::Io(std::io::Error::other(format!("tuic bind: {e}"))))?;
+        let bound = endpoint.local_addr().map_err(Error::Io)?.port();
         let this = self.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -462,14 +489,13 @@ trait ToAddrsDyn {
 }
 impl ToAddrsDyn for (&str, u16) {
     fn to_socket_addrs_dyn(&self) -> SocketAddr {
-        format!("{}:{}", self.0, self.1).parse().unwrap_or_else(|_| {
-            SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.1)
-        })
+        format!("{}:{}", self.0, self.1)
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.1))
     }
 }
 
 impl TuicInbound {
-
     /// UDP 会话：登记目标 + 建socket + 回包泵（datagram 模式回发）
     async fn udp_session_relay(
         conn: &quinn::Connection,
@@ -528,8 +554,10 @@ impl TuicInbound {
     async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
         // 并发接受 uni/bi 流与 datagram；认证在首个 uni 流上
         let authed = Arc::new(tokio::sync::Notify::new());
-        let mut udp_sessions: std::collections::HashMap<u16, std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>> =
-            std::collections::HashMap::new();
+        let mut udp_sessions: std::collections::HashMap<
+            u16,
+            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
+        > = std::collections::HashMap::new();
 
         // 期望 token 集合
         let expect: Vec<([u8; 16], [u8; 32])> = self
@@ -722,7 +750,9 @@ mod tests {
             let udp_echo = std::sync::Arc::new(udp_echo);
             let mut b = [0u8; 2048];
             loop {
-                let Ok((n, from)) = udp_echo.recv_from(&mut b).await else { break };
+                let Ok((n, from)) = udp_echo.recv_from(&mut b).await else {
+                    break;
+                };
                 let mut r = b"echo:".to_vec();
                 r.extend_from_slice(&b[..n]);
                 let _ = udp_echo.send_to(&r, from).await;
@@ -740,7 +770,10 @@ mod tests {
             "127.0.0.1",
             0,
             "tuic-srv",
-            vec![("b831381d-6324-4d53-ad4f-8cda48b30811".to_string(), "pw".to_string())],
+            vec![(
+                "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+                "pw".to_string(),
+            )],
             cert.cert.pem().into_bytes(),
             cert.key_pair.serialize_pem().into_bytes(),
         );

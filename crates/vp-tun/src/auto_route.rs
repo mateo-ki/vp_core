@@ -8,6 +8,7 @@ use vp_common::{Error, Result};
 /// 启用 auto-route：
 /// - Windows：route add <netmask 网段> mask <mask> <tun 地址> metric 1
 /// - Linux：ip route add <网段> dev tun
+///
 /// 完整默认路由接管（0.0.0.0/1 + 128.0.0.0/1 双路由方案）随 M3 完善。
 pub fn enable(address: &str, netmask: &str) -> Result<()> {
     let addr: IpAddr = address
@@ -20,7 +21,15 @@ pub fn enable(address: &str, netmask: &str) -> Result<()> {
     #[cfg(windows)]
     {
         let out = Command::new("route")
-            .args(["add", &net, "mask", &mask.to_string(), address, "metric", "1"])
+            .args([
+                "add",
+                &net,
+                "mask",
+                &mask.to_string(),
+                address,
+                "metric",
+                "1",
+            ])
             .output()
             .map_err(|e| Error::Other(format!("route 命令执行失败: {e}")))?;
         if !out.status.success() {
@@ -33,7 +42,6 @@ pub fn enable(address: &str, netmask: &str) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = prefix;
         let out = Command::new("ip")
             .args(["route", "replace", &net, "dev", "vpcore-tun"])
             .output()

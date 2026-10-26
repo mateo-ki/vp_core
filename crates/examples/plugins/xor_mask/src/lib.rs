@@ -1,6 +1,6 @@
 //! 示例 transform 插件：与配置 key 字节循环异或（演示 C-ABI 插件开发全流程）。
 
-use vp_plugin_sdk::{vp_transform_plugin, TransformImpl, DIR_DOWNSTREAM, DIR_UPSTREAM};
+use vp_plugin_sdk::{DIR_DOWNSTREAM, DIR_UPSTREAM, TransformImpl, vp_transform_plugin};
 
 pub struct XorMask {
     key: Vec<u8>,
@@ -31,7 +31,10 @@ impl TransformImpl for XorMask {
         if key.is_empty() {
             return Err("key 不能为空".into());
         }
-        Ok(XorMask { key, upstream_xor: cfg.symmetric })
+        Ok(XorMask {
+            key,
+            upstream_xor: cfg.symmetric,
+        })
     }
 
     fn transform(&mut self, dir: u32, input: &[u8]) -> Result<Vec<u8>, String> {
@@ -44,7 +47,11 @@ impl TransformImpl for XorMask {
             return Ok(input.to_vec());
         }
         let k = &self.key;
-        Ok(input.iter().enumerate().map(|(i, b)| b ^ k[i % k.len()]).collect())
+        Ok(input
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ k[i % k.len()])
+            .collect())
     }
 }
 

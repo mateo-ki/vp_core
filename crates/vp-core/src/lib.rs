@@ -17,4 +17,4 @@ pub use outbound::Outbound;
 pub use router::{Resolution, Router, RuleHit};
 pub use session::{Network, Session};
 pub use stream::{PacketConn, ProxyStream, UdpPacket};
-pub use tunnel::{relay, RelayHook};
+pub use tunnel::{RelayHook, relay};

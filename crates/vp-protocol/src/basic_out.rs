@@ -83,7 +83,10 @@ impl Socks5Outbound {
         let mut head = [0u8; 4];
         io.read_exact(&mut head).await?;
         if head[1] != 0x00 {
-            return Err(Error::ProtoMsg(format!("socks5 出站: 服务器拒绝 (rep={})", head[1])));
+            return Err(Error::ProtoMsg(format!(
+                "socks5 出站: 服务器拒绝 (rep={})",
+                head[1]
+            )));
         }
         let skip = match head[3] {
             0x01 => 4 + 2,
@@ -243,7 +246,9 @@ mod tests {
                     break;
                 }
             }
-            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
             // 透传
             let mut b = [0u8; 4];
             s.read_exact(&mut b).await.unwrap();
@@ -256,7 +261,8 @@ mod tests {
             password: None,
         };
         let dst = DstAddr::new("target.example", 443);
-        let mut s = out.connect_stream(&Session::new_tcp("t".into(), None, dst.clone()), &dst)
+        let mut s = out
+            .connect_stream(&Session::new_tcp("t".into(), None, dst.clone()), &dst)
             .await
             .unwrap();
         s.write_all(b"ping").await.unwrap();

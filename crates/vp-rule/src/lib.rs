@@ -3,9 +3,9 @@
 //! 规则行解析（括号感知分割）→ 编译期构造匹配器 → 热路径零分配匹配。
 
 pub mod domain;
-pub mod geosite;
 #[cfg(feature = "geoip")]
 pub mod geoip;
+pub mod geosite;
 pub mod ipset;
 pub mod process;
 pub mod provider;
@@ -13,7 +13,6 @@ pub mod provider;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-
 
 use crate::domain::DomainTrie;
 use crate::ipset::IpIntervalSet;
@@ -116,8 +115,12 @@ impl Matcher {
             Matcher::ProcessName(n) => ctx.process.is_some_and(|p| p.eq_ignore_ascii_case(n)),
             Matcher::ProcessPath(p) => ctx.process.is_some_and(|x| x.eq_ignore_ascii_case(p)),
             Matcher::Inbound(n) => ctx.inbound == &**n,
-            Matcher::InPort(ranges) => ctx.inbound_port.is_some_and(|p| ranges.iter().any(|&(lo, hi)| p >= lo && p <= hi)),
-            Matcher::InUser(u) => ctx.inbound_user.is_some_and(|user| user.eq_ignore_ascii_case(u)),
+            Matcher::InPort(ranges) => ctx
+                .inbound_port
+                .is_some_and(|p| ranges.iter().any(|&(lo, hi)| p >= lo && p <= hi)),
+            Matcher::InUser(u) => ctx
+                .inbound_user
+                .is_some_and(|user| user.eq_ignore_ascii_case(u)),
             Matcher::Network(n) => ctx.network == *n,
             Matcher::Logic { op, subs } => match op {
                 LogicOp::And => subs.iter().all(|m| m.r#match(ctx)),
@@ -213,7 +216,10 @@ impl RuleEngine {
                 if let Some((target, rule)) = r.matcher.match_sub(ctx) {
                     return Some(MatchResult { target, rule });
                 }
-                return Some(MatchResult { target: &r.target, rule: &r.raw });
+                return Some(MatchResult {
+                    target: &r.target,
+                    rule: &r.raw,
+                });
             }
         }
         None
@@ -249,7 +255,10 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
     }
     if errs.is_empty() {
         let needs_ip = compiled.iter().any(|r| r.matcher.needs_dst_ip());
-        Ok(RuleEngine { rules: compiled, needs_ip })
+        Ok(RuleEngine {
+            rules: compiled,
+            needs_ip,
+        })
     } else {
         Err(errs)
     }
@@ -307,7 +316,10 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
             target: sub_name.into(),
             matcher: Matcher::Logic {
                 op: LogicOp::And,
-                subs: Arc::new(vec![cond_matcher, Matcher::SubRules(Arc::new(sub_compiled))]),
+                subs: Arc::new(vec![
+                    cond_matcher,
+                    Matcher::SubRules(Arc::new(sub_compiled)),
+                ]),
             },
         });
     }
@@ -343,7 +355,10 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
         return Ok(CompiledRule {
             raw: raw.into(),
             target,
-            matcher: Matcher::Logic { op, subs: Arc::new(subs) },
+            matcher: Matcher::Logic {
+                op,
+                subs: Arc::new(subs),
+            },
         });
     }
 
@@ -354,11 +369,20 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
     let payload = parts[1].trim();
     let target = check_target(parts[2].trim(), env, raw)?;
     let matcher = parse_plain_rule(&format!("{ty},{payload}"), env, depth, raw)?;
-    Ok(CompiledRule { raw: raw.into(), target, matcher })
+    Ok(CompiledRule {
+        raw: raw.into(),
+        target,
+        matcher,
+    })
 }
 
 /// 解析 "TYPE,payload"（不带目标）
-fn parse_plain_rule(s: &str, env: &CompileEnv, _depth: usize, full: &str) -> Result<Matcher, String> {
+fn parse_plain_rule(
+    s: &str,
+    env: &CompileEnv,
+    _depth: usize,
+    full: &str,
+) -> Result<Matcher, String> {
     let parts = split_top_level(s);
     if parts.len() != 2 {
         return Err(format!("规则条件应为 TYPE,payload: {full:?}"));
@@ -388,7 +412,10 @@ fn parse_plain_rule(s: &str, env: &CompileEnv, _depth: usize, full: &str) -> Res
                 b.insert_cidr(cidr.trim())
                     .map_err(|e| format!("{e}: {full:?}"))?;
             }
-            Ok(Matcher::IpCidr { set: Arc::new(b.build()), src: false })
+            Ok(Matcher::IpCidr {
+                set: Arc::new(b.build()),
+                src: false,
+            })
         }
         "SRC-IP-CIDR" => {
             let mut b = ipset::IpIntervalSetBuilder::new();
@@ -396,7 +423,10 @@ fn parse_plain_rule(s: &str, env: &CompileEnv, _depth: usize, full: &str) -> Res
                 b.insert_cidr(cidr.trim())
                     .map_err(|e| format!("{e}: {full:?}"))?;
             }
-            Ok(Matcher::IpCidr { set: Arc::new(b.build()), src: true })
+            Ok(Matcher::IpCidr {
+                set: Arc::new(b.build()),
+                src: true,
+            })
         }
         "GEOIP" => {
             #[cfg(feature = "geoip")]
@@ -432,7 +462,10 @@ fn parse_plain_rule(s: &str, env: &CompileEnv, _depth: usize, full: &str) -> Res
             for p in payload.split('/') {
                 ranges.push(provider::parse_port_range(p.trim())?);
             }
-            Ok(Matcher::Port { src: ty == "SRC-PORT", ranges: Arc::new(ranges) })
+            Ok(Matcher::Port {
+                src: ty == "SRC-PORT",
+                ranges: Arc::new(ranges),
+            })
         }
         "PROCESS-PATH" => Ok(Matcher::ProcessPath(payload.into())),
         "PROCESS-NAME" => Ok(Matcher::ProcessName(payload.into())),
@@ -500,7 +533,10 @@ fn compile_logic_str(s: &str, env: &CompileEnv, depth: usize) -> Result<Matcher,
                     .or_else(|_| parse_plain_rule(x, env, depth + 1, s))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(Matcher::Logic { op, subs: Arc::new(subs) });
+        return Ok(Matcher::Logic {
+            op,
+            subs: Arc::new(subs),
+        });
     }
     parse_plain_rule(s, env, depth, s)
 }
@@ -563,8 +599,7 @@ mod tests {
     use super::*;
 
     fn test_env() -> CompileEnv<'static> {
-        static SUB: std::sync::OnceLock<HashMap<String, Vec<String>>> =
-            std::sync::OnceLock::new();
+        static SUB: std::sync::OnceLock<HashMap<String, Vec<String>>> = std::sync::OnceLock::new();
         static GEOSITE: Option<geosite::GeoSiteDb> = None;
         #[cfg(feature = "geoip")]
         static GEOIP: Option<geoip::GeoIpDb> = None;
@@ -613,11 +648,34 @@ mod tests {
             "DOMAIN-KEYWORD,github,PROXY",
             "MATCH,REJECT",
         ]);
-        assert_eq!(e.r#match(&ctx(Some("example.com"), None)).unwrap().target, "DIRECT");
-        assert_eq!(e.r#match(&ctx(Some("www.google.com"), None)).unwrap().target, "PROXY");
-        assert_eq!(e.r#match(&ctx(Some("api.github.x.com"), None)).unwrap().target, "PROXY");
-        assert_eq!(e.r#match(&ctx(None, Some("1.1.1.1".parse().unwrap()))).unwrap().target, "REJECT");
-        assert_eq!(e.r#match(&ctx(Some("sub.example.com"), None)).unwrap().target, "REJECT");
+        assert_eq!(
+            e.r#match(&ctx(Some("example.com"), None)).unwrap().target,
+            "DIRECT"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("www.google.com"), None))
+                .unwrap()
+                .target,
+            "PROXY"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("api.github.x.com"), None))
+                .unwrap()
+                .target,
+            "PROXY"
+        );
+        assert_eq!(
+            e.r#match(&ctx(None, Some("1.1.1.1".parse().unwrap())))
+                .unwrap()
+                .target,
+            "REJECT"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("sub.example.com"), None))
+                .unwrap()
+                .target,
+            "REJECT"
+        );
     }
 
     #[test]
@@ -630,7 +688,9 @@ mod tests {
         ]);
         assert!(e.needs_dst_ip());
         assert_eq!(
-            e.r#match(&ctx(Some("x"), Some("10.1.1.1".parse().unwrap()))).unwrap().target,
+            e.r#match(&ctx(Some("x"), Some("10.1.1.1".parse().unwrap())))
+                .unwrap()
+                .target,
             "DIRECT"
         );
         // 域名未解析时 IP 规则跳过，落到 SRC-PORT
@@ -646,19 +706,31 @@ mod tests {
             "MATCH,DIRECT",
         ]);
         assert_eq!(e.r#match(&ctx(Some("x.cn"), None)).unwrap().target, "PROXY");
-        assert_eq!(e.r#match(&ctx(Some("y.b.com"), None)).unwrap().target, "AUTO");
+        assert_eq!(
+            e.r#match(&ctx(Some("y.b.com"), None)).unwrap().target,
+            "AUTO"
+        );
         // 注意 x.gov.cn 也满足 DOMAIN-SUFFIX,cn，但端口为 80 时不满足 AND 的 443 条件
         let mut p80 = ctx(Some("x.gov.cn"), None);
         p80.dst_port = 80;
         assert_eq!(e.r#match(&p80).unwrap().target, "DIRECT");
-        assert_eq!(e.r#match(&ctx(Some("ok.com"), None)).unwrap().target, "PROXY");
+        assert_eq!(
+            e.r#match(&ctx(Some("ok.com"), None)).unwrap().target,
+            "PROXY"
+        );
     }
 
     #[test]
     fn sub_rule() {
         let e = engine(&["SUB-RULE,(DOMAIN-SUFFIX,sub.com),sub1", "MATCH,REJECT"]);
-        assert_eq!(e.r#match(&ctx(Some("a.sub.com"), None)).unwrap().target, "DIRECT");
-        assert_eq!(e.r#match(&ctx(Some("other.com"), None)).unwrap().target, "REJECT");
+        assert_eq!(
+            e.r#match(&ctx(Some("a.sub.com"), None)).unwrap().target,
+            "DIRECT"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("other.com"), None)).unwrap().target,
+            "REJECT"
+        );
     }
 
     #[test]
@@ -683,7 +755,10 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "myset".to_string(),
-            (provider::Behavior::Domain, "+.gg.com\ndomain:only.com\n".to_string()),
+            (
+                provider::Behavior::Domain,
+                "+.gg.com\ndomain:only.com\n".to_string(),
+            ),
         );
         let env = CompileEnv {
             is_known_target: &|t| matches!(t, "DIRECT" | "PROXY"),
@@ -693,11 +768,23 @@ mod tests {
             providers: &providers,
             sub_rules: &HashMap::new(),
         };
-        let rules = vec!["RULE-SET,myset,PROXY".to_string(), "MATCH,DIRECT".to_string()];
+        let rules = vec![
+            "RULE-SET,myset,PROXY".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
         let eng = compile(&rules, &env).unwrap();
-        assert_eq!(eng.r#match(&ctx(Some("a.gg.com"), None)).unwrap().target, "PROXY");
-        assert_eq!(eng.r#match(&ctx(Some("only.com"), None)).unwrap().target, "PROXY");
-        assert_eq!(eng.r#match(&ctx(Some("only.com.x"), None)).unwrap().target, "DIRECT");
+        assert_eq!(
+            eng.r#match(&ctx(Some("a.gg.com"), None)).unwrap().target,
+            "PROXY"
+        );
+        assert_eq!(
+            eng.r#match(&ctx(Some("only.com"), None)).unwrap().target,
+            "PROXY"
+        );
+        assert_eq!(
+            eng.r#match(&ctx(Some("only.com.x"), None)).unwrap().target,
+            "DIRECT"
+        );
     }
 
     #[test]
@@ -707,7 +794,10 @@ mod tests {
             "NETWORK,UDP,PROXY",
             "MATCH,REJECT",
         ]);
-        assert_eq!(e.r#match(&ctx(Some("a.com"), None)).unwrap().target, "DIRECT");
+        assert_eq!(
+            e.r#match(&ctx(Some("a.com"), None)).unwrap().target,
+            "DIRECT"
+        );
         let mut u = ctx(Some("a.com"), None);
         u.process = None;
         u.network = Net::Udp;

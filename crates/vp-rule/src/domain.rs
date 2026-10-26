@@ -2,6 +2,7 @@
 //! - insert_suffix_all：自身 + 所有子域（DOMAIN-SUFFIX / "+.x" / geosite Root）
 //! - insert_suffix_sub：仅子域（".x" 语义）
 //! - insert_exact：仅自身（DOMAIN / geosite Full）
+//!
 //! 三种标记可共存于同一节点；子节点按标签排序，查询二分，热路径零分配。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

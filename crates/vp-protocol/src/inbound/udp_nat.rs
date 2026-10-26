@@ -21,6 +21,8 @@ use vp_core::stream::UdpPacket;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 一个客户端 UDP 关联
+pub type ReplyFormatter = Arc<dyn Fn(SocketAddr, &[u8]) -> Vec<u8> + Send + Sync>;
+
 pub struct UdpNat {
     ctx: InboundCtx,
     tag: Arc<str>,
@@ -31,7 +33,7 @@ pub struct UdpNat {
     /// 目标 → 发送队列（会话存活标志）
     sessions: Mutex<HashMap<DstAddr, tokio::sync::mpsc::Sender<UdpPacket>>>,
     /// 回包格式化（None = 裸转发，TUN 场景）
-    reply_formatter: std::sync::Mutex<Option<Arc<dyn Fn(SocketAddr, &[u8]) -> Vec<u8> + Send + Sync>>>,
+    reply_formatter: std::sync::Mutex<Option<ReplyFormatter>>,
 }
 
 impl UdpNat {
@@ -48,7 +50,11 @@ impl UdpNat {
 
     /// 客户端数据报 → 路由 → 出站。
     /// fake_domain：TUN 场景下 fake-ip 还原出的域名（优先于 IP）
-    pub async fn dispatch(self: &Arc<Self>, pkt: UdpPacket, fake_domain: Option<String>) -> Result<()> {
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        pkt: UdpPacket,
+        fake_domain: Option<String>,
+    ) -> Result<()> {
         // 记录真实数据报来源（首个来源；同 IP 的后来者允许）
         {
             let mut c = self.client.lock().await;
@@ -78,10 +84,7 @@ impl UdpNat {
     }
 
     /// 回包格式化器：入站协议注入（如 socks5 的 [rsv][frag][addr][payload]）
-    pub fn set_reply_formatter(
-        &self,
-        f: Arc<dyn Fn(SocketAddr, &[u8]) -> Vec<u8> + Send + Sync>,
-    ) {
+    pub fn set_reply_formatter(&self, f: ReplyFormatter) {
         *self.reply_formatter.lock().unwrap() = Some(f);
     }
 
@@ -91,10 +94,7 @@ impl UdpNat {
     ) -> Result<tokio::sync::mpsc::Sender<UdpPacket>> {
         let client = match *self.client.lock().await {
             Some(c) => c,
-            None => std::net::SocketAddr::new(
-                std::net::IpAddr::V4([127, 0, 0, 1].into()),
-                0,
-            ), // 尚无数据报来源（占位）
+            None => std::net::SocketAddr::new(std::net::IpAddr::V4([127, 0, 0, 1].into()), 0), // 尚无数据报来源（占位）
         };
         let mut sess = Session::new_udp(self.tag.clone(), Some(client), dst.clone());
         sess.network = Network::Udp;
@@ -110,10 +110,7 @@ impl UdpNat {
         let reply_formatter = self.reply_formatter.lock().unwrap().clone();
         let client = match *self.client.lock().await {
             Some(c) => c,
-            None => std::net::SocketAddr::new(
-                std::net::IpAddr::V4([127, 0, 0, 1].into()),
-                0,
-            ), // 尚无数据报来源（占位）
+            None => std::net::SocketAddr::new(std::net::IpAddr::V4([127, 0, 0, 1].into()), 0), // 尚无数据报来源（占位）
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
         let dst_key = dst.clone();

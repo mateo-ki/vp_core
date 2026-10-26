@@ -14,7 +14,7 @@ use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::stream::UdpPacket;
 
-use super::dispatch::{dispatch_stream, ClientReply};
+use super::dispatch::{ClientReply, dispatch_stream};
 use super::udp_nat::UdpNat;
 
 pub struct Socks5Inbound {
@@ -25,7 +25,11 @@ pub struct Socks5Inbound {
 
 impl Socks5Inbound {
     pub fn new(bind: String, port: u16, tag: &str) -> Self {
-        Socks5Inbound { bind, port, tag: tag.into() }
+        Socks5Inbound {
+            bind,
+            port,
+            tag: tag.into(),
+        }
     }
 }
 
@@ -47,9 +51,7 @@ impl vp_core::Inbound for Socks5Inbound {
                         let ctx = ctx.clone();
                         let tag = tag.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                serve_socks5(stream, src, tag, &ctx).await
-                            {
+                            if let Err(e) = serve_socks5(stream, src, tag, &ctx).await {
                                 debug!("socks5 入站会话结束: {e}");
                             }
                         });
@@ -190,7 +192,9 @@ where
             }
             Ok(())
         }
-        other => Err(Error::ProtoMsg(format!("socks5 入站: 不支持的命令 {other}"))),
+        other => Err(Error::ProtoMsg(format!(
+            "socks5 入站: 不支持的命令 {other}"
+        ))),
     }
 }
 

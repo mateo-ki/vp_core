@@ -31,10 +31,14 @@ impl Cipher {
             other => {
                 return Err(Error::Config(format!(
                     "不支持的加密方式 {other:?}（M1 支持 AEAD 与 2022 系）"
-                )))
+                )));
             }
         };
-        Ok(Cipher { name: name.into(), kind, is_2022 })
+        Ok(Cipher {
+            name: name.into(),
+            kind,
+            is_2022,
+        })
     }
 
     pub fn key_len(&self) -> usize {
@@ -122,7 +126,11 @@ impl AeadChunkCodec {
 
     /// 直接以现成 AEAD 构造（vmess body 用）
     pub fn from_aead(aead: AnyAead) -> Self {
-        AeadChunkCodec { aead, counter: 0, tag_len: 16 }
+        AeadChunkCodec {
+            aead,
+            counter: 0,
+            tag_len: 16,
+        }
     }
 
     fn next_nonce(&mut self) -> u64 {
@@ -135,7 +143,9 @@ impl AeadChunkCodec {
     pub fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(payload.len() + 2 + 2 * self.tag_len);
         let n1 = self.next_nonce();
-        let len_ct = self.aead.seal(n1, &(payload.len() as u16).to_be_bytes(), b"");
+        let len_ct = self
+            .aead
+            .seal(n1, &(payload.len() as u16).to_be_bytes(), b"");
         out.extend_from_slice(&len_ct);
         let n2 = self.next_nonce();
         let data_ct = self.aead.seal(n2, payload, b"");
@@ -162,7 +172,10 @@ impl AeadChunkCodec {
         if buf.len() < total {
             return None;
         }
-        let data = match self.aead.open(self.counter + 1, &buf[len_ct_len..total], b"") {
+        let data = match self
+            .aead
+            .open(self.counter + 1, &buf[len_ct_len..total], b"")
+        {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };

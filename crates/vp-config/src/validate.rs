@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{is_builtin, Config};
+use crate::model::{Config, is_builtin};
 
 pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
     let mut errs = Vec::new();
@@ -52,16 +52,16 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
             errs.push(format!("组 {:?} proxies 与 use 均为空", g.name));
         }
         for r in &g.proxies {
-            if !names.contains(r.as_str())
-                && !group_names.contains(r.as_str())
-                && !is_builtin(r)
-            {
+            if !names.contains(r.as_str()) && !group_names.contains(r.as_str()) && !is_builtin(r) {
                 errs.push(format!("组 {:?} 引用了不存在的出站 {:?}", g.name, r));
             }
         }
         for u in &g.r#use {
             if !cfg.proxy_providers.contains_key(u) {
-                errs.push(format!("组 {:?} 引用了未定义的 proxy-provider {:?}", g.name, u));
+                errs.push(format!(
+                    "组 {:?} 引用了未定义的 proxy-provider {:?}",
+                    g.name, u
+                ));
             }
         }
     }
@@ -114,9 +114,7 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
             if let Some(pos) = rest.rfind(',') {
                 let sub = rest[pos + 1..].trim();
                 if !cfg.sub_rules.contains_key(sub) {
-                    errs.push(format!(
-                        "rules[{i}]: SUB-RULE 引用的子规则 {sub:?} 不存在"
-                    ));
+                    errs.push(format!("rules[{i}]: SUB-RULE 引用的子规则 {sub:?} 不存在"));
                 }
             } else {
                 errs.push(format!("rules[{i}]: SUB-RULE 格式非法: {rule:?}"));
@@ -144,11 +142,7 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
         }
     }
 
-    if errs.is_empty() {
-        Ok(())
-    } else {
-        Err(errs)
-    }
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
 #[cfg(test)]

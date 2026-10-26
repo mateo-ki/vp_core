@@ -40,11 +40,19 @@ pub struct Config {
     pub tproxy_port: Option<u16>,
     #[serde(alias = "allow-lan", alias = "allow_lan", default)]
     pub allow_lan: bool,
-    #[serde(alias = "bind-address", alias = "bind_address", default = "default_bind")]
+    #[serde(
+        alias = "bind-address",
+        alias = "bind_address",
+        default = "default_bind"
+    )]
     pub bind_address: String,
     #[serde(default = "default_mode")]
     pub mode: Mode,
-    #[serde(alias = "log-level", alias = "log_level", default = "default_log_level")]
+    #[serde(
+        alias = "log-level",
+        alias = "log_level",
+        default = "default_log_level"
+    )]
     pub log_level: String,
     #[serde(default)]
     pub ipv6: bool,
@@ -56,15 +64,35 @@ pub struct Config {
     pub dns: DnsConfig,
     #[serde(default, deserialize_with = "null_to_default")]
     pub proxies: Vec<ProxyCfg>,
-    #[serde(alias = "proxy-groups", alias = "proxy_groups", default, deserialize_with = "null_to_default")]
+    #[serde(
+        alias = "proxy-groups",
+        alias = "proxy_groups",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     pub proxy_groups: Vec<GroupCfg>,
-    #[serde(alias = "proxy-providers", alias = "proxy_providers", default, deserialize_with = "null_to_default")]
+    #[serde(
+        alias = "proxy-providers",
+        alias = "proxy_providers",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     pub proxy_providers: HashMap<String, ProxyProviderCfg>,
     #[serde(default, deserialize_with = "null_to_default")]
     pub rules: Vec<String>,
-    #[serde(alias = "sub-rules", alias = "sub_rules", default, deserialize_with = "null_to_default")]
+    #[serde(
+        alias = "sub-rules",
+        alias = "sub_rules",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     pub sub_rules: HashMap<String, Vec<String>>,
-    #[serde(alias = "rule-providers", alias = "rule_providers", default, deserialize_with = "null_to_default")]
+    #[serde(
+        alias = "rule-providers",
+        alias = "rule_providers",
+        default,
+        deserialize_with = "null_to_default"
+    )]
     pub rule_providers: HashMap<String, RuleProviderCfg>,
     #[serde(alias = "geosite-url", alias = "geosite_url", default)]
     pub geosite_url: Option<String>,
@@ -98,7 +126,13 @@ pub struct ListenerCfg {
     #[serde(default)]
     pub key: Option<String>,
     /// shadow-tls v3 外层伪装（ss listener 可选；host 为伪装转发目标）
-    #[serde(alias = "shadow-tls", alias = "shadowtls", alias = "shadow-tls-opts", alias = "shadow_tls_opts", default)]
+    #[serde(
+        alias = "shadow-tls",
+        alias = "shadowtls",
+        alias = "shadow-tls-opts",
+        alias = "shadow_tls_opts",
+        default
+    )]
     pub shadow_tls: Option<ShadowTlsCfg>,
 }
 
@@ -113,7 +147,11 @@ pub struct TunCfg {
     pub netmask: String,
     #[serde(default = "default_tun_mtu")]
     pub mtu: u16,
-    #[serde(alias = "fake-ip-range", alias = "fake_ip_range", default = "default_fake_range")]
+    #[serde(
+        alias = "fake-ip-range",
+        alias = "fake_ip_range",
+        default = "default_fake_range"
+    )]
     pub fake_ip_range: String,
     #[serde(alias = "auto-route", alias = "auto_route", default = "default_true")]
     pub auto_route: bool,
@@ -195,7 +233,11 @@ pub struct DnsConfig {
 pub struct FallbackFilterConfig {
     #[serde(default = "default_true")]
     pub geoip: bool,
-    #[serde(alias = "geoip-code", alias = "geoip_code", default = "default_geoip_code")]
+    #[serde(
+        alias = "geoip-code",
+        alias = "geoip_code",
+        default = "default_geoip_code"
+    )]
     pub geoip_code: String,
     #[serde(default)]
     pub ipcidr: Vec<String>,
@@ -330,7 +372,13 @@ pub struct VmessCfg {
     pub cipher: String,
     #[serde(default)]
     pub tls: bool,
-    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    #[serde(
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        default
+    )]
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
@@ -359,7 +407,13 @@ pub struct VlessCfg {
     pub flow: Option<String>,
     #[serde(default)]
     pub tls: bool,
-    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    #[serde(
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        default
+    )]
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
@@ -394,7 +448,13 @@ pub struct TrojanCfg {
     pub password: String,
     #[serde(default)]
     pub tls: bool,
-    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    #[serde(
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        default
+    )]
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
@@ -512,7 +572,13 @@ pub struct AnytlsCfg {
     pub server: String,
     pub port: u16,
     pub password: String,
-    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    #[serde(
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        default
+    )]
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
@@ -531,7 +597,13 @@ pub struct NaiveCfg {
     pub username: String,
     #[serde(default)]
     pub password: String,
-    #[serde(alias = "servername", alias = "server-name", alias = "server_name", alias = "sni", default)]
+    #[serde(
+        alias = "servername",
+        alias = "server-name",
+        alias = "server_name",
+        alias = "sni",
+        default
+    )]
     pub server_name: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
@@ -568,7 +640,11 @@ pub struct TuicCfg {
     pub sni: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
-    #[serde(alias = "congestion-controller", alias = "congestion_controller", default)]
+    #[serde(
+        alias = "congestion-controller",
+        alias = "congestion_controller",
+        default
+    )]
     pub congestion_controller: Option<String>,
     #[serde(default)]
     pub udp_relay_mode: Option<String>,
@@ -585,7 +661,11 @@ pub struct WgCfg {
     pub public_key: String,
     #[serde(alias = "pre-shared-key", alias = "pre_shared_key", default)]
     pub pre_shared_key: Option<String>,
-    #[serde(alias = "persistent-keepalive", alias = "persistent_keepalive", default)]
+    #[serde(
+        alias = "persistent-keepalive",
+        alias = "persistent_keepalive",
+        default
+    )]
     pub persistent_keepalive: Option<u16>,
     /// 本机隧道 IPv4 地址（点对点）
     pub ip: String,
@@ -717,5 +797,8 @@ pub const BUILTIN_DIRECT: &str = "DIRECT";
 pub const BUILTIN_REJECT: &str = "REJECT";
 
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "GLOBAL" | "COMPATIBLE")
+    matches!(
+        name,
+        "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "GLOBAL" | "COMPATIBLE"
+    )
 }

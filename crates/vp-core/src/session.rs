@@ -1,8 +1,8 @@
 //! 会话与连接元数据。
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use vp_common::DstAddr;
 

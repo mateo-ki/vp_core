@@ -63,7 +63,10 @@ pub async fn socks5_udp_connect(
     let mut head = [0u8; 4];
     ctrl.read_exact(&mut head).await?;
     if head[1] != 0x00 {
-        return Err(Error::ProtoMsg(format!("socks5 udp: 关联失败 rep={}", head[1])));
+        return Err(Error::ProtoMsg(format!(
+            "socks5 udp: 关联失败 rep={}",
+            head[1]
+        )));
     }
     let skip = match head[3] {
         0x01 => 6,
@@ -96,7 +99,10 @@ pub async fn socks5_udp_connect(
     };
     let relay = UdpSocket::bind("0.0.0.0:0").await?;
     relay.connect(bind).await?;
-    Ok(Socks5PacketConn { _ctrl: ctrl, relay: Arc::new(relay) })
+    Ok(Socks5PacketConn {
+        _ctrl: ctrl,
+        relay: Arc::new(relay),
+    })
 }
 
 #[async_trait]
@@ -126,7 +132,9 @@ impl PacketConn for Socks5PacketConn {
             if n < 4 || buf[2] != 0 {
                 continue;
             }
-            let Ok((src, used)) = decode_socks_addr(&buf[3..n]) else { continue };
+            let Ok((src, used)) = decode_socks_addr(&buf[3..n]) else {
+                continue;
+            };
             return Ok(UdpPacket {
                 src: std::net::SocketAddr::new(
                     match &src.host {
@@ -224,7 +232,9 @@ impl PacketConn for SsUdpConn {
             let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else {
                 continue;
             };
-            let Ok((src, used)) = decode_socks_addr(&plain) else { continue };
+            let Ok((src, used)) = decode_socks_addr(&plain) else {
+                continue;
+            };
             return Ok(UdpPacket {
                 src: std::net::SocketAddr::new(
                     match &src.host {

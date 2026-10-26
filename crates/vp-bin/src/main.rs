@@ -4,7 +4,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "vpcore", version, about = "VP_Core —— 小而快的全协议代理/VPN 内核")]
+#[command(
+    name = "vpcore",
+    version,
+    about = "VP_Core —— 小而快的全协议代理/VPN 内核"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -62,8 +66,7 @@ fn fetch(url: String) -> Result<String, String> {
 
 fn init_logging(level: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     // panic 不退出（任务级隔离），但记录到日志
     std::panic::set_hook(Box::new(|info| {
@@ -142,7 +145,10 @@ async fn main() {
                 std::process::exit(2);
             });
             let fmt = vp_config::Format::from_path(&config.to_string_lossy());
-            let dir = config.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+            let dir = config
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
             match vp_app::App::start(&text, fmt, &dir, false).await {
                 Ok(app) => app.url_test_all_groups().await,
                 Err(e) => {
@@ -183,12 +189,17 @@ async fn main() {
             // 跨平台文件变动检测（每秒检查一次 mtime）+ Unix SIGHUP / SIGINT·SIGTERM
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             ticker.tick().await; // 消耗初始即刻 tick
-            let mut last_mtime = std::fs::metadata(&config).ok().and_then(|m| m.modified().ok());
+            let mut last_mtime = std::fs::metadata(&config)
+                .ok()
+                .and_then(|m| m.modified().ok());
 
             #[cfg(unix)]
             {
-                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-                let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .unwrap();
+                let mut hup =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
@@ -201,7 +212,7 @@ async fn main() {
                         }
                         _ = ticker.tick() => {
                             if let Ok(m) = std::fs::metadata(&config).and_then(|m| m.modified()) {
-                                if last_mtime.map_or(false, |last| m > last) {
+                                if last_mtime.is_some_and(|last| m > last) {
                                     last_mtime = Some(m);
                                     match app.reload().await {
                                         Ok(()) => println!("✓ 配置文件变动，已平滑热重载"),
@@ -223,7 +234,7 @@ async fn main() {
                         _ = tokio::signal::ctrl_c() => break,
                         _ = ticker.tick() => {
                             if let Ok(m) = std::fs::metadata(&config).and_then(|m| m.modified()) {
-                                if last_mtime.map_or(false, |last| m > last) {
+                                if last_mtime.is_some_and(|last| m > last) {
                                     last_mtime = Some(m);
                                     match app.reload().await {
                                         Ok(()) => println!("✓ 配置文件变动，已平滑热重载"),

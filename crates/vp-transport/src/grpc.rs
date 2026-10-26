@@ -20,7 +20,9 @@ pub struct GrpcConfig {
 
 impl Default for GrpcConfig {
     fn default() -> Self {
-        GrpcConfig { service_name: "Turbo".into() }
+        GrpcConfig {
+            service_name: "Turbo".into(),
+        }
     }
 }
 
@@ -39,11 +41,7 @@ pub struct GrpcStream {
 // ---------------------------------------------------------------------------
 
 /// 在 TLS 流上建立 gRPC（要求 alpn=h2 已协商）
-pub async fn grpc_connect<S>(
-    io: S,
-    host: &str,
-    cfg: &GrpcConfig,
-) -> Result<GrpcStream>
+pub async fn grpc_connect<S>(io: S, host: &str, cfg: &GrpcConfig) -> Result<GrpcStream>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -103,9 +101,7 @@ where
         .ok_or(Error::Proto("grpc: 无请求"))?
         .map_err(|e| Error::ProtoMsg(format!("grpc accept 失败: {e}")))?;
     // 连接驱动：继续 accept（忽略后续请求）以维持 h2 连接存活
-    tokio::spawn(async move {
-        while let Some(_) = server.accept().await {}
-    });
+    tokio::spawn(async move { while server.accept().await.is_some() {} });
     let recv = req.into_body();
     let resp = http::Response::builder()
         .status(200)
@@ -156,9 +152,7 @@ impl AsyncRead for GrpcStream {
                     self.pending.extend_from_slice(&chunk);
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::other(format!(
-                        "grpc recv: {e}"
-                    ))))
+                    return Poll::Ready(Err(std::io::Error::other(format!("grpc recv: {e}"))));
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // 流结束
                 Poll::Pending => return Poll::Pending,
@@ -186,10 +180,7 @@ impl AsyncWrite for GrpcStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         std::task::ready!(self.flush_pending(cx))?;
         self.send
             .send_trailers(http::HeaderMap::new())
@@ -212,20 +203,18 @@ impl GrpcStream {
                         Err(e) => {
                             return Poll::Ready(Err(std::io::Error::other(format!(
                                 "grpc send: {e}"
-                            ))))
+                            ))));
                         }
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::other(format!(
-                        "grpc capacity: {e}"
-                    ))))
+                    return Poll::Ready(Err(std::io::Error::other(format!("grpc capacity: {e}"))));
                 }
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
                         "grpc 发送侧关闭",
-                    )))
+                    )));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -243,7 +232,7 @@ mod tests {
     #[tokio::test]
     async fn grpc_loopback() {
         use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-        use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+        use tokio_rustls::{TlsAcceptor, rustls::ServerConfig};
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
@@ -279,8 +268,12 @@ mod tests {
             server_name: None,
             alpn: vec!["h2".into()],
         };
-        let tls = crate::tls::tls_connect(tcp, "localhost", &cfg).await.unwrap();
-        let mut c = grpc_connect(tls, "localhost", &GrpcConfig::default()).await.unwrap();
+        let tls = crate::tls::tls_connect(tcp, "localhost", &cfg)
+            .await
+            .unwrap();
+        let mut c = grpc_connect(tls, "localhost", &GrpcConfig::default())
+            .await
+            .unwrap();
 
         c.write_all(b"ping-grpc").await.unwrap();
         let mut buf = [0u8; 9];

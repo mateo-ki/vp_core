@@ -23,7 +23,9 @@ impl GeoIpDb {
     pub fn load(path: &Path) -> Result<Self, String> {
         let reader = maxminddb::Reader::open_readfile(path)
             .map_err(|e| format!("打开 GeoIP 数据库 {} 失败: {e}", path.display()))?;
-        Ok(GeoIpDb { reader: Arc::new(reader) })
+        Ok(GeoIpDb {
+            reader: Arc::new(reader),
+        })
     }
 
     /// 国家代码匹配器（实际国家判定在查询时进行）
@@ -33,7 +35,10 @@ impl GeoIpDb {
         if code.len() != 2 && code != "LAN" && code != "PRIVATE" {
             return None;
         }
-        Some(GeoIpMatcher { code, reader: self.reader.clone() })
+        Some(GeoIpMatcher {
+            code,
+            reader: self.reader.clone(),
+        })
     }
 }
 
@@ -46,7 +51,8 @@ pub struct GeoIpMatcher {
 impl GeoIpMatcher {
     pub fn matches(&self, ip: IpAddr) -> bool {
         if self.code == "LAN" || self.code == "PRIVATE" {
-            return ip.is_loopback() || ip.is_unspecified()
+            return ip.is_loopback()
+                || ip.is_unspecified()
                 || match ip {
                     std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
                     std::net::IpAddr::V6(v6) => {
@@ -55,11 +61,7 @@ impl GeoIpMatcher {
                     }
                 };
         }
-        let hit: Option<CountryLookup> = self
-            .reader
-            .lookup(ip)
-            .ok()
-            .flatten();
+        let hit: Option<CountryLookup> = self.reader.lookup(ip).ok().flatten();
         hit.and_then(|c| c.country)
             .and_then(|c| c.iso_code)
             .is_some_and(|iso| iso.eq_ignore_ascii_case(&self.code))

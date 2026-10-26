@@ -16,7 +16,7 @@ use tracing::debug;
 
 use vp_common::{Error, Result};
 use vp_core::ProxyStream;
-use vp_plugin_sdk::{VpTransformVt, DIR_DOWNSTREAM, DIR_UPSTREAM};
+use vp_plugin_sdk::{DIR_DOWNSTREAM, DIR_UPSTREAM, VpTransformVt};
 
 /// 已加载的 transform 插件
 pub struct TransformPlugin {
@@ -50,15 +50,16 @@ impl TransformPlugin {
                 )));
             }
             let cfg_bytes = cfg_json.as_bytes();
-            let handle = (vt.create)(
-                cfg_bytes.as_ptr() as *const c_char,
-                cfg_bytes.len(),
-            );
+            let handle = (vt.create)(cfg_bytes.as_ptr() as *const c_char, cfg_bytes.len());
             if handle.is_null() {
                 return Err(Error::Plugin("插件 create 失败".into()));
             }
             debug!("插件已加载: {}", path.display());
-            Ok(TransformPlugin { _lib: lib, vt, handle })
+            Ok(TransformPlugin {
+                _lib: lib,
+                vt,
+                handle,
+            })
         }
     }
 
@@ -102,8 +103,8 @@ impl Drop for TransformPlugin {
 pub struct TransformStream<S> {
     inner: S,
     plugin: Arc<TransformPlugin>,
-    pending: Vec<u8>,  // 变换后待读
-    out: Vec<u8>,      // 写方向积压
+    pending: Vec<u8>, // 变换后待读
+    out: Vec<u8>,     // 写方向积压
     closed: bool,
 }
 
@@ -184,7 +185,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TransformStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(n)) => {
                     this.out.drain(..n);
@@ -196,9 +197,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TransformStream<S> {
         match this.plugin.transform(DIR_UPSTREAM, buf) {
             Ok(Some(v)) => this.out.extend_from_slice(&v),
             Ok(None) => this.out.extend_from_slice(buf),
-            Err(e) => {
-                return Poll::Ready(Err(std::io::Error::other(e.to_string())))
-            }
+            Err(e) => return Poll::Ready(Err(std::io::Error::other(e.to_string()))),
         }
         while !this.out.is_empty() {
             let mut inner = Pin::new(&mut this.inner);
@@ -207,7 +206,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TransformStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(n)) => {
                     this.out.drain(..n);
@@ -228,9 +227,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TransformStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "写入 0 字节",
-                    )))
+                    )));
                 }
-                Poll::Ready(Ok(n)) => { this.out.drain(..n); },
+                Poll::Ready(Ok(n)) => {
+                    this.out.drain(..n);
+                }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -289,10 +290,18 @@ mod tests {
 
     // 返回 (Option<()>, path)：dll 不存在时 None
     fn find_plugin() -> (Option<()>, std::path::PathBuf) {
-        let name = if cfg!(windows) { "xor_mask.dll" } else { "libxor_mask.so" };
+        let name = if cfg!(windows) {
+            "xor_mask.dll"
+        } else {
+            "libxor_mask.so"
+        };
         for cand in [
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release").join(name),
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug").join(name),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/release")
+                .join(name),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/debug")
+                .join(name),
         ] {
             if cand.exists() {
                 return (Some(()), cand);

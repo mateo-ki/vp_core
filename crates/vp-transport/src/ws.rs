@@ -193,7 +193,8 @@ impl<S: AsyncRead + Unpin> WsStream<S> {
                         if self.raw.len() < header_len + 4 {
                             return false;
                         }
-                        self.mask_key.copy_from_slice(&self.raw[header_len..header_len + 4]);
+                        self.mask_key
+                            .copy_from_slice(&self.raw[header_len..header_len + 4]);
                         self.raw.advance(header_len + 4);
                     } else {
                         self.raw.advance(header_len);
@@ -253,7 +254,7 @@ impl<S: AsyncWrite + Unpin> WsStream<S> {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "ws: 写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(n) => {
                     self.write_out.advance(n);
@@ -286,7 +287,11 @@ impl<S: AsyncWrite + Unpin> WsStream<S> {
             let mut key = [0u8; 4];
             vp_common::rand_bytes(&mut key);
             self.write_out.extend_from_slice(&key);
-            let masked: Vec<u8> = buf.iter().enumerate().map(|(i, b)| b ^ key[i % 4]).collect();
+            let masked: Vec<u8> = buf
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i % 4])
+                .collect();
             self.write_out.extend_from_slice(&masked);
         } else {
             self.write_out.extend_from_slice(buf);
@@ -425,7 +430,10 @@ fn parse_header(raw: &[u8]) -> Option<(bool, u8, bool, usize, usize)> {
 mod tests {
     use super::*;
 
-    async fn echo_pair() -> (WsStream<tokio::io::DuplexStream>, WsStream<tokio::io::DuplexStream>) {
+    async fn echo_pair() -> (
+        WsStream<tokio::io::DuplexStream>,
+        WsStream<tokio::io::DuplexStream>,
+    ) {
         let (a, b) = tokio::io::duplex(8192);
         let cfg = WsConfig {
             path: "/ws".into(),

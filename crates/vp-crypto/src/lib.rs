@@ -53,12 +53,8 @@ impl AnyAead {
             )));
         }
         Ok(match kind {
-            AeadKind::Aes128Gcm => {
-                AnyAead::A128(Box::new(Aes128Gcm::new_from_slice(key).unwrap()))
-            }
-            AeadKind::Aes256Gcm => {
-                AnyAead::A256(Box::new(Aes256Gcm::new_from_slice(key).unwrap()))
-            }
+            AeadKind::Aes128Gcm => AnyAead::A128(Box::new(Aes128Gcm::new_from_slice(key).unwrap())),
+            AeadKind::Aes256Gcm => AnyAead::A256(Box::new(Aes256Gcm::new_from_slice(key).unwrap())),
             AeadKind::ChaCha20Poly1305 => {
                 AnyAead::Chacha(Box::new(ChaCha20Poly1305::new_from_slice(key).unwrap()))
             }
@@ -67,7 +63,10 @@ impl AnyAead {
 
     pub fn seal(&self, nonce_counter: u64, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         let nonce = nonce_from_counter(nonce_counter);
-        let payload = Payload { msg: plaintext, aad };
+        let payload = Payload {
+            msg: plaintext,
+            aad,
+        };
         match self {
             AnyAead::A128(a) => a.encrypt(&nonce, payload).unwrap(),
             AnyAead::A256(a) => a.encrypt(&nonce, payload).unwrap(),
@@ -78,7 +77,10 @@ impl AnyAead {
     /// 使用显式 12 字节 nonce
     pub fn seal_nonce(&self, nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
         let n = Nonce::from(*nonce);
-        let payload = Payload { msg: plaintext, aad };
+        let payload = Payload {
+            msg: plaintext,
+            aad,
+        };
         match self {
             AnyAead::A128(a) => a.encrypt(&n, payload).unwrap(),
             AnyAead::A256(a) => a.encrypt(&n, payload).unwrap(),
@@ -88,7 +90,10 @@ impl AnyAead {
 
     pub fn open_nonce(&self, nonce: &[u8; 12], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let n = Nonce::from(*nonce);
-        let payload = Payload { msg: ciphertext, aad };
+        let payload = Payload {
+            msg: ciphertext,
+            aad,
+        };
         let r = match self {
             AnyAead::A128(a) => a.decrypt(&n, payload),
             AnyAead::A256(a) => a.decrypt(&n, payload),
@@ -99,7 +104,10 @@ impl AnyAead {
 
     pub fn open(&self, nonce_counter: u64, ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let nonce = nonce_from_counter(nonce_counter);
-        let payload = Payload { msg: ciphertext, aad };
+        let payload = Payload {
+            msg: ciphertext,
+            aad,
+        };
         let r = match self {
             AnyAead::A128(a) => a.decrypt(&nonce, payload),
             AnyAead::A256(a) => a.decrypt(&nonce, payload),
@@ -122,7 +130,11 @@ mod tests {
 
     #[test]
     fn aead_roundtrip_all_kinds() {
-        for kind in [AeadKind::Aes128Gcm, AeadKind::Aes256Gcm, AeadKind::ChaCha20Poly1305] {
+        for kind in [
+            AeadKind::Aes128Gcm,
+            AeadKind::Aes256Gcm,
+            AeadKind::ChaCha20Poly1305,
+        ] {
             let key = vec![7u8; kind.key_len()];
             let a = AnyAead::new(kind, &key).unwrap();
             let ct = a.seal(0, b"hello", b"");

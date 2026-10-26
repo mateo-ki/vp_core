@@ -26,7 +26,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use async_trait::async_trait;
 use chacha20poly1305::aead::Aead;
@@ -272,7 +272,9 @@ impl SessionMeta {
         }
         let payload_len = u16::from_be_bytes(b[15..17].try_into().unwrap());
         if payload_len as usize > MAX_SESSION_OPEN_PAYLOAD {
-            return Err(Error::ProtoMsg(format!("mieru: 会话载荷超长 {payload_len}")));
+            return Err(Error::ProtoMsg(format!(
+                "mieru: 会话载荷超长 {payload_len}"
+            )));
         }
         Ok(SessionMeta {
             protocol,
@@ -502,7 +504,10 @@ impl Socks5ReplyParser {
             return Err(Error::Proto("mieru: SOCKS5 应答版本错误"));
         }
         if buf[1] != 0x00 {
-            return Err(Error::ProtoMsg(format!("mieru: SOCKS5 连接失败 rep={}", buf[1])));
+            return Err(Error::ProtoMsg(format!(
+                "mieru: SOCKS5 连接失败 rep={}",
+                buf[1]
+            )));
         }
         let atyp = buf[3];
         let hdr_extra = if atyp == 0x03 { 1 } else { 0 };
@@ -513,11 +518,7 @@ impl Socks5ReplyParser {
             0x01 => 4,
             0x03 => buf[4] as usize,
             0x04 => 16,
-            a => {
-                return Err(Error::ProtoMsg(format!(
-                    "mieru: SOCKS5 非法 ATYP {a:#04x}"
-                )))
-            }
+            a => return Err(Error::ProtoMsg(format!("mieru: SOCKS5 非法 ATYP {a:#04x}"))),
         };
         let total = 4 + hdr_extra + addr_len + 2;
         if buf.len() < total {
@@ -569,7 +570,11 @@ impl MieruOutbound {
         mut io: Box<dyn ProxyStream>,
         dst: &DstAddr,
     ) -> Result<MieruStream<Box<dyn ProxyStream>>> {
-        let key = derive_key(self.password.as_bytes(), self.username.as_bytes(), now_unix());
+        let key = derive_key(
+            self.password.as_bytes(),
+            self.username.as_bytes(),
+            now_unix(),
+        );
         let mut tx = MieruCipher::new(key, self.username.as_bytes());
         let session_id = random_u32();
 
@@ -625,8 +630,12 @@ impl Outbound for MieruOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::dial(&self.server, self.port, &transport::TransportConfig::default())
-            .await?;
+        let io = transport::dial(
+            &self.server,
+            self.port,
+            &transport::TransportConfig::default(),
+        )
+        .await?;
         let st = self.handshake(io, dst).await?;
         Ok(Box::new(st))
     }
@@ -721,9 +730,8 @@ impl<S: ProxyStream> MieruStream<S> {
 
     /// 元数据已解出：按段布局推进状态
     fn enter_segment(&mut self, meta: [u8; METADATA_LEN]) -> io::Result<()> {
-        let (prefix, payload_len, suffix) = segment_layout(&meta).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let (prefix, payload_len, suffix) = segment_layout(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.pending_meta = Some(meta);
         self.pending_pt = Vec::new();
         if prefix > 0 {
@@ -757,9 +765,10 @@ impl<S: ProxyStream> MieruStream<S> {
     }
 
     fn decrypt_payload(&mut self, buf: Vec<u8>) -> io::Result<()> {
-        let (pt, _) = self.rx.open(&buf).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let (pt, _) = self
+            .rx
+            .open(&buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.pending_pt = pt;
         Ok(())
     }
@@ -786,9 +795,10 @@ impl<S: ProxyStream> MieruStream<S> {
                         return Poll::Pending;
                     }
                     let buf = std::mem::take(buf);
-                    let (meta, _) = self.rx.open(&buf).map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    let (meta, _) = self
+                        .rx
+                        .open(&buf)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     let meta: [u8; METADATA_LEN] = meta.as_slice().try_into().map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidData, "mieru: 元数据长度错误")
                     })?;
@@ -797,16 +807,16 @@ impl<S: ProxyStream> MieruStream<S> {
                 RState::Prefix { size, fill } => {
                     // padding 明文直接丢弃
                     let mut sink = vec![0u8; *size - *fill];
-                    let done = poll_fill(&mut self.io, cx, &mut sink, &mut 0)?;
-                    *fill += *size - sink.len() + if done { 0 } else { 0 };
+                    let mut read_bytes = 0;
+                    let done = poll_fill(&mut self.io, cx, &mut sink, &mut read_bytes)?;
+                    *fill += read_bytes;
                     if !done {
                         return Poll::Pending;
                     }
                     // 进入载荷或 suffix
                     let meta = self.pending_meta.unwrap_or([0u8; METADATA_LEN]);
-                    let (_, payload_len, suffix) = segment_layout(&meta).map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    let (_, payload_len, suffix) = segment_layout(&meta)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     if payload_len > 0 {
                         self.rst = RState::Payload {
                             buf: vec![0u8; payload_len + TAG],
@@ -829,9 +839,8 @@ impl<S: ProxyStream> MieruStream<S> {
                     let buf = std::mem::take(buf);
                     self.decrypt_payload(buf)?;
                     let meta = self.pending_meta.unwrap_or([0u8; METADATA_LEN]);
-                    let (_, _, suffix) = segment_layout(&meta).map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-                    })?;
+                    let (_, _, suffix) = segment_layout(&meta)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                     if suffix > 0 {
                         self.rst = RState::Suffix {
                             size: suffix,
@@ -907,7 +916,7 @@ impl<S: ProxyStream> MieruStream<S> {
 fn poll_fill<S: AsyncRead + Unpin>(
     io: &mut S,
     cx: &mut Context<'_>,
-    buf: &mut Vec<u8>,
+    buf: &mut [u8],
     fill: &mut usize,
 ) -> io::Result<bool> {
     // 这里无法访问 self.eof，用哨兵：读满返回 Ok(true)，EOF 返回 Err(UnexpectedEof)
@@ -1087,7 +1096,12 @@ impl MieruInbound {
         Ok((tx, rx, m.session_id, socks_buf))
     }
 
-    async fn serve(&self, mut io: tokio::net::TcpStream, src: SocketAddr, _ctx: &InboundCtx) -> Result<()> {
+    async fn serve(
+        &self,
+        mut io: tokio::net::TcpStream,
+        src: SocketAddr,
+        _ctx: &InboundCtx,
+    ) -> Result<()> {
         let (mut tx, mut rx, session_id, mut socks_buf) = self.accept(&mut io).await?;
         let mut seq: u32 = 0;
         let mut next_recv: u32 = 1; // openSessionRequest 已消费 seq 0
@@ -1183,21 +1197,16 @@ impl MieruInbound {
         let (rec_tx, mut rec_rx) = mpsc::channel::<Vec<u8>>(64);
         let reader = tokio::spawn(async move {
             let mut first = false; // accept/handshake 已消费 rx 首段 nonce
-            loop {
-                match read_segment(&mut rh, &mut rx, first).await {
-                    Ok((meta, payload)) => {
-                        first = false;
-                        match meta[0] {
-                            DATA_C2S => {
-                                if rec_tx.send(payload).await.is_err() {
-                                    break;
-                                }
-                            }
-                            CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => break,
-                            _ => {}
+            while let Ok((meta, payload)) = read_segment(&mut rh, &mut rx, first).await {
+                first = false;
+                match meta[0] {
+                    DATA_C2S => {
+                        if rec_tx.send(payload).await.is_err() {
+                            break;
                         }
                     }
-                    Err(_) => break,
+                    CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => break,
+                    _ => {}
                 }
             }
         });
@@ -1209,7 +1218,13 @@ impl MieruInbound {
                 while !rest.is_empty() {
                     let k = rest.len().min(MAX_PDU);
                     if write_data_segment(
-                        &mut wh, &mut tx, DATA_S2C, session_id, s, next_recv, &rest[..k],
+                        &mut wh,
+                        &mut tx,
+                        DATA_S2C,
+                        session_id,
+                        s,
+                        next_recv,
+                        &rest[..k],
                     )
                     .await
                     .is_err()
@@ -1285,7 +1300,7 @@ impl Inbound for MieruInbound {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     fn outbound_plain(server: &str, port: u16, username: &str, password: &str) -> MieruOutbound {
         MieruOutbound::new(&MieruCfg {
@@ -1302,7 +1317,9 @@ mod tests {
         let l2 = l.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut s, _)) = l2.accept().await else { break };
+                let Ok((mut s, _)) = l2.accept().await else {
+                    break;
+                };
                 tokio::spawn(async move {
                     let mut b = vec![0u8; 65536];
                     loop {
@@ -1449,7 +1466,9 @@ mod tests {
             Ok(Err(_)) => {} // 服务端发现失败关闭
             Ok(Ok(mut s)) => {
                 let mut b = [0u8; 16];
-                let r = timeout(Duration::from_secs(5), s.read(&mut b)).await.unwrap();
+                let r = timeout(Duration::from_secs(5), s.read(&mut b))
+                    .await
+                    .unwrap();
                 assert!(matches!(r, Ok(0) | Err(_)), "错误密码不应收到数据: {r:?}");
             }
         }

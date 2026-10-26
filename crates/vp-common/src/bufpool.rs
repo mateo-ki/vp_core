@@ -58,7 +58,10 @@ pub fn get_buf() -> PooledBuf {
         .unwrap()
         .pop()
         .unwrap_or_else(|| vec![0u8; BUF_SIZE].try_into().expect("exact size"));
-    PooledBuf { buf: Some(buf), len: 0 }
+    PooledBuf {
+        buf: Some(buf),
+        len: 0,
+    }
 }
 
 #[cfg(test)]

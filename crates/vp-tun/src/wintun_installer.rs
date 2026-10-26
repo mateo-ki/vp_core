@@ -35,7 +35,10 @@ pub mod windows {
         if let Ok(env_path) = std::env::var("WINTUN_DLL_PATH") {
             let p = PathBuf::from(env_path);
             if p.exists() {
-                debug!("从 WINTUN_DLL_PATH 环境变量指定路径加载 wintun: {}", p.display());
+                debug!(
+                    "从 WINTUN_DLL_PATH 环境变量指定路径加载 wintun: {}",
+                    p.display()
+                );
                 return Ok(p);
             }
         }
@@ -50,7 +53,10 @@ pub mod windows {
                 }
                 let candidate_rel = parent.join(arch_rel);
                 if candidate_rel.exists() {
-                    debug!("从可执行文件架构子目录加载 wintun: {}", candidate_rel.display());
+                    debug!(
+                        "从可执行文件架构子目录加载 wintun: {}",
+                        candidate_rel.display()
+                    );
                     return Ok(candidate_rel);
                 }
             }
@@ -65,7 +71,10 @@ pub mod windows {
             }
             let candidate_rel = cwd.join(arch_rel);
             if candidate_rel.exists() {
-                debug!("从当前工作目录架构子目录加载 wintun: {}", candidate_rel.display());
+                debug!(
+                    "从当前工作目录架构子目录加载 wintun: {}",
+                    candidate_rel.display()
+                );
                 return Ok(candidate_rel);
             }
         }
@@ -99,7 +108,8 @@ pub mod windows {
             请从官方下载驱动 (https://www.wintun.net/) 并执行以下任一操作：\n\
               1. 将对应架构的 wintun.dll 放置在 vpcore.exe 同级目录\n\
               2. 或设置环境变量 WINTUN_DLL_PATH 指向该文件绝对路径\n\
-              3. 或将 wintun.dll 复制到 C:\\Windows\\System32 目录下".into(),
+              3. 或将 wintun.dll 复制到 C:\\Windows\\System32 目录下"
+                .into(),
         ))
     }
 
@@ -112,11 +122,18 @@ pub mod windows {
             // 在未设置非法路径的情况下，测试探测机制不 panic
             match ensure_wintun_dll() {
                 Ok(path) => {
-                    assert!(path.exists(), "查找到的外部 Wintun 路径必须存在: {}", path.display());
+                    assert!(
+                        path.exists(),
+                        "查找到的外部 Wintun 路径必须存在: {}",
+                        path.display()
+                    );
                 }
                 Err(err) => {
                     let msg = err.to_string();
-                    assert!(msg.contains("wintun.dll"), "未找到时应给出包含 wintun.dll 说明的指引: {msg}");
+                    assert!(
+                        msg.contains("wintun.dll"),
+                        "未找到时应给出包含 wintun.dll 说明的指引: {msg}"
+                    );
                 }
             }
         }

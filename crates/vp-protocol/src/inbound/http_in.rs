@@ -11,7 +11,7 @@ use vp_common::{DstAddr, Result};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 
-use super::dispatch::{dispatch_stream, ClientReply};
+use super::dispatch::{ClientReply, dispatch_stream};
 
 pub struct HttpInbound {
     bind: String,
@@ -21,7 +21,11 @@ pub struct HttpInbound {
 
 impl HttpInbound {
     pub fn new(bind: String, port: u16, tag: &str) -> Self {
-        HttpInbound { bind, port, tag: tag.into() }
+        HttpInbound {
+            bind,
+            port,
+            tag: tag.into(),
+        }
     }
 }
 
@@ -97,7 +101,9 @@ where
             if k.trim().eq_ignore_ascii_case("proxy-authorization") {
                 if let Some(rest) = v.trim().strip_prefix("Basic ") {
                     use base64::Engine;
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(rest.trim()) {
+                    if let Ok(decoded) =
+                        base64::engine::general_purpose::STANDARD.decode(rest.trim())
+                    {
                         if let Ok(cred) = String::from_utf8(decoded) {
                             if let Some((u, _)) = cred.split_once(':') {
                                 user = Some(u.to_string());
@@ -116,13 +122,21 @@ where
         if let Some(u) = user {
             sess = sess.with_inbound_user(u);
         }
-        dispatch_stream(ctx, sess, Box::new(stream), ClientReply::Http("200 Connection established"))
-            .await;
+        dispatch_stream(
+            ctx,
+            sess,
+            Box::new(stream),
+            ClientReply::Http("200 Connection established"),
+        )
+        .await;
         return Ok(());
     }
 
     // absolute-form: GET http://host/path → 转发时改写为相对路径
-    let (host, rewritten) = match target.strip_prefix("http://").or_else(|| target.strip_prefix("https://")) {
+    let (host, rewritten) = match target
+        .strip_prefix("http://")
+        .or_else(|| target.strip_prefix("https://"))
+    {
         Some(rest) => {
             let (h, path) = match rest.find('/') {
                 Some(i) => (&rest[..i], &rest[i..]),
@@ -133,8 +147,14 @@ where
         None => {
             // origin-form：从 Host 头取目标
             let host = lines
-                .find_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).filter(|(k, _)| k == "host"))
-                .and_then(|(_, v)| Some(v))
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("host") {
+                        Some(v.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
                 .ok_or(vp_common::Error::Proto("http 入站: 缺少 Host"))?;
             (host, target.to_string())
         }
@@ -167,7 +187,10 @@ where
                     dst_port: sess.dst.port,
                     src: sess.src.map(|s| s.to_string()),
                     process: sess.process.clone(),
-                    rule: outbound.rule.as_ref().map(|r| format!("{} => {}", r.rule, r.target)),
+                    rule: outbound
+                        .rule
+                        .as_ref()
+                        .map(|r| format!("{} => {}", r.rule, r.target)),
                     chain: Some(outbound.via.clone()),
                     start: vp_common::now_millis(),
                 }),

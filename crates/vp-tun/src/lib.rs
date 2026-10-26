@@ -57,13 +57,19 @@ pub struct TunInbound {
 
 impl TunInbound {
     pub fn new(cfg: TunConfig, tag: &str) -> Self {
-        TunInbound { cfg, tag: tag.into() }
+        TunInbound {
+            cfg,
+            tag: tag.into(),
+        }
     }
 
     pub fn new_with_fd(cfg: TunConfig, tag: &str, fd: i32) -> Self {
         let mut cfg = cfg;
         cfg.fd = Some(fd);
-        TunInbound { cfg, tag: tag.into() }
+        TunInbound {
+            cfg,
+            tag: tag.into(),
+        }
     }
 }
 
@@ -99,13 +105,18 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
             use std::os::fd::FromRawFd;
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let tokio_file = tokio::fs::File::from_std(file);
-            info!("TUN 移动端模式已启动（外部 FD={fd}）: fakeip={}", cfg.fake_ip_range);
+            info!(
+                "TUN 移动端模式已启动（外部 FD={fd}）: fakeip={}",
+                cfg.fake_ip_range
+            );
             return run_with_device(cfg, tag, ctx, pool, resolver, tokio_file).await;
         }
         #[cfg(not(unix))]
         {
             let _ = fd;
-            return Err(Error::Unsupported("外部 FD 注入仅在 Unix/移动端系统支持".into()));
+            return Err(Error::Unsupported(
+                "外部 FD 注入仅在 Unix/移动端系统支持".into(),
+            ));
         }
     }
 
@@ -161,7 +172,9 @@ where
     D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let mut stack_cfg = IpStackConfig::default();
-    stack_cfg.mtu(cfg.mtu).map_err(|e| Error::Config(format!("MTU 非法: {e}")))?;
+    stack_cfg
+        .mtu(cfg.mtu)
+        .map_err(|e| Error::Config(format!("MTU 非法: {e}")))?;
     stack_cfg.packet_information(false);
     let mut stack = IpStack::new(stack_cfg, dev);
 
@@ -246,7 +259,10 @@ async fn dispatch_tcp(ctx: &InboundCtx, sess: Session, client: Box<dyn vp_core::
         dst_port: sess.dst.port,
         src: sess.src.map(|s| s.to_string()),
         process: sess.process.clone(),
-        rule: res.rule.as_ref().map(|r| format!("{} => {}", r.rule, r.target)),
+        rule: res
+            .rule
+            .as_ref()
+            .map(|r| format!("{} => {}", r.rule, r.target)),
         chain: Some(res.via.clone()),
         start: vp_common::now_millis(),
     };
@@ -321,7 +337,11 @@ async fn dispatch_udp(
 }
 
 /// DNS 劫持：就地应答（fake-ip / PTR / 上游转发）
-async fn handle_dns(mut udp: ipstack::IpStackUdpStream, pool: Arc<FakeIpPool>, resolver: Arc<Resolver>) {
+async fn handle_dns(
+    mut udp: ipstack::IpStackUdpStream,
+    pool: Arc<FakeIpPool>,
+    resolver: Arc<Resolver>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 1500];
     loop {
@@ -336,7 +356,11 @@ async fn handle_dns(mut udp: ipstack::IpStackUdpStream, pool: Arc<FakeIpPool>, r
     }
 }
 
-async fn build_dns_reply(query: &[u8], pool: &Arc<FakeIpPool>, resolver: &Arc<Resolver>) -> Vec<u8> {
+async fn build_dns_reply(
+    query: &[u8],
+    pool: &Arc<FakeIpPool>,
+    resolver: &Arc<Resolver>,
+) -> Vec<u8> {
     let Some((_id, name, qtype)) = vp_dns::wire::parse_query(query) else {
         return vp_dns::wire::build_empty_response(query);
     };
@@ -361,7 +385,8 @@ async fn build_dns_reply(query: &[u8], pool: &Arc<FakeIpPool>, resolver: &Arc<Re
             if fwd.connect(up).await.is_ok() && fwd.send(query).await.is_ok() {
                 let mut buf = vec![0u8; 1500];
                 if let Ok(Ok(n)) =
-                    tokio::time::timeout(std::time::Duration::from_secs(3), fwd.recv(&mut buf)).await
+                    tokio::time::timeout(std::time::Duration::from_secs(3), fwd.recv(&mut buf))
+                        .await
                 {
                     let mut out = buf[..n].to_vec();
                     if query.len() >= 2 && out.len() >= 2 {
@@ -374,6 +399,20 @@ async fn build_dns_reply(query: &[u8], pool: &Arc<FakeIpPool>, resolver: &Arc<Re
         }
     }
     vp_dns::wire::build_empty_response(query)
+}
+
+fn parse_ptr_name(name: &str) -> Option<std::net::Ipv4Addr> {
+    let prefix = name.strip_suffix(".in-addr.arpa")?;
+    let parts: Vec<&str> = prefix.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    Some(std::net::Ipv4Addr::new(
+        parts[3].parse().ok()?,
+        parts[2].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[0].parse().ok()?,
+    ))
 }
 
 #[cfg(test)]
@@ -423,22 +462,9 @@ mod tests {
         let msg = wire::parse_response(&reply).unwrap();
         assert_eq!(msg.answers.len(), 1);
         // rdata 尾部标签序列: [3]ptr[4]test[0]
-        let expect: Vec<u8> = [vec![3], b"ptr".to_vec(), vec![4], b"test".to_vec(), vec![0]].concat();
+        let expect: Vec<u8> =
+            [vec![3], b"ptr".to_vec(), vec![4], b"test".to_vec(), vec![0]].concat();
         let tail = &reply[reply.len() - expect.len()..];
         assert_eq!(tail, &expect[..], "PTR rdata 应含域名标签");
     }
-}
-
-fn parse_ptr_name(name: &str) -> Option<std::net::Ipv4Addr> {
-    let prefix = name.strip_suffix(".in-addr.arpa")?;
-    let parts: Vec<&str> = prefix.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    Some(std::net::Ipv4Addr::new(
-        parts[3].parse().ok()?,
-        parts[2].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[0].parse().ok()?,
-    ))
 }

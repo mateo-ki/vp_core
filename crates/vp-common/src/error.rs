@@ -57,7 +57,7 @@ impl From<Error> for std::io::Error {
     fn from(e: Error) -> Self {
         match e {
             Error::Io(io) => io,
-            other => std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
+            other => std::io::Error::other(other.to_string()),
         }
     }
 }

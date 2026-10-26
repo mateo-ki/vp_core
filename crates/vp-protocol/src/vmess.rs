@@ -14,7 +14,7 @@ use vp_common::{DstAddr, Error, Host, Result};
 use vp_config::VmessCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, ProxyStream};
 use vp_crypto::ss::AeadChunkCodec;
 use vp_crypto::vmess_kdf as kdf;
@@ -101,7 +101,9 @@ fn decode_v2ray_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
                 return Err(Error::Proto("vmess 地址截断"));
             }
             (
-                Host::Ip(std::net::IpAddr::V4([buf[3], buf[4], buf[5], buf[6]].into())),
+                Host::Ip(std::net::IpAddr::V4(
+                    [buf[3], buf[4], buf[5], buf[6]].into(),
+                )),
                 7,
             )
         }
@@ -200,7 +202,14 @@ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
     if i != body.len() {
         return Err(Error::Proto("vmess 请求头长度异常"));
     }
-    Ok(VmessRequest { body_key, body_iv, resp_auth, security, cmd, dst })
+    Ok(VmessRequest {
+        body_key,
+        body_iv,
+        resp_auth,
+        security,
+        cmd,
+        dst,
+    })
 }
 
 /// 密封 AEAD 认证头：authID(16) + lenCT(18) + nonce(8) + payloadCT
@@ -224,7 +233,11 @@ fn seal_header(cmd_key: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
     let mut len_nonce12 = [0u8; 12];
     len_nonce12.copy_from_slice(&len_nonce);
     let len_aead = AnyAead::new(AeadKind::Aes128Gcm, &len_key)?;
-    let len_ct = len_aead.seal_nonce(&len_nonce12, &(plaintext.len() as u16).to_be_bytes(), &auth_id);
+    let len_ct = len_aead.seal_nonce(
+        &len_nonce12,
+        &(plaintext.len() as u16).to_be_bytes(),
+        &auth_id,
+    );
 
     let pay_key = kdf::kdf16(
         cmd_key,
@@ -258,10 +271,15 @@ async fn open_header<S: AsyncRead + Unpin>(
     io.read_exact(&mut len_ct).await?;
     let mut nonce8 = [0u8; 8];
     io.read_exact(&mut nonce8).await?;
-    let len_key =
-        kdf::kdf16(cmd_key, &[kdf::SALT_HEADER_LEN_KEY.as_bytes(), auth_id, &nonce8]);
-    let len_nonce =
-        kdf::kdf_x(cmd_key, &[kdf::SALT_HEADER_LEN_IV.as_bytes(), auth_id, &nonce8], 12);
+    let len_key = kdf::kdf16(
+        cmd_key,
+        &[kdf::SALT_HEADER_LEN_KEY.as_bytes(), auth_id, &nonce8],
+    );
+    let len_nonce = kdf::kdf_x(
+        cmd_key,
+        &[kdf::SALT_HEADER_LEN_IV.as_bytes(), auth_id, &nonce8],
+        12,
+    );
     let mut n12 = [0u8; 12];
     n12.copy_from_slice(&len_nonce);
     let len_aead = AnyAead::new(AeadKind::Aes128Gcm, &len_key)?;
@@ -274,9 +292,15 @@ async fn open_header<S: AsyncRead + Unpin>(
     let plen = u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize;
     let mut pay_ct = vec![0u8; plen + 16];
     io.read_exact(&mut pay_ct).await?;
-    let pay_key = kdf::kdf16(cmd_key, &[kdf::SALT_HEADER_KEY.as_bytes(), auth_id, &nonce8]);
-    let pay_nonce =
-        kdf::kdf_x(cmd_key, &[kdf::SALT_HEADER_IV.as_bytes(), auth_id, &nonce8], 12);
+    let pay_key = kdf::kdf16(
+        cmd_key,
+        &[kdf::SALT_HEADER_KEY.as_bytes(), auth_id, &nonce8],
+    );
+    let pay_nonce = kdf::kdf_x(
+        cmd_key,
+        &[kdf::SALT_HEADER_IV.as_bytes(), auth_id, &nonce8],
+        12,
+    );
     let mut pn12 = [0u8; 12];
     pn12.copy_from_slice(&pay_nonce);
     let pay_aead = AnyAead::new(AeadKind::Aes128Gcm, &pay_key)?;
@@ -293,7 +317,11 @@ fn resp_keys(body_key: &[u8; 16], body_iv: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     (kdf::sha256_16(body_key), kdf::sha256_16(body_iv))
 }
 
-fn build_response_header(resp_auth: u8, resp_key: &[u8; 16], resp_iv: &[u8; 16]) -> Result<Vec<u8>> {
+fn build_response_header(
+    resp_auth: u8,
+    resp_key: &[u8; 16],
+    resp_iv: &[u8; 16],
+) -> Result<Vec<u8>> {
     let payload = [resp_auth, OPT_CHUNK_STREAM];
     let len_key = kdf::kdf16(resp_key, &[kdf::SALT_RESP_LEN_KEY.as_bytes()]);
     let len_nonce = kdf::kdf_x(resp_iv, &[kdf::SALT_RESP_LEN_IV.as_bytes()], 12);
@@ -419,7 +447,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "vmess: 写入 0 字节",
-                    )))
+                    )));
                 }
                 Poll::Ready(Ok(n)) => self.out.advance(n),
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -788,7 +816,8 @@ mod tests {
             conns: Arc::new(vp_core::ConnTable::new()),
         };
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
-        let server = VmessInbound::new("127.0.0.1", 0, "vm-srv", &[uuid.clone()]).unwrap();
+        let server =
+            VmessInbound::new("127.0.0.1", 0, "vm-srv", std::slice::from_ref(&uuid)).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         let out = VmessOutbound::new(&VmessCfg {
@@ -831,7 +860,8 @@ mod tests {
             conns: Arc::new(vp_core::ConnTable::new()),
         };
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
-        let server = VmessInbound::new("127.0.0.1", 0, "vm-srv", &[uuid.clone()]).unwrap();
+        let server =
+            VmessInbound::new("127.0.0.1", 0, "vm-srv", std::slice::from_ref(&uuid)).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
         let out = VmessOutbound::new(&VmessCfg {
             server: "127.0.0.1".into(),

@@ -9,12 +9,12 @@ use vp_common::{DstAddr, Error, Host, Result};
 use vp_config::VlessCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
-use vp_core::tunnel::{relay, RelayHook};
+use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, ProxyStream};
 use vp_crypto::vmess_kdf::parse_uuid;
 
 use crate::direct::DirectOutbound;
-use crate::vless_vision::{VisionStream, VISION_FLOW_BYTES};
+use crate::vless_vision::{VISION_FLOW_BYTES, VisionStream};
 use vp_dns::Resolver;
 use vp_transport as transport;
 
@@ -283,7 +283,9 @@ impl VlessInbound {
                     let remote = self.direct.connect_stream(&sess, &dst).await?;
                     // 响应：如果启用了 vision，回送 [VERSION, 18, VISION_FLOW_BYTES]
                     if is_vision {
-                        stream.write_all(&[VERSION, VISION_FLOW_BYTES.len() as u8]).await?;
+                        stream
+                            .write_all(&[VERSION, VISION_FLOW_BYTES.len() as u8])
+                            .await?;
                         stream.write_all(VISION_FLOW_BYTES).await?;
                     } else {
                         stream.write_all(&[VERSION, 0]).await?;
@@ -318,7 +320,8 @@ impl VlessInbound {
                     });
                     return Ok(());
                 }
-                Err(Error::Proto("vless 请求头过短" | "vless 请求头截断" | "vless 地址截断")) => {
+                Err(Error::Proto("vless 请求头过短" | "vless 请求头截断" | "vless 地址截断")) =>
+                {
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -387,7 +390,8 @@ mod tests {
             conns: Arc::new(vp_core::ConnTable::new()),
         };
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
-        let server = VlessInbound::new("127.0.0.1", 0, "vl-srv", &[uuid.clone()]).unwrap();
+        let server =
+            VlessInbound::new("127.0.0.1", 0, "vl-srv", std::slice::from_ref(&uuid)).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         let out = VlessOutbound::new(&VlessCfg {
@@ -438,7 +442,9 @@ mod tests {
             conns: Arc::new(vp_core::ConnTable::new()),
         };
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
-        let server = VlessInbound::new("127.0.0.1", 0, "vl-vision-srv", &[uuid.clone()]).unwrap();
+        let server =
+            VlessInbound::new("127.0.0.1", 0, "vl-vision-srv", std::slice::from_ref(&uuid))
+                .unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         // 构造配置了 flow: xtls-rprx-vision 的出站
@@ -470,7 +476,10 @@ mod tests {
 
         let mut recv_ch = vec![0u8; client_hello.len()];
         s.read_exact(&mut recv_ch).await.unwrap();
-        assert_eq!(recv_ch, client_hello, "ClientHello 内容经 Vision 填充/剥离后应完全一致");
+        assert_eq!(
+            recv_ch, client_hello,
+            "ClientHello 内容经 Vision 填充/剥离后应完全一致"
+        );
 
         // 2. 发送 ApplicationData（0x17），触发 PaddingEnd 并切换到裸流直通
         let mut app_data = vec![0x17, 0x03, 0x03, 0x00, 0x20];

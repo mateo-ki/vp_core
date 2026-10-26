@@ -2,7 +2,9 @@
 //!
 //! 提供供 Android (JNI)、iOS (Swift / Objective-C) 以及嵌入式系统调用的 C 语言标准 ABI 动态/静态库接口。
 
-use std::ffi::{c_char, c_int, CStr, CString};
+#![allow(clippy::missing_safety_doc, clippy::doc_overindented_list_items)]
+
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, Once};
@@ -52,8 +54,8 @@ pub unsafe extern "C" fn vp_init_logger(log_level: *const c_char) -> c_int {
 
     INIT_LOGGER_ONCE.call_once(|| {
         use tracing_subscriber::EnvFilter;
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&level_str));
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&level_str));
         let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     });
 
@@ -186,7 +188,9 @@ pub unsafe extern "C" fn vp_stop() -> c_int {
     };
 
     // 终止活动连接记录并关闭运行时
-    instance.runtime.shutdown_timeout(Duration::from_millis(600));
+    instance
+        .runtime
+        .shutdown_timeout(Duration::from_millis(600));
     VP_OK
 }
 
@@ -224,7 +228,10 @@ pub unsafe extern "C" fn vp_reload(config_str: *const c_char) -> c_int {
         }
     };
 
-    match instance.runtime.block_on(instance.app.reload_with_text(cfg_slice)) {
+    match instance
+        .runtime
+        .block_on(instance.app.reload_with_text(cfg_slice))
+    {
         Ok(_) => VP_OK,
         Err(e) => {
             set_last_error(format!("平滑热重载失败: {e}"));
@@ -242,11 +249,7 @@ pub unsafe extern "C" fn vp_is_running() -> c_int {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if guard.is_some() {
-        1
-    } else {
-        0
-    }
+    if guard.is_some() { 1 } else { 0 }
 }
 
 /// 获取全局累计流量统计（上传字节数与下载字节数）
@@ -338,10 +341,13 @@ mod tests {
             assert!(err_str.contains("配置校验未通过") || err_str.contains("failed"));
             vp_free_string(err_ptr);
 
-            let good_cfg = CString::new(r#"
+            let good_cfg = CString::new(
+                r#"
 mixed-port: 17890
 mode: direct
-"#).unwrap();
+"#,
+            )
+            .unwrap();
             let ok_ptr = vp_validate_config(good_cfg.as_ptr());
             assert!(ok_ptr.is_null());
         }
@@ -352,10 +358,13 @@ mode: direct
         unsafe {
             assert_eq!(vp_is_running(), 0);
 
-            let cfg = CString::new(r#"
+            let cfg = CString::new(
+                r#"
 mixed-port: 27891
 mode: direct
-"#).unwrap();
+"#,
+            )
+            .unwrap();
 
             let ret = vp_start(cfg.as_ptr(), -1);
             assert_eq!(ret, VP_OK);
@@ -373,12 +382,15 @@ mode: direct
             assert_eq!(down, 0);
 
             // 热重载
-            let reload_cfg = CString::new(r#"
+            let reload_cfg = CString::new(
+                r#"
 mixed-port: 27891
 mode: rule
 rules:
   - MATCH,DIRECT
-"#).unwrap();
+"#,
+            )
+            .unwrap();
             let reload_ret = vp_reload(reload_cfg.as_ptr());
             assert_eq!(reload_ret, VP_OK);
 

@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, BytesMut};
-use tokio_rustls::rustls::client::WebPkiServerVerifier;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use tokio_rustls::rustls::RootCertStore;
+use tokio_rustls::rustls::client::WebPkiServerVerifier;
+use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use vp_common::{Error, Result};
 
@@ -41,9 +41,8 @@ const HS_KEY_UPDATE: u8 = 24;
 
 // HRR 随机值（RFC 8446 §4.1.3）
 const HRR_RANDOM: [u8; 32] = [
-    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
-    0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
-    0x33, 0x9C,
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
 /// 支持的指纹（v1：chrome）
@@ -77,13 +76,13 @@ pub struct UtlsConfig {
 
 /// Chrome 常用套件（与 shadow-tls CH 同表：1301/1302/1303 + 11 个 TLS1.2 套件）
 const CH_SUITES: [u8; 28] = [
-    0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30, 0xc0,
-    0x13, 0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
+    0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30, 0xc0, 0x13,
+    0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
 ];
 /// Chrome 签名算法（ecdsa_sha256, rsa_pss_*, rsa_pkcs1_*, …）
 const CH_SIG_ALGS: [u8; 18] = [
-    0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06,
-    0x01, 0x02, 0x01,
+    0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01,
+    0x02, 0x01,
 ];
 
 struct ClientHello {
@@ -142,7 +141,11 @@ fn build_ch(
     ext(&mut exts, 23, &[]); // extended_master_secret
     ext(&mut exts, 65281, &[0x00]); // renegotiation_info（初次握手：空向量）
     // supported_groups: 前缀 = 群列表字节长度（NamedGroup list<2..2^16-1>）
-    ext(&mut exts, 10, &[0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18]);
+    ext(
+        &mut exts,
+        10,
+        &[0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18],
+    );
     ext(&mut exts, 11, &[0x01, 0x00]); // ec_point_formats
     ext(&mut exts, 35, &[]); // session_ticket
     if !alpn.is_empty() {
@@ -240,7 +243,12 @@ impl ring::hkdf::KeyType for OkmLen {
     }
 }
 
-fn hkdf_expand_label(prk: &ring::hkdf::Prk, label: &str, context: &[u8], len: usize) -> Result<Vec<u8>> {
+fn hkdf_expand_label(
+    prk: &ring::hkdf::Prk,
+    label: &str,
+    context: &[u8],
+    len: usize,
+) -> Result<Vec<u8>> {
     let full_label = format!("tls13 {label}");
     let mut info = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
     info.extend_from_slice(&(len as u16).to_be_bytes());
@@ -270,7 +278,12 @@ fn hkdf_expand_raw(prk: &ring::hkdf::Prk, info: &[u8], len: usize) -> Result<Vec
     Ok(out)
 }
 
-fn aes_256_gcm_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], in_out: &mut BytesMut) -> Result<()> {
+fn aes_256_gcm_seal(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    in_out: &mut BytesMut,
+) -> Result<()> {
     let uk = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key)
         .map_err(|_| Error::Proto("utls: reality aes-gcm key 失败"))?;
     let lsk = ring::aead::LessSafeKey::new(uk);
@@ -291,7 +304,9 @@ fn derive_secret(prk: &ring::hkdf::Prk, label: &str, transcript_hash: &[u8]) -> 
 }
 
 fn sha256(data: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, data).as_ref().to_vec()
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .to_vec()
 }
 
 const SUITE_AES128: u16 = 0x1301;
@@ -359,7 +374,13 @@ impl Direction {
         let plain = self
             .key()?
             .open_in_place(n, ring::aead::Aad::from(aad), &mut buf)
-            .map_err(|_| Error::ProtoMsg(format!("utls: 解密失败 seq={} ctlen={}", self.seq, ciphertext.len())))?;
+            .map_err(|_| {
+                Error::ProtoMsg(format!(
+                    "utls: 解密失败 seq={} ctlen={}",
+                    self.seq,
+                    ciphertext.len()
+                ))
+            })?;
         self.seq += 1;
         if plain.is_empty() {
             return Err(Error::Proto("utls: 空记录"));
@@ -448,7 +469,10 @@ async fn read_record<S: tokio::io::AsyncRead + Unpin>(
             }
         }
         // dummy ChangeCipherSpec（中间盒兼容模式）：透传，由调用方跳过
-        20 => Ok(Frame::Data { inner: 20, data: body }),
+        20 => Ok(Frame::Data {
+            inner: 20,
+            data: body,
+        }),
         t => Err(Error::ProtoMsg(format!("utls: 非法记录类型 {t}"))),
     }
 }
@@ -604,7 +628,9 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
 }
 
 /// Certificate 消息解析：返回 (叶子, 中间链)
-fn parse_certificate(msg: &[u8]) -> Result<(CertificateDer<'static>, Vec<CertificateDer<'static>>)> {
+fn parse_certificate(
+    msg: &[u8],
+) -> Result<(CertificateDer<'static>, Vec<CertificateDer<'static>>)> {
     let mut c = Cursor::new(msg);
     let ctx_len = c.u8()? as usize;
     if !c.take(ctx_len)?.is_empty() {
@@ -649,7 +675,8 @@ fn extract_spki(cert: &CertificateDer<'_>) -> Result<Vec<u8>> {
             }
             len = 0;
             for i in 0..n {
-                len = (len << 8) | *b.get(pos + 2 + i).ok_or(Error::Proto("utls: DER 越界"))? as usize;
+                len = (len << 8)
+                    | *b.get(pos + 2 + i).ok_or(Error::Proto("utls: DER 越界"))? as usize;
             }
             hl = 2 + n;
         }
@@ -686,7 +713,7 @@ fn extract_spki(cert: &CertificateDer<'_>) -> Result<Vec<u8>> {
         }
         pos += h + l;
     }
-    spki.ok_or_else(|| Error::Proto("utls: 未找到 SPKI"))
+    spki.ok_or(Error::Proto("utls: 未找到 SPKI"))
 }
 
 /// 验证 CertificateVerify 签名（ring 直接验，覆盖 TLS 1.3 允许的方案）
@@ -707,13 +734,13 @@ fn verify_cert_verify(
         _ => {
             return Err(Error::ProtoMsg(format!(
                 "utls: 不支持的 CertificateVerify 方案 {scheme:#06x}"
-            )))
+            )));
         }
     };
     let spki = extract_spki(leaf)?;
     // ring 的 UnparsedPublicKey：RSA 用 SPKI DER；ECDSA/Ed25519 用裸公钥
     // （即 SPKI 内 BIT STRING 的内容，跳过首字节的 unused-bits 计数）
-    let key = if matches!(scheme, 0x0804 | 0x0805 | 0x0806) {
+    let key = if matches!(scheme, 0x0804..=0x0806) {
         spki
     } else {
         // SPKI = SEQ { 算法 SEQ, BIT STRING }：进入外层 SEQ 内容找 BIT STRING
@@ -856,7 +883,7 @@ where
             Frame::Data { inner: 20, .. } => continue,
             Frame::Closed => return Err(Error::Proto("utls: 握手期对端关闭")),
             Frame::Data { inner, .. } => {
-                return Err(Error::ProtoMsg(format!("utls: 握手期收到记录类型 {inner}")))
+                return Err(Error::ProtoMsg(format!("utls: 握手期收到记录类型 {inner}")));
             }
         };
         let mut it = MsgIter::new();
@@ -872,13 +899,18 @@ where
             suite = sh.suite;
             peer_share = sh.peer_share;
             // transcript 需要完整握手消息（含 4 字节头）
-            transcript.extend_from_slice(&[2, (msg.len() >> 16) as u8, (msg.len() >> 8) as u8, msg.len() as u8]);
+            transcript.extend_from_slice(&[
+                2,
+                (msg.len() >> 16) as u8,
+                (msg.len() >> 8) as u8,
+                msg.len() as u8,
+            ]);
             transcript.extend_from_slice(&msg);
             break;
         }
     }
-    let (alg, _key_len) =
-        suite_alg(suite).ok_or_else(|| Error::ProtoMsg(format!("utls: 服务器选择了不支持的套件 {suite:#06x}")))?;
+    let (alg, _key_len) = suite_alg(suite)
+        .ok_or_else(|| Error::ProtoMsg(format!("utls: 服务器选择了不支持的套件 {suite:#06x}")))?;
 
     // 3. x25519 → 握手密钥
     let peer_share_arr: [u8; 32] = peer_share
@@ -921,15 +953,19 @@ where
             }
         };
         it.push(&data);
-        loop {
-            let Some((ty, msg)) = it.next_msg() else { break };
+        while let Some((ty, msg)) = it.next_msg() {
             // transcript 需要完整握手消息（含 4 字节头）
-            transcript.extend_from_slice(&[ty, (msg.len() >> 16) as u8, (msg.len() >> 8) as u8, msg.len() as u8]);
+            transcript.extend_from_slice(&[
+                ty,
+                (msg.len() >> 16) as u8,
+                (msg.len() >> 8) as u8,
+                msg.len() as u8,
+            ]);
             transcript.extend_from_slice(&msg);
             match ty {
                 HS_EE => {}
                 HS_CERT_REQUEST => {
-                    return Err(Error::Unsupported("utls: 不支持客户端证书请求".into()))
+                    return Err(Error::Unsupported("utls: 不支持客户端证书请求".into()));
                 }
                 HS_CERT => {
                     let c = parse_certificate(&msg)?;
@@ -960,7 +996,9 @@ where
                     let mut cv_msg = vec![0x20u8; 64];
                     cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
                     cv_msg.push(0);
-                    cv_msg.extend_from_slice(&sha256(&transcript[..transcript.len() - msg.len() - 4]));
+                    cv_msg.extend_from_slice(&sha256(
+                        &transcript[..transcript.len() - msg.len() - 4],
+                    ));
                     verify_cert_verify(&leaf.0, scheme, &sig, &cv_msg)?;
                 }
                 HS_FINISHED => {
@@ -980,11 +1018,7 @@ where
                     }
                     fin_ok = true;
                 }
-                _ => {
-                    return Err(Error::ProtoMsg(format!(
-                        "utls: 握手期意外消息 {ty}"
-                    )))
-                }
+                _ => return Err(Error::ProtoMsg(format!("utls: 握手期意外消息 {ty}"))),
             }
             if fin_ok {
                 break;
@@ -1320,7 +1354,9 @@ mod tests {
         let body = &ch.record[5..];
         let mut c = Cursor::new(body);
         let _ty = c.u8();
-        let _len = ((c.b[c.pos] as usize) << 16) | ((c.b[c.pos + 1] as usize) << 8) | c.b[c.pos + 2] as usize;
+        let _len = ((c.b[c.pos] as usize) << 16)
+            | ((c.b[c.pos + 1] as usize) << 8)
+            | c.b[c.pos + 2] as usize;
         c.take(3).unwrap(); // 跳过长度字段（消息内容在后续字段里逐段消费）
         let _ = c.u16().unwrap(); // legacy_version
         c.take(32).unwrap(); // random
@@ -1343,19 +1379,7 @@ mod tests {
         out
     }
 
-
-
-
-
-
-
-
-
-
-
     /// 测试辅助：从 CH 记录中删除指定扩展并修正各长度
-
-
 
     #[test]
     fn ch_profile_chrome_like() {
@@ -1389,7 +1413,9 @@ mod tests {
                 let Ok((s, _)) = l.accept().await else { break };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
-                    let Ok(mut tls) = acceptor.accept(s).await else { return };
+                    let Ok(mut tls) = acceptor.accept(s).await else {
+                        return;
+                    };
                     let mut b = vec![0u8; 32 * 1024];
                     loop {
                         let n = match tls.read(&mut b).await {
@@ -1404,7 +1430,9 @@ mod tests {
             }
         });
 
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let mut s = match utls_connect(
             tcp,
             "localhost",
@@ -1449,9 +1477,12 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_pem = cert.cert.pem().into_bytes();
         let key_pem = cert.key_pair.serialize_pem().into_bytes();
-        let certs: Vec<CertificateDer<'_>> =
-            rustls_pemfile::certs(&mut &cert_pem[..]).map(|c| c.unwrap()).collect();
-        let key = rustls_pemfile::private_key(&mut &key_pem[..]).unwrap().unwrap();
+        let certs: Vec<CertificateDer<'_>> = rustls_pemfile::certs(&mut &cert_pem[..])
+            .map(|c| c.unwrap())
+            .collect();
+        let key = rustls_pemfile::private_key(&mut &key_pem[..])
+            .unwrap()
+            .unwrap();
         let mut sc = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
@@ -1469,7 +1500,9 @@ mod tests {
             let _ = tls.write_all(&b[..n]).await;
         });
 
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let mut s = utls_connect(
             tcp,
             "localhost",
@@ -1555,7 +1588,8 @@ mod tests {
         assert_eq!(client_share.len(), 32);
 
         // 4. 服务端推导 auth_secret 与 aead_key
-        let client_pub = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(client_share.as_slice()).unwrap());
+        let client_pub =
+            x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(client_share.as_slice()).unwrap());
         let server_auth_secret = srv_pri.diffie_hellman(&client_pub);
         let srv_prk = hkdf_extract(&rnd[0..20], server_auth_secret.as_bytes()).unwrap();
         let srv_aead_key = hkdf_expand_raw(&srv_prk, b"REALITY", 32).unwrap();
@@ -1566,21 +1600,26 @@ mod tests {
         // AAD 规范：session_id 所在位置置零
         aad[39..71].copy_from_slice(&[0u8; 32]);
 
-        let uk = ring::aead::UnboundKey::new(
-            &ring::aead::AES_256_GCM,
-            &srv_aead_key,
-        ).unwrap();
+        let uk = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &srv_aead_key).unwrap();
         let lsk = ring::aead::LessSafeKey::new(uk);
         let nonce = ring::aead::Nonce::assume_unique_for_key(rnd[20..32].try_into().unwrap());
         let mut in_out = sid.clone();
-        let plain = lsk.open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out).unwrap();
+        let plain = lsk
+            .open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out)
+            .unwrap();
 
         assert_eq!(plain.len(), 16);
         assert_eq!(&plain[0..3], &[1, 8, 1]);
         assert_eq!(plain[3], 0);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
         let ts = u32::from_be_bytes(plain[4..8].try_into().unwrap());
-        assert!((now as i64 - ts as i64).abs() <= 5, "时间戳误差应在 5 秒以内");
+        assert!(
+            (now as i64 - ts as i64).abs() <= 5,
+            "时间戳误差应在 5 秒以内"
+        );
         assert_eq!(&plain[8..16], &short_id);
 
         // 6. 验证：错误的公钥或被篡改的 AAD 必定解密失败
@@ -1589,7 +1628,11 @@ mod tests {
         let lsk_wrong = ring::aead::LessSafeKey::new(uk_wrong);
         let nonce = ring::aead::Nonce::assume_unique_for_key(rnd[20..32].try_into().unwrap());
         let mut in_out2 = sid;
-        assert!(lsk_wrong.open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out2).is_err());
+        assert!(
+            lsk_wrong
+                .open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out2)
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1644,7 +1687,9 @@ mod tests {
                 }
             }
             let client_share = client_share.unwrap();
-            let client_pub = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(client_share.as_slice()).unwrap());
+            let client_pub = x25519_dalek::PublicKey::from(
+                <[u8; 32]>::try_from(client_share.as_slice()).unwrap(),
+            );
 
             // 认证并推导密钥
             let auth_secret = srv_static_pri.diffie_hellman(&client_pub);
@@ -1658,7 +1703,9 @@ mod tests {
             let lsk = ring::aead::LessSafeKey::new(uk);
             let nonce = ring::aead::Nonce::assume_unique_for_key(rnd[20..32].try_into().unwrap());
             let mut in_out = sid.clone();
-            let plain = lsk.open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out).unwrap();
+            let plain = lsk
+                .open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out)
+                .unwrap();
             assert_eq!(&plain[8..16], &short_id);
 
             // 2. 服务端临时 x25519
@@ -1734,7 +1781,10 @@ mod tests {
             let expected_hmac = ring::hmac::sign(&hmac_key, &ed_pub).as_ref().to_vec();
 
             let orig_sig = extract_cert_signature(&cert_obj).unwrap();
-            let sig_pos = cert_der.windows(64).rposition(|w| w == orig_sig.as_slice()).unwrap();
+            let sig_pos = cert_der
+                .windows(64)
+                .rposition(|w| w == orig_sig.as_slice())
+                .unwrap();
             cert_der[sig_pos..sig_pos + 64].copy_from_slice(&expected_hmac);
 
             // Certificate 消息封装
@@ -1787,11 +1837,14 @@ mod tests {
                 "finished",
                 &[],
                 32,
-            ).unwrap();
+            )
+            .unwrap();
             let srv_verify_data = ring::hmac::sign(
                 &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &fk),
                 &sha256(&transcript),
-            ).as_ref().to_vec();
+            )
+            .as_ref()
+            .to_vec();
 
             let mut fin = vec![HS_FINISHED, 0, 0, srv_verify_data.len() as u8];
             fin.extend_from_slice(&srv_verify_data);
@@ -1836,7 +1889,9 @@ mod tests {
 
             // 8. 双向数据收发
             let req_frame = read_record(&mut conn, Some(&mut c_ap_dir)).await.unwrap();
-            let Frame::Data { inner, data } = req_frame else { panic!("Expected app data") };
+            let Frame::Data { inner, data } = req_frame else {
+                panic!("Expected app data")
+            };
             assert_eq!(inner, REC_APPDATA);
             assert_eq!(&data, b"ping reality");
 
@@ -1853,7 +1908,9 @@ mod tests {
         });
 
         // 客户端连接并验证
-        let client_tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let client_tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
         let reality_client_cfg = crate::RealityConfig {
             public_key: *srv_pub.as_bytes(),
             short_id,
@@ -1871,7 +1928,9 @@ mod tests {
                 skip_cert_verify: false,
                 reality: Some(reality_client_cfg),
             },
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         client_stream.write_all(b"ping reality").await.unwrap();
         let mut buf = [0u8; 12];
@@ -1918,7 +1977,9 @@ mod tests {
                 }
             }
             let client_share = client_share.unwrap();
-            let client_pub = x25519_dalek::PublicKey::from(<[u8; 32]>::try_from(client_share.as_slice()).unwrap());
+            let client_pub = x25519_dalek::PublicKey::from(
+                <[u8; 32]>::try_from(client_share.as_slice()).unwrap(),
+            );
 
             let auth_secret = srv_static_pri.diffie_hellman(&client_pub);
             let prk = hkdf_extract(&rnd[0..20], auth_secret.as_bytes()).unwrap();
@@ -1992,7 +2053,10 @@ mod tests {
             tampered_hmac[0] ^= 0xff;
 
             let orig_sig = extract_cert_signature(&cert_obj).unwrap();
-            let sig_pos = cert_der.windows(64).rposition(|w| w == orig_sig.as_slice()).unwrap();
+            let sig_pos = cert_der
+                .windows(64)
+                .rposition(|w| w == orig_sig.as_slice())
+                .unwrap();
             cert_der[sig_pos..sig_pos + 64].copy_from_slice(&tampered_hmac);
 
             let mut cert_msg = Vec::new();
@@ -2042,11 +2106,14 @@ mod tests {
                 "finished",
                 &[],
                 32,
-            ).unwrap();
+            )
+            .unwrap();
             let srv_verify_data = ring::hmac::sign(
                 &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &fk),
                 &sha256(&transcript),
-            ).as_ref().to_vec();
+            )
+            .as_ref()
+            .to_vec();
 
             let mut fin = vec![HS_FINISHED, 0, 0, srv_verify_data.len() as u8];
             fin.extend_from_slice(&srv_verify_data);
@@ -2068,7 +2135,9 @@ mod tests {
             let _ = conn.write_all(&enc_rec).await;
         });
 
-        let client_tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2)).await.unwrap();
+        let client_tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2))
+            .await
+            .unwrap();
         let reality_client_cfg = crate::RealityConfig {
             public_key: *srv_pub.as_bytes(),
             short_id,
@@ -2085,10 +2154,15 @@ mod tests {
                 skip_cert_verify: false,
                 reality: Some(reality_client_cfg),
             },
-        ).await.err().expect("篡改证书签名必须被客户端阻断拒绝");
+        )
+        .await
+        .err()
+        .expect("篡改证书签名必须被客户端阻断拒绝");
 
-        assert!(err.to_string().contains("HMAC-SHA512"), "错误信息应包含 HMAC-SHA512 失败: {err}");
+        assert!(
+            err.to_string().contains("HMAC-SHA512"),
+            "错误信息应包含 HMAC-SHA512 失败: {err}"
+        );
         srv_task2.await.unwrap();
     }
 }
-

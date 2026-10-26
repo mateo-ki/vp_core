@@ -4,26 +4,21 @@
 //! - 半关闭传播（EOF -> shutdown 对端写侧）
 //! - 连接表/统计挂载
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
-use vp_common::{get_buf, Stats};
 use vp_common::bufpool::BUF_SIZE;
+use vp_common::{Stats, get_buf};
 
 use crate::conn_table::{ConnMeta, ConnTable};
 use crate::stream::ProxyStream;
 
+#[derive(Default)]
 pub struct RelayHook {
     pub table: Option<Arc<ConnTable>>,
     pub meta: Option<ConnMeta>,
     pub stats: Option<Arc<Stats>>,
-}
-
-impl Default for RelayHook {
-    fn default() -> Self {
-        RelayHook { table: None, meta: None, stats: None }
-    }
 }
 
 enum Dir {
@@ -32,7 +27,11 @@ enum Dir {
 }
 
 /// 双向转发。返回 (up, down) 字节数。任何一侧结束都会向对端传播关闭。
-pub async fn relay(left: Box<dyn ProxyStream>, right: Box<dyn ProxyStream>, hook: RelayHook) -> (u64, u64) {
+pub async fn relay(
+    left: Box<dyn ProxyStream>,
+    right: Box<dyn ProxyStream>,
+    hook: RelayHook,
+) -> (u64, u64) {
     // 连接注册
     let registered = match (&hook.table, &hook.meta) {
         (Some(t), Some(m)) => {
@@ -45,7 +44,11 @@ pub async fn relay(left: Box<dyn ProxyStream>, right: Box<dyn ProxyStream>, hook
     };
     let (id, up, down) = match &registered {
         Some(rc) => (Some(rc.id), rc.up.clone(), rc.down.clone()),
-        None => (None, Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))),
+        None => (
+            None,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        ),
     };
 
     let (lr, lw) = tokio::io::split(left);
@@ -69,10 +72,7 @@ pub async fn relay(left: Box<dyn ProxyStream>, right: Box<dyn ProxyStream>, hook
             s.conn_close();
         }
     }
-    (
-        up.load(Ordering::Relaxed),
-        down.load(Ordering::Relaxed),
-    )
+    (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed))
 }
 
 /// 拥有式泵：结束后关闭对端写侧。
@@ -183,9 +183,12 @@ mod tests {
         let (b1, mut b2) = duplex(4096);
         let t = table.clone();
         let handle = tokio::spawn(async move {
-            let h = RelayHook { table: Some(t), meta: Some(meta), stats: Some(stats.clone()) };
-            let r = relay(Box::new(a1), Box::new(b1), h).await;
-            r
+            let h = RelayHook {
+                table: Some(t),
+                meta: Some(meta),
+                stats: Some(stats.clone()),
+            };
+            relay(Box::new(a1), Box::new(b1), h).await
         });
 
         a2.write_all(&[0u8; 100]).await.unwrap();

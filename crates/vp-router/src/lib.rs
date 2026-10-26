@@ -20,6 +20,8 @@ pub struct RouterSpec {
     /// 具名出站（含 DIRECT/REJECT 内置与所有协议节点）
     pub outbounds: HashMap<String, Arc<dyn Outbound>>,
     pub groups: Vec<GroupSpec>,
+    /// 链式代理配置表（target -> dialer）
+    pub dialers: HashMap<String, String>,
     pub rules: RuleEngine,
     pub mode: Mode,
     pub dns: Arc<Resolver>,
@@ -42,12 +44,31 @@ impl Router {
         let mut resolved: HashMap<String, Arc<dyn Outbound>> = spec.outbounds;
         let mut groups: HashMap<String, Arc<Group>> = HashMap::new();
 
-        // 组可能嵌套引用组：按轮次解析直到收敛
+        // 组与链式代理可能嵌套引用：按轮次解析直到收敛
         let mut round = spec.groups;
         let mut deferred: Vec<GroupSpec> = Vec::new();
+        let mut dialers = spec.dialers;
         let mut progress = true;
         while progress {
             progress = false;
+
+            // 1. 尝试解析其 dialer 已就绪的节点
+            let mut resolved_dialers = Vec::new();
+            for (target, dialer_name) in &dialers {
+                if let Some(dialer) = resolved.get(dialer_name).cloned() {
+                    if let Some(node) = resolved.get(target).cloned() {
+                        let chained = Arc::new(vp_core::ChainedOutbound::new(node, dialer));
+                        resolved.insert(target.clone(), chained);
+                        resolved_dialers.push(target.clone());
+                        progress = true;
+                    }
+                }
+            }
+            for t in resolved_dialers {
+                dialers.remove(&t);
+            }
+
+            // 2. 尝试解析成员已就绪的策略组
             deferred.clear();
             for gs in round.drain(..) {
                 let mut members: Vec<Arc<dyn Outbound>> = Vec::with_capacity(gs.members.len());
@@ -84,10 +105,11 @@ impl Router {
                 }
             }
             round = std::mem::take(&mut deferred);
-            if !progress && !round.is_empty() {
+            if !progress && (!round.is_empty() || !dialers.is_empty()) {
                 return Err(vp_common::Error::Config(format!(
-                    "组引用无法解析（可能成环）: {:?}",
-                    round.iter().map(|g| &g.name).collect::<Vec<_>>()
+                    "组或 dialer-proxy 引用无法解析（可能成环或目标不存在）: groups={:?}, dialers={:?}",
+                    round.iter().map(|g| &g.name).collect::<Vec<_>>(),
+                    dialers
                 )));
             }
         }
@@ -329,6 +351,7 @@ mod tests {
                 lazy: true,
                 lb_strategy: LbStrategy::RoundRobin,
             }],
+            dialers: HashMap::new(),
             rules,
             mode,
             dns: Arc::new(Resolver::system()),
@@ -357,6 +380,57 @@ mod tests {
         let d = build_router(Mode::Direct).await;
         let res = d.pick(&sess("anything.com")).await;
         assert_eq!(&*res.via, "DIRECT");
+    }
+
+    #[tokio::test]
+    async fn dialer_proxy_chaining_resolved() {
+        let direct = Arc::new(CountingOutbound {
+            name: "DIRECT".into(),
+            connects: AtomicUsize::new(0),
+        });
+        let proxy1 = Arc::new(CountingOutbound {
+            name: "P1".into(),
+            connects: AtomicUsize::new(0),
+        });
+        let proxy2 = Arc::new(CountingOutbound {
+            name: "P2".into(),
+            connects: AtomicUsize::new(0),
+        });
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("DIRECT".into(), direct as Arc<dyn Outbound>);
+        outbounds.insert("P1".into(), proxy1 as Arc<dyn Outbound>);
+        outbounds.insert("P2".into(), proxy2 as Arc<dyn Outbound>);
+
+        let mut dialers = HashMap::new();
+        dialers.insert("P2".into(), "P1".into()); // P2 经由 P1 跳板
+
+        let rules = vp_rule::compile(
+            &["MATCH,P2".to_string()],
+            &vp_rule::CompileEnv {
+                is_known_target: &|_| true,
+                geosite: &None,
+                #[cfg(feature = "geoip")]
+                geoip: &None,
+                providers: &HashMap::new(),
+                sub_rules: &HashMap::new(),
+            },
+        )
+        .unwrap();
+
+        let r = Router::build(RouterSpec {
+            outbounds,
+            groups: vec![],
+            dialers,
+            rules,
+            mode: Mode::Rule,
+            dns: Arc::new(Resolver::system()),
+            ipv6: false,
+        })
+        .unwrap();
+
+        let res = r.pick(&sess("target.com")).await;
+        assert_eq!(&*res.via, "P2");
     }
 
     #[tokio::test]

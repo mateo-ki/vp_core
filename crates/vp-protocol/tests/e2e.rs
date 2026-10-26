@@ -83,6 +83,7 @@ async fn build_core() -> (u16 /*mixed port*/, Arc<Router>, u16 /*echo port*/) {
             lazy: true,
             lb_strategy: LbStrategy::RoundRobin,
         }],
+        dialers: HashMap::new(),
         rules,
         mode: Mode::Rule,
         dns: Arc::new(Resolver::system()),

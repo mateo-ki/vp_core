@@ -5,6 +5,7 @@
 pub mod anytls;
 pub mod basic_out;
 pub mod brook;
+pub mod chained;
 pub mod direct;
 pub mod h3_min;
 pub mod hysteria2;
@@ -13,8 +14,10 @@ pub mod mieru;
 pub mod naive;
 pub mod redir;
 pub mod shadowtls;
+pub mod smux;
 #[cfg(feature = "snell")]
 pub mod snell;
+pub mod sniff;
 #[cfg(feature = "ss")]
 pub mod ss;
 pub mod ssh;
@@ -206,7 +209,9 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
             port,
             username,
             password,
-            ..
+            tls,
+            skip_cert_verify,
+            sni,
         }) => Arc::new(NamedOutbound::new_named(
             &cfg.name,
             HttpOutbound {
@@ -214,6 +219,29 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
                 port: *port,
                 username: username.clone(),
                 password: password.clone(),
+                tls: *tls,
+                skip_cert_verify: *skip_cert_verify,
+                sni: sni.clone(),
+            },
+        )),
+        ProxyKind::Https(HttpCfg {
+            server,
+            port,
+            username,
+            password,
+            tls: _,
+            skip_cert_verify,
+            sni,
+        }) => Arc::new(NamedOutbound::new_named(
+            &cfg.name,
+            HttpOutbound {
+                server: server.clone(),
+                port: *port,
+                username: username.clone(),
+                password: password.clone(),
+                tls: true,
+                skip_cert_verify: *skip_cert_verify,
+                sni: sni.clone(),
             },
         )),
         ProxyKind::Wireguard(wg) => Arc::new(wireguard::WgOutbound::new_named(
@@ -241,7 +269,7 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         ProxyKind::Naive(n) => build_naive(cfg, n)?,
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
-    Ok(match cfg.kind {
+    let o = match cfg.kind {
         ProxyKind::Wireguard(_)
         | ProxyKind::Hysteria2(_)
         | ProxyKind::Tuic(_)
@@ -250,7 +278,27 @@ pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Out
         | ProxyKind::Reject => o,
         _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o)),
         _ => o,
-    })
+    };
+    // smux 多路复用包装（仅流型协议出站生效）
+    let o = match cfg.kind {
+        ProxyKind::Wireguard(_)
+        | ProxyKind::Hysteria2(_)
+        | ProxyKind::Tuic(_)
+        | ProxyKind::Direct
+        | ProxyKind::Reject => o,
+        _ => {
+            if let Some(ref smux_cfg) = cfg.smux {
+                if smux_cfg.enabled {
+                    Arc::new(smux::SmuxOutbound::new(o, smux_cfg.clone()))
+                } else {
+                    o
+                }
+            } else {
+                o
+            }
+        }
+    };
+    Ok(o)
 }
 
 /// 组定义转换

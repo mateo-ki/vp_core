@@ -74,6 +74,7 @@ async fn build_udp_router_with(
             lazy: true,
             lb_strategy: LbStrategy::RoundRobin,
         }],
+        dialers: HashMap::new(),
         rules,
         mode: vp_config::Mode::Rule,
         dns: Arc::new(Resolver::system()),

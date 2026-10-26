@@ -111,7 +111,8 @@ impl Outbound for TrojanOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        self.handshake(underlying, dst, None).await
+        let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
+        self.handshake(io, dst, None).await
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {

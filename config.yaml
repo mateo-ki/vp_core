@@ -1,0 +1,244 @@
+# ==============================================================================
+# VP_Core 生产级全功能参考配置 (Production Configuration)
+# 支持 YAML / JSON / JSON5 格式，完全兼容 Clash / Clash.Meta / Mihomo 语法
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. 基础网络与控制器
+# ------------------------------------------------------------------------------
+port: 7890                          # HTTP 代理端口
+socks-port: 7891                    # SOCKS5 代理端口
+mixed-port: 7892                    # 混合代理端口（HTTP + SOCKS5 同端口自适应）
+allow-lan: false                    # 是否允许局域网设备连接
+bind-address: "*"                   # 监听绑定地址
+mode: rule                          # 运行模式：rule (规则分流) / global (全局代理) / direct (全直连)
+log-level: info                     # 日志级别：silent / error / warning / info / debug
+ipv6: false                         # 是否启用 IPv6 出站解析
+
+# RESTful 外部控制器（兼容 Clash API / Yacd / Metacubexd / Clash-Verge 面板）
+external-controller: 127.0.0.1:9090
+secret: ""                          # API 访问密钥（留空无鉴权）
+
+# ------------------------------------------------------------------------------
+# 2. 性能与缓冲区调优 (High-Performance Tuning)
+# ------------------------------------------------------------------------------
+# 缓冲区与 TCP 参数调优对高带宽（百兆/千兆）及跨洋高延迟连接至关重要：
+# 1. socket-buffer-size (SO_RCVBUF / SO_SNDBUF)：
+#    高延迟跨洋网络存在较大带宽时延积 (BDP)。若维持默认小缓冲(64KB)，百毫秒高延迟下
+#    TCP 拥塞窗口将受限，导致单流理论带宽跑不满；放大至 512KB~1MB 能充分激活窗口缩放，
+#    4K 视频秒开、大文件吞吐提升极其显著且流畅。
+# 2. tcp-nodelay：
+#    禁用 Nagle 算法，消灭小包合并产生的 40ms 延迟，交互操作与网页加载反应迅捷。
+# 3. tcp-keepalive-secs：
+#    定时探活对端僵尸连接，避免句柄与内存泄露，保障 7x24 小时长时间稳定挂载。
+tuning:
+  socket-buffer-size: 524288        # 套接字收发缓冲 512KB (兼顾极佳流畅度与极低内存)
+  tcp-nodelay: true                 # 禁用 Nagle 降低延迟 (默认 true)
+  tcp-keepalive-secs: 60            # 连接保活探活周期 (秒)
+
+# ------------------------------------------------------------------------------
+# 3. DNS 分流与 Fake-IP 引擎
+# ------------------------------------------------------------------------------
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip            # fake-ip 或 redir-host
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "localhost.ptlogin2.qq.com"
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+    - https://dns.alidns.com/dns-query
+  fallback:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+  # 域名特定解析策略
+  nameserver-policy:
+    "geosite:cn": 223.5.5.5
+    "*.google.com,+.youtube.com": https://dns.google/dns-query
+  # 防污染回退过滤
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+      - 127.0.0.1/32
+
+# ------------------------------------------------------------------------------
+# 4. TUN 虚拟网卡与透明代理 (系统级全局接管)
+# ------------------------------------------------------------------------------
+# VP_Core 具备路由自愈（Self-Healing）与退出守卫机制，异常强杀后路由自动还原，
+# 同时内置主动 SNI 嗅探层，纯 IP 连接也能精准还原真实域名进行规则分流。
+tun:
+  enable: false                     # 开启需管理员/root权限
+  device: vpcore-tun                # 网卡设备名
+  stack: system                     # 协议栈
+  address: 198.18.0.1
+  netmask: 255.255.0.0
+  mtu: 1500
+  auto-route: true                  # 自动配置操作系统路由表接管所有流量
+  auto-detect-interface: true       # 自动识别系统主力物理网卡作为默认出站
+
+# ------------------------------------------------------------------------------
+# 5. 代理节点集合 (Proxies)
+# ------------------------------------------------------------------------------
+proxies:
+  # 5.1 Shadowsocks (支持 AEAD 与 2022 系列)
+  - name: "ss-01-hk"
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: "Password123"
+    udp: true
+
+  # 5.2 VMess (支持 WS/TCP/gRPC、TLS)
+  - name: "vmess-02-jp"
+    type: vmess
+    server: jp.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: jp.example.com
+    network: ws
+    ws-opts:
+      path: /ray
+      headers:
+        Host: jp.example.com
+
+  # 5.3 VLESS (支持 XTLS Vision 零拷贝流控与 REALITY 伪装)
+  - name: "vless-03-us"
+    type: vless
+    server: us.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    flow: xtls-rprx-vision
+    servername: www.microsoft.com
+    # REALITY 专有伪装配置
+    # reality-opts:
+    #   public-key: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx="
+    #   short-id: "0123456789abcdef"
+
+  # 5.4 Trojan (轻量高性能 TLS 代理)
+  - name: "trojan-04-sg"
+    type: trojan
+    server: sg.example.com
+    port: 443
+    password: "TrojanPassword"
+    sni: sg.example.com
+    skip-cert-verify: false
+
+  # 5.5 Snell v4 (Surge 原生协议，带 HTTP 混淆与 UDP)
+  - name: "snell-05-kr"
+    type: snell
+    server: kr.example.com
+    port: 1234
+    psk: "SnellPskSecret"
+    version: 4
+    obfs-opts:
+      mode: http
+      host: www.bing.com
+    udp: true
+
+  # 5.6 链式代理与跳板 (Chained Proxy / Dialer-Proxy / Detour)
+  # 业务场景：本地 -> 前置机 (国内BGP中转/入口机) -> 落地机 (香港/日本/美国) -> 目标网站
+  - name: "bgp-transit-shanghai"
+    type: ss
+    server: sh-transit.example.com
+    port: 9000
+    cipher: aes-128-gcm
+    password: "TransitPassword"
+
+  - name: "hk-landing-chained"
+    type: trojan
+    server: hk-node.internal.net
+    port: 443
+    password: "LandingPassword"
+    sni: hk-node.internal.net
+    # 关键：指定前置跳板节点，该节点的所有底层流量将全部经由上海 BGP 节点隧道转发！
+    dialer-proxy: "bgp-transit-shanghai"
+
+  # 5.7 smux 多路复用节点 (Multiplexing)
+  # 业务场景：在单条 TCP 连接上承载多条并发请求，消除多次 TCP/TLS 握手，显著降低首包延迟
+  - name: "vless-smux-optimized"
+    type: vless
+    server: fast.example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    servername: fast.example.com
+    smux:
+      enable: true
+      max-streams: 16               # 单连接最大并发子流数
+      max-connections: 4            # 最大并发物理底层连接数
+
+# ------------------------------------------------------------------------------
+# 6. 策略组 (Proxy Groups)
+# ------------------------------------------------------------------------------
+proxy-groups:
+  # 手动选择主策略
+  - name: PROXY
+    type: select
+    proxies:
+      - 自动优选
+      - hk-landing-chained
+      - vless-smux-optimized
+      - ss-01-hk
+      - vmess-02-jp
+      - vless-03-us
+      - trojan-04-sg
+      - DIRECT
+
+  # 自动测速延迟优选
+  - name: 自动优选
+    type: url-test
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - ss-01-hk
+      - vmess-02-jp
+      - vless-03-us
+      - trojan-04-sg
+
+  # 故障自动回退
+  - name: 故障回退
+    type: fallback
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300
+    proxies:
+      - ss-01-hk
+      - vmess-02-jp
+      - vless-03-us
+
+# ------------------------------------------------------------------------------
+# 7. 分流规则 (Routing Rules)
+# ------------------------------------------------------------------------------
+rules:
+  # 本地局域网直连 (no-resolve 避免提前触发 DNS 解析)
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+
+  # 域名与后缀匹配
+  - DOMAIN-SUFFIX,linux.do,DIRECT
+  - DOMAIN-SUFFIX,cn,DIRECT
+  - DOMAIN-KEYWORD,baidu,DIRECT
+  - DOMAIN-KEYWORD,google,PROXY
+  - DOMAIN-SUFFIX,github.com,PROXY
+  - DOMAIN-SUFFIX,youtube.com,PROXY
+
+  # GEO 数据库规则 (需放置 geosite.dat / geoip.metadb 或 Country.mmdb)
+  # - GEOSITE,cn,DIRECT
+  # - GEOIP,CN,DIRECT
+
+  # 兜底规则
+  - MATCH,PROXY

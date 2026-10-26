@@ -2591,6 +2591,7 @@ dependencies = [
  "vp-common",
  "vp-config",
  "vp-protocol",
+ "vp-tun",
 ]
 
 [[package]]

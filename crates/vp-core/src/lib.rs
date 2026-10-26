@@ -8,13 +8,15 @@ pub mod inbound;
 pub mod outbound;
 pub mod router;
 pub mod session;
+pub mod sniff;
 pub mod stream;
 pub mod tunnel;
 
 pub use conn_table::{ConnMeta, ConnSnapshot, ConnTable};
 pub use inbound::{Inbound, InboundCtx};
-pub use outbound::Outbound;
+pub use outbound::{ChainedOutbound, Outbound};
 pub use router::{Resolution, Router, RuleHit};
 pub use session::{Network, Session};
+pub use sniff::{PeekedStream, parse_http_host, parse_tls_sni, sniff_stream};
 pub use stream::{PacketConn, ProxyStream, UdpPacket};
 pub use tunnel::{RelayHook, relay};

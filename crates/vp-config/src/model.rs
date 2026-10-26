@@ -103,6 +103,27 @@ pub struct Config {
     /// 协议服务端入站（自建服务器场景）
     #[serde(default)]
     pub listeners: Vec<ListenerCfg>,
+    /// 性能与套接字缓冲区调优
+    #[serde(default)]
+    pub tuning: Option<TuningConfig>,
+}
+
+/// 性能与套接字参数调优配置
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TuningConfig {
+    /// 统一设置 SO_RCVBUF 与 SO_SNDBUF 大小（字节，如 524288 即 512KB）
+    #[serde(alias = "socket-buffer-size", alias = "socket_buffer_size", default)]
+    pub socket_buffer_size: Option<usize>,
+    #[serde(alias = "so-rcvbuf", alias = "so_rcvbuf", default)]
+    pub so_rcvbuf: Option<usize>,
+    #[serde(alias = "so-sndbuf", alias = "so_sndbuf", default)]
+    pub so_sndbuf: Option<usize>,
+    /// 禁用 Nagle 算法以降低交互式数据包延迟（默认 true）
+    #[serde(alias = "tcp-nodelay", alias = "tcp_nodelay", default = "default_true")]
+    pub tcp_nodelay: bool,
+    /// TCP Keepalive 保活空闲周期（秒，默认 60）
+    #[serde(alias = "tcp-keepalive-secs", alias = "tcp_keepalive_secs", default)]
+    pub tcp_keepalive_secs: Option<u64>,
 }
 
 /// 服务端入站定义（M1：trojan/vmess/vless/ss，TLS 证书项随 M3 补）
@@ -251,6 +272,18 @@ fn default_geoip_code() -> String {
     "CN".into()
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SmuxConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(alias = "max-connections", alias = "max_connections", default)]
+    pub max_connections: Option<usize>,
+    #[serde(alias = "max-streams", alias = "max_streams", default)]
+    pub max_streams: Option<usize>,
+}
+
 /// 节点定义：name + 扁平化协议参数
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyCfg {
@@ -258,6 +291,12 @@ pub struct ProxyCfg {
     /// UDP over TCP（UoT v1）：仅流型协议出站生效
     #[serde(default, alias = "udp_over_tcp")]
     pub udp_over_tcp: bool,
+    /// 链式代理/前置代理（dialer-proxy / detour）
+    #[serde(alias = "dialer-proxy", alias = "detour", default)]
+    pub dialer_proxy: Option<String>,
+    /// 多路复用（smux）
+    #[serde(default)]
+    pub smux: Option<SmuxConfig>,
     #[serde(flatten)]
     pub kind: ProxyKind,
 }
@@ -280,6 +319,7 @@ pub enum ProxyKind {
     Tuic(TuicCfg),
     Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
+    Https(HttpCfg),
     Wireguard(WgCfg),
     Direct,
     Reject,
@@ -304,6 +344,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
             ProxyKind::Http(_) => "http",
+            ProxyKind::Https(_) => "https",
             ProxyKind::Wireguard(_) => "wireguard",
             ProxyKind::Direct => "direct",
             ProxyKind::Reject => "reject",
@@ -712,6 +753,10 @@ pub struct HttpCfg {
     pub password: Option<String>,
     #[serde(default)]
     pub tls: bool,
+    #[serde(alias = "skip-cert-verify", default)]
+    pub skip_cert_verify: bool,
+    #[serde(alias = "sni", alias = "servername", default)]
+    pub sni: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

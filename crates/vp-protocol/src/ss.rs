@@ -348,7 +348,13 @@ impl Outbound for SsOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        self.handshake(underlying, dst).await
+        let io = match &self.shadow_tls {
+            Some(st) => Box::new(
+                crate::shadowtls::client_handshake(underlying, &st.password, &st.host).await?,
+            ) as Box<dyn ProxyStream>,
+            None => underlying,
+        };
+        self.handshake(io, dst).await
     }
 
     fn support_udp(&self) -> bool {

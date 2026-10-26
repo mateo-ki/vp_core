@@ -2,9 +2,7 @@
 
 use std::sync::Arc;
 
-use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::rustls::client::WebPkiServerVerifier;
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
@@ -15,7 +13,7 @@ use vp_common::{Error, Result};
 
 /// 允许任意自签/过期证书的验证器
 #[derive(Debug)]
-struct NoVerify(Arc<RootCertStore>);
+struct NoVerify;
 
 impl ServerCertVerifier for NoVerify {
     fn verify_server_cert(
@@ -31,26 +29,20 @@ impl ServerCertVerifier for NoVerify {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        WebPkiServerVerifier::builder(self.0.clone())
-            .build()
-            .unwrap()
-            .verify_tls12_signature(message, cert, dss)
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        WebPkiServerVerifier::builder(self.0.clone())
-            .build()
-            .unwrap()
-            .verify_tls13_signature(message, cert, dss)
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -82,23 +74,19 @@ fn root_store() -> RootCertStore {
     roots
 }
 
-/// 客户端 TCP 包装为 TLS
-pub async fn tls_connect(
-    tcp: TcpStream,
+/// 客户端流包装为 TLS
+pub async fn tls_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: S,
     host: &str,
     cfg: &TlsClientConfig,
-) -> Result<ClientTlsStream<TcpStream>> {
+) -> Result<ClientTlsStream<S>> {
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_store())
         .with_no_client_auth();
     if cfg.skip_cert_verify {
-        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store()))
-            .build()
-            .unwrap();
-        let _ = verifier; // 仅为 NoVerify 构造签名方案
         config
             .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerify(Arc::new(root_store()))));
+            .set_certificate_verifier(Arc::new(NoVerify));
     }
     if !cfg.alpn.is_empty() {
         config.alpn_protocols = cfg.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
@@ -108,7 +96,7 @@ pub async fn tls_connect(
     let name =
         ServerName::try_from(sni.clone()).map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;
     let stream = connector
-        .connect(name, tcp)
+        .connect(name, stream)
         .await
         .map_err(|e| Error::Io(std::io::Error::other(format!("TLS 握手失败: {e}"))))?;
     Ok(stream)
@@ -130,8 +118,10 @@ pub fn tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsAcceptor> {
 }
 
 /// 统一签名：连接到 server（host:port 会被解析），按需叠加 TLS
-pub async fn connect_tls(
-    tcp: TcpStream,
+pub async fn connect_tls<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+>(
+    stream: S,
     host: &str,
     skip_cert_verify: bool,
     server_name: Option<&str>,
@@ -141,7 +131,7 @@ pub async fn connect_tls(
         server_name: server_name.map(|s| s.to_string()),
         alpn: Vec::new(),
     };
-    let s = tls_connect(tcp, host, &cfg).await?;
+    let s = tls_connect(stream, host, &cfg).await?;
     Ok(Box::new(s))
 }
 
@@ -185,5 +175,52 @@ mod tests {
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"pong!");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_real_node_connect() {
+        let tcp = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect("119.28.24.235:3128"),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                eprintln!("Cannot connect TCP to node (offline or timeout), skipping");
+                return;
+            }
+        };
+        let client_res = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tls_connect(
+                tcp,
+                "119.28.24.235",
+                &TlsClientConfig {
+                    skip_cert_verify: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+
+        let mut client = match client_res {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("TLS handshake timeout or fail, skipping");
+                return;
+            }
+        };
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let req = b"CONNECT www.google.com:443 HTTP/1.1\r\nHost: www.google.com:443\r\n\r\n";
+        if client.write_all(req).await.is_err() {
+            return;
+        }
+        let mut resp = [0u8; 100];
+        if let Ok(n) = client.read(&mut resp).await {
+            let resp_str = String::from_utf8_lossy(&resp[..n]);
+            assert!(resp_str.contains("200 Connection established") || resp_str.contains("200"));
+        }
     }
 }

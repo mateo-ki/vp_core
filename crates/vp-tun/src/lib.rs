@@ -132,6 +132,7 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
             tcfg.address(v6);
         }
     }
+    tcfg.tun_name("vpcore-tun");
     tcfg.mtu(cfg.mtu);
     tcfg.up();
 
@@ -249,7 +250,22 @@ where
     }
 }
 
-async fn dispatch_tcp(ctx: &InboundCtx, sess: Session, client: Box<dyn vp_core::ProxyStream>) {
+async fn dispatch_tcp(
+    ctx: &InboundCtx,
+    mut sess: Session,
+    mut client: Box<dyn vp_core::ProxyStream>,
+) {
+    // 协议嗅探：若目标为纯 IP，窥探首包 SNI / HTTP Host 还原真实域名
+    if matches!(sess.dst.host, vp_common::Host::Ip(_)) {
+        let (sniffed, peeked) =
+            vp_core::sniff_stream(client, std::time::Duration::from_millis(100)).await;
+        client = peeked;
+        if let Some(domain) = sniffed {
+            debug!("tun sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+            sess.dst.host = vp_common::Host::Domain(domain);
+        }
+    }
+
     let res = ctx.router.pick(&sess).await;
     let meta = vp_core::ConnMeta {
         id: sess.id,

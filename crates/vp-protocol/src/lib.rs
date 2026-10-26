@@ -124,7 +124,7 @@ pub fn transport_of(
     ws_opts: &Option<WsOpts>,
     fingerprint: &Option<String>,
 ) -> Result<TransportConfig> {
-    transport_of_full(tls, server_name, skip_cert_verify, network, ws_opts, &None, fingerprint)
+    transport_of_full(tls, server_name, skip_cert_verify, network, ws_opts, &None, fingerprint, &None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,6 +136,7 @@ pub fn transport_of_full(
     ws_opts: &Option<WsOpts>,
     grpc_opts: &Option<vp_config::GrpcOpts>,
     fingerprint: &Option<String>,
+    reality_opts: &Option<vp_config::RealityOpts>,
 ) -> Result<TransportConfig> {
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
@@ -154,13 +155,22 @@ pub fn transport_of_full(
         }),
         _ => None,
     };
+    let reality = match reality_opts {
+        Some(r) => Some(vp_transport::parse_reality_config(
+            &r.public_key,
+            r.short_id.as_deref(),
+            r.spider_x.clone(),
+        )?),
+        None => None,
+    };
     Ok(TransportConfig {
-        tls,
+        tls: tls || reality.is_some(),
         server_name: server_name.clone(),
         skip_cert_verify,
         fingerprint: fingerprint.clone(),
         ws,
         grpc,
+        reality,
     })
 }
 

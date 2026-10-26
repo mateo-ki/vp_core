@@ -29,6 +29,83 @@ pub fn tune(stream: &tokio::net::TcpStream) {
     let _ = sock.set_tcp_keepalive(&ka);
 }
 
+/// REALITY 扩展配置（VLESS / Trojan 专有，对标 Xray-core / sing-box）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealityConfig {
+    /// 32 字节服务端静态 Curve25519 公钥
+    pub public_key: [u8; 32],
+    /// 0~8 字节 short_id（不足 8 字节右补零）
+    pub short_id: [u8; 8],
+    /// 爬虫探测路径（如 "/"）
+    pub spider_x: Option<String>,
+}
+
+pub fn parse_reality_config(
+    public_key_str: &str,
+    short_id_str: Option<&str>,
+    spider_x: Option<String>,
+) -> Result<RealityConfig> {
+    let clean_pk = public_key_str.trim();
+    let pk_bytes = if clean_pk.len() == 64 && clean_pk.chars().all(|c| c.is_ascii_hexdigit()) {
+        hex_decode(clean_pk)
+            .map_err(|e| vp_common::Error::Config(format!("REALITY public_key 十六进制解码失败: {e}")))?
+    } else {
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        URL_SAFE_NO_PAD
+            .decode(clean_pk)
+            .or_else(|_| URL_SAFE.decode(clean_pk))
+            .or_else(|_| STANDARD_NO_PAD.decode(clean_pk))
+            .or_else(|_| STANDARD.decode(clean_pk))
+            .map_err(|e| vp_common::Error::Config(format!("REALITY public_key base64解码失败: {e}")))?
+    };
+    if pk_bytes.len() != 32 {
+        return Err(vp_common::Error::Config(format!(
+            "REALITY public_key 必须为 32 字节 (当前 {} 字节)",
+            pk_bytes.len()
+        )));
+    }
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&pk_bytes);
+
+    let mut short_id = [0u8; 8];
+    if let Some(sid) = short_id_str {
+        let clean_sid = sid.trim();
+        if !clean_sid.is_empty() {
+            let decoded = hex_decode(clean_sid)
+                .map_err(|e| vp_common::Error::Config(format!("REALITY short_id 十六进制解码失败: {e}")))?;
+            if decoded.len() > 8 {
+                return Err(vp_common::Error::Config(format!(
+                    "REALITY short_id 最长 8 字节 (16 字符)，当前 {} 字节",
+                    decoded.len()
+                )));
+            }
+            short_id[..decoded.len()].copy_from_slice(&decoded);
+        }
+    }
+
+    Ok(RealityConfig {
+        public_key,
+        short_id,
+        spider_x,
+    })
+}
+
+fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err("长度必须为偶数");
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for i in (0..bytes.len()).step_by(2) {
+        let hi = (bytes[i] as char).to_digit(16).ok_or("非法字符")? as u8;
+        let lo = (bytes[i + 1] as char).to_digit(16).ok_or("非法字符")? as u8;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
 /// 传输配置（各协议出站共用）
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -41,6 +118,8 @@ pub struct TransportConfig {
     pub ws: Option<WsConfig>,
     /// network: "grpc" 时启用 gRPC（要求 TLS + ALPN h2）
     pub grpc: Option<grpc::GrpcConfig>,
+    /// REALITY 认证扩展
+    pub reality: Option<RealityConfig>,
 }
 
 /// 拨号：TCP →（可选 WS）→（可选 TLS，TLS 在最外层）
@@ -77,8 +156,9 @@ pub async fn dial(
         let s = grpc::grpc_connect(tls, server_host, g).await?;
         return Ok(Box::new(s));
     }
-    if cfg.tls {
-        let tls: Box<dyn ProxyStream> = if let Some(fp) = &cfg.fingerprint {
+    if cfg.tls || cfg.reality.is_some() {
+        let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() || cfg.fingerprint.is_some() {
+            let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
             let s = utls::utls_connect(
                 tcp,
                 server_host,
@@ -87,6 +167,7 @@ pub async fn dial(
                     server_name: cfg.server_name.clone(),
                     alpn: Vec::new(),
                     skip_cert_verify: cfg.skip_cert_verify,
+                    reality: cfg.reality.clone(),
                 },
             )
             .await?;
@@ -141,5 +222,38 @@ mod tests {
         c.read_exact(&mut b).await.unwrap();
         assert_eq!(&b, b"ok");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn parse_reality_config_formats() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+
+        let raw_pk = [42u8; 32];
+        let b64_url = URL_SAFE_NO_PAD.encode(&raw_pk);
+        let b64_std = STANDARD.encode(&raw_pk);
+        let hex_pk = raw_pk.iter().map(|b| format!("{b:02x}")).collect::<String>();
+
+        // 1. URL_SAFE_NO_PAD (Xray / sing-box 标准)
+        let cfg1 = parse_reality_config(&b64_url, Some("0123456789abcdef"), Some("/".into())).unwrap();
+        assert_eq!(cfg1.public_key, raw_pk);
+        assert_eq!(cfg1.short_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        assert_eq!(cfg1.spider_x.as_deref(), Some("/"));
+
+        // 2. STANDARD Base64
+        let cfg2 = parse_reality_config(&b64_std, Some("1234"), None).unwrap();
+        assert_eq!(cfg2.public_key, raw_pk);
+        assert_eq!(cfg2.short_id, [0x12, 0x34, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(cfg2.spider_x, None);
+
+        // 3. Hex 64 字符
+        let cfg3 = parse_reality_config(&hex_pk, None, None).unwrap();
+        assert_eq!(cfg3.public_key, raw_pk);
+        assert_eq!(cfg3.short_id, [0u8; 8]);
+
+        // 4. 异常输入校验
+        assert!(parse_reality_config("short", None, None).is_err());
+        assert!(parse_reality_config(&b64_url, Some("not_hex"), None).is_err());
+        assert!(parse_reality_config(&b64_url, Some("0123456789abcdef0123"), None).is_err()); // 超过 8 字节
     }
 }

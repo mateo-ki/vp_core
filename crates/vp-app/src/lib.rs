@@ -43,14 +43,22 @@ impl Router for RouterHandle {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ConfigMeta {
+    pub path: Option<std::path::PathBuf>,
+    pub text: String,
+    pub fmt: Format,
+    pub base_dir: std::path::PathBuf,
+}
+
 pub struct App {
     pub router: Arc<RouterHandle>,
     pub stats: Arc<Stats>,
     pub conns: Arc<ConnTable>,
     pub listen_ports: Vec<(String, u16)>,
     pub controller: Option<String>,
-    /// 重载用：配置文本与格式
-    config_text: RwLock<Option<(String, Format, std::path::PathBuf)>>,
+    /// 重载用：配置元数据
+    pub config_meta: Arc<RwLock<Option<ConfigMeta>>>,
 }
 
 impl App {
@@ -61,8 +69,20 @@ impl App {
         base_dir: &Path,
         start_listeners: bool,
     ) -> Result<Arc<App>> {
-        let app = Self::assemble(text, fmt, base_dir, start_listeners).await?;
-        Ok(app)
+        Self::assemble(text, fmt, base_dir, start_listeners, None).await
+    }
+
+    /// 从配置文件路径构建并启动
+    pub async fn start_from_file(
+        config_path: &Path,
+        start_listeners: bool,
+    ) -> Result<Arc<App>> {
+        let text = tokio::fs::read_to_string(config_path)
+            .await
+            .map_err(|e| Error::Config(format!("读取 {} 失败: {e}", config_path.display())))?;
+        let fmt = Format::from_path(&config_path.to_string_lossy());
+        let base_dir = config_path.parent().unwrap_or(Path::new("."));
+        Self::assemble(&text, fmt, base_dir, start_listeners, Some(config_path.to_path_buf())).await
     }
 
     /// 热重载用：仅重建（不启动监听），返回新 App 供 router 替换
@@ -71,19 +91,40 @@ impl App {
         fmt: vp_config::Format,
         base_dir: &Path,
     ) -> Result<Arc<App>> {
-        Self::assemble(text, fmt, base_dir, false).await
+        Self::assemble(text, fmt, base_dir, false, None).await
     }
 
     pub async fn reload(&self) -> Result<()> {
-        let (text, fmt, dir) = self
-            .config_text
+        let meta = self
+            .config_meta
             .read()
             .unwrap()
             .clone()
             .ok_or(Error::Config("无可重载配置".into()))?;
-        let new = Self::assemble(&text, fmt, &dir, false).await?;
-        self.router.swap(new.router.current());
-        info!("配置已热重载");
+
+        // 若保留了文件路径，优先从磁盘重新读取最新文本
+        let (new_text, new_fmt, new_dir) = if let Some(ref path) = meta.path {
+            let t = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| Error::Config(format!("读取 {} 失败: {e}", path.display())))?;
+            let fmt = Format::from_path(&path.to_string_lossy());
+            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            (t, fmt, dir)
+        } else {
+            (meta.text, meta.fmt, meta.base_dir)
+        };
+
+        let new_app = Self::assemble(&new_text, new_fmt, &new_dir, false, meta.path.clone()).await?;
+        self.router.swap(new_app.router.current());
+
+        *self.config_meta.write().unwrap() = Some(ConfigMeta {
+            path: meta.path,
+            text: new_text,
+            fmt: new_fmt,
+            base_dir: new_dir,
+        });
+
+        info!("配置已平滑热重载");
         Ok(())
     }
 
@@ -92,6 +133,7 @@ impl App {
         fmt: Format,
         base_dir: &Path,
         start_listeners: bool,
+        config_path: Option<std::path::PathBuf>,
     ) -> Result<Arc<App>> {
         let cfg: vp_config::Config = vp_config::parse(text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
         if let Err(errs) = vp_config::validate::validate(&cfg) {
@@ -119,7 +161,7 @@ impl App {
         let outbound_names: Vec<String> = outbounds.keys().cloned().collect();
 
         // 规则
-        let providers = load_providers(&cfg, base_dir)?;
+        let providers = load_providers(&cfg, base_dir).await?;
         let geosite = load_geosite(base_dir);
         let geoip = load_geoip(base_dir);
         let known: Vec<String> = outbound_names.iter().cloned().chain(cfg.proxy_groups.iter().map(|g| g.name.clone())).collect();
@@ -146,6 +188,113 @@ impl App {
         let router_handle = Arc::new(RouterHandle::new(router));
         let stats = Arc::new(Stats::default());
         let conns = Arc::new(ConnTable::new());
+
+        // 规则提供者定时后台更新任务
+        if start_listeners {
+            let providers_state = Arc::new(RwLock::new(providers.clone()));
+            for (name, p) in &cfg.rule_providers {
+                if let Some(ref url) = p.url {
+                    let interval = p.interval.unwrap_or(0);
+                    if interval > 0 {
+                        let name = name.clone();
+                        let url = url.clone();
+                        let behavior = match vp_rule::provider::Behavior::parse(
+                            p.behavior.as_deref().unwrap_or("domain"),
+                        ) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+                        let cache_path = p
+                            .path
+                            .as_ref()
+                            .map(|p| base_dir.join(p))
+                            .unwrap_or_else(|| base_dir.join(".cache").join(format!("{name}.txt")));
+                        let router_handle = router_handle.clone();
+                        let providers_state = providers_state.clone();
+                        let rules_spec = cfg.rules.clone();
+                        let sub_rules = cfg.sub_rules.clone();
+                        let known = known.clone();
+                        let geosite = geosite.clone();
+                        let geoip = geoip.clone();
+
+                        tokio::spawn(async move {
+                            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                                interval.max(1),
+                            ));
+                            ticker.tick().await; // 消耗初次立即触发的 tick
+                            loop {
+                                ticker.tick().await;
+                                let u = url.clone();
+                                let fetch_res =
+                                    tokio::task::spawn_blocking(move || fetch_remote_provider(&u)).await;
+                                match fetch_res {
+                                    Ok(Ok(new_text)) => {
+                                        let is_same = {
+                                            let guard = providers_state.read().unwrap();
+                                            guard
+                                                .get(&name)
+                                                .map(|(_, old)| old == &new_text)
+                                                .unwrap_or(false)
+                                        };
+                                        if is_same {
+                                            continue;
+                                        }
+                                        if let Err(e) =
+                                            vp_rule::provider::load_payload(&new_text, behavior)
+                                        {
+                                            warn!("rule-provider {name} 定时拉取内容校验未通过: {e}");
+                                            continue;
+                                        }
+                                        if let Some(parent) = cache_path.parent() {
+                                            let _ = tokio::fs::create_dir_all(parent).await;
+                                        }
+                                        let _ = tokio::fs::write(&cache_path, &new_text).await;
+                                        providers_state
+                                            .write()
+                                            .unwrap()
+                                            .insert(name.clone(), (behavior, new_text));
+
+                                        let providers_guard = providers_state.read().unwrap();
+                                        let is_known = |t: &str| {
+                                            known.iter().any(|k| k == t) || vp_config::is_builtin(t)
+                                        };
+                                        let env = CompileEnv {
+                                            is_known_target: &is_known,
+                                            geosite: &geosite,
+                                            geoip: &geoip,
+                                            providers: &providers_guard,
+                                            sub_rules: &sub_rules,
+                                        };
+                                        match vp_rule::compile(&rules_spec, &env) {
+                                            Ok(new_rules) => {
+                                                let cur_router = router_handle.current();
+                                                let new_router =
+                                                    cur_router.clone_with_rules(new_rules);
+                                                router_handle.swap(new_router);
+                                                info!(
+                                                    "rule-provider {name} 定时刷新完成，规则引擎已平滑替换"
+                                                );
+                                            }
+                                            Err(errs) => {
+                                                warn!(
+                                                    "rule-provider {name} 规则重编译失败: {errs:?}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        warn!("rule-provider {name} 定时拉取失败: {e}");
+                                    }
+                                    Err(e) => {
+                                        warn!("rule-provider {name} 任务异常: {e}");
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
 
         // 入站
         let mut listen_ports = Vec::new();
@@ -259,6 +408,13 @@ impl App {
             }
         }
 
+        let config_meta = Arc::new(RwLock::new(Some(ConfigMeta {
+            path: config_path,
+            text: text.to_string(),
+            fmt,
+            base_dir: base_dir.to_path_buf(),
+        })));
+
         // 控制器
         let controller = cfg.external_controller.clone();
         if let Some(addr) = &controller {
@@ -268,7 +424,7 @@ impl App {
                     stats: stats.clone(),
                     conns: conns.clone(),
                     secret: cfg.secret.clone().filter(|s| !s.is_empty()),
-                    config_text: RwLock::new(Some((text.to_string(), fmt, base_dir.to_path_buf()))),
+                    config_meta: config_meta.clone(),
                 };
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 api::spawn_on(listener, Arc::new(app_ref));
@@ -282,7 +438,7 @@ impl App {
             conns,
             listen_ports,
             controller,
-            config_text: RwLock::new(Some((text.to_string(), fmt, base_dir.to_path_buf()))),
+            config_meta,
         };
         Ok(Arc::new(app))
     }
@@ -391,7 +547,25 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
     }
 }
 
-fn load_providers(cfg: &vp_config::Config, base_dir: &Path) -> Result<HashMap<String, (vp_rule::provider::Behavior, String)>> {
+fn fetch_remote_provider(url: &str) -> std::result::Result<String, String> {
+    let resp = ureq::get(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .set("User-Agent", "vpcore/rule-provider")
+        .call()
+        .map_err(|e| format!("{e}"))?;
+    let mut body = String::new();
+    use std::io::Read;
+    resp.into_reader()
+        .take(16 << 20)
+        .read_to_string(&mut body)
+        .map_err(|e| format!("{e}"))?;
+    Ok(body)
+}
+
+async fn load_providers(
+    cfg: &vp_config::Config,
+    base_dir: &Path,
+) -> Result<HashMap<String, (vp_rule::provider::Behavior, String)>> {
     let mut out = HashMap::new();
     for (name, p) in &cfg.rule_providers {
         let behavior = p
@@ -400,13 +574,54 @@ fn load_providers(cfg: &vp_config::Config, base_dir: &Path) -> Result<HashMap<St
             .ok_or_else(|| Error::Config(format!("rule-provider {name:?} 缺少 behavior")))?;
         let behavior = vp_rule::provider::Behavior::parse(behavior)
             .map_err(|e| Error::Config(format!("rule-provider {name:?}: {e}")))?;
-        let path = p
+
+        // 缓存路径：优先配置的 path，否则使用 .cache/{name}.txt
+        let cache_path = p
             .path
             .as_ref()
             .map(|p| base_dir.join(p))
-            .ok_or_else(|| Error::Config(format!("rule-provider {name:?} 缺少 path")))?;
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Config(format!("rule-provider {name:?} 读取失败: {e}")))?;
+            .unwrap_or_else(|| base_dir.join(".cache").join(format!("{name}.txt")));
+
+        let text = if let Some(ref url) = p.url {
+            // 在线拉取尝试
+            let u = url.clone();
+            let res = tokio::task::spawn_blocking(move || fetch_remote_provider(&u))
+                .await
+                .map_err(|e| Error::Config(format!("拉取任务失败: {e}")))?;
+            match res {
+                Ok(t) if vp_rule::provider::load_payload(&t, behavior).is_ok() => {
+                    if let Some(parent) = cache_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&cache_path, &t);
+                    info!("rule-provider {name:?} 在线拉取成功并已写入缓存");
+                    t
+                }
+                other => {
+                    let err_msg = match other {
+                        Ok(_) => "在线拉取内容格式校验未通过".to_string(),
+                        Err(e) => e,
+                    };
+                    if cache_path.exists() {
+                        warn!(
+                            "rule-provider {name:?} 在线拉取失败 ({err_msg})，降级使用本地缓存: {}",
+                            cache_path.display()
+                        );
+                        std::fs::read_to_string(&cache_path)
+                            .map_err(|e| Error::Config(format!("rule-provider {name:?} 缓存读取失败: {e}")))?
+                    } else {
+                        return Err(Error::Config(format!(
+                            "rule-provider {name:?} 在线拉取失败且无可用本地缓存: {err_msg}"
+                        )));
+                    }
+                }
+            }
+        } else {
+            // 本地文件读取
+            std::fs::read_to_string(&cache_path)
+                .map_err(|e| Error::Config(format!("rule-provider {name:?} 读取失败: {e}")))?
+        };
+
         out.insert(name.clone(), (behavior, text));
     }
     Ok(out)
@@ -554,6 +769,7 @@ rules:
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            reality_opts: None,
             udp: false,
         })
         .unwrap();
@@ -720,6 +936,7 @@ rules: ['MATCH,DIRECT']
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            reality_opts: None,
             udp: false,
         })
         .unwrap();
@@ -937,5 +1154,138 @@ rules: ['MATCH,ss-uot']
             "源端口应为 echo 端口"
         );
         assert_eq!(&rbuf[10..n], b"uot-e2e");
+    }
+
+    #[tokio::test]
+    async fn app_file_hot_reload() {
+        let temp_dir = std::env::temp_dir();
+        let config_path = temp_dir.join(format!("vp_reload_test_{}.yaml", std::process::id()));
+
+        let cfg1 = r#"
+mode: rule
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules: ['MATCH,PROXY']
+"#;
+        tokio::fs::write(&config_path, cfg1).await.unwrap();
+
+        let app = App::start_from_file(&config_path, false).await.unwrap();
+        assert!(app.router.current().outbound("new-node").is_none());
+
+        // 动态修改磁盘上的配置文件，增加一个节点
+        let cfg2 = r#"
+mode: rule
+proxies:
+  - name: "new-node"
+    type: socks5
+    server: 127.0.0.1
+    port: 10800
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: ["new-node", DIRECT]
+rules: ['MATCH,PROXY']
+"#;
+        tokio::fs::write(&config_path, cfg2).await.unwrap();
+
+        // 触发热重载
+        app.reload().await.expect("从磁盘重读配置热重载应成功");
+        assert!(
+            app.router.current().outbound("new-node").is_some(),
+            "新节点应出现在路由表中"
+        );
+
+        // 写入错误语法配置，热重载应拦截并保留旧状态
+        tokio::fs::write(&config_path, "invalid: yaml: syntax: [").await.unwrap();
+        let res = app.reload().await;
+        assert!(res.is_err(), "非法配置重载应返回 Err");
+        assert!(
+            app.router.current().outbound("new-node").is_some(),
+            "非法配置重载失败后旧路由配置应完整保留"
+        );
+
+        let _ = tokio::fs::remove_file(&config_path).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rule_provider_online_fetch_and_refresh() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let srv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+
+        // 简易 HTTP 服务器：第 1 次返回仅含 google.com；第 2 次返回含 youtube.com
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = call_count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = srv.accept().await else { break };
+                let count = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    let _ = s.read(&mut b).await;
+                    let body = if count == 0 {
+                        "payload:\n  - google.com\n"
+                    } else {
+                        "payload:\n  - google.com\n  - youtube.com\n"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/yaml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.shutdown().await;
+                });
+            }
+        });
+
+        let temp_dir = std::env::temp_dir();
+        let cache_file = temp_dir.join(format!("vp_prov_{}.txt", std::process::id()));
+        let cfg = format!(
+            r#"
+mode: rule
+rule-providers:
+  test-prov:
+    type: http
+    behavior: domain
+    url: http://127.0.0.1:{srv_port}/rules.yaml
+    path: {}
+    interval: 1
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - RULE-SET,test-prov,PROXY
+  - MATCH,DIRECT
+"#,
+            cache_file.to_string_lossy().replace('\\', "/")
+        );
+
+        let app = App::start(&cfg, Format::Yaml, &temp_dir, true).await.unwrap();
+
+        // 验证初始状态：google.com 命中 PROXY，youtube.com 命中 MATCH,DIRECT
+        let sess1 = vp_core::Session::new_tcp("in".into(), None, vp_common::DstAddr::new("google.com", 80));
+        let res1 = app.router.current().pick(&sess1).await;
+        assert_eq!(res1.outbound.name(), "PROXY");
+
+        let sess2 = vp_core::Session::new_tcp("in".into(), None, vp_common::DstAddr::new("youtube.com", 80));
+        let res2 = app.router.current().pick(&sess2).await;
+        assert_eq!(res2.outbound.name(), "DIRECT");
+
+        // 缓存文件已写入磁盘
+        assert!(cache_file.exists(), "离线缓存文件应已生成");
+
+        // 等待后台 interval 触发定时更新（interval 设为 1 秒，等待 1.5 秒）
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // 验证定时更新后：youtube.com 命中 PROXY！
+        let res3 = app.router.current().pick(&sess2).await;
+        assert_eq!(res3.outbound.name(), "PROXY", "定时更新后 youtube.com 应命中 RULE-SET");
+
+        let _ = tokio::fs::remove_file(&cache_file).await;
     }
 }

@@ -1,119 +1,112 @@
-# VP_Core — Rust 代理/VPN 内核总体实施计划
+# VP_Core 功能增强实施方案：REALITY 协议、热重载完善、Rule-Provider 在线刷新
 
-对标 sing-box / mihomo 的内核，Rust 实现。目标：全协议覆盖、极致体积与性能、C-ABI 插件体系、完整规则引擎与策略组、TUN 透明代理。
+针对用户的“1、2、4 都做，3（插件市场装配）先放一放”的要求，本方案系统性设计并规划这三大特性的实现与测试。
 
-## 一、总体架构：Cargo Workspace 分层
+---
 
-```
-VP_Core/
-├── Cargo.toml                 # workspace；统一 release profile
-├── crates/
-│   ├── vp-common/     # 错误类型、缓冲池、地址解析、原子计数器、日志封装
-│   ├── vp-core/       # 核心 trait（Outbound/Inbound/Router/Session）+ 双向转发引擎（性能核心）
-│   ├── vp-config/     # 内部统一 IR + 双前端解析（Clash 兼容 YAML / JSON 含注释容忍）+ 校验
-│   ├── vp-rule/       # 规则引擎：域名 trie、IP LPM 基数树、端口/进程/逻辑规则、rule-set、geosite
-│   ├── vp-router/     # 路由决策 + 策略组（selector/url-test/fallback/load-balance/relay）+ 健康检查
-│   ├── vp-dns/        # DNS：UDP/TCP/DoT（DoH M2），LRU+TTL 缓存；fake-ip 预留接口
-│   ├── vp-transport/  # 传输层：tls(rustls/ring)、ws(手写 RFC6455)、grpc/h2/quic 后续
-│   ├── vp-crypto/     # 密码套件聚合：aes-gcm、chacha20poly1305、blake3(ss2022)、md5/sha/hkdf
-│   ├── vp-protocol/   # 出入站协议（每协议一个 cargo feature）
-│   ├── vp-tun/        # TUN 设备抽象（M1 立接口，M2 完整实现：wintun/tokio-tun + smoltcp 用户态栈）
-│   ├── vp-plugin/     # C-ABI 插件宿主（libloading）+ 版本化 vtable
-│   ├── vp-plugin-sdk/ # 插件作者用的 Rust SDK（冻结 ABI 绑定）+ C 头文件
-│   ├── vp-app/        # 组装：supervisor、热重载、Clash 兼容 RESTful 外部控制器
-│   └── vp-bin/        # CLI 入口（clap）：run / validate / test / version
-```
+## 一、特性 1：REALITY 协议扩展（VLESS / Trojan / 通用 TLS 客户端）
 
-依赖方向单向向下：`bin → app → protocol/transport/dns → router → rule → core → common`，无环。
+### 1.1 核心线格式与规范（对标 Xray-core / sing-box）
+- **客户端密钥与参数**：
+  - `public_key` / `pbk`：服务端静态 Curve25519 公钥（32 字节，Base64 URL-safe / Hex 解码）；
+  - `short_id` / `sid`：服务端 short-id（0~8 字节 Hex，不足 8 字节补零）；
+  - `server_name` / `sni`：目标伪装域名（如 `www.apple.com`）；
+  - `spider_x` / `spx`：爬虫探测路径。
+- **握手认证机制**：
+  - 客户端生成临时 Curve25519 密钥对 `(client_eph_pri, client_eph_pub)`，将 `client_eph_pub` 写入 ClientHello `key_share`（group 0x001d）；
+  - 计算协商秘密：$\text{auth\_secret} = \text{X25519}(\text{client\_eph\_pri}, \text{server\_static\_pub})$；
+  - 派生认证密钥：$\text{aead\_key} = \text{HKDF-SHA256}(\text{auth\_secret}, \text{salt} = \text{random}[0..20], \text{info} = \text{"REALITY"}, \text{len} = 32)$；
+  - 组装 16 字节明文载荷：`[1, 8, 1, 0, unix_secs_be(4), short_id(8)]`；
+  - 使用 AES-256-GCM 加密载荷，`nonce = random[20..32]`，`AAD = ClientHello`（此时 `session_id` 填 32 个零字节）；
+  - 密文 16B + Tag 16B = 32B，写入 `ClientHello.legacy_session_id`。
+- **服务端响应与证书验签**：
+  - 服务端回送 ServerHello（包含临时 `server_eph_pub` 并 echo `session_id`）；
+  - 在后续 EncryptedHandshake 中，REALITY 服务端下发特殊 Ed25519 证书；
+  - 客户端提取证书中 32B Ed25519 公钥，验证签名是否等于 $\text{HMAC-SHA512}(\text{aead\_key}, \text{ed25519\_pubkey})$；
+  - 若匹配，则服务端通过认证，客户端跳过系统根证书 WebPKI 校验，完成 Finished 握手并进入应用数据流传输。
 
-## 二、核心抽象（vp-core）
+### 1.2 涉及文件与修改内容
+1. `crates/vp-config/src/model.rs`：
+   - 新增 `RealityOpts` 结构体（`public_key`, `short_id`, `spider_x`）；
+   - 在 `VlessCfg` 与 `TrojanCfg` 中增加字段 `pub reality_opts: Option<RealityOpts>`（aliases: `reality-opts`, `reality_opts`）。
+2. `crates/vp-transport/src/lib.rs` & `crates/vp-transport/src/utls.rs`：
+   - 在 `TransportConfig` 中新增 `reality: Option<RealityConfig>`；
+   - 在 `utls.rs` 中扩展握手引擎：当 `reality` 启用时，执行 REALITY 认证流程并在解析服务端证书时校验 `HMAC-SHA512`；
+   - 密码学计算复用已有 `ring` 依赖（X25519 agreement、AES-256-GCM、HMAC-SHA512），零新增依赖。
+3. `crates/vp-protocol/src/vless.rs` & `crates/vp-protocol/src/trojan.rs` & `crates/vp-protocol/src/lib.rs`：
+   - 提取 `reality_opts` 并通过 `transport_of_full` 传入 `TransportConfig`；
+   - 更新 `crates/vp-protocol/src/sub.rs`：`parse_vless` 与 `parse_trojan` 支持 `security=reality`、`pbk=...`、`sid=...`、`spx=...`。
+4. **测试**：
+   - 构造最小 REALITY 服务端握手与客户端自环测试：验证正确密钥/short_id 成功通信，错误密钥/篡改证书阻断。
 
-一切流量归约为字节流（TCP 型）与数据报（UDP 型）两类：
+---
 
-```rust
-pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
-pub struct Packet { src: SocketAddr, dst: SocketAddr, data: Bytes }
+## 二、特性 2：热重载（Hot-Reload）完善
 
-#[async_trait]
-pub trait Outbound: Send + Sync {
-    fn name(&self) -> &str;
-    async fn connect(&self, dst: &DstAddr) -> Result<Box<dyn ProxyStream>>;
-    async fn connect_packet(&self, dst: &DstAddr) -> Result<Box<dyn PacketConn>>;
-    fn support_udp(&self) -> bool { false }
-}
-pub trait Inbound: Send + Sync { /* listen() 产出 Session 交给 Router */ }
-pub trait Router: Send + Sync { /* route_stream / route_packet */ }
-```
+### 2.1 现有问题
+- 目前 `App::reload()` 仅使用内存中初次读取的配置字符串，修改磁盘文件后调用 reload 无法生效；
+- Windows 平台没有 Unix `SIGHUP` 信号，在控制台运行无平滑重载触发入口；
+- `api.rs` 的 `PUT /configs` 尚未解析 JSON 请求体中的 `{"path": "..."}`。
 
-策略组自身也实现 `Outbound`，天然支持嵌套（DAG，构建期检测环）。
+### 2.2 解决方案与涉及文件
+1. `crates/vp-app/src/lib.rs`：
+   - 将 `config_text: RwLock<Option<(String, Format, PathBuf)>>` 升级为保留配置文件真实路径 `config_path: Option<PathBuf>` 的共享结构 `Arc<RwLock<ConfigMeta>>`；
+   - `App::reload(&self)`：若配置来源为文件，先从磁盘异步重读最新文本（`tokio::fs::read_to_string`）；
+   - 重新执行 `assemble_for_reload`，若校验或解析失败，保留当前路由器并报错，保证服务零中断；
+   - 若成功，调用 `router_handle.swap(...)` 平滑切换路由规则与出站表。
+2. `crates/vp-bin/src/main.rs`：
+   - 在 `Cmd::Run` 的主事件循环中，利用 `tokio::time::interval(1s)` 配合 `std::fs::metadata(&config).modified()` 监控配置文件修改时间（mtime）；
+   - **跨平台通用**（Windows、macOS、Linux 一致支持）：保存配置文件立即自动触发平滑热重载，无需按快捷键或重启进程；
+   - 同时保留 Unix 下的 `SIGHUP` 信号支持。
+3. `crates/vp-app/src/api.rs`：
+   - `PUT /configs` 增强：支持从请求体 JSON（`{"path": "..."}`）提取目标路径，若无参数则默认重新读取当前运行的配置文件磁盘内容。
+4. **测试**：
+   - 编写自动化测试：启动 App 后动态修改临时磁盘配置文件，断言 `app.reload()` 正确应用新增代理节点与路由规则。
 
-**转发引擎（性能核心）**：全程 `bytes::Bytes` 引用计数零拷贝；双向 2 task + 有界 channel；池化 64KiB buffer；批量读 + vectored write（writev）；连接表（供 API 查询/关闭）。Linux 后续升级 splice/io_uring。
+---
 
-## 三、规则引擎（vp-rule）
+## 三、特性 4：Rule-Provider 在线订阅拉取与定时刷新
 
-- 域名：反向标签压缩 trie，统一容纳 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX（regex 单独小集合）
-- IP：前缀压缩 LPM 基数树（IPv4/IPv6 统一 128bit），支持 IP-CIDR / IP-CIDR6 / GEOIP（maxminddb mmap 零解析）
-- GEOSITE / v2ray .dat：手写 protobuf wire 解码（~150 行，零依赖）
-- RULE-SET：文本 .list 与二进制 .mrs（mihomo 生态）双支持，mmap 加载
-- 端口、SRC-IP、SRC-PORT、PROCESS-NAME/PATH（Windows `GetExtendedTcpTable` / Linux `/proc/net/*`）、IN-TYPE
-- 逻辑规则 AND/OR/NOT/SUB-RULE
-- 全部规则**编译期**构建为紧凑结构，热路径零分配
+### 3.1 现有问题
+- 目前 `load_providers` 仅支持同步读取本地存在的文件（必须配置 `path`），若配置 `url` 或 `interval` 会被忽略；
+- 如果每次更新 rule-provider 都完整重建 App，会导致已有的策略组、延时统计、Selector 手动选择被重置。
 
-## 四、策略组（vp-router）
+### 3.2 解决方案与涉及文件
+1. `crates/vp-config/src/model.rs`：
+   - `RuleProviderCfg` 增加 `#[serde(rename = "type", default)] pub kind: Option<String>`（兼容 `type: http` / `type: file`）；
+   - 若配置了 `url` 且未提供 `path`，自动默认缓存路径为 `.cache/{name}.txt`。
+2. `crates/vp-app/src/lib.rs`（在线拉取与离线降级）：
+   - 在 `vp-app/Cargo.toml` 中引用已在 workspace 内声明的 `ureq.workspace = true`；
+   - 启动加载时，若包含 `url`，先发起 HTTP GET 拉取内容（带超时），并尝试用 `vp_rule::provider::load_payload` 校验；
+   - 校验成功后写入磁盘缓存文件，保证断网或重启离线时直接降级读取缓存；若拉取失败且缓存存在，打出 warn 日志并降级使用本地缓存。
+3. `crates/vp-router/src/lib.rs`（原子平滑规则替换）：
+   - 新增方法 `Router::clone_with_rules(&self, rules: RuleEngine) -> Arc<Router>`；
+   - 保持所有的 `groups`、`outbounds`、`dns` 不变，仅更新规则引擎，彻底保留节点的历史延时记录与手动 Selector 选择状态。
+4. `crates/vp-app/src/lib.rs`（后台定时刷新任务）：
+   - 对所有配置了 `interval > 0` 的 HTTP rule-provider，在 `start` 时启动后台定时协程；
+   - 定时从 `url` 拉取最新内容，若内容有变动且校验通过，写入磁盘缓存并重编译规则，调用 `router_handle.swap(...)` 实现零连接中断的规则热生效。
+5. **测试**：
+   - 模拟 HTTP 本地服务器返回 provider 内容，验证首次启动拉取、离线文件缓存降级、后台 interval 触发重编译和热替换生效。
 
-- **Selector**（手动切换，可被 API 修改）/ **URLTest**（延迟测速，EMA 平滑 + tolerance 滞回，惰性触发）/ **Fallback**（按优先级故障转移）/ **LoadBalance**（一致性哈希 / 轮询）/ **Relay**（链式串联）
-- 独立健康检查 task，指数退避；原子计数器记录每节点连接数/流量
+---
 
-## 五、配置（vp-config）
+## 四、实施顺序
 
-内部统一 IR，双前端：Clash 兼容 YAML（proxies / proxy-groups / rules / dns / port / external-controller 等，机场订阅零成本迁移）；JSON 前端为同一 schema 的 JSON/JSON5 表示（容忍注释）。校验阶段检测：组环引用、规则指向不存在的策略、端口冲突等，给出精确报错位置。
-
-## 六、协议矩阵与里程碑
-
-**M1（本次，完整骨架+主流协议跑通，出入站对称实现便于自环测试）**
-- 入站：mixed（socks5+http 同端口自动识别）、socks5、http；协议服务端同套实现（ss/vmess/vless/trojan server）
-- 出站：direct、reject、socks5、http、shadowsocks（AEAD + 2022-blake3）、vmess（aes-128-gcm/chacha20/zero）、vless（uuid + flow 基础）、trojan（sha224）
-- 传输：tcp、tls（rustls+ring）、ws；DNS：UDP/TCP/DoT + 缓存
-- CLI + Clash 兼容 REST API（GET /proxies、PUT 切换、GET /rules、GET /connections、延迟测试）
-- **验收**：`vpcore validate` 双格式通过；curl 经 mixed 端口 → direct/各协议自环（本机协议 server）全部 2xx；规则+策略组生效
-
-**M2（TUN 模式）**：wintun（Windows）/ tokio-tun，smoltcp 用户态栈，fake-ip DNS 劫持与回映射，auto-route；UDP 全链路（ss/vmess UDP、DNS 劫持）；redir/tproxy（Linux）；DoH
-**M3（QUIC 系）**：quinn 基础上 hysteria2、TUIC v5、quic transport、grpc/h2 transport、uTLS 指纹、shadowtls、WireGuard（boringtun）
-**M4（长尾+插件完善）**：anytls、mieru、brook、ssh；naive；插件市场机制、热重载完善
-
-## 七、C-ABI 插件体系（vp-plugin + vp-plugin-sdk）
-
-版本化稳定 ABI（`vp_plugin.h` + SDK crate），插件为 .dll/.so/.dylib，三类：
-1. **transform**：纯缓冲区变换（输入/输出指针+len），无 IO，最快最安全——混淆/加解密类
-2. **outbound**：`connect()` 返回已连接 socket fd 交还宿主，由宿主 tokio 接管
-3. **provider**：节点/规则订阅扩展（M4）
-
-宿主侧 libloading 动态加载，ABI 版本协商，插件崩溃不影响其它流量；SDK 提供 `#[vp_plugin]` 宏生成导出。M1 交付宿主 + transform/outbound 两类 + 官方示例插件（simple-obfs 风格 transform）。
-
-## 八、体积与性能工程
-
-- workspace release profile：`lto="fat"`、`codegen-units=1`、`panic="abort"`、`strip="symbols"`；opt-level 3 与 z 二选一以实测为准
-- rustls 用 ring 后端（避免 aws-lc）；tokio 精确 features 不用 full；ws/http 解析手写（httparse + 自实现 RFC6455），不拉 hyper
-- 每协议 cargo feature，`--no-default-features` 可出最小内核
-- 目标：最小 feature Linux musl < 3MB；全功能 M1 < 12MB
-- 基准：criterion（trie/LPM/转发吞吐）+ iperf 端到端，对比 mihomo 记录基线
-
-## 九、测试
-
-- 单元：trie/LPM、配置解析双格式、各协议编码 roundtrip、策略组状态机
-- e2e：本机起内核 + 协议 server 自环 + curl --socks5 全协议矩阵
-- 基准：criterion + 吞吐脚本
-
-## 十、实施顺序（批准后立即开始）
-
-1. `git init` + workspace + 全 crate 骨架 + profile
-2. vp-common / vp-core（trait + 转发引擎 + 单测）
-3. vp-config（IR + 双格式 + 校验）
-4. vp-rule（trie + LPM + 逻辑规则 + geosite 解析）
-5. vp-router（策略组 + 健康检查）
-6. 垂直打通：mixed 入站 → direct/socks5 出站 → 本机 e2e
-7. vp-transport（tls/ws）→ ss/vmess/vless/trojan 出入站 → 协议自环 e2e
-8. vp-dns、vp-plugin 宿主 + 示例插件、vp-app API、vp-bin CLI
-9. 基准与体积报告
-
-每步含单测；M1 全部完成后输出验收报告。M2（TUN）作为下一阶段紧接推进。
+1. **第 1 阶段（特性 2：热重载完善）**：
+   - 改造 `App` / `ApiState` 配置元数据，实现从磁盘重读配置文本；
+   - 在 `vp-bin` 中加入跨平台 mtime 文件轮询热重载与 Unix SIGHUP 统一；
+   - 完善 `PUT /configs` 接口；
+   - 运行测试并验证。
+2. **第 2 阶段（特性 4：Rule-Provider 在线拉取与定时刷新）**：
+   - `vp-config` 兼容字段与默认缓存路径；
+   - `vp-router` 增加 `clone_with_rules`；
+   - `vp-app` 实现 HTTP GET 拉取 + 离线缓存降级 + 后台 interval 自动热更新；
+   - 编写单测并验证。
+3. **第 3 阶段（特性 1：REALITY 协议扩展）**：
+   - `vp-config` 增加 `RealityOpts`；
+   - `vp-transport` / `utls.rs` 实现完整的 REALITY ClientHello 认证与 Ed25519 签名校验；
+   - `vp-protocol` 中接线 VLESS / Trojan / sub 订阅解析；
+   - 编写 REALITY 自环与认证拒绝测试。
+4. **第 4 阶段（全 Workspace 回归与 README）**：
+   - 运行全 workspace 单元测试与端到端测试；
+   - 更新 README 协议矩阵与功能说明，完成代码提交。

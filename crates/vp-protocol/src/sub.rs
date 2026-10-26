@@ -70,6 +70,22 @@ impl SubNode {
                 "\n    ws-opts:\n      path: {path}\n      headers:\n        Host: {host}"
             ));
         }
+        // reality-opts 块（若存在）
+        if let Some((_, pbk)) = self.fields.iter().find(|(k, _)| k == "__reality_pbk") {
+            out.push_str(&format!(
+                "\n    reality-opts:\n      public-key: {pbk}"
+            ));
+            if let Some((_, sid)) = self.fields.iter().find(|(k, _)| k == "__reality_sid") {
+                if !sid.is_empty() {
+                    out.push_str(&format!("\n      short-id: {sid}"));
+                }
+            }
+            if let Some((_, spx)) = self.fields.iter().find(|(k, _)| k == "__reality_spx") {
+                if !spx.is_empty() {
+                    out.push_str(&format!("\n      spider-x: {spx}"));
+                }
+            }
+        }
         out.push('\n');
         out
     }
@@ -135,7 +151,10 @@ fn split_main(rest: &str) -> Result<(String, String, String, HashMap<String, Str
 fn parse_vless(rest: &str) -> Result<SubNode> {
     let (uuid, host, port, p, name) = split_main(rest)?;
     let network = p.get("type").cloned().unwrap_or_else(|| "tcp".into());
-    let tls = p.get("security").map(|s| s != "none").unwrap_or(false);
+    let is_reality = p.get("security").map(|s| s == "reality").unwrap_or(false)
+        || p.contains_key("pbk")
+        || p.contains_key("publicKey");
+    let tls = is_reality || p.get("security").map(|s| s != "none").unwrap_or(false);
     let mut f = vec![
         ("name".into(), q(&name)),
         ("type".into(), "vless".into()),
@@ -149,6 +168,19 @@ fn parse_vless(rest: &str) -> Result<SubNode> {
     }
     if p.get("allowInsecure").map(|v| v == "1").unwrap_or(false) {
         f.push(("skip-cert-verify".into(), "true".into()));
+    }
+    if is_reality {
+        if let Some(pbk) = p.get("pbk").or_else(|| p.get("publicKey")) {
+            f.push(("__reality_pbk".into(), q(pbk)));
+        }
+        if let Some(sid) = p.get("sid").or_else(|| p.get("shortId")) {
+            f.push(("__reality_sid".into(), q(sid)));
+        }
+        if let Some(spx) = p.get("spx").or_else(|| p.get("spiderX")) {
+            f.push(("__reality_spx".into(), q(spx)));
+        }
+        let fp = p.get("fp").or_else(|| p.get("fingerprint")).cloned().unwrap_or_else(|| "chrome".into());
+        f.push(("client-fingerprint".into(), fp));
     }
     f.push(("network".into(), network.clone()));
     if network == "ws" {
@@ -218,18 +250,36 @@ fn parse_vmess(rest: &str) -> Result<SubNode> {
 fn parse_trojan(rest: &str) -> Result<SubNode> {
     let (password, host, port, p, name) = split_main(rest)?;
     let network = p.get("type").cloned().unwrap_or_else(|| "tcp".into());
+    let is_reality = p.get("security").map(|s| s == "reality").unwrap_or(false)
+        || p.contains_key("pbk")
+        || p.contains_key("publicKey");
+    let tls = is_reality || p.get("security").map(|s| s != "none").unwrap_or(true);
     let mut f = vec![
         ("name".into(), q(&name)),
         ("type".into(), "trojan".into()),
         ("server".into(), host),
         ("port".into(), port),
         ("password".into(), q(&password)),
+        ("tls".into(), tls.to_string()),
     ];
     if let Some(sni) = p.get("sni").or_else(|| p.get("peer")) {
         f.push(("sni".into(), sni.clone()));
     }
     if p.get("allowInsecure").map(|v| v == "1").unwrap_or(false) {
         f.push(("skip-cert-verify".into(), "true".into()));
+    }
+    if is_reality {
+        if let Some(pbk) = p.get("pbk").or_else(|| p.get("publicKey")) {
+            f.push(("__reality_pbk".into(), q(pbk)));
+        }
+        if let Some(sid) = p.get("sid").or_else(|| p.get("shortId")) {
+            f.push(("__reality_sid".into(), q(sid)));
+        }
+        if let Some(spx) = p.get("spx").or_else(|| p.get("spiderX")) {
+            f.push(("__reality_spx".into(), q(spx)));
+        }
+        let fp = p.get("fp").or_else(|| p.get("fingerprint")).cloned().unwrap_or_else(|| "chrome".into());
+        f.push(("client-fingerprint".into(), fp));
     }
     f.push(("network".into(), network.clone()));
     if network == "ws" {
@@ -695,6 +745,63 @@ mod tests {
         let n = parse_uri(&format!("vmess://{enc}")).unwrap();
         assert_eq!(n.name(), "vm");
         assert!(n.to_yaml().contains("uuid: u1"));
+    }
+
+    #[test]
+    fn vless_reality_uri() {
+        let uri = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@1.2.3.4:443?security=reality&sni=www.apple.com&fp=chrome&pbk=1111222233334444555566667777888899990000111&sid=0123456789abcdef&spx=%2F#reality-node";
+        let n = parse_uri(uri).unwrap();
+        assert_eq!(n.name(), "reality-node");
+        let y = n.to_yaml();
+        assert!(y.contains("type: vless"), "{y}");
+        assert!(y.contains("tls: true"), "{y}");
+        assert!(y.contains("servername: www.apple.com"), "{y}");
+        assert!(y.contains("client-fingerprint: chrome"), "{y}");
+        assert!(y.contains("reality-opts:"), "{y}");
+        assert!(y.contains("public-key: \"1111222233334444555566667777888899990000111\""), "{y}");
+        assert!(y.contains("short-id: \"0123456789abcdef\""), "{y}");
+        assert!(y.contains("spider-x: \"/\""), "{y}");
+
+        // 反序列化为 ProxyCfg 确认格式完全兼容
+        let doc = format!("proxies:\n{y}");
+        let mut map: std::collections::HashMap<String, Vec<vp_config::ProxyCfg>> =
+            serde_yaml::from_str(&doc).unwrap();
+        let cfg = map.remove("proxies").unwrap().pop().unwrap();
+        match cfg.kind {
+            vp_config::ProxyKind::Vless(v) => {
+                let ro = v.reality_opts.unwrap();
+                assert_eq!(ro.public_key, "1111222233334444555566667777888899990000111");
+                assert_eq!(ro.short_id.as_deref(), Some("0123456789abcdef"));
+                assert_eq!(ro.spider_x.as_deref(), Some("/"));
+            }
+            _ => panic!("Expected VLESS kind"),
+        }
+    }
+
+    #[test]
+    fn trojan_reality_uri() {
+        let uri = "trojan://password123@1.2.3.4:443?security=reality&sni=www.apple.com&fp=chrome&pbk=aabbccdd11223344&sid=1234#tr-reality";
+        let n = parse_uri(uri).unwrap();
+        assert_eq!(n.name(), "tr-reality");
+        let y = n.to_yaml();
+        assert!(y.contains("type: trojan"), "{y}");
+        assert!(y.contains("tls: true"), "{y}");
+        assert!(y.contains("reality-opts:"), "{y}");
+        assert!(y.contains("public-key: \"aabbccdd11223344\""), "{y}");
+        assert!(y.contains("short-id: \"1234\""), "{y}");
+
+        let doc = format!("proxies:\n{y}");
+        let mut map: std::collections::HashMap<String, Vec<vp_config::ProxyCfg>> =
+            serde_yaml::from_str(&doc).unwrap();
+        let cfg = map.remove("proxies").unwrap().pop().unwrap();
+        match cfg.kind {
+            vp_config::ProxyKind::Trojan(t) => {
+                let ro = t.reality_opts.unwrap();
+                assert_eq!(ro.public_key, "aabbccdd11223344");
+                assert_eq!(ro.short_id.as_deref(), Some("1234"));
+            }
+            _ => panic!("Expected Trojan kind"),
+        }
     }
 
     #[test]

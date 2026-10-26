@@ -30,16 +30,16 @@ cargo build --release -p vp-bin
 | 模块 | 能力 |
 |---|---|
 | 入站 | mixed（socks5+http 同端口自动识别）、socks5、http（CONNECT + absolute-form） |
-| 出站 | direct、reject、socks5、http、**shadowsocks**（AEAD + 2022-blake3）、**vmess**（AEAD 认证头）、**vless**、**trojan**（出入站对称，服务端可用于自建） |
-| 传输 | TCP、TLS（rustls/ring，skip-cert-verify、SNI 覆盖）、WebSocket（手写 RFC6455） |
-| 规则 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX / IP-CIDR(6) / SRC-IP-CIDR / DST-PORT / SRC-PORT / PROCESS-NAME / NETWORK / GEOIP(mmdb) / GEOSITE(.dat) / RULE-SET(.list/.yaml，domain/ipcidr/classical) / AND-OR-NOT / SUB-RULE / MATCH |
+| 出站 | direct、reject、socks5、http、**shadowsocks**（AEAD + 2022-blake3）、**vmess**（AEAD 认证头）、**vless**（含 REALITY）、**trojan**（含 REALITY，出入站对称，服务端可用于自建） |
+| 传输 | TCP、TLS（rustls/ring，skip-cert-verify、SNI 覆盖）、WebSocket（手写 RFC6455）、**REALITY**（X25519 + AEAD 认证 ClientHello + Ed25519 HMAC-SHA512 自签验签） |
+| 规则 | DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX / IP-CIDR(6) / SRC-IP-CIDR / DST-PORT / SRC-PORT / PROCESS-NAME / NETWORK / GEOIP(mmdb) / GEOSITE(.dat) / RULE-SET(.list/.yaml 在线拉取与自动刷新) / AND-OR-NOT / SUB-RULE / MATCH |
 | 策略组 | select / url-test（EMA+容差滞回）/ fallback / load-balance（轮询+一致性哈希）/ relay（链式） |
 | DNS | UDP/TCP/DoT 解析器 + TTL 缓存 + **fake-ip 池** + **DNS 服务器**（A/AAAA/PTR/上游转发） |
 | 插件 | C-ABI 动态库宿主（transform 流变换），SDK + 示例插件见 `crates/examples/plugins/xor_mask` |
-| API | Clash 兼容 REST 控制器：/proxies、/rules、/connections、delay 测速、selector 切换、Bearer 鉴权 |
+| API | Clash 兼容 REST 控制器：/proxies、/rules、/connections、/configs 热载入、delay 测速、selector 切换、Bearer 鉴权 |
 | TUN | **TUN 透明代理**（tun+ipstack 用户态栈）：TCP/UDP 分发、fake-ip 回射、DNS 劫持、ICMP echo 应答、auto-route（需管理员权限） |
 | UDP | 全链路：socks5 ASSOCIATE+NAT、ss UDP（每包独立 salt）、socks5/ss 出站 PacketConn |
-| 其它 | 规则匹配零分配热路径、连接表（查询/关闭）、流量统计、热重载路由、每协议 cargo feature 裁剪 |
+| 其它 | 规则匹配零分配热路径、连接表（查询/关闭）、流量统计、跨平台 mtime 自动热重载 / SIGHUP、每协议 cargo feature 裁剪 |
 
 ## 架构
 
@@ -77,7 +77,10 @@ vp-common   错误 / 地址编解码 / 缓冲池 / 统计
 - **brook 出+入站（已完成）**：txthinking/brook 原生协议（master 线格式）——客户端 12B 随机 ClientNonce 明文首发，密钥 = HKDF-SHA256(ikm=password, salt=nonce, info="brook") 派生 AES-256-GCM；双向记录流 `GCM(len u16be) + GCM(frag)`（AAD 空，每记录耗两个 nonce，nonce 前 8 字节按 LE u64 递增）；首 fragment = u32be 时间戳 + SOCKS 地址，奇偶区分 TCP / UDP-over-TCP，60s 重放窗口；TCP 记录总长 ≤ 2048、UoT ≤ 65507。Clash 语法 `type: brook`（server/port/password/udp——UDP 经 brook 原生 UoT 模式），listener `type: brook`（users 密码列表，多密码逐一试解），订阅 `brook://password@host:port?udp=1#name` 与官方 `brook://server?server=host:port&password=xxx&udpovertcp=true` 双形式。自环测试：300KB 回显逐字节一致 / 错误密码拒绝 / 过期时间戳拒绝 / UoT 数据报往返 ×8；nonce 递增 / RFC 5869 HKDF 向量 / 记录 roundtrip + nonce 滚动 + 篡改检测单测。边界：原生 UDP 数据报（packetclient）未实现；ws/wss/quic 传输变体未实现
 - **mieru 出+入站（已完成，TCP 最小实现）**：enfein/mieru v3 会话协议——密钥链 hashedPassword = SHA256(password‖0x00‖username)、timeSalt = SHA256(u64be(unix 按 2 分钟取整))、key = PBKDF2-HMAC-SHA256(hashed, salt, 64 轮)（手写 PBKDF2，RFC 7914 双向量验证；客户端用当前盐，服务端试 ±2 分钟共 3 盐，容忍 4 分钟时差）；XChaCha20-Poly1305 隐式 nonce 模式（首段带 24B nonce，末 4 字节 = SHA256(username‖nonce[0..16])[..4] 用户提示，此后每加密操作 nonce 自末字节进位）；32B 元数据（sessionStruct/dataAckStruct）+ 16B tag，段含可选 padding（本实现恒 0）；会话载荷为 SOCKS5 流量（greeting + CONNECT 搭载于 openSessionRequest，≤1024B），服务端内嵌 SOCKS5 处理器。Clash 语法 `type: mieru`（server/port/username/password），listener `type: mieru`（users 为 username:password 列表），订阅 `mieru://user:pass@host:port?transport=tcp#name`。自环测试：300KB 回显逐字节一致（跨段分帧）/错误密码发现失败/多用户列表非首位用户命中；PBKDF2 向量/nonce 进位/用户提示单测。边界：单会话单 underlay（无多路复用）、无低熵编码、UDP packet 传输不支持；对真实 mieru 服务端（官方 CLI）应可互通，对端启用 multiplexing 的客户端无法接入本入站
 - **naive 出+入站（已完成）**：基于 HTTP/2 CONNECT + 8 包 Padding 机制（对标 klzgrad/naiveproxy 与 Caddy forwardproxy 参考实现）——线格式：TLS（ALPN `["h2"]`）或明文 HTTP/2 传输；CONNECT 请求发送 `:method = CONNECT`、`:authority = host:port`、`proxy-authorization: Basic base64` 以及 30..61 字符伪随机 `padding` 请求头（对抗主动探测，服务端缺失返回 400 Bad Request）；服务端回送 200 OK + `Padding` 头；双向 **8 包 Padding 流控**（前 8 个写入包帧化为 `[u16be data_len][u8 pad_len][data][zeros]`，读取侧解析解包并抛弃填充，第 8 包后进入零开销纯裸数据阶段）；UDP 通过 UoT（`sp.udp-over-tcp.arpa`）无缝承载。Clash 语法 `type: naive`（server/port/username/password/sni/skip-cert-verify/client-fingerprint/udp），listener `type: naive`（users 为 username:password 列表），订阅 `naive+https://`、`naive+http://`、`naive://`。自环测试：300KB 跨 8 包 Padding 边界大流量回显逐字节一致 / 错误密码拒绝 / 缺少 Padding 头 400 拒绝 / Padding 头格式与字符集单测
-- **长尾协议（计划）**：插件市场、热重载完善
+- **REALITY 协议扩展（已完成）**：完整对标 Xray-core / sing-box 规范——支持 VLESS 与 Trojan 出站（Clash 语法 `reality-opts: { public-key, short-id, spider-x }`，订阅格式 `security=reality&pbk=...&sid=...&spx=...`）；基于 Curve25519 临时密钥复用与 HKDF-SHA256 派生认证密钥，在 ClientHello `legacy_session_id` 嵌入 AES-256-GCM 认证载荷（16B 载荷含协议版本/时间戳与 short-id + 16B 认证 Tag）；服务端特殊证书验证拦截：自动从证书 DER 提取 32 字节 Ed25519 公钥并校验 HMAC-SHA512 签名，验签通过即信任，绕过 WebPKI 证书链；复用已链接的 x25519-dalek 与 ring 库，零额外运行时网络依赖；自环测试覆盖正确密钥握手/数据全双工交互/证书签名篡改检测。
+- **平滑热重载完善（已完成）**：支持运行时磁盘配置文件重读，新增跨平台通用（Windows / macOS / Linux）mtime 文件修改监听（1 秒轮询探测，保存即热生效）；统一 Unix SIGHUP 信号与 REST API `PUT /configs` 接口；配置重载执行严格两阶段校验（语法解析 + 端口冲突与引用校验），新配置合法时原子平滑切换（router_handle.swap），若校验失败自动保留旧配置继续服务，保证零停机中断。
+- **Rule-Provider 在线订阅与定时后台刷新（已完成）**：支持 HTTP/HTTPS 远程规则订阅拉取（ureq 客户端超时保护）；磁盘离线本地缓存机制（默认缓存至 `.cache/{name}.txt`，网络抖动或离线启动时自动降级加载本地缓存）；后台定时刷新协程（`interval` 周期自动增量检测更新）；`Router::clone_with_rules` 原子规则替换，不重建出站与策略组，保留节点 EMA 延迟统计历史与 Selector 手动选择状态，活跃 TCP/UDP 传输不中断。
+- **长尾协议与生态（计划）**：C-ABI 插件市场装配
 
 ## 插件开发
 
@@ -98,4 +101,4 @@ vp_transform_plugin!(MyPlugin);
 
 ## 测试
 
-185 项单测/集成测试（`cargo test --workspace`）：协议编解码 roundtrip、各协议出入站自环、规则引擎、策略组状态机、转发引擎（半关闭/计数）、TLS/WS 传输、垂直 e2e（mixed→规则→组→出站）、控制器 API、C-ABI 插件往返。
+192 项单测/集成测试（`cargo test --workspace`）：协议编解码 roundtrip、各协议出入站自环、规则引擎、策略组状态机、转发引擎（半关闭/计数）、TLS/WS 传输、垂直 e2e（mixed→规则→组→出站）、控制器 API、C-ABI 插件往返、REALITY 握手与篡改检测、mtime 热重载、Rule-Provider 在线拉取与后台定时平滑刷新。

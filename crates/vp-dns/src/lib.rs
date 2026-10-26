@@ -34,9 +34,29 @@ struct CacheInner {
     map: HashMap<(String, bool), CacheEntry>,
 }
 
-/// DNS 解析器：多上游，UDP 优先 TCP 兜底；进程内共享缓存。
+#[derive(Clone)]
+pub struct PolicyRule {
+    pub trie: vp_rule::domain::DomainTrie,
+    pub geosite: Vec<vp_rule::geosite::CompiledSite>,
+    pub resolver: Arc<Resolver>,
+}
+
+#[derive(Clone)]
+pub struct CompiledFallbackFilter {
+    pub geoip: bool,
+    pub geoip_code: String,
+    pub geoip_matcher: Option<vp_rule::geoip::GeoIpMatcher>,
+    pub ipcidr: vp_rule::ipset::IpIntervalSet,
+    pub domain: vp_rule::domain::DomainTrie,
+    pub geosite: Vec<vp_rule::geosite::CompiledSite>,
+}
+
+/// DNS 解析器：多上游，UDP 优先 TCP 兜底；进程内共享缓存；支持 nameserver-policy 分流与 fallback-filter 污染过滤。
 pub struct Resolver {
     servers: Vec<ServerAddr>,
+    fallbacks: Vec<ServerAddr>,
+    policies: Vec<PolicyRule>,
+    fallback_filter: Option<CompiledFallbackFilter>,
     cache: Mutex<CacheInner>,
     /// 无 nameserver 配置时走系统解析
     pub use_system: bool,
@@ -68,7 +88,59 @@ impl Resolver {
     pub fn new(servers: Vec<String>) -> Self {
         let parsed: Vec<ServerAddr> = servers.iter().filter_map(|s| parse_server(s)).collect();
         let use_system = parsed.is_empty();
-        Resolver { servers: parsed, cache: Mutex::new(CacheInner::default()), use_system }
+        Resolver {
+            servers: parsed,
+            fallbacks: Vec::new(),
+            policies: Vec::new(),
+            fallback_filter: None,
+            cache: Mutex::new(CacheInner::default()),
+            use_system,
+        }
+    }
+
+    pub fn build(
+        servers: Vec<String>,
+        fallbacks: Vec<String>,
+        policies: Vec<PolicyRule>,
+        fallback_filter: Option<CompiledFallbackFilter>,
+    ) -> Self {
+        let parsed_servers: Vec<ServerAddr> = servers.iter().filter_map(|s| parse_server(s)).collect();
+        let parsed_fallbacks: Vec<ServerAddr> = fallbacks.iter().filter_map(|s| parse_server(s)).collect();
+        let use_system = parsed_servers.is_empty() && parsed_fallbacks.is_empty() && policies.is_empty();
+        Resolver {
+            servers: parsed_servers,
+            fallbacks: parsed_fallbacks,
+            policies,
+            fallback_filter,
+            cache: Mutex::new(CacheInner::default()),
+            use_system,
+        }
+    }
+
+    pub fn system() -> Self {
+        Resolver {
+            servers: Vec::new(),
+            fallbacks: Vec::new(),
+            policies: Vec::new(),
+            fallback_filter: None,
+            cache: Mutex::new(CacheInner::default()),
+            use_system: true,
+        }
+    }
+
+    pub fn with_fallbacks(mut self, fallbacks: Vec<String>) -> Self {
+        self.fallbacks = fallbacks.iter().filter_map(|s| parse_server(s)).collect();
+        self
+    }
+
+    pub fn with_policies(mut self, policies: Vec<PolicyRule>) -> Self {
+        self.policies = policies;
+        self
+    }
+
+    pub fn with_fallback_filter(mut self, filter: Option<CompiledFallbackFilter>) -> Self {
+        self.fallback_filter = filter;
+        self
     }
 
     /// 第一个 UDP 上游（DNS 服务器原样转发用）
@@ -77,14 +149,6 @@ impl Resolver {
             .iter()
             .find(|s| s.proto == Proto::Udp)
             .and_then(|s| s.addr)
-    }
-
-    pub fn system() -> Self {
-        Resolver {
-            servers: Vec::new(),
-            cache: Mutex::new(CacheInner::default()),
-            use_system: true,
-        }
     }
 
     /// 解析目标。ipv6=false 时仅查 A 记录。
@@ -105,24 +169,100 @@ impl Resolver {
                 }
             }
         }
-        let ips = self.query_all(domain, ipv6).await?;
+
+        // 1. Policy 路由检查：nameserver-policy 优先专有分流
+        for rule in &self.policies {
+            if rule.trie.is_match(domain) || rule.geosite.iter().any(|s| s.matches(domain)) {
+                let ips = Box::pin(rule.resolver.resolve_domain(domain, ipv6)).await?;
+                self.cache_store(key, ips.clone());
+                return Ok(ips);
+            }
+        }
+
+        let qtype = if ipv6 { QType::Aaaa } else { QType::A };
+
+        // 2. Fallback Filter 专有分流（域名或 geosite 强制 fallback）
+        if let Some(ref ff) = self.fallback_filter {
+            if (ff.domain.is_match(domain) || ff.geosite.iter().any(|s| s.matches(domain)))
+                && !self.fallbacks.is_empty()
+            {
+                if let Ok(ips) = Self::query_servers(&self.fallbacks, domain, qtype).await {
+                    let ips = Arc::new(ips);
+                    self.cache_store(key, ips.clone());
+                    return Ok(ips);
+                }
+            }
+        }
+
+        // 3. 主 DNS 解析
+        let primary_res = if self.servers.is_empty() {
+            self.system_lookup(domain).await
+        } else {
+            Self::query_servers(&self.servers, domain, qtype).await.map(Arc::new)
+        };
+
+        let ips = match primary_res {
+            Ok(ips) => {
+                // 4. 污染检测（CIDR 污染网段 / 非 CN GeoIP 污染剔除）
+                let mut poisoned = false;
+                if let Some(ref ff) = self.fallback_filter {
+                    for ip in ips.iter() {
+                        // (1) IP-CIDR 污染库拦截（如 240.0.0.0/4、127.0.0.1、0.0.0.0/8 等）
+                        if ff.ipcidr.contains(*ip) {
+                            poisoned = true;
+                            break;
+                        }
+                        // (2) GeoIP 国内归属检查
+                        if ff.geoip {
+                            if let Some(ref matcher) = ff.geoip_matcher {
+                                if !matcher.matches(*ip) {
+                                    poisoned = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if poisoned && !self.fallbacks.is_empty() {
+                    tracing::info!("域名 {domain} 命中 fallback-filter 污染过滤，切换至 fallback 上游");
+                    match Self::query_servers(&self.fallbacks, domain, qtype).await {
+                        Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
+                        _ => ips,
+                    }
+                } else {
+                    ips
+                }
+            }
+            Err(e) => {
+                if !self.fallbacks.is_empty() {
+                    match Self::query_servers(&self.fallbacks, domain, qtype).await {
+                        Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
+                        _ => return Err(e),
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        self.cache_store(key, ips.clone());
+        Ok(ips)
+    }
+
+    fn cache_store(&self, key: (String, bool), ips: Arc<Vec<IpAddr>>) {
         let mut c = self.cache.lock().unwrap();
         if c.map.len() >= CACHE_CAP {
             c.map.clear();
         }
-        c.map.insert(key, CacheEntry { ips: ips.clone(), at: Instant::now(), ttl: MIN_TTL });
-        Ok(ips)
+        c.map.insert(key, CacheEntry { ips, at: Instant::now(), ttl: MIN_TTL });
     }
 
-    async fn query_all(&self, domain: &str, ipv6: bool) -> Result<Arc<Vec<IpAddr>>> {
-        if self.servers.is_empty() {
-            return self.system_lookup(domain).await;
-        }
-        let qtype = if ipv6 { QType::Aaaa } else { QType::A };
+    async fn query_servers(servers: &[ServerAddr], domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
         let mut last_err = None;
-        for server in &self.servers {
+        for server in servers {
             match query_server(server, domain, qtype).await {
-                Ok(ips) if !ips.is_empty() => return Ok(Arc::new(ips)),
+                Ok(ips) if !ips.is_empty() => return Ok(ips),
                 Ok(_) => last_err = Some(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
                 Err(e) => last_err = Some(e),
             }
@@ -199,6 +339,94 @@ fn split_host_port(s: &str, default_port: u16) -> Option<(String, u16)> {
             Some((h.to_string(), p.parse().ok()?))
         }
         _ => Some((s.to_string(), default_port)),
+    }
+}
+
+pub fn compile_nameserver_policy(
+    policy: &std::collections::HashMap<String, serde_yaml::Value>,
+    geosite_db: Option<&vp_rule::geosite::GeoSiteDb>,
+) -> Vec<PolicyRule> {
+    let mut rules = Vec::new();
+    for (key, val) in policy {
+        let server_strs: Vec<String> = match val {
+            serde_yaml::Value::String(s) => vec![s.clone()],
+            serde_yaml::Value::Sequence(seq) => seq
+                .iter()
+                .filter_map(|v| match v {
+                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => continue,
+        };
+        if server_strs.is_empty() {
+            continue;
+        }
+        let resolver = Arc::new(Resolver::new(server_strs));
+        let mut trie = vp_rule::domain::DomainTrie::new();
+        let mut geosite_list = Vec::new();
+
+        for part in key.split(',') {
+            let part = part.trim();
+            if let Some(tag) = part.strip_prefix("geosite:") {
+                if let Some(db) = geosite_db {
+                    if let Some(compiled) = db.compile(tag) {
+                        geosite_list.push(compiled);
+                    }
+                }
+            } else {
+                let clean = part.trim_start_matches('+').trim_start_matches('*').trim_start_matches('.');
+                trie.insert_suffix_all(clean);
+            }
+        }
+        rules.push(PolicyRule {
+            trie,
+            geosite: geosite_list,
+            resolver,
+        });
+    }
+    rules
+}
+
+pub fn compile_fallback_filter(
+    cfg: &vp_config::FallbackFilterConfig,
+    geosite_db: Option<&vp_rule::geosite::GeoSiteDb>,
+    geoip_db: Option<&vp_rule::geoip::GeoIpDb>,
+) -> CompiledFallbackFilter {
+    let mut ip_builder = vp_rule::ipset::IpIntervalSetBuilder::new();
+    for cidr in &cfg.ipcidr {
+        let _ = ip_builder.insert_cidr(cidr);
+    }
+    let ipcidr = ip_builder.build();
+
+    let mut domain_trie = vp_rule::domain::DomainTrie::new();
+    for d in &cfg.domain {
+        let clean = d.trim_start_matches('+').trim_start_matches('*').trim_start_matches('.');
+        domain_trie.insert_suffix_all(clean);
+    }
+
+    let mut geosite_list = Vec::new();
+    if let Some(db) = geosite_db {
+        for tag in &cfg.geosite {
+            if let Some(compiled) = db.compile(tag) {
+                geosite_list.push(compiled);
+            }
+        }
+    }
+
+    let geoip_matcher = if cfg.geoip && !cfg.geoip_code.is_empty() {
+        geoip_db.and_then(|db| db.matcher(cfg.geoip_code.clone()))
+    } else {
+        None
+    };
+
+    CompiledFallbackFilter {
+        geoip: cfg.geoip,
+        geoip_code: cfg.geoip_code.clone(),
+        geoip_matcher,
+        ipcidr,
+        domain: domain_trie,
+        geosite: geosite_list,
     }
 }
 
@@ -430,7 +658,6 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Ve
     tls.write_all(req.as_bytes()).await?;
     tls.write_all(&q).await?;
     tls.flush().await?;
-    eprintln!("[c] doh request sent+flushed ({}B + {}B)", req.len(), q.len());
 
     // 4) 读响应头 + body
     let mut head = Vec::with_capacity(1024);
@@ -603,19 +830,12 @@ mod tests {
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(tcp).await else { return };
-                    eprintln!("[s] tls accepted");
                     let mut buf = Vec::new();
                     let mut b = [0u8; 1];
                     loop {
                         match tls.read(&mut b).await {
-                            Ok(0) => {
-                                eprintln!("[s] read eof");
-                                return;
-                            }
-                            Err(e) => {
-                                eprintln!("[s] read err: {e}");
-                                return;
-                            }
+                            Ok(0) => return,
+                            Err(_) => return,
                             Ok(_) => {}
                         }
                         buf.push(b[0]);
@@ -630,13 +850,10 @@ mod tests {
                         .find(|(k, _)| k.trim() == "content-length")
                         .and_then(|(_, v)| v.trim().parse().ok())
                         .unwrap_or(0);
-                    eprintln!("[s] headers done clen={clen}");
                     let mut query = vec![0u8; clen];
                     if tls.read_exact(&mut query).await.is_err() {
-                        eprintln!("[s] body read failed");
                         return;
                     }
-                    eprintln!("[s] query received {}B", query.len());
                     // 固定应答：test.local → 9.9.9.9
                     let resp_msg = {
                         let mut m = Vec::new();
@@ -653,19 +870,15 @@ mod tests {
                     );
                     let _ = tls.write_all(http.as_bytes()).await;
                     let _ = tls.write_all(&resp_msg).await;
-                    eprintln!("[s] response sent");
                 });
             }
         });
 
-        eprintln!("[t] doh server ready on {port}");
         let r = Resolver::new(vec![format!("https://127.0.0.1:{port}/dns-query#insecure")]);
-        eprintln!("[t] resolving...");
         let ips = tokio::time::timeout(std::time::Duration::from_secs(5), r.resolve_domain("test.local", false))
             .await
             .expect("resolve 超时")
             .unwrap();
-        eprintln!("[t] got {ips:?}");
         assert_eq!(ips.len(), 1);
         assert_eq!(ips[0].to_string(), "9.9.9.9");
     }
@@ -683,5 +896,110 @@ mod tests {
         let r2 = Resolver::new(vec!["https://dns.google/dns-query".into()]);
         let ips2 = r2.resolve_domain("www.google.com", false).await.unwrap();
         assert!(!ips2.is_empty());
+    }
+
+    async fn spawn_mock_dns(ip: [u8; 4]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else { break };
+                if n < 12 { continue; }
+                let mut m = Vec::new();
+                m.extend_from_slice(&buf[..2]);
+                m.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+                m.extend_from_slice(&buf[12..n]);
+                m.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, ip[0], ip[1], ip[2], ip[3]]);
+                let _ = sock.send_to(&m, from).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn nameserver_policy_routing() {
+        let (primary_addr, _h1) = spawn_mock_dns([10, 0, 0, 1]).await;
+        let (policy_addr, _h2) = spawn_mock_dns([8, 8, 8, 8]).await;
+
+        let mut policy_map = std::collections::HashMap::new();
+        policy_map.insert(
+            "*.google.com".into(),
+            serde_yaml::Value::String(format!("udp://{}", policy_addr)),
+        );
+
+        let policies = compile_nameserver_policy(&policy_map, None);
+        let resolver = Resolver::build(
+            vec![format!("udp://{}", primary_addr)],
+            Vec::new(),
+            policies,
+            None,
+        );
+
+        // 匹配 policy 的域名解析到 8.8.8.8
+        let google_ips = resolver.resolve_domain("www.google.com", false).await.unwrap();
+        assert_eq!(google_ips[0].to_string(), "8.8.8.8");
+
+        // 不匹配 policy 的普通域名解析到 10.0.0.1
+        let normal_ips = resolver.resolve_domain("example.com", false).await.unwrap();
+        assert_eq!(normal_ips[0].to_string(), "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn fallback_filter_domain_routing() {
+        let (primary_addr, _h1) = spawn_mock_dns([10, 0, 0, 1]).await;
+        let (fallback_addr, _h2) = spawn_mock_dns([1, 1, 1, 1]).await;
+
+        let ff_cfg = vp_config::FallbackFilterConfig {
+            geoip: false,
+            geoip_code: "CN".into(),
+            ipcidr: vec![],
+            domain: vec!["+.twitter.com".into()],
+            geosite: vec![],
+        };
+        let filter = compile_fallback_filter(&ff_cfg, None, None);
+
+        let resolver = Resolver::build(
+            vec![format!("udp://{}", primary_addr)],
+            vec![format!("udp://{}", fallback_addr)],
+            Vec::new(),
+            Some(filter),
+        );
+
+        // 命中 fallback-filter domain 的域名直接走 fallback
+        let twitter_ips = resolver.resolve_domain("api.twitter.com", false).await.unwrap();
+        assert_eq!(twitter_ips[0].to_string(), "1.1.1.1");
+
+        // 普通域名走 primary
+        let normal_ips = resolver.resolve_domain("baidu.com", false).await.unwrap();
+        assert_eq!(normal_ips[0].to_string(), "10.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn fallback_filter_cidr_poison_rejection() {
+        // 主 DNS 返回污染网段 240.0.0.1 (Bogon)
+        let (poison_primary, _h1) = spawn_mock_dns([240, 0, 0, 1]).await;
+        // Fallback 返回正常 IP 1.1.1.1
+        let (clean_fallback, _h2) = spawn_mock_dns([1, 1, 1, 1]).await;
+
+        let ff_cfg = vp_config::FallbackFilterConfig {
+            geoip: false,
+            geoip_code: "CN".into(),
+            ipcidr: vec!["240.0.0.0/4".into()],
+            domain: vec![],
+            geosite: vec![],
+        };
+        let filter = compile_fallback_filter(&ff_cfg, None, None);
+
+        let resolver = Resolver::build(
+            vec![format!("udp://{}", poison_primary)],
+            vec![format!("udp://{}", clean_fallback)],
+            Vec::new(),
+            Some(filter),
+        );
+
+        // 主 DNS 返回的 IP 命中 240.0.0.0/4 污染列表，被自动拒绝并降级切换到 fallback (1.1.1.1)
+        let ips = resolver.resolve_domain("blocked-service.com", false).await.unwrap();
+        assert_eq!(ips[0].to_string(), "1.1.1.1");
     }
 }

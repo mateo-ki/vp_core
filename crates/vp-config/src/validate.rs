@@ -48,8 +48,8 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
     }
     // 引用检查（两遍：允许前向引用）
     for g in &cfg.proxy_groups {
-        if g.proxies.is_empty() {
-            errs.push(format!("组 {:?} proxies 为空", g.name));
+        if g.proxies.is_empty() && g.r#use.is_empty() {
+            errs.push(format!("组 {:?} proxies 与 use 均为空", g.name));
         }
         for r in &g.proxies {
             if !names.contains(r.as_str())
@@ -57,6 +57,11 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
                 && !is_builtin(r)
             {
                 errs.push(format!("组 {:?} 引用了不存在的出站 {:?}", g.name, r));
+            }
+        }
+        for u in &g.r#use {
+            if !cfg.proxy_providers.contains_key(u) {
+                errs.push(format!("组 {:?} 引用了未定义的 proxy-provider {:?}", g.name, u));
             }
         }
     }

@@ -114,6 +114,10 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_brook(rest)
     } else if let Some(rest) = line.strip_prefix("mieru://") {
         parse_mieru(rest)
+    } else if let Some(rest) = line.strip_prefix("snell://") {
+        parse_snell(rest)
+    } else if let Some(rest) = line.strip_prefix("ssr://") {
+        parse_ssr(rest)
     } else if let Some(rest) = line.strip_prefix("naive+https://") {
         parse_naive(rest, true)
     } else if let Some(rest) = line.strip_prefix("naive+http://") {
@@ -163,6 +167,11 @@ fn parse_vless(rest: &str) -> Result<SubNode> {
         ("uuid".into(), uuid),
         ("tls".into(), tls.to_string()),
     ];
+    if let Some(flow) = p.get("flow") {
+        if !flow.is_empty() {
+            f.push(("flow".into(), flow.clone()));
+        }
+    }
     if let Some(sni) = p.get("sni").or_else(|| p.get("host")) {
         f.push(("servername".into(), sni.clone()));
     }
@@ -421,6 +430,125 @@ fn parse_mieru(rest: &str) -> Result<SubNode> {
     })
 }
 
+fn parse_snell(rest: &str) -> Result<SubNode> {
+    // snell://psk@host:port?version=4&obfs=http&host=bing.com&udp=1#name
+    let (psk, host, port, p, name) = split_main(rest)?;
+    let mut f = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "snell".into()),
+        ("server".into(), host),
+        ("port".into(), port),
+        ("psk".into(), q(&psk)),
+    ];
+    let version = p.get("version").or_else(|| p.get("v")).cloned().unwrap_or_else(|| "4".into());
+    f.push(("version".into(), version));
+    if let Some(obfs) = p.get("obfs").or_else(|| p.get("mode")) {
+        f.push(("obfs".into(), q(obfs)));
+    }
+    if let Some(h) = p.get("host").or_else(|| p.get("obfs-host")) {
+        f.push(("host".into(), q(h)));
+    }
+    if p.get("udp").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        f.push(("udp".into(), "true".into()));
+    }
+    Ok(SubNode { fields: f })
+}
+
+fn decode_base64_flexible(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let clean = s.trim().replace('-', "+").replace('_', "/");
+    let pad = match clean.len() % 4 {
+        2 => "==",
+        3 => "=",
+        _ => "",
+    };
+    let with_pad = format!("{clean}{pad}");
+    base64::engine::general_purpose::STANDARD
+        .decode(&with_pad)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()))
+        .ok()
+}
+
+fn parse_ssr(rest: &str) -> Result<SubNode> {
+    // ssr://base64(host:port:protocol:method:obfs:base64pass/?obfsparam=...&protoparam=...&remarks=...&group=...)
+    let decoded_bytes = decode_base64_flexible(rest)
+        .ok_or_else(|| Error::Config("ssr 链接 Base64 解码失败".into()))?;
+    let decoded = String::from_utf8(decoded_bytes)
+        .map_err(|e| Error::Config(format!("ssr 链接非 UTF-8: {e}")))?;
+
+    let (main_part, query_part) = match decoded.split_once("/?") {
+        Some((m, q)) => (m, Some(q)),
+        None => (decoded.as_str(), None),
+    };
+
+    let parts: Vec<&str> = main_part.split(':').collect();
+    if parts.len() < 6 {
+        return Err(Error::Config("ssr 链接格式错误：字段不足 6 项".into()));
+    }
+
+    let base64pass = parts[parts.len() - 1];
+    let obfs = parts[parts.len() - 2];
+    let method = parts[parts.len() - 3];
+    let protocol = parts[parts.len() - 4];
+    let port = parts[parts.len() - 5];
+    let host = parts[..parts.len() - 5].join(":");
+
+    let password = decode_base64_flexible(base64pass)
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| base64pass.to_string());
+
+    let mut params = HashMap::new();
+    if let Some(q) = query_part {
+        for pair in q.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                params.insert(k.to_ascii_lowercase(), v);
+            }
+        }
+    }
+
+    let name = params
+        .get("remarks")
+        .and_then(|r| decode_base64_flexible(r))
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("ssr-{}:{}", host, port));
+
+    let obfs_param = params
+        .get("obfsparam")
+        .and_then(|r| decode_base64_flexible(r))
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty());
+
+    let proto_param = params
+        .get("protoparam")
+        .and_then(|r| decode_base64_flexible(r))
+        .and_then(|b| String::from_utf8(b).ok())
+        .filter(|s| !s.is_empty());
+
+    let mut f = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "ssr".into()),
+        ("server".into(), host),
+        ("port".into(), port.to_string()),
+        ("password".into(), q(&password)),
+        ("cipher".into(), method.to_string()),
+        ("protocol".into(), protocol.to_string()),
+        ("obfs".into(), obfs.to_string()),
+    ];
+
+    if let Some(op) = obfs_param {
+        f.push(("obfs-param".into(), q(&op)));
+    }
+    if let Some(pp) = proto_param {
+        f.push(("protocol-param".into(), q(&pp)));
+    }
+    if params.get("udpport").is_some() || params.get("uot").map(|v| *v == "1").unwrap_or(false) {
+        f.push(("udp".into(), "true".into()));
+    }
+
+    Ok(SubNode { fields: f })
+}
+
 fn parse_naive(rest: &str, default_tls: bool) -> Result<SubNode> {
     let (userinfo, host, port, p, name) = split_main(rest)?;
     let (username, password) = match userinfo.split_once(':') {
@@ -623,6 +751,51 @@ pub fn build_config(nodes: &[SubNode], port: u16) -> String {
     out
 }
 
+/// 解析 proxy-provider 载荷（支持 Clash YAML proxies 段，或 Base64 / URI 列表）
+pub fn parse_provider_proxies(
+    text: &str,
+    filter: Option<&str>,
+) -> std::result::Result<Vec<vp_config::ProxyCfg>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 1. 尝试直接作为 YAML 反序列化
+    let mut proxies: Vec<vp_config::ProxyCfg> = if let Ok(doc) =
+        serde_yaml::from_str::<std::collections::HashMap<String, Vec<vp_config::ProxyCfg>>>(text)
+    {
+        doc.get("proxies").cloned().unwrap_or_default()
+    } else if let Ok(list) = serde_yaml::from_str::<Vec<vp_config::ProxyCfg>>(text) {
+        list
+    } else {
+        // 2. 尝试作为订阅节点链接（Base64 或 raw URI 列表）解析
+        let nodes = parse_subscription(text);
+        if nodes.is_empty() {
+            return Err("无法解析为 YAML 节点列表或订阅链接".into());
+        }
+        let mut y = String::from("proxies:\n");
+        for n in &nodes {
+            y.push_str(&n.to_yaml());
+        }
+        let doc: std::collections::HashMap<String, Vec<vp_config::ProxyCfg>> =
+            serde_yaml::from_str(&y).map_err(|e| format!("节点转换为配置失败: {e}"))?;
+        doc.get("proxies").cloned().unwrap_or_default()
+    };
+
+    // 3. 正则过滤 (filter)
+    if let Some(f) = filter {
+        let trimmed = f.trim();
+        if !trimmed.is_empty() {
+            let re = regex::Regex::new(trimmed)
+                .map_err(|e| format!("无效的 filter 正则表达式: {e}"))?;
+            proxies.retain(|p| re.is_match(&p.name));
+        }
+    }
+
+    Ok(proxies)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +849,41 @@ mod tests {
         assert!(parse_uri("mieru://alice:pw@m.com:1?transport=udp#x").is_err());
         // 订阅打包
         let nodes = parse_subscription("mieru://alice:pw@m.com:443#n1");
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn snell_uri() {
+        let n = parse_uri("snell://psk123@s.com:8388?version=4&obfs=http&host=bing.com&udp=1#sn1").unwrap();
+        assert_eq!(n.name(), "sn1");
+        let y = n.to_yaml();
+        assert!(y.contains("type: snell"), "{y}");
+        assert!(y.contains("psk: \"psk123\""), "{y}");
+        assert!(y.contains("version: 4"), "{y}");
+        assert!(y.contains("obfs: \"http\""), "{y}");
+        assert!(y.contains("host: \"bing.com\""), "{y}");
+        assert!(y.contains("udp: true"), "{y}");
+
+        let nodes = parse_subscription("snell://psk@s.com:443#n1");
+        assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn ssr_uri() {
+        let uri = "ssr://MTI3LjAuMC4xOjg4ODg6YXV0aF9hZXMxMjhfbWQ1OmFlcy0xMjgtY2ZiOmh0dHBfc2ltcGxlOmNHRnpjM2R2Y21ReE1qTT0vP29iZnNwYXJhbT1kM2QzTG1KcGJtY3VZMjl0JnJlbWFya3M9VTFOU0xVNXZaR1U9";
+        let n = parse_uri(uri).unwrap();
+        assert_eq!(n.name(), "SSR-Node");
+        let y = n.to_yaml();
+        assert!(y.contains("type: ssr"), "{y}");
+        assert!(y.contains("server: 127.0.0.1"), "{y}");
+        assert!(y.contains("port: 8888"), "{y}");
+        assert!(y.contains("password: \"password123\""), "{y}");
+        assert!(y.contains("cipher: aes-128-cfb"), "{y}");
+        assert!(y.contains("protocol: auth_aes128_md5"), "{y}");
+        assert!(y.contains("obfs: http_simple"), "{y}");
+        assert!(y.contains("obfs-param: \"www.bing.com\""), "{y}");
+
+        let nodes = parse_subscription(uri);
         assert_eq!(nodes.len(), 1);
     }
 
@@ -839,5 +1047,39 @@ vless://u@h2.com:443?security=tls&sni=h2.com&type=ws&path=/v&host=h2.com#v1";
         // 验证可被 serde_yaml 解析
         let v: serde_yaml::Value = serde_yaml::from_str(&cfg).unwrap();
         assert!(v.get("proxies").is_some());
+    }
+
+    #[test]
+    fn proxy_provider_payload_parsing() {
+        // 1. Clash YAML 格式 + filter 过滤
+        let yaml = r#"
+proxies:
+  - name: "HK-01"
+    type: ss
+    server: 1.1.1.1
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw1
+  - name: "US-01"
+    type: ss
+    server: 2.2.2.2
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw2
+"#;
+        let all = parse_provider_proxies(yaml, None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let filtered = parse_provider_proxies(yaml, Some("^HK")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "HK-01");
+
+        // 2. Base64 订阅链接格式
+        use base64::Engine;
+        let raw = "trojan://pw@h.com:443#JP-01\ntrojan://pw@h2.com:443#SG-01\n";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let from_b64 = parse_provider_proxies(&b64, Some("SG")).unwrap();
+        assert_eq!(from_b64.len(), 1);
+        assert_eq!(from_b64[0].name, "SG-01");
     }
 }

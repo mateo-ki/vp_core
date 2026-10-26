@@ -32,6 +32,8 @@ pub struct TunConfig {
     /// fake-ip 池网段
     pub fake_ip_range: String,
     pub dns_hijack: bool,
+    /// 移动端 (Android VpnService / iOS) 注入的文件描述符
+    pub fd: Option<i32>,
 }
 
 impl Default for TunConfig {
@@ -42,6 +44,7 @@ impl Default for TunConfig {
             mtu: 1500,
             fake_ip_range: "198.18.0.0/16".into(),
             dns_hijack: true,
+            fd: None,
         }
     }
 }
@@ -53,6 +56,12 @@ pub struct TunInbound {
 
 impl TunInbound {
     pub fn new(cfg: TunConfig, tag: &str) -> Self {
+        TunInbound { cfg, tag: tag.into() }
+    }
+
+    pub fn new_with_fd(cfg: TunConfig, tag: &str, fd: i32) -> Self {
+        let mut cfg = cfg;
+        cfg.fd = Some(fd);
         TunInbound { cfg, tag: tag.into() }
     }
 }
@@ -83,6 +92,22 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
     );
     let resolver = Arc::new(Resolver::system());
 
+    if let Some(fd) = cfg.fd {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let tokio_file = tokio::fs::File::from_std(file);
+            info!("TUN 移动端模式已启动（外部 FD={fd}）: fakeip={}", cfg.fake_ip_range);
+            return run_with_device(cfg, tag, ctx, pool, resolver, tokio_file).await;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+            return Err(Error::Unsupported("外部 FD 注入仅在 Unix/移动端系统支持".into()));
+        }
+    }
+
     let mut tcfg = tun::Configuration::default();
     match cfg.address {
         IpAddr::V4(v4) => {
@@ -100,14 +125,28 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
     let dev = tun::create_as_async(&tcfg)
         .map_err(|e| Error::Other(format!("创建 TUN 设备失败（需要管理员权限）: {e}")))?;
 
-    let mut stack_cfg = IpStackConfig::default();
-    stack_cfg.mtu(cfg.mtu).map_err(|e| Error::Config(format!("MTU 非法: {e}")))?;
-    stack_cfg.packet_information(false);
-    let mut stack = IpStack::new(stack_cfg, dev);
     info!(
         "TUN 已启动: {} mtu={} fakeip={}",
         cfg.address, cfg.mtu, cfg.fake_ip_range
     );
+    run_with_device(cfg, tag, ctx, pool, resolver, dev).await
+}
+
+async fn run_with_device<D>(
+    cfg: TunConfig,
+    tag: Arc<str>,
+    ctx: InboundCtx,
+    pool: Arc<FakeIpPool>,
+    resolver: Arc<Resolver>,
+    dev: D,
+) -> Result<()>
+where
+    D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut stack_cfg = IpStackConfig::default();
+    stack_cfg.mtu(cfg.mtu).map_err(|e| Error::Config(format!("MTU 非法: {e}")))?;
+    stack_cfg.packet_information(false);
+    let mut stack = IpStack::new(stack_cfg, dev);
 
     loop {
         let stream = match stack.accept().await {

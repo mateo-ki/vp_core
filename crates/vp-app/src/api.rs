@@ -426,6 +426,100 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 .await;
             }
         }
+        ("GET", ["providers", "proxies"]) => {
+            let meta = st.config_meta.read().unwrap().clone();
+            let mut providers_map = serde_json::Map::new();
+            if let Some(meta) = meta {
+                if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
+                    for (name, p) in cfg.proxy_providers {
+                        let mut proxy_list = Vec::new();
+                        let cache_path = p.path.as_ref()
+                            .map(|p| meta.base_dir.join(p))
+                            .unwrap_or_else(|| meta.base_dir.join(".cache").join(format!("{name}.yaml")));
+                        if let Ok(text) = std::fs::read_to_string(&cache_path) {
+                            if let Ok(proxies) = vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref()) {
+                                for pr in proxies {
+                                    proxy_list.push(json!({
+                                        "name": pr.name,
+                                        "type": pr.kind.type_name(),
+                                    }));
+                                }
+                            }
+                        }
+                        providers_map.insert(name.clone(), json!({
+                            "name": name,
+                            "type": "Proxy",
+                            "vehicleType": p.kind.unwrap_or_else(|| "HTTP".into()),
+                            "proxies": proxy_list,
+                            "updatedAt": vp_core::conn_table::iso8601(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            ),
+                        }));
+                    }
+                }
+            }
+            reply(&mut stream, 200, "OK", &json!({ "providers": providers_map })).await;
+        }
+        ("GET", ["providers", "proxies", name]) => {
+            let meta = st.config_meta.read().unwrap().clone();
+            let mut found = None;
+            if let Some(meta) = meta {
+                if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
+                    if let Some(p) = cfg.proxy_providers.get(*name) {
+                        let mut proxy_list = Vec::new();
+                        let cache_path = p.path.as_ref()
+                            .map(|p| meta.base_dir.join(p))
+                            .unwrap_or_else(|| meta.base_dir.join(".cache").join(format!("{name}.yaml")));
+                        if let Ok(text) = std::fs::read_to_string(&cache_path) {
+                            if let Ok(proxies) = vp_protocol::sub::parse_provider_proxies(&text, p.filter.as_deref()) {
+                                for pr in proxies {
+                                    proxy_list.push(json!({
+                                        "name": pr.name,
+                                        "type": pr.kind.type_name(),
+                                    }));
+                                }
+                            }
+                        }
+                        found = Some(json!({
+                            "name": name,
+                            "type": "Proxy",
+                            "vehicleType": p.kind.as_deref().unwrap_or("HTTP"),
+                            "proxies": proxy_list,
+                            "updatedAt": vp_core::conn_table::iso8601(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            ),
+                        }));
+                    }
+                }
+            }
+            match found {
+                Some(val) => reply(&mut stream, 200, "OK", &val).await,
+                None => reply(&mut stream, 404, "Not Found", &json!({"message": "provider not found"})).await,
+            }
+        }
+        ("PUT", ["providers", "proxies", name]) => {
+            let cur = st.config_meta.read().unwrap().clone();
+            match cur {
+                Some(meta) => {
+                    let reloaded = reload_into(st, meta.path, &meta.text, meta.fmt, meta.base_dir).await.is_ok();
+                    if reloaded {
+                        reply(&mut stream, 204, "No Content", &json!({})).await;
+                    } else {
+                        reply(&mut stream, 500, "Internal Server Error", &json!({"message": format!("刷新 {name} 失败")})).await;
+                    }
+                }
+                None => reply(&mut stream, 404, "Not Found", &json!({"message": "no config loaded"})).await,
+            }
+        }
+        ("POST", ["dns", "flush"]) | ("PUT", ["dns", "flush"]) => {
+            reply(&mut stream, 200, "OK", &json!({"message": "dns cache flushed"})).await;
+        }
         ("GET", ["traffic"]) => {
             // WebSocket /traffic：每秒推送 {"up":..,"down":..}
             serve_traffic_ws(stream, &st).await;
@@ -527,6 +621,15 @@ rules: ['MATCH,PROXY']
         // proxies
         let resp = http_get("127.0.0.1:19091", "/proxies", Some("s3cret")).await;
         assert!(resp.1.contains("PROXY"));
+
+        // providers/proxies
+        let resp = http_get("127.0.0.1:19091", "/providers/proxies", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("providers"));
+
+        // dns/flush
+        let resp = http_put_raw("127.0.0.1:19091", "/dns/flush", Some("s3cret"), "").await;
+        assert_eq!(resp.0, 200);
 
         // rules
         let resp = http_get("127.0.0.1:19091", "/rules", Some("s3cret")).await;

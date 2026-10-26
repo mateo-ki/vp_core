@@ -13,7 +13,9 @@ use vp_core::Inbound;
 
 
 pub struct RedirInbound {
+    #[allow(dead_code)]
     bind: String,
+    #[allow(dead_code)]
     port: u16,
     tag: Arc<str>,
 }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use vp_common::{DstAddr, Error, Result};
 use vp_core::session::Session;
@@ -87,7 +87,7 @@ pub struct Hysteria2Outbound {
     password: String,
     sni: Option<String>,
     skip_verify: bool,
-    up_mbps: u32,
+    _up_mbps: u32,
     udp_session: AtomicU32,
 }
 
@@ -100,7 +100,7 @@ impl Hysteria2Outbound {
             password: cfg.password.clone(),
             sni: cfg.sni.clone().or(Some(cfg.server.clone())),
             skip_verify: cfg.skip_cert_verify,
-            up_mbps: 0,
+            _up_mbps: 0,
             udp_session: AtomicU32::new(1),
         })
     }
@@ -468,7 +468,6 @@ impl Hysteria2Inbound {
                 uni = conn.accept_uni() => {
                     let Ok(mut s) = uni else { break };
                     let mut tb = [0u8; 1];
-                    use tokio::io::AsyncReadExt;
                     if s.read_exact(&mut tb).await.is_err() {
                         continue;
                     }
@@ -607,7 +606,6 @@ impl Hysteria2Inbound {
         mut send: quinn::SendStream,
         ctx: &InboundCtx,
     ) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
         let dst = loop {
             match read_varint(&addr_buf) {
@@ -721,7 +719,6 @@ async fn read_h3_headers(
     recv: &mut quinn::RecvStream,
     buf: &mut Vec<u8>,
 ) -> Result<Vec<(String, String)>> {
-    use tokio::io::AsyncReadExt;
     loop {
         if let Some((ty, payload, _)) = crate::h3_min::parse_frame(buf) {
             if ty != crate::h3_min::FRAME_HEADERS {

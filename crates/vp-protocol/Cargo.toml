@@ -45,6 +45,7 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 chacha20 = { version = "0.10", features = ["legacy"] }
@@ -55,13 +56,14 @@ rcgen.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-default = ["socks5", "http", "ss", "vmess", "vless", "trojan", "plugin", "geoip"]
+default = ["socks5", "http", "ss", "vmess", "vless", "trojan", "snell", "plugin", "geoip"]
 socks5 = []
 http = []
 ss = []
 vmess = []
 vless = []
 trojan = []
+snell = []
 plugin = []
 geoip = ["vp-rule/geoip"]
 

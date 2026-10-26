@@ -26,6 +26,7 @@ httparse.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
 ureq.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

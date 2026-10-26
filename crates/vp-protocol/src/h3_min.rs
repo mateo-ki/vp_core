@@ -412,7 +412,6 @@ async fn open_h3_streams(conn: &quinn::Connection) -> Result<()> {
     write_varint(&mut buf, STREAM_CONTROL);
     write_varint(&mut buf, FRAME_SETTINGS);
     write_varint(&mut buf, 0); // 空 SETTINGS
-    use tokio::io::AsyncWriteExt;
     ctl.write_all(&buf).await.map_err(quic_io_err)?;
     // QPACK encoder/decoder 流（保持打开即可）
     for t in [STREAM_QPACK_ENCODER, STREAM_QPACK_DECODER] {
@@ -434,7 +433,6 @@ pub async fn auth_roundtrip(
     conn: &quinn::Connection,
     headers: &[(&str, &str)],
 ) -> Result<Vec<(String, String)>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     open_h3_streams(conn).await?;
     let (mut send, mut recv) = conn.open_bi().await.map_err(quic_io_err)?;
     send.write_all(&headers_frame(headers)).await.map_err(quic_io_err)?;
@@ -466,7 +464,6 @@ pub async fn auth_roundtrip(
 
 /// 服务端握手流初始化：控制流上回应空 SETTINGS
 pub async fn server_init_stream(mut s: quinn::SendStream, stream_type: u64) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     if stream_type == STREAM_CONTROL {
         let mut b = Vec::new();
         write_varint(&mut b, STREAM_CONTROL);
@@ -481,7 +478,6 @@ pub async fn server_init_stream(mut s: quinn::SendStream, stream_type: u64) -> R
 pub async fn read_request_headers(
     recv: &mut quinn::RecvStream,
 ) -> Result<Vec<(String, String)>> {
-    use tokio::io::AsyncReadExt;
     let mut buf = Vec::with_capacity(512);
     loop {
         // 先尽力解析帧
@@ -508,7 +504,6 @@ pub async fn write_response_headers(
     send: &mut quinn::SendStream,
     fields: &[(&str, &str)],
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     send.write_all(&headers_frame(fields)).await.map_err(quic_io_err)?;
     Ok(())
 }

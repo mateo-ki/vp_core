@@ -18,7 +18,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use vp_common::{DstAddr, Error, Host, Result};
 use vp_core::inbound::InboundCtx;
@@ -31,6 +30,7 @@ const T_AUTH: u8 = 0x00;
 const T_CONNECT: u8 = 0x01;
 const T_PACKET: u8 = 0x02;
 const T_DISSOCIATE: u8 = 0x03;
+#[allow(dead_code)]
 const T_HEARTBEAT: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
@@ -115,7 +115,7 @@ pub struct TuicOutbound {
     uuid: String,
     password: String,
     skip_verify: bool,
-    congestion_controller: Option<String>,
+    _congestion_controller: Option<String>,
     assoc_counter: AtomicU16,
 }
 
@@ -128,7 +128,7 @@ impl TuicOutbound {
             uuid: cfg.uuid.clone(),
             password: cfg.password.clone(),
             skip_verify: cfg.skip_cert_verify,
-            congestion_controller: cfg.congestion_controller.clone(),
+            _congestion_controller: cfg.congestion_controller.clone(),
             assoc_counter: AtomicU16::new(1),
         })
     }
@@ -203,7 +203,7 @@ impl Outbound for TuicOutbound {
             conn,
             assoc,
             pkt: AtomicU16::new(1),
-            reply_assoc: None,
+            _reply_assoc: None,
         }))
     }
 
@@ -218,7 +218,7 @@ struct TuicPacketConn {
     assoc: u16,
     pkt: AtomicU16,
     /// 服务端回包流
-    reply_assoc: Option<tokio::sync::Mutex<Option<quinn::RecvStream>>>,
+    _reply_assoc: Option<tokio::sync::Mutex<Option<quinn::RecvStream>>>,
 }
 
 #[async_trait]

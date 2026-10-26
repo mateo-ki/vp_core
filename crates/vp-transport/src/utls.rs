@@ -1456,19 +1456,23 @@ mod tests {
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello-utls");
 
-        // 大包（跨多记录分帧 + 对端分片回读）
+        // 大包（跨多记录分帧 + 并发回读避免 TCP 缓冲区死锁）
         let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
-        s.write_all(&payload).await.unwrap();
+        let (mut rh, mut wh) = tokio::io::split(s);
+        let send_payload = payload.clone();
+        let send_task = tokio::spawn(async move {
+            wh.write_all(&send_payload).await.unwrap();
+            wh.shutdown().await.unwrap();
+        });
         let mut got = Vec::with_capacity(payload.len());
         let mut rb = [0u8; 64 * 1024];
         while got.len() < payload.len() {
-            let n = s.read(&mut rb).await.unwrap();
+            let n = rh.read(&mut rb).await.unwrap();
             assert!(n > 0, "对端提前关闭");
             got.extend_from_slice(&rb[..n]);
         }
+        send_task.await.unwrap();
         assert_eq!(got, payload, "300KB 回显应逐字节一致");
-
-        s.shutdown().await.unwrap();
     }
 
     #[tokio::test]

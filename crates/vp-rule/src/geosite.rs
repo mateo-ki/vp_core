@@ -163,6 +163,7 @@ impl<'a> PbReader<'a> {
 }
 
 /// geosite 库：加载一次，按 tag 惰性编译 trie 并缓存
+#[derive(Clone)]
 pub struct GeoSiteDb {
     sites: HashMap<String, Vec<(SiteEntryKind, String)>>,
 }

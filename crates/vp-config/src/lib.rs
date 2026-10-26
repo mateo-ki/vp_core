@@ -111,6 +111,12 @@ proxies:
     uuid: b831381d-6324-4d53-ad4f-8cda48b30811
     flow: xtls-rprx-vision
     tls: true
+    servername: www.apple.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: "1111222233334444555566667777888899990000111"
+      short-id: "0123456789abcdef"
+      spider-x: "/"
     network: tcp
   - name: "tr1"
     type: trojan

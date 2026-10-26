@@ -1,6 +1,6 @@
 //! 配置 IR：Clash 兼容 schema（YAML / JSON 同构双前端）。
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 /// null 视为缺省（兼容手写配置中的空键）
@@ -321,8 +321,20 @@ pub struct VlessCfg {
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
     pub grpc_opts: Option<GrpcOpts>,
+    #[serde(alias = "reality-opts", alias = "reality_opts", default)]
+    pub reality_opts: Option<RealityOpts>,
     #[serde(default)]
     pub udp: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RealityOpts {
+    #[serde(alias = "public-key", alias = "publicKey", alias = "pbk")]
+    pub public_key: String,
+    #[serde(alias = "short-id", alias = "shortId", alias = "sid", default)]
+    pub short_id: Option<String>,
+    #[serde(alias = "spider-x", alias = "spiderX", alias = "spx", default)]
+    pub spider_x: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -344,6 +356,8 @@ pub struct TrojanCfg {
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
     pub grpc_opts: Option<GrpcOpts>,
+    #[serde(alias = "reality-opts", alias = "reality_opts", default)]
+    pub reality_opts: Option<RealityOpts>,
     #[serde(default)]
     pub udp: bool,
 }
@@ -545,6 +559,9 @@ pub enum GroupKind {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuleProviderCfg {
+    /// http / file
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
     /// domain / ipcidr / classical
     #[serde(default)]
     pub behavior: Option<String>,

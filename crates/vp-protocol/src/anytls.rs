@@ -291,6 +291,7 @@ impl AnytlsOutbound {
                 fingerprint: cfg.client_fingerprint.clone(),
                 ws: None,
                 grpc: None,
+                reality: None,
             },
         })
     }

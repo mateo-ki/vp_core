@@ -165,8 +165,7 @@ async fn main() {
                     .unwrap_or_else(|| "info".into())
             });
             init_logging(&level);
-            let dir = config.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-            let app = match vp_app::App::start(&text, fmt, &dir, true).await {
+            let app = match vp_app::App::start_from_file(&config, true).await {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("启动失败: {e}");
@@ -180,33 +179,63 @@ async fn main() {
             if let Some(c) = &app.controller {
                 println!("  controller: http://{c}");
             }
-            // SIGHUP 热重载 / SIGINT·SIGTERM 退出
+
+            // 跨平台文件变动检测（每秒检查一次 mtime）+ Unix SIGHUP / SIGINT·SIGTERM
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.tick().await; // 消耗初始即刻 tick
+            let mut last_mtime = std::fs::metadata(&config).ok().and_then(|m| m.modified().ok());
+
             #[cfg(unix)]
             {
-                let mut term = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate(),
-                )
-                .unwrap();
-                let mut hup = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::hangup(),
-                )
-                .unwrap();
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
                         _ = term.recv() => break,
                         Some(_) = hup.recv() => {
                             match app.reload().await {
-                                Ok(()) => println!("已热重载"),
-                                Err(e) => eprintln!("热重载失败（保留旧配置）: {e}"),
+                                Ok(()) => println!("✓ SIGHUP：配置已平滑热重载"),
+                                Err(e) => eprintln!("✗ SIGHUP：热重载失败（保留旧配置）: {e}"),
+                            }
+                        }
+                        _ = ticker.tick() => {
+                            if let Ok(m) = std::fs::metadata(&config).and_then(|m| m.modified()) {
+                                if last_mtime.map_or(false, |last| m > last) {
+                                    last_mtime = Some(m);
+                                    match app.reload().await {
+                                        Ok(()) => println!("✓ 配置文件变动，已平滑热重载"),
+                                        Err(e) => eprintln!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
+                                    }
+                                } else if last_mtime.is_none() {
+                                    last_mtime = Some(m);
+                                }
                             }
                         }
                     }
                 }
             }
+
             #[cfg(not(unix))]
             {
-                let _ = tokio::signal::ctrl_c().await;
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => break,
+                        _ = ticker.tick() => {
+                            if let Ok(m) = std::fs::metadata(&config).and_then(|m| m.modified()) {
+                                if last_mtime.map_or(false, |last| m > last) {
+                                    last_mtime = Some(m);
+                                    match app.reload().await {
+                                        Ok(()) => println!("✓ 配置文件变动，已平滑热重载"),
+                                        Err(e) => eprintln!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
+                                    }
+                                } else if last_mtime.is_none() {
+                                    last_mtime = Some(m);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             println!("bye");
         }

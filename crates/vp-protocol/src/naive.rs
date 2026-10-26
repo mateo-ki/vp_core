@@ -288,6 +288,7 @@ impl NaiveOutbound {
                 fingerprint: cfg.client_fingerprint.clone(),
                 ws: None,
                 grpc: None,
+                reality: None,
             },
             udp: cfg.udp,
         })

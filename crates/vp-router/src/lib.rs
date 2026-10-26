@@ -146,6 +146,19 @@ impl Router {
         &self.rules
     }
 
+    /// 仅替换规则引擎（复用现有 groups 与出站表，保持延迟历史与已选手工状态）
+    pub fn clone_with_rules(&self, rules: RuleEngine) -> Arc<Router> {
+        Arc::new(Router {
+            outbounds: self.outbounds.clone(),
+            groups: self.groups.clone(),
+            rules,
+            mode: self.mode,
+            dns: self.dns.clone(),
+            ipv6: self.ipv6,
+            global_outbound: self.global_outbound.clone(),
+        })
+    }
+
     /// 穿透组得到叶子节点名（API 展示 via）
     fn resolve_via(&self, outbound: &Arc<dyn Outbound>, sess: &Session) -> Arc<str> {
         let mut name: Arc<str> = outbound.name().into();

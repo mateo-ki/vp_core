@@ -88,6 +88,7 @@ universal-hash = "0.5"
 blake3 = "1"
 base64 = "0.22"
 rand = "0.9"
+x25519-dalek = { version = "2.0.0-rc.3", default-features = false, features = ["static_secrets"] }
 
 # 网络
 httparse = "1"

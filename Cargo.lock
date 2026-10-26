@@ -2564,6 +2564,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "vp-common",
  "vp-config",
  "vp-core",
@@ -2781,6 +2782,7 @@ dependencies = [
  "vp-common",
  "vp-core",
  "webpki-roots 0.26.11",
+ "x25519-dalek",
 ]
 
 [[package]]

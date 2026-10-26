@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct GeoIpDb {
     reader: Arc<maxminddb::Reader<Vec<u8>>>,
 }

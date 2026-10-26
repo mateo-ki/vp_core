@@ -16,7 +16,7 @@ pub struct ApiState {
     pub stats: Arc<vp_common::Stats>,
     pub conns: Arc<ConnTable>,
     pub secret: Option<String>,
-    pub config_text: RwLock<Option<(String, vp_config::Format, std::path::PathBuf)>>,
+    pub config_meta: Arc<RwLock<Option<crate::ConfigMeta>>>,
 }
 
 /// 监听已建立的 controller：启动 accept 循环（同步返回，切断类型环）
@@ -101,6 +101,7 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
 /// 热重载：重建 Router 并替换（失败保留旧配置）
 async fn reload_into(
     st: &ApiState,
+    path: Option<std::path::PathBuf>,
     text: &str,
     fmt: vp_config::Format,
     dir: std::path::PathBuf,
@@ -111,7 +112,12 @@ async fn reload_into(
         Err(e) => return Err(e.to_string()),
     };
     st.router.swap(app.router.current());
-    *st.config_text.write().unwrap() = Some((text.to_string(), fmt, dir));
+    *st.config_meta.write().unwrap() = Some(crate::ConfigMeta {
+        path,
+        text: text.to_string(),
+        fmt,
+        base_dir: dir,
+    });
     tracing::info!("API 热重载完成");
     Ok(())
 }
@@ -361,23 +367,50 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             .await;
         }
         ("PUT", ["configs"]) => {
-            // 热重载：PUT /configs?force= {"path": "..."} 或用启动时配置
-            let path_override = query_param(&req.query, "path");
-            let reloaded = if let Some(p) = path_override {
+            // 热重载：PUT /configs?path=... 或 JSON body {"path": "..."} 或重新读取当前配置
+            let mut target_path = query_param(&req.query, "path");
+            if target_path.is_none() && !req.body.is_empty() {
+                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                    if let Some(p) = val.get("path").and_then(|v| v.as_str()) {
+                        target_path = Some(p.to_string());
+                    }
+                }
+            }
+
+            let reloaded = if let Some(p) = target_path {
                 let base = std::path::PathBuf::from(&p);
-                let text = tokio::fs::read_to_string(&base).await.ok();
-                match text {
-                    Some(t) => {
+                match tokio::fs::read_to_string(&base).await {
+                    Ok(t) => {
                         let fmt = vp_config::Format::from_path(&p);
                         let dir = base.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-                        reload_into(&st, &t, fmt, dir).await.is_ok()
+                        reload_into(st, Some(base), &t, fmt, dir).await.is_ok()
                     }
-                    None => false,
+                    Err(e) => {
+                        tracing::warn!("读取路径 {p:?} 失败: {e}");
+                        false
+                    }
                 }
             } else {
-                let cur = st.config_text.read().unwrap().clone();
+                let cur = st.config_meta.read().unwrap().clone();
                 match cur {
-                    Some((t, fmt, dir)) => reload_into(&st, &t, fmt, dir).await.is_ok(),
+                    Some(meta) => {
+                        let (new_text, new_fmt, new_dir) = if let Some(ref path) = meta.path {
+                            match tokio::fs::read_to_string(path).await {
+                                Ok(t) => {
+                                    let fmt = vp_config::Format::from_path(&path.to_string_lossy());
+                                    let dir = path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+                                    (t, fmt, dir)
+                                }
+                                Err(e) => {
+                                    tracing::warn!("重读配置失败: {e}");
+                                    (meta.text, meta.fmt, meta.base_dir)
+                                }
+                            }
+                        } else {
+                            (meta.text, meta.fmt, meta.base_dir)
+                        };
+                        reload_into(st, meta.path, &new_text, new_fmt, new_dir).await.is_ok()
+                    }
                     None => false,
                 }
             };

@@ -160,11 +160,11 @@ where
         }
     };
     let dst = DstAddr::new(host.clone(), 80);
-    // 改写请求行（absolute-form → origin-form）
+    // 改写请求行（absolute-form → origin-form），保留首个 \r\n 与后续头
     let new_first_line = format!("{method} {rewritten} HTTP/1.1");
     let mut new_req = new_first_line.into_bytes();
     if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-        new_req.extend_from_slice(&buf[pos + 2..]);
+        new_req.extend_from_slice(&buf[pos..]);
     }
 
     // absolute-form：响应由远端直接透传，不做本地应答

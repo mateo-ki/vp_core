@@ -72,6 +72,35 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     }
 }
 
+/// 流式读取 QUIC varint（TCPResponse 字段边界可能落在任意字节处）。
+async fn read_varint_async(recv: &mut quinn::RecvStream) -> Result<(u64, usize)> {
+    let mut one = [0u8; 1];
+    recv.read_exact(&mut one)
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 varint: {e}"))))?;
+    let b0 = one[0];
+    let len = match b0 >> 6 {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    if len == 1 {
+        return Ok((b0 as u64, 1));
+    }
+    let mut b = [0u8; 8];
+    b[0] = b0 & 0x3f;
+    recv.read_exact(&mut b[1..len])
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 varint: {e}"))))?;
+    let v = match len {
+        2 => u16::from_be_bytes([b[0], b[1]]) as u64,
+        4 => u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64,
+        _ => u64::from_be_bytes(b),
+    };
+    Ok((v, len))
+}
+
 fn addr_text(dst: &DstAddr) -> String {
     dst.to_string()
 }
@@ -172,27 +201,27 @@ impl Outbound for Hysteria2Outbound {
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 写请求: {e}"))))?;
         // TCPResponse: [u8 status][varint |msg|][msg][varint |pad|][pad]
-        // 本实现两端 msg=pad=空 → 固定 3 字节（status + 两个单字节零 varint）
-        let mut head = [0u8; 3];
-        recv.read_exact(&mut head)
+        // 服务端普遍会带非零 padding —— pad 字段必须完整消费，否则数据流永久错位。
+        let mut status = [0u8; 1];
+        recv.read_exact(&mut status)
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读响应: {e}"))))?;
-        if head[0] != 0x00 {
+        if status[0] != 0x00 {
             return Err(Error::ProtoMsg("hy2 TCPResponse 错误".into()));
         }
-        let (msg_len, used) = read_varint(&head[1..]).ok_or(Error::Proto("hy2 varint"))?;
-        let extra = (used as isize - 2).max(0) as usize;
-        if extra > 0 {
-            let mut ex = vec![0u8; extra];
-            recv.read_exact(&mut ex)
-                .await
-                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2: {e}"))))?;
-        }
+        let (msg_len, _) = read_varint_async(&mut recv).await?;
         if msg_len > 0 {
-            let mut skip = vec![0u8; msg_len as usize];
-            recv.read_exact(&mut skip)
+            let mut msg = vec![0u8; msg_len as usize];
+            recv.read_exact(&mut msg)
                 .await
-                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 跳过消息: {e}"))))?;
+                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读消息: {e}"))))?;
+        }
+        let (pad_len, _) = read_varint_async(&mut recv).await?;
+        if pad_len > 0 {
+            let mut pad = vec![0u8; pad_len as usize];
+            recv.read_exact(&mut pad)
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 跳过 padding: {e}"))))?;
         }
         Ok(Box::new(QuicBiStream { send, recv }))
     }
@@ -916,17 +945,104 @@ mod tests {
         msg.push(1);
         write_varint(&mut msg, addr.len() as u64);
         msg.extend_from_slice(addr.as_bytes());
-        msg.extend_from_slice(b"");
-        // 解析（与 Hy2UdpConn::recv 相同布局）
         assert_eq!(
             u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]),
             0xdead_beef
         );
         let (alen, used) = read_varint(&msg[8..]).unwrap();
+        assert_eq!(alen, 10);
+        assert_eq!(used, 1);
         assert_eq!(
             std::str::from_utf8(&msg[8 + used..8 + used + alen as usize]).unwrap(),
             addr
         );
-        assert_eq!(&msg[8 + used + alen as usize..], b"");
+        assert_eq!(&msg[8 + used + alen as usize..], b"");
+    }
+}
+
+#[cfg(test)]
+mod real_node_probe {
+    use super::*;
+
+    /// 真实节点 hy2 QUIC 握手探针（#[ignore]，需要外网与可达 UDP）。
+    #[tokio::test]
+    #[ignore = "真实节点调试：需要外网"]
+    async fn hy2_real_quic_probe() {
+        let cfg = vp_config::Hysteria2Cfg {
+            server: "snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into(),
+            port: 21540,
+            password: "6c055d29-d726-4a3e-b875-28b5a5e92e12".into(),
+            sni: Some("snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into()),
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+        };
+        let out = Hysteria2Outbound::new(&cfg).expect("build");
+        let t0 = std::time::Instant::now();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(10), out.connect_quic()).await;
+        let (conn, _ep) = match r {
+            Err(_) => {
+                println!(
+                    "[{:.2}s] QUIC 握手 10s 超时 —— UDP 无响应",
+                    t0.elapsed().as_secs_f32()
+                );
+                return;
+            }
+            Ok(Err(e)) => {
+                println!("[{:.2}s] QUIC 握手 error: {e}", t0.elapsed().as_secs_f32());
+                return;
+            }
+            Ok(Ok(v)) => {
+                println!("[{:.2}s] QUIC 握手 OK", t0.elapsed().as_secs_f32());
+                v
+            }
+        };
+        let r = tokio::time::timeout(std::time::Duration::from_secs(8), out.auth(&conn)).await;
+        match r {
+            Err(_) => println!("[{:.2}s] auth 8s 超时", t0.elapsed().as_secs_f32()),
+            Ok(Err(e)) => println!("[{:.2}s] auth error: {e}", t0.elapsed().as_secs_f32()),
+            Ok(Ok(())) => println!(
+                "[{:.2}s] auth OK —— hy2 全链路握手通过",
+                t0.elapsed().as_secs_f32()
+            ),
+        }
+    }
+    /// hy2 数据面探针：connect_stream 后直接发 HTTP GET 并转储响应字节。
+    #[tokio::test]
+    #[ignore = "真实节点调试：需要外网"]
+    async fn hy2_real_data_probe() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cfg = vp_config::Hysteria2Cfg {
+            server: "snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into(),
+            port: 21540,
+            password: "6c055d29-d726-4a3e-b875-28b5a5e92e12".into(),
+            sni: Some("snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into()),
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+        };
+        let out = Hysteria2Outbound::new(&cfg).expect("build");
+        let dst = vp_common::DstAddr::new("www.gstatic.com", 80);
+        let sess = Session::new_tcp("probe".into(), None, dst.clone());
+        let mut s = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            out.connect_stream(&sess, &dst),
+        )
+        .await
+        .expect("connect 10s 超时")
+        .expect("connect error");
+        s.write_all(
+            b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        let mut buf = vec![0u8; 300];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(8), s.read(&mut buf)).await;
+        match n {
+            Err(_) => println!("读 8s 超时"),
+            Ok(Ok(0)) => println!("EOF"),
+            Ok(Ok(n)) => println!("{} 字节: {:02x?}", n, &buf[..n]),
+            Ok(Err(e)) => println!("read error: {e}"),
+        }
     }
 }

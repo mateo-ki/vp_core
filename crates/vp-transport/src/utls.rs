@@ -1162,7 +1162,10 @@ impl<S: tokio::io::AsyncRead + Unpin> UtlsStream<S> {
                     self.rx_closed = true;
                     Ok(false)
                 } else {
-                    let code = data.get(1).copied().unwrap_or(data.first().copied().unwrap_or(0));
+                    let code = data
+                        .get(1)
+                        .copied()
+                        .unwrap_or(data.first().copied().unwrap_or(0));
                     if data.is_empty() {
                         self.rx_closed = true;
                         Ok(false)

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use vp_common::{DstAddr, Error, Result};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
@@ -223,14 +223,16 @@ impl Group {
         if self.ty != GroupType::UrlTest && self.ty != GroupType::Fallback {
             return;
         }
-        if self.lazy {
-            return;
-        }
         let g = self.clone();
         tokio::spawn(async move {
+            // 无论是否设置 lazy，初始化均立即触发首轮健康测速，确保 selected 指向真实存活节点
+            g.probe_all().await;
+            if g.lazy {
+                return;
+            }
             loop {
-                g.probe_all().await;
                 tokio::time::sleep(Duration::from_secs(g.interval)).await;
+                g.probe_all().await;
             }
         });
     }
@@ -406,7 +408,50 @@ impl Outbound for Group {
             }
             return self.connect_relay(sess, dst).await;
         }
-        self.pick(sess).connect_stream(sess, dst).await
+
+        let primary_idx = self.pick_index(sess);
+        let primary = self.members[primary_idx.min(self.members.len() - 1)].clone();
+        match primary.connect_stream(sess, dst).await {
+            Ok(stream) => Ok(stream),
+            Err(first_err) => {
+                if (self.ty == GroupType::UrlTest || self.ty == GroupType::Fallback)
+                    && self.members.len() > 1
+                {
+                    warn!(
+                        "组 {} 选定节点 {} 连接失败: {first_err}，自动故障转移...",
+                        self.name, self.member_names[primary_idx]
+                    );
+                    {
+                        let mut alive = self.alive.lock().unwrap();
+                        if primary_idx < alive.len() {
+                            alive[primary_idx] = false;
+                        }
+                    }
+                    for (idx, member) in self.members.iter().enumerate() {
+                        if idx == primary_idx {
+                            continue;
+                        }
+                        match member.connect_stream(sess, dst).await {
+                            Ok(stream) => {
+                                info!(
+                                    "组 {} 故障转移成功 -> {}",
+                                    self.name, self.member_names[idx]
+                                );
+                                self.selected.store(idx, Ordering::Relaxed);
+                                return Ok(stream);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "组 {} 备用节点 {} 连接失败: {e}",
+                                    self.name, self.member_names[idx]
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(first_err)
+            }
+        }
     }
 
     async fn connect_over(

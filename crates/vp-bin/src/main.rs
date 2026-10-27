@@ -21,14 +21,22 @@ enum Cmd {
         /// 配置文件（.yaml / .yml / .json）
         #[arg(short, long)]
         config: PathBuf,
+        /// 工作目录 / 规则库目录（支持 -d / -D / --directory）
+        #[arg(short = 'd', short_alias = 'D', long, alias = "dir")]
+        directory: Option<PathBuf>,
         /// 日志级别覆盖（trace/debug/info/warn/error）
         #[arg(short, long)]
         log_level: Option<String>,
     },
     /// 校验配置
+    #[command(alias = "check")]
     Validate {
+        /// 配置文件（.yaml / .yml / .json）
         #[arg(short, long)]
         config: PathBuf,
+        /// 工作目录 / 规则库目录（支持 -d / -D / --directory）
+        #[arg(short = 'd', short_alias = 'D', long, alias = "dir")]
+        directory: Option<PathBuf>,
     },
     /// 全组测速
     Test {
@@ -80,7 +88,10 @@ fn init_logging(level: &str) {
 async fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Validate { config } => {
+        Cmd::Validate {
+            config,
+            directory: _,
+        } => {
             let text = match std::fs::read_to_string(&config) {
                 Ok(t) => t,
                 Err(e) => {
@@ -159,7 +170,11 @@ async fn main() {
                 }
             }
         }
-        Cmd::Run { config, log_level } => {
+        Cmd::Run {
+            config,
+            directory,
+            log_level,
+        } => {
             let text = std::fs::read_to_string(&config).unwrap_or_else(|e| {
                 eprintln!("读取 {} 失败: {e}", config.display());
                 std::process::exit(2);
@@ -173,13 +188,16 @@ async fn main() {
                     .unwrap_or_else(|| "info".into())
             });
             init_logging(&level);
-            let app = match vp_app::App::start_from_file(&config, true).await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("启动失败: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let app =
+                match vp_app::App::start_from_file_with_dir(&config, directory.as_deref(), true)
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("启动失败: {e}");
+                        std::process::exit(1);
+                    }
+                };
             println!("vpcore {} 已启动", env!("CARGO_PKG_VERSION"));
             for (tag, port) in &app.listen_ports {
                 println!("  {tag}: 127.0.0.1:{port}");

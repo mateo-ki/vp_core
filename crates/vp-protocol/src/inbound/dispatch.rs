@@ -74,7 +74,11 @@ pub async fn dispatch_stream(
             .rule
             .as_ref()
             .map(|r| format!("{} => {}", r.rule, r.target)),
-        chain: Some(res.via.clone()),
+        chain: Some(if outbound.name() != res.via.as_ref() {
+            Arc::from(format!("{} > {}", outbound.name(), res.via))
+        } else {
+            res.via.clone()
+        }),
         start: now_millis(),
     };
 

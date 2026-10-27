@@ -54,6 +54,7 @@ impl TrojanOutbound {
             &cfg.grpc_opts,
             &cfg.client_fingerprint,
             &cfg.reality_opts,
+            &cfg.http_opts,
         )?;
         Ok(TrojanOutbound {
             name: name.unwrap_or("trojan").into(),
@@ -298,6 +299,7 @@ mod tests {
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            http_opts: None,
             reality_opts: None,
             udp: false,
         })

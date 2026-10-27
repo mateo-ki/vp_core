@@ -45,76 +45,75 @@ impl GoHash for Sha256Go {
     }
 }
 
-type Shared = Rc<RefCell<dyn GoHash>>;
-
-/// hash2{parent}：Write/Sum 均转发给父对象
-struct Hash2 {
-    parent: Shared,
-}
-
-impl GoHash for Hash2 {
-    fn write(&mut self, data: &[u8]) {
-        self.parent.borrow_mut().write(data);
-    }
-    fn sum(&mut self) -> Vec<u8> {
-        self.parent.borrow_mut().sum()
-    }
-}
-
+/// Go `hmac.New(hashFactory, key)`：inner/outer 各调用一次 hashFactory。
+/// sing-vmess 的 factory（`h.parent.Create`）每次返回**全新**的 parent 实例，
+/// 因此每层的 ipad/opad 落在两个独立的 parent 对象中（对齐 mihomo/xray 实测互通语义）。
 struct GoHmac {
-    outer: Shared,
-    inner: Shared,
+    outer: Box<dyn GoHash>,
+    inner: Box<dyn GoHash>,
 }
 
 impl GoHmac {
-    /// 等价 Go hmac.New(hashFactory, key)
-    fn new_with_factory(factory: &dyn Fn() -> Shared, key: &[u8]) -> Rc<RefCell<GoHmac>> {
+    fn new(factory: &dyn Fn() -> Box<dyn GoHash>, key: &[u8]) -> Box<dyn GoHash> {
         const BLOCK: usize = 64;
-        debug_assert!(key.len() <= BLOCK, "vmess kdf path 均为短字符串");
         let mut ipad = vec![0x36u8; BLOCK];
         let mut opad = vec![0x5cu8; BLOCK];
-        for (i, b) in key.iter().enumerate() {
+        let padded: Vec<u8> = if key.len() > BLOCK {
+            let mut h = Sha256Go(Sha256::new());
+            GoHash::write(&mut h, key);
+            GoHash::sum(&mut h)
+        } else {
+            key.to_vec()
+        };
+        for (i, b) in padded.iter().enumerate() {
             ipad[i] ^= *b;
             opad[i] ^= *b;
         }
-        let h = GoHmac {
-            outer: factory(),
-            inner: factory(),
-        };
-        GoHash::write(&mut *h.inner.borrow_mut(), &ipad);
-        GoHash::write(&mut *h.outer.borrow_mut(), &opad);
-        Rc::new(RefCell::new(h))
+        let mut inner = factory();
+        let mut outer = factory();
+        GoHash::write(&mut *inner, &ipad);
+        GoHash::write(&mut *outer, &opad);
+        Box::new(GoHmac { outer, inner })
     }
 }
 
 impl GoHash for GoHmac {
     fn write(&mut self, data: &[u8]) {
-        self.inner.borrow_mut().write(data);
+        self.inner.write(data);
     }
     fn sum(&mut self) -> Vec<u8> {
-        let d = self.inner.borrow_mut().sum();
-        self.outer.borrow_mut().write(&d);
-        self.outer.borrow_mut().sum()
+        let d = self.inner.sum();
+        self.outer.write(&d);
+        self.outer.sum()
     }
 }
 
-/// v2ray aead.KDF：逐层以 path 为 key 包装父 hmac，最后写入 key 并 Sum。
+/// sing-vmess/xray KDF 链：level 0 为根 HMAC("VMess AEAD KDF")，
+/// 每向上一层以该层 value 为 key 包装（parent factory 生成独立实例）。
 fn kdf_go(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
-    let mut hmacf: Shared = GoHmac::new_with_factory(
-        &|| Rc::new(RefCell::new(Sha256Go(Sha256::new()))),
-        KDF_SALT.as_bytes(),
-    );
-    for p in paths {
-        let parent = hmacf.clone();
-        let factory = move || -> Shared {
-            Rc::new(RefCell::new(Hash2 {
-                parent: parent.clone(),
-            }))
-        };
-        hmacf = GoHmac::new_with_factory(&factory, p);
+    // 链 = 根("VMess AEAD KDF") → salt/path…（sing-vmess kdf.go 的 creator 链）
+    let mut levels: Vec<&[u8]> = vec![KDF_SALT.as_bytes()];
+    levels.extend_from_slice(paths);
+    fn leaf() -> Box<dyn GoHash> {
+        Box::new(Sha256Go(Sha256::new()))
     }
-    hmacf.borrow_mut().write(key);
-    hmacf.borrow_mut().sum()
+    fn create(level: usize, levels: Vec<Vec<u8>>) -> Box<dyn Fn() -> Box<dyn GoHash> + 'static> {
+        if level == 0 {
+            let v = levels[0].clone();
+            Box::new(move || GoHmac::new(&|| leaf(), &v))
+        } else {
+            let v = levels[level].clone();
+            Box::new(move || {
+                let parent = create(level - 1, levels.clone());
+                GoHmac::new(&|| parent(), &v)
+            })
+        }
+    }
+    let owned: Vec<Vec<u8>> = levels.iter().map(|l| l.to_vec()).collect();
+    let factory = create(owned.len() - 1, owned);
+    let mut hf = factory();
+    hf.write(key);
+    hf.sum()
 }
 
 pub fn kdf(key: &[u8], paths: &[&[u8]]) -> Vec<u8> {
@@ -241,10 +240,33 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
     Ok(out)
 }
 
-/// cmdKey = MD5(uuid bytes)
+/// cmdKey = MD5(uuid ‖ "c48619fe-8f02-49e0-b9e9-edf763e17e21")
+/// （对齐 xray `NewID` 与 sing-vmess `Key`；v2ray 老版的 MD5(uuid×4) 已弃用）
 pub fn uuid_to_cmd_key(uuid: &[u8; 16]) -> [u8; 16] {
     use md5::Digest;
-    Md5::digest(uuid).into()
+    let mut h = Md5::new();
+    h.update(uuid);
+    h.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+    h.finalize().into()
+}
+
+/// legacy（alterId>0）认证 key = MD5(uuid ‖ "16167dc8-...")（sing-vmess `AlterId`）
+pub fn uuid_alter_key(uuid: &[u8; 16]) -> [u8; 16] {
+    use md5::Digest;
+    let mut h = Md5::new();
+    h.update(uuid);
+    h.update(b"16167dc8-16b6-4e6d-b8bb-65dd68113a81");
+    let out: [u8; 16] = h.finalize().into();
+    if out == *uuid {
+        // sing-vmess：结果撞原 uuid 时再混入第三个常量
+        let mut h = Md5::new();
+        h.update(uuid);
+        h.update(b"16167dc8-16b6-4e6d-b8bb-65dd68113a81");
+        h.update(b"533eff8a-4113-4b10-b5ce-0f5d76b98cd2");
+        h.finalize().into()
+    } else {
+        out
+    }
 }
 
 /// responseBodyKey/IV = SHA256(requestBodyKey/IV)[:16]
@@ -253,6 +275,43 @@ pub fn sha256_16(input: &[u8]) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&d[..16]);
     out
+}
+
+// ---------------------------------------------------------------------------
+// VMess legacy（alterId>0）认证头派生 —— 对齐 sing-vmess writeHandshake
+// ---------------------------------------------------------------------------
+
+type HmacMd5 = hmac::Hmac<md5::Md5>;
+
+/// legacy 认证信息 = HMAC-MD5(K=alterKey, M=时间戳 8B BE)[:16]
+pub fn legacy_auth_id(alter_key: &[u8; 16], ts: u64) -> [u8; 16] {
+    use hmac::Mac;
+    let mut mac = <HmacMd5 as hmac::Mac>::new_from_slice(alter_key).expect("hmac-md5");
+    mac.update(&ts.to_be_bytes());
+    let out = mac.finalize().into_bytes();
+    out[..16].try_into().expect("hmac-md5 16B")
+}
+
+/// legacy 指令块 IV = MD5(时间戳 8B BE ×4)（sing-vmess：binary.Write ×4）
+pub fn legacy_req_iv(ts: u64) -> [u8; 16] {
+    use md5::Digest;
+    let mut h = Md5::new();
+    let tsb = ts.to_be_bytes();
+    for _ in 0..4 {
+        h.update(tsb);
+    }
+    h.finalize().into()
+}
+
+/// legacy 指令块 Key = MD5(UUID ‖ "c48619fe-...") = cmdKey（sing-vmess `Key`）
+pub fn legacy_req_key(uuid: &[u8; 16]) -> [u8; 16] {
+    uuid_to_cmd_key(uuid)
+}
+
+/// legacy 响应头 Key/IV = MD5(requestKey) / MD5(requestNonce)
+pub fn legacy_resp_keys(body_key: &[u8; 16], body_iv: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
+    use md5::Digest;
+    (Md5::digest(body_key).into(), Md5::digest(body_iv).into())
 }
 
 #[cfg(test)]
@@ -305,5 +364,84 @@ mod tests {
         assert_eq!(k.len(), 32);
         let a: [u8; 16] = Md5::digest([1u8; 16]).into();
         assert_eq!(&k[..16], &a);
+    }
+
+    #[test]
+    #[ignore = "抓包分析：需要 target/vm_cap_mh_aead.bin"]
+    fn decode_captured_auth() {
+        let data =
+            std::fs::read("D:/project/rust/vs/vpn-parser/target/vm_cap_mh_aead.bin").unwrap();
+        let auth: [u8; 16] = data[..16].try_into().unwrap();
+        let uuid = parse_uuid("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let cmd = uuid_to_cmd_key(&uuid);
+        println!("cmdkey(x4) = {}", hex(&cmd));
+        match decode_auth_id(&cmd, &auth) {
+            Some((ts, _)) => println!("AEAD authID 命中: cmdKey=x4, ts={ts}"),
+            None => println!("AEAD authID 未命中 (cmdKey=x4)"),
+        }
+        use md5::Digest;
+        let mut h = md5::Md5::new();
+        h.update(uuid);
+        let cmd1: [u8; 16] = h.finalize().into();
+        match decode_auth_id(&cmd1, &auth) {
+            Some((ts, _)) => println!("AEAD authID 命中: cmdKey=x1, ts={ts}"),
+            None => println!("AEAD authID 未命中 (cmdKey=x1)"),
+        }
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    use crate::{AeadKind, AnyAead};
+
+    #[test]
+    #[ignore = "xray 服务端逻辑验证 vpcore 抓包头"]
+    fn verify_captured_header_as_xray_server() {
+        let data = std::fs::read("D:/project/rust/vs/vpn-parser/target/vm_cap_vp.bin").unwrap();
+        println!("总长 {}", data.len());
+        let uuid = parse_uuid("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let cmd = uuid_to_cmd_key(&uuid);
+        let auth_id: [u8; 16] = data[..16].try_into().unwrap();
+        // xray GetAEAD: decode authID
+        match decode_auth_id(&cmd, &auth_id) {
+            Some((ts, _)) => println!("[1] authID decode OK ts={ts}"),
+            None => {
+                println!("[1] authID decode FAILED");
+                return;
+            }
+        }
+        let len_ct: [u8; 18] = data[16..34].try_into().unwrap();
+        let nonce8: [u8; 8] = data[34..42].try_into().unwrap();
+        let pay_ct = &data[42..];
+        let len_key = kdf16(&cmd, &[SALT_HEADER_LEN_KEY.as_bytes(), &auth_id, &nonce8]);
+        let len_nonce = kdf_x(
+            &cmd,
+            &[SALT_HEADER_LEN_IV.as_bytes(), &auth_id, &nonce8],
+            12,
+        );
+        let mut n12 = [0u8; 12];
+        n12.copy_from_slice(&len_nonce);
+        let aead = AnyAead::new(AeadKind::Aes128Gcm, &len_key).unwrap();
+        match aead.open_nonce(&n12, &len_ct, &auth_id) {
+            Ok(pt) => {
+                let l = u16::from_be_bytes([pt[0], pt[1]]) as usize;
+                println!(
+                    "[2] len 块 OK，明文长度={l}，payload ct 长={}（应 {}）",
+                    pay_ct.len(),
+                    l + 16
+                );
+                let pay_key = kdf16(&cmd, &[SALT_HEADER_KEY.as_bytes(), &auth_id, &nonce8]);
+                let pay_nonce = kdf_x(&cmd, &[SALT_HEADER_IV.as_bytes(), &auth_id, &nonce8], 12);
+                let mut pn12 = [0u8; 12];
+                pn12.copy_from_slice(&pay_nonce);
+                let paead = AnyAead::new(AeadKind::Aes128Gcm, &pay_key).unwrap();
+                match paead.open_nonce(&pn12, pay_ct, &auth_id) {
+                    Ok(p) => println!("[3] payload OK，{}B，明文头版本={:02x}", p.len(), p[0]),
+                    Err(e) => println!("[3] payload FAILED: {e}"),
+                }
+            }
+            Err(e) => println!("[2] len 块 FAILED: {e}"),
+        }
     }
 }

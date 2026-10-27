@@ -182,6 +182,7 @@ pub struct CompiledRule {
     pub raw: Arc<str>,
     pub target: Arc<str>,
     pub matcher: Matcher,
+    pub no_resolve: bool,
 }
 
 impl CompiledRule {
@@ -201,7 +202,11 @@ impl CompiledRule {
     }
 
     pub fn needs_dst_ip(&self) -> bool {
-        self.matcher.needs_dst_ip()
+        if self.no_resolve {
+            false
+        } else {
+            self.matcher.needs_dst_ip()
+        }
     }
 }
 
@@ -278,7 +283,7 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
         }
     }
     if errs.is_empty() {
-        let needs_ip = compiled.iter().any(|r| r.matcher.needs_dst_ip());
+        let needs_ip = compiled.iter().any(|r| r.needs_dst_ip());
         Ok(RuleEngine {
             rules: compiled,
             needs_ip,
@@ -314,6 +319,7 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
             raw: raw.into(),
             target,
             matcher: Matcher::MatchAll,
+            no_resolve: false,
         });
     }
     if ty == "SUB-RULE" {
@@ -345,6 +351,7 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
                     Matcher::SubRules(Arc::new(sub_compiled)),
                 ]),
             },
+            no_resolve: false,
         });
     }
     if matches!(ty.as_str(), "AND" | "OR" | "NOT") {
@@ -383,6 +390,7 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
                 op,
                 subs: Arc::new(subs),
             },
+            no_resolve: false,
         });
     }
 
@@ -392,11 +400,16 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
     }
     let payload = parts[1].trim();
     let target = check_target(parts[2].trim(), env, raw)?;
+    let no_resolve = parts
+        .iter()
+        .skip(3)
+        .any(|p| p.trim().eq_ignore_ascii_case("no-resolve"));
     let matcher = parse_plain_rule(&format!("{ty},{payload}"), env, depth, raw)?;
     Ok(CompiledRule {
         raw: raw.into(),
         target,
         matcher,
+        no_resolve,
     })
 }
 
@@ -494,7 +507,7 @@ fn parse_plain_rule(
                     return Ok(Matcher::NeverMatch);
                 }
             };
-            Ok(Matcher::GeoSite(Arc::new(site)))
+            Ok(Matcher::GeoSite(site))
         }
         "DST-PORT" | "SRC-PORT" => {
             let mut ranges = Vec::new();

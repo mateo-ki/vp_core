@@ -10,6 +10,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use crate::domain::DomainTrie;
 
@@ -165,7 +166,8 @@ impl<'a> PbReader<'a> {
 /// geosite 库：加载一次，按 tag 惰性编译 trie 并缓存
 #[derive(Clone)]
 pub struct GeoSiteDb {
-    sites: HashMap<String, Vec<(SiteEntryKind, String)>>,
+    sites: Arc<HashMap<String, Vec<(SiteEntryKind, String)>>>,
+    cache: Arc<RwLock<HashMap<String, Arc<CompiledSite>>>>,
 }
 
 impl GeoSiteDb {
@@ -178,16 +180,26 @@ impl GeoSiteDb {
                 .or_insert_with(Vec::new)
                 .extend(s.entries);
         }
-        Ok(GeoSiteDb { sites })
+        Ok(GeoSiteDb {
+            sites: Arc::new(sites),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        })
     }
 
     pub fn has(&self, tag: &str) -> bool {
         self.sites.contains_key(&tag.to_ascii_lowercase())
     }
 
-    /// 编译某 tag 为域名匹配集（trie + 正则）
-    pub fn compile(&self, tag: &str) -> Option<CompiledSite> {
-        let entries = self.sites.get(&tag.to_ascii_lowercase())?;
+    /// 编译某 tag 为域名匹配集（trie + 正则），结果自动常驻缓存
+    pub fn compile(&self, tag: &str) -> Option<Arc<CompiledSite>> {
+        let tag_lower = tag.to_ascii_lowercase();
+        {
+            let c = self.cache.read().unwrap();
+            if let Some(hit) = c.get(&tag_lower) {
+                return Some(hit.clone());
+            }
+        }
+        let entries = self.sites.get(&tag_lower)?;
         let mut trie = DomainTrie::new();
         let mut keywords: Vec<Box<str>> = Vec::new();
         let mut regexes: Vec<regex::Regex> = Vec::new();
@@ -203,11 +215,16 @@ impl GeoSiteDb {
                 }
             }
         }
-        Some(CompiledSite {
+        let compiled = Arc::new(CompiledSite {
             trie,
             keywords,
             regexes,
-        })
+        });
+        self.cache
+            .write()
+            .unwrap()
+            .insert(tag_lower, compiled.clone());
+        Some(compiled)
     }
 }
 

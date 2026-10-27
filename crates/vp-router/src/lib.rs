@@ -243,6 +243,7 @@ impl RouterTrait for Router {
                     }
 
                     if let Some((target, rule)) = r.match_target(&ctx) {
+                        tracing::debug!("Router::pick matched: target={target}, rule={rule}");
                         matched = Some((target.to_string(), rule.to_string()));
                         break;
                     }

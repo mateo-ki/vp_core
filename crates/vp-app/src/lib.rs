@@ -1202,6 +1202,7 @@ rules:
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            http_opts: None,
             reality_opts: None,
             udp: false,
         })
@@ -1301,6 +1302,7 @@ rules:
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            http_opts: None,
             udp: false,
         })
         .unwrap();
@@ -1367,6 +1369,7 @@ rules: ['MATCH,DIRECT']
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            http_opts: None,
             reality_opts: None,
             udp: false,
         })

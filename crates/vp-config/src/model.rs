@@ -12,6 +12,43 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// 数字字段宽容反序列化：真实订阅里 "0"/"443" 这类字符串数字很常见，
+/// 严格 u32/u16 会让整个内核因单个节点拒绝启动。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LenientNum {
+    Num(u64),
+    Str(String),
+}
+
+fn de_u64_lenient<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    match LenientNum::deserialize(deserializer)? {
+        LenientNum::Num(n) => Ok(n),
+        LenientNum::Str(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| D::Error::custom(format!("无效数字: {s}"))),
+    }
+}
+
+fn de_u32_lenient<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    de_u64_lenient(deserializer).map(|v| v as u32)
+}
+
+fn de_u16_lenient<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    de_u64_lenient(deserializer).map(|v| v as u16)
+}
+
 fn default_mode() -> Mode {
     Mode::Rule
 }
@@ -134,6 +171,7 @@ pub struct ListenerCfg {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     /// trojan: 密码列表；vmess/vless: uuid 列表；ss: 单密码
     #[serde(default)]
@@ -371,6 +409,18 @@ pub struct WsOpts {
     pub max_early_data: Option<u64>,
 }
 
+/// HTTP 伪装传输选项（Clash `http-opts`，network: "http"）。
+/// headers 的值是数组（mihomo 语义），序列化时取首个（或多值逗号连接）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HttpOpts {
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub path: Option<Vec<String>>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, Vec<String>>>,
+}
+
 /// shadow-tls v3 伪装选项。字段全 Option 以容忍其它插件（如 simple-obfs）的
 /// plugin-opts 形状——只在 plugin 为 shadow-tls 时才要求 host/password。
 #[derive(Debug, Clone, Deserialize)]
@@ -390,6 +440,7 @@ pub struct ShadowTlsCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SsCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub cipher: String,
     pub password: String,
@@ -405,9 +456,15 @@ pub struct SsCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VmessCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub uuid: String,
-    #[serde(alias = "alterId", alias = "alter_id", default)]
+    #[serde(
+        alias = "alterId",
+        alias = "alter_id",
+        default,
+        deserialize_with = "de_u32_lenient"
+    )]
     pub alter_id: u32,
     #[serde(alias = "cipher", alias = "security", default = "default_vmess_cipher")]
     pub cipher: String,
@@ -431,6 +488,8 @@ pub struct VmessCfg {
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
     pub grpc_opts: Option<GrpcOpts>,
+    #[serde(alias = "http-opts", alias = "http_opts", default)]
+    pub http_opts: Option<HttpOpts>,
     #[serde(default)]
     pub udp: bool,
 }
@@ -442,6 +501,7 @@ fn default_vmess_cipher() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VlessCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub uuid: String,
     #[serde(default)]
@@ -468,6 +528,8 @@ pub struct VlessCfg {
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(alias = "reality-opts", alias = "reality_opts", default)]
     pub reality_opts: Option<RealityOpts>,
+    #[serde(alias = "http-opts", alias = "http_opts", default)]
+    pub http_opts: Option<HttpOpts>,
     #[serde(default)]
     pub udp: bool,
 }
@@ -485,9 +547,11 @@ pub struct RealityOpts {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrojanCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub password: String,
-    #[serde(default)]
+    /// Clash 语义：trojan 天然 TLS，缺省即 true（显式 `tls: false` 仍可覆盖）
+    #[serde(default = "default_true")]
     pub tls: bool,
     #[serde(
         alias = "servername",
@@ -509,6 +573,8 @@ pub struct TrojanCfg {
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(alias = "reality-opts", alias = "reality_opts", default)]
     pub reality_opts: Option<RealityOpts>,
+    #[serde(alias = "http-opts", alias = "http_opts", default)]
+    pub http_opts: Option<HttpOpts>,
     #[serde(default)]
     pub udp: bool,
 }
@@ -517,6 +583,7 @@ pub struct TrojanCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SshCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub username: String,
     #[serde(default)]
@@ -532,6 +599,7 @@ pub struct SshCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MieruCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub username: String,
     pub password: String,
@@ -541,6 +609,7 @@ pub struct MieruCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BrookCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub password: String,
     /// UDP over TCP（brook 原生 UoT 模式）
@@ -562,6 +631,7 @@ pub struct SnellObfsOpts {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SnellCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub psk: String,
     #[serde(default = "default_snell_version")]
@@ -584,6 +654,7 @@ fn default_snell_version() -> u8 {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SsrCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub password: String,
     pub cipher: String,
@@ -611,6 +682,7 @@ fn default_ssr_obfs() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnytlsCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub password: String,
     #[serde(
@@ -633,6 +705,7 @@ pub struct AnytlsCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NaiveCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     #[serde(default)]
     pub username: String,
@@ -659,6 +732,7 @@ pub struct NaiveCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Hysteria2Cfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub password: String,
     #[serde(default)]
@@ -674,6 +748,7 @@ pub struct Hysteria2Cfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TuicCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub uuid: String,
     pub password: String,
@@ -695,6 +770,7 @@ pub struct TuicCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WgCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     #[serde(alias = "private-key", alias = "private_key")]
     pub private_key: String,
@@ -732,6 +808,7 @@ impl WgCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SocksCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     #[serde(default)]
     pub username: Option<String>,
@@ -746,6 +823,7 @@ pub struct SocksCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HttpCfg {
     pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     #[serde(default)]
     pub username: Option<String>,

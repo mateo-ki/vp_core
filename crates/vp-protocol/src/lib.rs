@@ -130,6 +130,7 @@ pub fn transport_of(
         &None,
         fingerprint,
         &None,
+        &None,
     )
 }
 
@@ -143,14 +144,35 @@ pub fn transport_of_full(
     grpc_opts: &Option<vp_config::GrpcOpts>,
     fingerprint: &Option<String>,
     reality_opts: &Option<vp_config::RealityOpts>,
+    http_opts: &Option<vp_config::HttpOpts>,
 ) -> Result<TransportConfig> {
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
         Some("ws") => Some(ws_config(ws_opts).unwrap_or_default()),
         Some("grpc") => None,
+        Some("http") => None,
         Some(other) => {
             return Err(Error::Unsupported(format!("传输 {other:?} 暂不支持")));
         }
+    };
+    let http = match network.as_deref() {
+        Some("http") => {
+            let o = http_opts.clone().unwrap_or_default();
+            Some(vp_transport::http::HttpConfig {
+                method: o.method.unwrap_or_else(|| "GET".into()),
+                path: o
+                    .path
+                    .and_then(|p| p.into_iter().next())
+                    .unwrap_or_else(|| "/".into()),
+                headers: o
+                    .headers
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(k, vs)| (k, vs.join(", ")))
+                    .collect(),
+            })
+        }
+        _ => None,
     };
     let grpc = match network.as_deref() {
         Some("grpc") => Some(vp_transport::grpc::GrpcConfig {
@@ -175,6 +197,7 @@ pub fn transport_of_full(
         skip_cert_verify,
         fingerprint: fingerprint.clone(),
         ws,
+        http,
         grpc,
         reality,
     })

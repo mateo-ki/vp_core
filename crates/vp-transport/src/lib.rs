@@ -1,6 +1,7 @@
-//! vp-transport：传输层（TCP / TLS / WebSocket）。
+//! vp-transport：传输层（TCP / TLS / WebSocket / HTTP 伪装）。
 
 pub mod grpc;
+pub mod http;
 pub mod quic;
 pub mod tls;
 pub mod utls;
@@ -8,6 +9,7 @@ pub mod ws;
 
 pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
 
+pub use http::{HttpConfig, HttpStream, http_handshake_client};
 pub use tls::{TlsClientConfig, connect_tls, tls_acceptor, tls_connect};
 pub use ws::{WsConfig, WsStream, ws_handshake_client, ws_handshake_server};
 
@@ -156,6 +158,8 @@ pub struct TransportConfig {
     pub fingerprint: Option<String>,
     /// network: "ws" 时启用 WebSocket
     pub ws: Option<WsConfig>,
+    /// network: "http" 时启用 HTTP 伪装传输
+    pub http: Option<http::HttpConfig>,
     /// network: "grpc" 时启用 gRPC（要求 TLS + ALPN h2）
     pub grpc: Option<grpc::GrpcConfig>,
     /// REALITY 认证扩展
@@ -220,11 +224,19 @@ pub async fn wrap_transport(
             let ws_stream = ws::ws_handshake_client(tls, server_host, ws).await?;
             return Ok(Box::new(ws_stream));
         }
+        if let Some(h) = &cfg.http {
+            let s = http::http_handshake_client(tls, server_host, h)?;
+            return Ok(Box::new(s));
+        }
         return Ok(tls);
     }
     if let Some(ws) = &cfg.ws {
         let ws_stream = ws::ws_handshake_client(stream, server_host, ws).await?;
         return Ok(Box::new(ws_stream));
+    }
+    if let Some(h) = &cfg.http {
+        let s = http::http_handshake_client(stream, server_host, h)?;
+        return Ok(Box::new(s));
     }
     Ok(stream)
 }

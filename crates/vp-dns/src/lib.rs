@@ -37,7 +37,7 @@ struct CacheInner {
 #[derive(Clone)]
 pub struct PolicyRule {
     pub trie: vp_rule::domain::DomainTrie,
-    pub geosite: Vec<vp_rule::geosite::CompiledSite>,
+    pub geosite: Vec<Arc<vp_rule::geosite::CompiledSite>>,
     pub resolver: Arc<Resolver>,
 }
 
@@ -48,7 +48,7 @@ pub struct CompiledFallbackFilter {
     pub geoip_matcher: Option<vp_rule::geoip::GeoIpMatcher>,
     pub ipcidr: vp_rule::ipset::IpIntervalSet,
     pub domain: vp_rule::domain::DomainTrie,
-    pub geosite: Vec<vp_rule::geosite::CompiledSite>,
+    pub geosite: Vec<Arc<vp_rule::geosite::CompiledSite>>,
 }
 
 /// DNS 解析器：多上游，UDP 优先 TCP 兜底；进程内共享缓存；支持 nameserver-policy 分流与 fallback-filter 污染过滤。
@@ -176,9 +176,13 @@ impl Resolver {
         // 1. Policy 路由检查：nameserver-policy 优先专有分流
         for rule in &self.policies {
             if rule.trie.is_match(domain) || rule.geosite.iter().any(|s| s.matches(domain)) {
-                let ips = Box::pin(rule.resolver.resolve_domain(domain, ipv6)).await?;
-                self.cache_store(key, ips.clone());
-                return Ok(ips);
+                if let Ok(ips) = Box::pin(rule.resolver.resolve_domain(domain, ipv6)).await {
+                    if !ips.is_empty() {
+                        self.cache_store(key, ips.clone());
+                        return Ok(ips);
+                    }
+                }
+                tracing::warn!("nameserver-policy 解析失败，平滑降级至主 DNS: {domain}");
             }
         }
 
@@ -277,15 +281,34 @@ impl Resolver {
         domain: &str,
         qtype: QType,
     ) -> Result<Vec<IpAddr>> {
-        let mut last_err = None;
+        if servers.is_empty() {
+            return Err(Error::Dns("无可用 DNS 服务器".into()));
+        }
+        if servers.len() == 1 {
+            return match query_server(&servers[0], domain, qtype).await {
+                Ok(ips) if !ips.is_empty() => Ok(ips),
+                Ok(_) => Err(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
+                Err(e) => Err(e),
+            };
+        }
+
+        let mut set = tokio::task::JoinSet::new();
         for server in servers {
-            match query_server(server, domain, qtype).await {
-                Ok(ips) if !ips.is_empty() => return Ok(ips),
-                Ok(_) => last_err = Some(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
-                Err(e) => last_err = Some(e),
+            let server = server.clone();
+            let domain = domain.to_string();
+            set.spawn(async move { query_server(&server, &domain, qtype).await });
+        }
+
+        let mut last_err = None;
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok(Ok(ips)) if !ips.is_empty() => return Ok(ips),
+                Ok(Ok(_)) => last_err = Some(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
+                Ok(Err(e)) => last_err = Some(e),
+                Err(e) => last_err = Some(Error::Dns(format!("DNS 任务失败: {e}"))),
             }
         }
-        Err(last_err.unwrap_or_else(|| Error::Dns("无可用 DNS 服务器".into())))
+        Err(last_err.unwrap_or_else(|| Error::Dns("全部 DNS 服务器查询失败".into())))
     }
 
     async fn system_lookup(&self, domain: &str) -> Result<Arc<Vec<IpAddr>>> {
@@ -467,7 +490,7 @@ async fn query_server(server: &ServerAddr, domain: &str, qtype: QType) -> Result
             )
             .await
         }
-        Proto::Doh => query_doh(server, domain, qtype).await,
+        Proto::Doh => with_timeout(query_doh(server, domain, qtype)).await,
     }
 }
 

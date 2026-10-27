@@ -38,6 +38,22 @@ pub struct Socks5Outbound {
     pub udp: bool,
 }
 
+/// 节点拨号（8s 超时）：与 vp_transport::dial 的 TCP 超时语义对齐
+async fn connect_node(server: &str, port: u16) -> Result<TcpStream> {
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        TcpStream::connect((server, port)),
+    )
+    .await
+    .map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("连接 {server}:{port} 超时"),
+        ))
+    })??;
+    Ok(tcp)
+}
+
 impl Socks5Outbound {
     /// 在任意流上完成 SOCKS5 握手（支持 relay 链）
     async fn handshake<S>(&self, mut io: S, dst: &DstAddr) -> Result<S>
@@ -111,8 +127,16 @@ impl Outbound for Socks5Outbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io = TcpStream::connect((self.server.as_str(), self.port)).await?;
-        Ok(Box::new(self.handshake(io, dst).await?))
+        let io = connect_node(&self.server, self.port).await?;
+        let hs = tokio::time::timeout(std::time::Duration::from_secs(10), self.handshake(io, dst))
+            .await
+            .map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "socks5 出站握手超时",
+                ))
+            })??;
+        Ok(Box::new(hs))
     }
 
     async fn connect_over(
@@ -121,7 +145,18 @@ impl Outbound for Socks5Outbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        Ok(Box::new(self.handshake(underlying, dst).await?))
+        let hs = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.handshake(underlying, dst),
+        )
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "socks5 出站握手超时",
+            ))
+        })??;
+        Ok(Box::new(hs))
     }
 
     fn support_udp(&self) -> bool {
@@ -206,7 +241,7 @@ impl Outbound for HttpOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let tcp = TcpStream::connect((self.server.as_str(), self.port)).await?;
+        let tcp = connect_node(&self.server, self.port).await?;
         let io: Box<dyn ProxyStream> = if self.tls {
             vp_transport::tls::connect_tls(
                 tcp,

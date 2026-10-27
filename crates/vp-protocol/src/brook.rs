@@ -773,7 +773,6 @@ impl Inbound for BrookInbound {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             if let Err(e) = this.serve(stream, src, &ctx).await {
-                                eprintln!("[dbg-srv] serve err: {e}");
                                 tracing::warn!("brook 入站会话结束: {e}");
                             }
                         });

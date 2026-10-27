@@ -5,8 +5,6 @@
 //! 因此这里用共享可变对象复刻 Go 语义，保证跨实现一致。
 
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use vp_common::{Error, Result};
 
@@ -54,6 +52,7 @@ struct GoHmac {
 }
 
 impl GoHmac {
+    #[allow(clippy::new_ret_no_self)]
     fn new(factory: &dyn Fn() -> Box<dyn GoHash>, key: &[u8]) -> Box<dyn GoHash> {
         const BLOCK: usize = 64;
         let mut ipad = vec![0x36u8; BLOCK];

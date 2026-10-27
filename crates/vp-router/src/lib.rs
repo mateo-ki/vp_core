@@ -196,36 +196,6 @@ impl Router {
         }
         name
     }
-
-    /// 构造匹配上下文（IP 规则在时解析 DNS）
-    async fn match_context<'a>(&'a self, sess: &'a Session) -> MatchCtx<'a> {
-        let mut dst_ip = match &sess.dst.host {
-            vp_common::Host::Ip(ip) => Some(*ip),
-            vp_common::Host::Domain(_) => None,
-        };
-        if dst_ip.is_none() && self.rules.needs_dst_ip() {
-            if let Ok(ips) = self.dns.resolve(&sess.dst.host, self.ipv6).await {
-                if let Some(first) = ips.first() {
-                    dst_ip = Some(*first);
-                }
-            }
-        }
-        MatchCtx {
-            host: sess.dst.host.as_domain(),
-            dst_ip,
-            src_ip: sess.src.map(|s| s.ip()),
-            dst_port: sess.dst.port,
-            src_port: sess.src.map(|s| s.port()).unwrap_or(0),
-            network: match sess.network {
-                vp_core::Network::Tcp => Net::Tcp,
-                vp_core::Network::Udp => Net::Udp,
-            },
-            process: sess.process.as_deref(),
-            inbound: &sess.inbound,
-            inbound_port: sess.inbound_port,
-            inbound_user: sess.inbound_user.as_deref(),
-        }
-    }
 }
 
 #[async_trait]
@@ -241,16 +211,52 @@ impl RouterTrait for Router {
             ),
             Mode::Global => (self.global_outbound.clone(), None),
             Mode::Rule => {
-                let ctx = self.match_context(sess).await;
-                match self.rules.r#match(&ctx) {
-                    Some(m) => {
+                let dst_ip = match &sess.dst.host {
+                    vp_common::Host::Ip(ip) => Some(*ip),
+                    vp_common::Host::Domain(_) => None,
+                };
+                let mut ctx = MatchCtx {
+                    host: sess.dst.host.as_domain(),
+                    dst_ip,
+                    src_ip: sess.src.map(|s| s.ip()),
+                    dst_port: sess.dst.port,
+                    src_port: sess.src.map(|s| s.port()).unwrap_or(0),
+                    network: match sess.network {
+                        vp_core::Network::Tcp => Net::Tcp,
+                        vp_core::Network::Udp => Net::Udp,
+                    },
+                    process: sess.process.as_deref(),
+                    inbound: &sess.inbound,
+                    inbound_port: sess.inbound_port,
+                    inbound_user: sess.inbound_user.as_deref(),
+                };
+
+                let mut matched = None;
+                for r in self.rules.rules() {
+                    // 仅当当前规则需要目标 IP，且尚未解析时，才惰性触发 DNS 解析（避免前置域名规则被阻塞）
+                    if ctx.dst_ip.is_none() && r.needs_dst_ip() {
+                        if let Ok(ips) = self.dns.resolve(&sess.dst.host, self.ipv6).await {
+                            if let Some(first) = ips.first() {
+                                ctx.dst_ip = Some(*first);
+                            }
+                        }
+                    }
+
+                    if let Some((target, rule)) = r.match_target(&ctx) {
+                        matched = Some((target.to_string(), rule.to_string()));
+                        break;
+                    }
+                }
+
+                match matched {
+                    Some((target, rule_str)) => {
                         let hit = RuleHit {
-                            rule: m.rule.to_string(),
-                            target: m.target.to_string(),
+                            rule: rule_str,
+                            target: target.clone(),
                         };
                         let ob = self
                             .outbounds
-                            .get(m.target)
+                            .get(&target)
                             .cloned()
                             .unwrap_or_else(|| self.global_outbound.clone());
                         (ob, Some(hit))

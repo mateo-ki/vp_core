@@ -158,7 +158,7 @@ impl Matcher {
     }
 
     /// 是否依赖目标 IP（决定路由器是否需要先解析 DNS）
-    fn needs_dst_ip(&self) -> bool {
+    pub fn needs_dst_ip(&self) -> bool {
         match self {
             Matcher::IpCidr { src: true, .. } => false,
             Matcher::IpCidr { src: false, .. } => true,
@@ -182,6 +182,27 @@ pub struct CompiledRule {
     pub raw: Arc<str>,
     pub target: Arc<str>,
     pub matcher: Matcher,
+}
+
+impl CompiledRule {
+    pub fn r#match(&self, ctx: &MatchCtx) -> bool {
+        self.matcher.r#match(ctx)
+    }
+
+    pub fn match_target<'a>(&'a self, ctx: &MatchCtx) -> Option<(&'a str, &'a str)> {
+        if !self.matcher.r#match(ctx) {
+            return None;
+        }
+        if let Some((target, rule)) = self.matcher.match_sub(ctx) {
+            Some((target, rule))
+        } else {
+            Some((&self.target, &self.raw))
+        }
+    }
+
+    pub fn needs_dst_ip(&self) -> bool {
+        self.matcher.needs_dst_ip()
+    }
 }
 
 pub struct MatchResult<'a> {

@@ -687,9 +687,7 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Ve
     let connector = webpki_connector(server.skip_verify);
     let sni = server_name(&server.host, addr.ip())?;
     let tcp = with_timeout(tokio::net::TcpStream::connect(addr)).await?;
-    eprintln!("[c] doh tcp connected");
     let mut tls = with_timeout(connector.connect(sni, tcp)).await?;
-    eprintln!("[c] doh tls ready");
 
     // 3) HTTP/1.1 POST（application/dns-message）
     let id = query_id();

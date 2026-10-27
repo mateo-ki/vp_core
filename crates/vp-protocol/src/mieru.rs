@@ -460,10 +460,6 @@ async fn write_data_segment<S: AsyncWrite + Unpin>(
 // SOCKS5 会话载荷
 // ---------------------------------------------------------------------------
 
-fn socks5_greeting() -> Vec<u8> {
-    vec![0x05, 0x01, 0x00]
-}
-
 fn socks5_request(dst: &DstAddr) -> Result<Vec<u8>> {
     let mut req = vec![0x05, 0x01, 0x00];
     encode_socks_addr(dst, &mut req);
@@ -475,28 +471,13 @@ fn socks5_success_reply() -> Vec<u8> {
     vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
 }
 
-/// SOCKS5 应答解析（greeting 应答 + CONNECT 应答，容忍合并/分片到达）
+/// SOCKS5 应答解析（官方客户端不发 greeting，直接回 CONNECT 应答；容忍合并/分片到达）
 #[derive(Default)]
-struct Socks5ReplyParser {
-    got_greeting: bool,
-}
+struct Socks5ReplyParser;
 
 impl Socks5ReplyParser {
     /// 喂入累积数据；Ok(true) 表示握手完成（已消费应答，剩余为数据）
     fn feed(&mut self, buf: &mut Vec<u8>) -> Result<bool> {
-        if !self.got_greeting {
-            if buf.len() < 2 {
-                return Ok(false);
-            }
-            if buf[0] != 0x05 {
-                return Err(Error::Proto("mieru: SOCKS5 应答版本错误"));
-            }
-            if buf[1] != 0x00 {
-                return Err(Error::Proto("mieru: SOCKS5 认证协商失败"));
-            }
-            buf.drain(..2);
-            self.got_greeting = true;
-        }
         if buf.len() < 4 {
             return Ok(false);
         }
@@ -578,9 +559,8 @@ impl MieruOutbound {
         let mut tx = MieruCipher::new(key, self.username.as_bytes());
         let session_id = random_u32();
 
-        // openSessionRequest：搭载 SOCKS5 greeting + CONNECT 请求
-        let mut req = socks5_greeting();
-        req.extend_from_slice(&socks5_request(dst)?);
+        // openSessionRequest：搭载 SOCKS5 CONNECT 请求（官方客户端不发 greeting）
+        let req = socks5_request(dst)?;
         write_session_segment(
             &mut io,
             &mut tx,
@@ -1105,41 +1085,15 @@ impl MieruInbound {
         let (mut tx, mut rx, session_id, mut socks_buf) = self.accept(&mut io).await?;
         let mut seq: u32 = 0;
         let mut next_recv: u32 = 1; // openSessionRequest 已消费 seq 0
-
-        // 1. SOCKS5 greeting（可能搭载在首段，也可能在后续数据段）
-        loop {
-            if socks_buf.len() >= 2 && socks_buf[0] == 0x05 {
-                let n = socks_buf[1] as usize;
-                if socks_buf.len() >= 2 + n {
-                    socks_buf.drain(..2 + n);
-                    write_data_segment(
-                        &mut io,
-                        &mut tx,
-                        DATA_S2C,
-                        session_id,
-                        seq,
-                        next_recv,
-                        &[0x05, 0x00],
-                    )
-                    .await?;
-                    seq += 1;
-                    break;
-                }
-            }
-            let (meta, payload) = read_segment(&mut io, &mut rx, false).await?;
-            match meta[0] {
-                DATA_C2S => {
-                    next_recv += 1;
-                    socks_buf.extend_from_slice(&payload);
-                }
-                CLOSE_SESSION_REQUEST | CLOSE_SESSION_RESPONSE => {
-                    return Err(Error::Proto("mieru: 客户端关闭会话"));
-                }
-                _ => {}
-            }
+        if std::env::var("VPCORE_DEBUG_MIERU").is_ok() {
+            eprintln!(
+                "mieru dbg: session_id={session_id} 首载荷({}B): {:02x?}",
+                socks_buf.len(),
+                &socks_buf[..socks_buf.len().min(48)]
+            );
         }
 
-        // 2. SOCKS5 CONNECT 请求
+        // 1. SOCKS5 CONNECT 请求（官方客户端不发 greeting，直接发请求）
         let dst = loop {
             if socks_buf.len() >= 4 && socks_buf[0] == 0x05 {
                 match decode_socks_addr(&socks_buf[3..]) {
@@ -1166,7 +1120,7 @@ impl MieruInbound {
             }
         };
 
-        // 3. 连接目标并回 SOCKS5 成功应答
+        // 2. 连接目标并回 SOCKS5 成功应答
         let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
         let mut remote = match self.direct.connect_stream(&sess, &dst).await {
             Ok(r) => r,

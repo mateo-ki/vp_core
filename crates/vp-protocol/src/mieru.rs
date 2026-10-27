@@ -575,7 +575,7 @@ impl MieruOutbound {
         // 服务端方向：同 key，独立 nonce 流
         let mut rx = MieruCipher::new(key, &[]);
         let mut rbuf: Vec<u8> = Vec::new();
-        let mut parser = Socks5ReplyParser::default();
+        let mut parser = Socks5ReplyParser;
         let mut first = true;
         loop {
             let (meta, payload) = read_segment(&mut io, &mut rx, first).await?;

@@ -8,9 +8,9 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use bytes::{BufMut, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use vp_common::{Error, Result};
+use bytes::BytesMut;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use vp_common::Result;
 
 const MAX_HEADER_BUF: usize = 16 * 1024;
 
@@ -72,20 +72,6 @@ pub struct HttpStream<S> {
     resp_head_parsed: bool,
     buf: BytesMut,
     out: BytesMut,
-}
-
-enum HeadWrite {
-    Done,
-    Pending,
-}
-
-impl<S> HttpStream<S> {
-    fn take_head(&mut self) -> HeadWrite {
-        if self.pending_head.is_none() {
-            return HeadWrite::Done;
-        }
-        HeadWrite::Pending
-    }
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for HttpStream<S> {

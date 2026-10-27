@@ -273,7 +273,7 @@ fn seal_header_legacy(uuid: &[u8; 16], ts: u64, plaintext: &[u8]) -> Result<Vec<
     let auth = kdf::legacy_auth_id(&alter_key, ts);
     let key = kdf::legacy_req_key(uuid);
     let iv = kdf::legacy_req_iv(ts);
-    let mut cfb = cfb_mode::Encryptor::<aes::Aes128>::new(&key.into(), &iv.into());
+    let cfb = cfb_mode::Encryptor::<aes::Aes128>::new(&key.into(), &iv.into());
     let mut ct = plaintext.to_vec();
     cfb.encrypt(&mut ct);
     let mut out = Vec::with_capacity(16 + ct.len());
@@ -364,61 +364,6 @@ fn build_response_header(
     Ok(out)
 }
 
-async fn read_response_header<S: AsyncRead + Unpin>(
-    resp_auth_expect: u8,
-    resp_key: &[u8; 16],
-    resp_iv: &[u8],
-    io: &mut S,
-    legacy: bool,
-) -> Result<()> {
-    if legacy {
-        // legacy 响应头：AES-128-CFB(K=MD5(requestKey), IV=MD5(requestNonce)) 解密
-        // [V][opt][?][cmdLen]；cmdLen>0 时后续 cmd 数据为裸字节（不经 CFB）
-        use cfb_mode::cipher::{AsyncStreamCipher, KeyIvInit};
-        let iv: [u8; 16] = resp_iv
-            .try_into()
-            .map_err(|_| Error::Proto("vmess resp iv"))?;
-        let mut cfb = cfb_mode::Decryptor::<aes::Aes128>::new(resp_key.into(), &iv.into());
-        let mut head = [0u8; 4];
-        io.read_exact(&mut head).await?;
-        cfb.decrypt(&mut head);
-        if head[0] != resp_auth_expect {
-            return Err(Error::Proto("vmess 响应认证不匹配"));
-        }
-        let cmd_len = head[3] as usize;
-        if cmd_len > 0 {
-            let mut cmd = vec![0u8; cmd_len];
-            io.read_exact(&mut cmd).await?;
-        }
-        return Ok(());
-    }
-    let mut len_ct = [0u8; 18];
-    io.read_exact(&mut len_ct).await?;
-    let len_key = kdf::kdf16(resp_key, &[kdf::SALT_RESP_LEN_KEY.as_bytes()]);
-    let len_nonce = kdf::kdf_x(resp_iv, &[kdf::SALT_RESP_LEN_IV.as_bytes()], 12);
-    let mut n12 = [0u8; 12];
-    n12.copy_from_slice(&len_nonce);
-    let aead = AnyAead::new(AeadKind::Aes128Gcm, &len_key)?;
-    let len_pt = aead
-        .open_nonce(&n12, &len_ct, b"")
-        .map_err(|_| Error::Proto("vmess 响应头长度块解密失败"))?;
-    let plen = u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize;
-    let mut pay_ct = vec![0u8; plen + 16];
-    io.read_exact(&mut pay_ct).await?;
-    let pay_key = kdf::kdf16(resp_key, &[kdf::SALT_RESP_KEY.as_bytes()]);
-    let pay_nonce = kdf::kdf_x(resp_iv, &[kdf::SALT_RESP_IV.as_bytes()], 12);
-    let mut pn12 = [0u8; 12];
-    pn12.copy_from_slice(&pay_nonce);
-    let pay_aead = AnyAead::new(AeadKind::Aes128Gcm, &pay_key)?;
-    let payload = pay_aead
-        .open_nonce(&pn12, &pay_ct, b"")
-        .map_err(|_| Error::Proto("vmess 响应头解密失败"))?;
-    if payload.len() < 2 || payload[0] != resp_auth_expect {
-        return Err(Error::Proto("vmess 响应认证不匹配"));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Body 流（AEAD 分块或明文+fnv 分块）
 // ---------------------------------------------------------------------------
@@ -455,6 +400,7 @@ struct VmessBodyCodec {
     base: [u8; 10],
     idx: u16,
     mask: Option<SizeMask>,
+    expected_ct_len: Option<usize>,
 }
 
 impl VmessBodyCodec {
@@ -466,6 +412,7 @@ impl VmessBodyCodec {
             base,
             idx: 0,
             mask: masked.then(|| SizeMask::new(iv16)),
+            expected_ct_len: None,
         })
     }
 
@@ -491,18 +438,31 @@ impl VmessBodyCodec {
         out
     }
 
-    /// 尝试从 buf 解出一条 payload；数据不足返回 None
+    /// 尝试从 buf 解出一条 payload；数据不足返回 None。
+    /// 必须缓存已解出的分块长度，不能在分片到达时反复消费 SizeMask XOF 流，
+    /// 否则会导致掩码失步与后续所有分块解密失败。
     fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
-        if buf.len() < 2 {
-            return None;
-        }
-        let mut ct_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if let Some(m) = self.mask.as_mut() {
-            ct_len ^= m.next_u16() as usize;
-        }
+        let ct_len = match self.expected_ct_len {
+            Some(len) => len,
+            None => {
+                if buf.len() < 2 {
+                    return None;
+                }
+                let mut ct_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                if let Some(m) = self.mask.as_mut() {
+                    ct_len ^= m.next_u16() as usize;
+                }
+                self.expected_ct_len = Some(ct_len);
+                ct_len
+            }
+        };
         let total = 2 + ct_len;
-        if buf.len() < total || ct_len < 16 {
+        if buf.len() < total {
             return None;
+        }
+        self.expected_ct_len = None;
+        if ct_len < 16 {
+            return Some(Err(Error::Proto("vmess 分块长度小于 AEAD 标签")));
         }
         let idx = self.idx;
         let data = match self.aead.open_nonce(&self.nonce(idx), &buf[2..total], b"") {
@@ -547,12 +507,14 @@ impl BodyCodec {
 /// Security::None 的明文分块：chunk = [2B 掩码后长度][fnv32][payload]
 struct PlainCodec {
     mask: Option<SizeMask>,
+    expected_plen: Option<usize>,
 }
 
 impl PlainCodec {
     fn new(iv16: &[u8; 16], masked: bool) -> Self {
         PlainCodec {
             mask: masked.then(|| SizeMask::new(iv16)),
+            expected_plen: None,
         }
     }
 
@@ -569,22 +531,31 @@ impl PlainCodec {
     }
 
     fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
-        if buf.len() < 2 {
+        let plen = match self.expected_plen {
+            Some(len) => len,
+            None => {
+                if buf.len() < 2 {
+                    return None;
+                }
+                let mut plen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+                if let Some(m) = self.mask.as_mut() {
+                    plen ^= m.next_u16() as usize;
+                }
+                self.expected_plen = Some(plen);
+                plen
+            }
+        };
+        let total = 2 + 4 + plen;
+        if buf.len() < total {
             return None;
         }
-        let mut plen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if let Some(m) = self.mask.as_mut() {
-            plen ^= m.next_u16() as usize;
-        }
-        if buf.len() < 6 + plen {
-            return None;
-        }
+        self.expected_plen = None;
         let fnv = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
-        let payload = &buf[6..6 + plen];
+        let payload = &buf[6..total];
         if kdf::fnv1a32(payload) != fnv {
             return Some(Err(Error::Proto("vmess 明文块 fnv 校验失败")));
         }
-        Some(Ok((payload.to_vec(), 6 + plen)))
+        Some(Ok((payload.to_vec(), total)))
     }
 }
 
@@ -613,7 +584,6 @@ struct RespHeader {
     auth_expect: u8,
     key: [u8; 16],
     iv: Vec<u8>,
-    legacy: bool,
     state: RespState,
 }
 
@@ -628,7 +598,6 @@ impl RespHeader {
             auth_expect,
             key,
             iv,
-            legacy,
             state,
         }
     }
@@ -674,7 +643,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
         io: &mut S2,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        use cfb_mode::cipher::AsyncStreamCipher;
         let Some(h) = slot.as_mut() else {
             return Poll::Ready(Ok(()));
         };
@@ -706,7 +674,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
                     };
                     let pt = match aead.open_nonce(&n12, buf, b"") {
                         Ok(p) => p,
-                        Err(e) => {
+                        Err(_e) => {
                             return Poll::Ready(Err(std::io::Error::other(
                                 Error::Proto("vmess 响应头长度块解密失败").to_string(),
                             )));
@@ -745,7 +713,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
                     };
                     let payload = match paead.open_nonce(&pn12, buf, b"") {
                         Ok(p) => p,
-                        Err(e) => {
+                        Err(_e) => {
                             return Poll::Ready(Err(std::io::Error::other(
                                 Error::Proto("vmess 响应头解密失败").to_string(),
                             )));
@@ -780,7 +748,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
                         h.iv.as_slice()
                             .try_into()
                             .map_err(|_| std::io::Error::other("vmess legacy iv"))?;
-                    let mut cfb =
+                    let cfb =
                         cfb_mode::Decryptor::<aes::Aes128>::new((&h.key).into(), (&iv16).into());
                     cfb.decrypt(buf);
                     if buf[0] != h.auth_expect {
@@ -981,13 +949,11 @@ impl VmessOutbound {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let header = seal_header_legacy(&self.uuid, ts, &pt)?;
-            use tokio::io::AsyncWriteExt;
             io.write_all(&header).await?;
             let (rk, riv) = kdf::legacy_resp_keys(&body_key, &body_iv);
             (rk, riv, true)
         } else {
             let header = seal_header(&self.cmd_key, &pt)?;
-            use tokio::io::AsyncWriteExt;
             io.write_all(&header).await?;
             let (rk, riv) = resp_keys(&body_key, &body_iv);
             (rk, riv, false)
@@ -1292,5 +1258,35 @@ mod tests {
             .await;
         let mut b = [0u8; 16];
         assert!(s.read(&mut b).await.is_err(), "错误用户的首次 read 应报错");
+    }
+
+    #[test]
+    fn test_vmess_codec_fragmented_stream() {
+        let key = [0x42u8; 16];
+        let iv = [0x24u8; 16];
+        let mut enc = BodyCodec::new(Security::Aes128Gcm, &key, &iv, true).unwrap();
+        let mut dec = BodyCodec::new(Security::Aes128Gcm, &key, &iv, true).unwrap();
+
+        let chunk1 = enc.seal_chunk(b"hello vmess chunk 1");
+        let chunk2 = enc.seal_chunk(b"second chunk with more data here");
+
+        let mut stream_bytes = Vec::new();
+        stream_bytes.extend_from_slice(&chunk1);
+        stream_bytes.extend_from_slice(&chunk2);
+
+        // 模拟网络逐字节到达：之前由于未缓存分块长度，每次字节不足都会重复调用 next_u16() 导致失步
+        let mut raw = bytes::BytesMut::new();
+        let mut decoded = Vec::new();
+        for b in stream_bytes {
+            raw.extend_from_slice(&[b]);
+            while let Some(res) = dec.try_open_chunk(&raw) {
+                let (payload, used) = res.expect("chunk should decode cleanly");
+                bytes::Buf::advance(&mut raw, used);
+                decoded.push(payload);
+            }
+        }
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(&decoded[0], b"hello vmess chunk 1");
+        assert_eq!(&decoded[1], b"second chunk with more data here");
     }
 }

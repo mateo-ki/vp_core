@@ -670,10 +670,7 @@ impl SshOutbound {
         match reply.first() {
             Some(&MSG_USERAUTH_SUCCESS) => Ok(()),
             Some(&MSG_USERAUTH_FAILURE) => Err(Error::Proto("ssh: 密码认证被拒绝")),
-            _ => {
-                eprintln!("[dbg] auth reply: {reply:02x?}");
-                Err(Error::Proto("ssh: 认证应答异常"))
-            }
+            _ => Err(Error::Proto("ssh: 认证应答异常")),
         }
     }
 

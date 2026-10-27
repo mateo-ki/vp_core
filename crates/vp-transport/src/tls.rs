@@ -179,23 +179,25 @@ mod tests {
 
     #[tokio::test]
     async fn tls_real_node_connect() {
+        let node = match std::env::var("VPCORE_DEBUG_TLS_NODE") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => return, // 未提供真实节点调试环境变量，优雅跳过
+        };
         let tcp = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            tokio::net::TcpStream::connect("119.28.24.235:3128"),
+            tokio::net::TcpStream::connect(&node),
         )
         .await
         {
             Ok(Ok(s)) => s,
-            _ => {
-                eprintln!("Cannot connect TCP to node (offline or timeout), skipping");
-                return;
-            }
+            _ => return,
         };
+        let host = node.split(':').next().unwrap_or("example.com");
         let client_res = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             tls_connect(
                 tcp,
-                "119.28.24.235",
+                host,
                 &TlsClientConfig {
                     skip_cert_verify: true,
                     ..Default::default()
@@ -206,10 +208,7 @@ mod tests {
 
         let mut client = match client_res {
             Ok(Ok(c)) => c,
-            _ => {
-                eprintln!("TLS handshake timeout or fail, skipping");
-                return;
-            }
+            _ => return,
         };
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

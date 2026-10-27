@@ -101,11 +101,22 @@ impl App {
 
     /// 从配置文件路径构建并启动
     pub async fn start_from_file(config_path: &Path, start_listeners: bool) -> Result<Arc<App>> {
+        Self::start_from_file_with_dir(config_path, None, start_listeners).await
+    }
+
+    /// 从配置文件路径与指定工作目录构建并启动
+    pub async fn start_from_file_with_dir(
+        config_path: &Path,
+        work_dir: Option<&Path>,
+        start_listeners: bool,
+    ) -> Result<Arc<App>> {
         let text = tokio::fs::read_to_string(config_path)
             .await
             .map_err(|e| Error::Config(format!("读取 {} 失败: {e}", config_path.display())))?;
         let fmt = Format::from_path(&config_path.to_string_lossy());
-        let base_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let base_dir = work_dir
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| config_path.parent().unwrap_or(Path::new(".")).to_path_buf());
         let app = Self::assemble(
             text,
             fmt,

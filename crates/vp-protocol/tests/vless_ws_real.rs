@@ -15,6 +15,7 @@ fn debug_node_yaml() -> Option<String> {
     std::env::var("VPCORE_DEBUG_NODE_YAML")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("../../target/debug_node.yaml").ok())
 }
 
 fn node_with_fp(fp: Option<&str>) -> Option<VlessCfg> {

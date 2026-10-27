@@ -182,7 +182,7 @@ impl Resolver {
                         return Ok(ips);
                     }
                 }
-                tracing::warn!("nameserver-policy 解析失败，平滑降级至主 DNS: {domain}");
+                tracing::debug!("nameserver-policy 解析失败，平滑降级至主 DNS: {domain}");
             }
         }
 
@@ -599,6 +599,16 @@ async fn query_tls(
 
 /// webpki 根证书连接器（DoT/DoH 共用）；skip=true 容忍自签
 fn webpki_connector(skip_verify: bool) -> tokio_rustls::TlsConnector {
+    static VERIFY: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    static NO_VERIFY: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    if skip_verify {
+        NO_VERIFY.get_or_init(|| build_webpki_connector(true)).clone()
+    } else {
+        VERIFY.get_or_init(|| build_webpki_connector(false)).clone()
+    }
+}
+
+fn build_webpki_connector(skip_verify: bool) -> tokio_rustls::TlsConnector {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
     };

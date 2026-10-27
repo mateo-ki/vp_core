@@ -35,6 +35,8 @@ pub struct TunConfig {
     pub dns_hijack: bool,
     /// 移动端 (Android VpnService / iOS) 注入的文件描述符
     pub fd: Option<i32>,
+    /// Windows Wintun 环形缓冲区容量（字节，必须为 2 的幂，范围 128KB ~ 64MB，默认 4MB: 0x400000）
+    pub ring_capacity: Option<u32>,
 }
 
 impl Default for TunConfig {
@@ -46,6 +48,7 @@ impl Default for TunConfig {
             fake_ip_range: "198.18.0.0/16".into(),
             dns_hijack: true,
             fd: None,
+            ring_capacity: None,
         }
     }
 }
@@ -149,6 +152,11 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
                 warn!("Wintun 驱动准备提示: {e}");
             }
         }
+        // 关键内存优化：Wintun 驱动默认分配 64MB (MAX_RING_CAPACITY) 发送环与接收环，
+        // 映射后直接占用 128MB+ 物理工作集。
+        // 将其调整为 4MB (0x400000) 即可支撑万兆吞吐，同时直接降低约 120MB 常驻内存！
+        let cap = cfg.ring_capacity.unwrap_or(0x400000);
+        tcfg.ring_capacity(cap);
     }
 
     let dev = tun::create_as_async(&tcfg)

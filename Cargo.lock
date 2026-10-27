@@ -2794,6 +2794,7 @@ dependencies = [
  "vp-core",
  "vp-dns",
  "vp-rule",
+ "vp-transport",
 ]
 
 [[package]]

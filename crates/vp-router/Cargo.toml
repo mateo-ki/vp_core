@@ -12,6 +12,7 @@ vp-core.workspace = true
 vp-config.workspace = true
 vp-rule.workspace = true
 vp-dns.workspace = true
+vp-transport.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

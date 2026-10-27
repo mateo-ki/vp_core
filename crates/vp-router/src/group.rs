@@ -2,7 +2,7 @@
 //! 组本身实现 Outbound，天然支持嵌套（构建期保证无环）。
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -199,6 +199,8 @@ impl Group {
             .iter()
             .position(|n| &**n == member)
             .ok_or_else(|| Error::Other(format!("成员 {member:?} 不存在")))?;
+        let sem = global_probe_semaphore().clone();
+        let _permit = sem.acquire().await.ok();
         let started = std::time::Instant::now();
         let ok = probe(&self.members[i], &self.test_url).await.is_ok();
         let ms = started.elapsed().as_millis() as u32;
@@ -219,17 +221,22 @@ impl Group {
     }
 
     /// 启动后台健康检查（url-test / fallback 且非 lazy）
-    pub fn start_health_checks(self: &Arc<Self>) {
+    pub fn start_health_checks(self: &Arc<Self>, group_index: usize) {
         if self.ty != GroupType::UrlTest && self.ty != GroupType::Fallback {
             return;
         }
         let g = self.clone();
         tokio::spawn(async move {
-            // 无论是否设置 lazy，初始化均立即触发首轮健康测速，确保 selected 指向真实存活节点
-            g.probe_all().await;
+            // lazy 策略组不主动发起全量首轮探活，只有在真实请求触发或手动测速时才探活；
+            // 避免 49 个甚至更多策略组在启动时并发雪崩。
             if g.lazy {
                 return;
             }
+            // 针对非 lazy 组按序号错峰启动（每组错开 150ms）
+            if group_index > 0 {
+                tokio::time::sleep(Duration::from_millis((group_index as u64) * 150)).await;
+            }
+            g.probe_all().await;
             loop {
                 tokio::time::sleep(Duration::from_secs(g.interval)).await;
                 g.probe_all().await;
@@ -242,8 +249,8 @@ impl Group {
         if n == 0 {
             return;
         }
-        // 高并发测速池（信号量并发度 128，既能数十秒内跑完上万节点，又不会耗尽系统文件句柄）
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(128));
+        // 全局共享限流信号量（全进程限额 32，消除海量组并发导致的套接字耗尽与内存尖峰）
+        let semaphore = global_probe_semaphore().clone();
         let mut tasks = Vec::with_capacity(n);
         for m in &self.members {
             let m = m.clone();
@@ -360,7 +367,13 @@ async fn probe(o: &Arc<dyn Outbound>, url: &str) -> Result<Duration> {
         let dst = DstAddr::new(host.clone(), port);
         let sess = Session::new_tcp("healthcheck".into(), None, dst.clone());
         let started = std::time::Instant::now();
-        let mut stream = o.connect_stream(&sess, &dst).await?;
+        let stream = o.connect_stream(&sess, &dst).await?;
+        let is_https = port == 443 || url.starts_with("https://");
+        let mut stream: Box<dyn ProxyStream> = if is_https {
+            vp_transport::tls::connect_tls(stream, &host, false, None).await?
+        } else {
+            stream
+        };
         let req = format!(
             "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
         );
@@ -371,6 +384,11 @@ async fn probe(o: &Arc<dyn Outbound>, url: &str) -> Result<Duration> {
     })
     .await
     .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timeout")))?
+}
+
+static PROBE_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+fn global_probe_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    PROBE_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
 }
 
 fn parse_test_url(url: &str) -> Result<(String, u16, String)> {
@@ -427,10 +445,29 @@ impl Outbound for Group {
                             alive[primary_idx] = false;
                         }
                     }
-                    for (idx, member) in self.members.iter().enumerate() {
-                        if idx == primary_idx {
-                            continue;
+
+                    // 优先选择健康检查确认存活的节点，并限制单次连接重试不超过 2 次，
+                    // 避免大量连续超时拖垮客户端连接导致 ERR_TUNNEL_CONNECTION_FAILED
+                    let candidates: Vec<usize> = {
+                        let alive = self.alive.lock().unwrap();
+                        let mut alives = Vec::new();
+                        let mut others = Vec::new();
+                        for (idx, _) in self.members.iter().enumerate() {
+                            if idx == primary_idx {
+                                continue;
+                            }
+                            if alive.get(idx).copied().unwrap_or(false) {
+                                alives.push(idx);
+                            } else {
+                                others.push(idx);
+                            }
                         }
+                        alives.extend(others);
+                        alives.into_iter().take(2).collect()
+                    };
+
+                    for idx in candidates {
+                        let member = &self.members[idx];
                         match member.connect_stream(sess, dst).await {
                             Ok(stream) => {
                                 info!(
@@ -438,6 +475,12 @@ impl Outbound for Group {
                                     self.name, self.member_names[idx]
                                 );
                                 self.selected.store(idx, Ordering::Relaxed);
+                                {
+                                    let mut alive = self.alive.lock().unwrap();
+                                    if idx < alive.len() {
+                                        alive[idx] = true;
+                                    }
+                                }
                                 return Ok(stream);
                             }
                             Err(e) => {

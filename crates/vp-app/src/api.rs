@@ -179,7 +179,8 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
         }
     }
     let router = st.router.current();
-    let segs: Vec<&str> = req.path.trim_matches('/').split('/').collect();
+    let decoded_path = url_decode(&req.path);
+    let segs: Vec<&str> = decoded_path.trim_matches('/').split('/').collect();
 
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["version"]) => {
@@ -196,23 +197,36 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
         ("GET", ["proxies"]) => {
             let mut proxies = serde_json::Map::new();
             for (name, g) in router.groups() {
-                proxies.insert(
-                    name.clone(),
-                    json!({
-                        "type": g.ty().as_str(),
-                        "now": g.selected_name(),
-                        "all": g.member_names().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    }),
-                );
+                let mut item = json!({
+                    "name": name,
+                    "type": g.ty().as_str(),
+                    "now": g.selected_name(),
+                    "all": g.member_names().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                });
+                let states = g.member_states();
+                let selected = g.selected_name();
+                if let Some((_, delay, alive)) = states.iter().find(|(n, _, _)| *n == selected) {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("alive".into(), json!(alive));
+                        if let Some(ms) = delay {
+                            obj.insert("history".into(), json!([{"time": "now", "delay": ms}]));
+                        }
+                    }
+                }
+                proxies.insert(name.clone(), item);
             }
-            // 直连节点
+            // 直连节点与各组探测到的成员延迟状态
             for g in router.groups().values() {
-                for m in g.member_names() {
-                    if !proxies.contains_key(&*m.to_string()) {
-                        proxies.insert(
-                            m.to_string(),
-                            json!({ "type": "Static", "name": m.to_string(), "all": [] }),
-                        );
+                let states = g.member_states();
+                for (m, delay, alive) in states {
+                    let entry = proxies.entry(m.to_string()).or_insert_with(|| {
+                        json!({ "type": "Static", "name": m.to_string(), "all": [] })
+                    });
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("alive".into(), json!(alive));
+                        if let Some(ms) = delay {
+                            obj.insert("history".into(), json!([{"time": "now", "delay": ms}]));
+                        }
                     }
                 }
             }
@@ -220,17 +234,23 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
         }
         ("GET", ["proxies", name]) => {
             if let Some(g) = router.get_group(name) {
-                reply(
-                    &mut stream,
-                    200,
-                    "OK",
-                    &json!({
-                        "type": g.ty().as_str(),
-                        "now": g.selected_name(),
-                        "all": g.member_names().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    }),
-                )
-                .await;
+                let mut item = json!({
+                    "name": name,
+                    "type": g.ty().as_str(),
+                    "now": g.selected_name(),
+                    "all": g.member_names().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                });
+                let states = g.member_states();
+                let selected = g.selected_name();
+                if let Some((_, delay, alive)) = states.iter().find(|(n, _, _)| *n == selected) {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("alive".into(), json!(alive));
+                        if let Some(ms) = delay {
+                            obj.insert("history".into(), json!([{"time": "now", "delay": ms}]));
+                        }
+                    }
+                }
+                reply(&mut stream, 200, "OK", &item).await;
             } else {
                 reply(
                     &mut stream,
@@ -743,7 +763,19 @@ rules: ['MATCH,PROXY']
         )
         .await;
         assert!(resp.0 == 204, "{resp:?}");
+
+        // 验证 URL 编码策略组名访问（例如 %50%52%4F%58%59 即 PROXY）
+        let resp = http_get("127.0.0.1:19091", "/proxies/%50%52%4F%58%59", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("PROXY"));
         let _ = app;
+    }
+
+    #[test]
+    fn test_url_decode_percent_utf8() {
+        assert_eq!(url_decode("%E7%BE%8E%E5%9B%BD%E8%8A%82%E7%82%B9"), "美国节点");
+        assert_eq!(url_decode("%E6%B5%8B%E8%AF%95+name"), "测试 name");
+        assert_eq!(url_decode("PROXY"), "PROXY");
     }
 
     async fn http_put_raw(

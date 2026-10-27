@@ -138,8 +138,8 @@ impl Router {
             global_outbound,
         });
 
-        for g in router.groups.values() {
-            g.start_health_checks();
+        for (idx, g) in router.groups.values().enumerate() {
+            g.start_health_checks(idx);
         }
         Ok(router)
     }

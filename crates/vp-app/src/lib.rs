@@ -577,6 +577,7 @@ impl App {
                         fake_ip_range: tun_cfg.fake_ip_range.clone(),
                         dns_hijack: true,
                         fd: tun_cfg.fd,
+                        ring_capacity: tun_cfg.ring_capacity,
                     };
                     let tun_in: Arc<dyn vp_core::Inbound> =
                         Arc::new(vp_tun::TunInbound::new(t, "tun"));

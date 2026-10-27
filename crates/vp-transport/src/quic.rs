@@ -30,10 +30,8 @@ pub struct QuicStream {
 }
 
 fn client_config(skip_verify: bool, alpn: &str) -> quinn::ClientConfig {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(crate::tls::global_root_store().clone())
         .with_no_client_auth();
     if skip_verify {
         crypto

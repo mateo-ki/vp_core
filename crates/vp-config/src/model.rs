@@ -219,6 +219,9 @@ pub struct TunCfg {
     /// 移动端 (Android / iOS) 外部注入的文件描述符
     #[serde(default)]
     pub fd: Option<i32>,
+    /// Windows Wintun 环形缓冲区容量（字节，必须为 2 的幂，范围 128KB ~ 64MB，默认 4MB: 0x400000）
+    #[serde(alias = "ring-capacity", alias = "ring_capacity", default)]
+    pub ring_capacity: Option<u32>,
 }
 
 impl Default for TunCfg {
@@ -232,6 +235,7 @@ impl Default for TunCfg {
             auto_route: false,
             auto_redirect: None,
             fd: None,
+            ring_capacity: None,
         }
     }
 }

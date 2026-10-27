@@ -61,17 +61,83 @@ impl ServerCertVerifier for NoVerify {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TlsClientConfig {
     pub skip_cert_verify: bool,
     pub server_name: Option<String>,
     pub alpn: Vec<String>,
 }
 
-fn root_store() -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    roots
+/// 全局共享根证书库：避免每次 TLS 握手重复解析 140+ 根证书
+pub fn global_root_store() -> &'static Arc<RootCertStore> {
+    static ROOT_STORE: std::sync::OnceLock<Arc<RootCertStore>> = std::sync::OnceLock::new();
+    ROOT_STORE.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(roots)
+    })
+}
+
+/// 全局客户端连接器缓存：高频配置直接走无锁 OnceLock，消除海量 ClientConfig 分配
+pub fn get_tls_connector(skip_cert_verify: bool, alpn: &[String]) -> TlsConnector {
+    static DEFAULT_CONNECTOR: std::sync::OnceLock<TlsConnector> = std::sync::OnceLock::new();
+    static NO_VERIFY_CONNECTOR: std::sync::OnceLock<TlsConnector> = std::sync::OnceLock::new();
+    static H2_CONNECTOR: std::sync::OnceLock<TlsConnector> = std::sync::OnceLock::new();
+    static H2_NO_VERIFY_CONNECTOR: std::sync::OnceLock<TlsConnector> = std::sync::OnceLock::new();
+
+    if alpn.is_empty() {
+        if skip_cert_verify {
+            return NO_VERIFY_CONNECTOR
+                .get_or_init(|| build_connector(true, &[]))
+                .clone();
+        } else {
+            return DEFAULT_CONNECTOR
+                .get_or_init(|| build_connector(false, &[]))
+                .clone();
+        }
+    }
+
+    if alpn.len() == 2 && alpn[0] == "h2" && alpn[1] == "http/1.1" {
+        if skip_cert_verify {
+            return H2_NO_VERIFY_CONNECTOR
+                .get_or_init(|| build_connector(true, &["h2".into(), "http/1.1".into()]))
+                .clone();
+        } else {
+            return H2_CONNECTOR
+                .get_or_init(|| build_connector(false, &["h2".into(), "http/1.1".into()]))
+                .clone();
+        }
+    }
+
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<(bool, Vec<String>), TlsConnector>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    let key = (skip_cert_verify, alpn.to_vec());
+    {
+        let r = cache.read().unwrap();
+        if let Some(conn) = r.get(&key) {
+            return conn.clone();
+        }
+    }
+    let conn = build_connector(skip_cert_verify, alpn);
+    let mut w = cache.write().unwrap();
+    w.entry(key).or_insert_with(|| conn.clone()).clone()
+}
+
+fn build_connector(skip_cert_verify: bool, alpn: &[String]) -> TlsConnector {
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(global_root_store().clone())
+        .with_no_client_auth();
+    if skip_cert_verify {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerify));
+    }
+    if !alpn.is_empty() {
+        config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    }
+    TlsConnector::from(Arc::new(config))
 }
 
 /// 客户端流包装为 TLS
@@ -80,18 +146,7 @@ pub async fn tls_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
     host: &str,
     cfg: &TlsClientConfig,
 ) -> Result<ClientTlsStream<S>> {
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store())
-        .with_no_client_auth();
-    if cfg.skip_cert_verify {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerify));
-    }
-    if !cfg.alpn.is_empty() {
-        config.alpn_protocols = cfg.alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
-    }
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = get_tls_connector(cfg.skip_cert_verify, &cfg.alpn);
     let sni = cfg.server_name.clone().unwrap_or_else(|| host.to_string());
     let name =
         ServerName::try_from(sni.clone()).map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;

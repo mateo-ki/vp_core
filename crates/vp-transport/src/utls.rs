@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, BufMut, BytesMut};
-use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::client::WebPkiServerVerifier;
 use tokio_rustls::rustls::client::danger::ServerCertVerifier;
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -851,10 +850,16 @@ fn extract_cert_signature(cert: &CertificateDer<'_>) -> Result<Vec<u8>> {
 // 握手主流程
 // ---------------------------------------------------------------------------
 
-fn root_store() -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    roots
+fn global_webpki_verifier() -> Result<Arc<WebPkiServerVerifier>> {
+    static VERIFIER: std::sync::OnceLock<Arc<WebPkiServerVerifier>> = std::sync::OnceLock::new();
+    if let Some(v) = VERIFIER.get() {
+        return Ok(v.clone());
+    }
+    let verifier = WebPkiServerVerifier::builder(crate::tls::global_root_store().clone())
+        .build()
+        .map_err(|e| Error::ProtoMsg(format!("utls: verifier 构建失败: {e}")))?;
+    let _ = VERIFIER.set(verifier.clone());
+    Ok(verifier)
 }
 
 /// 建立 uTLS 连接：完成完整 TLS 1.3 握手并返回可用的加密流
@@ -1035,9 +1040,7 @@ where
     if reality_verified {
         // REALITY 握手：证书已通过 HMAC-SHA512 强认证，跳过系统 WebPKI 校验
     } else if !cfg.skip_cert_verify {
-        let verifier = WebPkiServerVerifier::builder(Arc::new(root_store()))
-            .build()
-            .map_err(|_| Error::Proto("utls: verifier 构建失败"))?;
+        let verifier = global_webpki_verifier()?;
         let name = ServerName::try_from(sni.clone())
             .map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;
         verifier

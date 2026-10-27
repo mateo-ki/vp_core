@@ -114,7 +114,11 @@ pub async fn dispatch_stream(
             let _ = relay(client, remote, hook).await;
         }
         Err(e) => {
-            warn!("出站 {} 失败: {}", outbound.name(), e);
+            if outbound.name() == "REJECT" {
+                tracing::debug!("出站 REJECT 阻断目标: {}", sess.dst);
+            } else {
+                warn!("出站 {} 失败: {}", outbound.name(), e);
+            }
             match reply {
                 ClientReply::Socks5(_) => {
                     let _ = client

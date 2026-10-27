@@ -139,16 +139,23 @@ impl AeadChunkCodec {
         n
     }
 
+    /// shadowsocks AEAD 的 nonce：u64 counter 小端置于前 8 字节，后 4 字节为零
+    fn ss_nonce(counter: u64) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[..8].copy_from_slice(&counter.to_le_bytes());
+        n
+    }
+
     /// 加密为一个分块（[2B len ct][len tag][payload ct][payload tag]）
     pub fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(payload.len() + 2 + 2 * self.tag_len);
-        let n1 = self.next_nonce();
+        let n1 = Self::ss_nonce(self.next_nonce());
         let len_ct = self
             .aead
-            .seal(n1, &(payload.len() as u16).to_be_bytes(), b"");
+            .seal_nonce(&n1, &(payload.len() as u16).to_be_bytes(), b"");
         out.extend_from_slice(&len_ct);
-        let n2 = self.next_nonce();
-        let data_ct = self.aead.seal(n2, payload, b"");
+        let n2 = Self::ss_nonce(self.next_nonce());
+        let data_ct = self.aead.seal_nonce(&n2, payload, b"");
         out.extend_from_slice(&data_ct);
         out
     }
@@ -160,7 +167,8 @@ impl AeadChunkCodec {
         if buf.len() < len_ct_len {
             return None;
         }
-        let len_pt = match self.aead.open(self.counter, &buf[..len_ct_len], b"") {
+        let n1 = Self::ss_nonce(self.counter);
+        let len_pt = match self.aead.open_nonce(&n1, &buf[..len_ct_len], b"") {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };
@@ -172,10 +180,8 @@ impl AeadChunkCodec {
         if buf.len() < total {
             return None;
         }
-        let data = match self
-            .aead
-            .open(self.counter + 1, &buf[len_ct_len..total], b"")
-        {
+        let n2 = Self::ss_nonce(self.counter + 1);
+        let data = match self.aead.open_nonce(&n2, &buf[len_ct_len..total], b"") {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };

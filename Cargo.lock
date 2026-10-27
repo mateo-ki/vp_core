@@ -291,6 +291,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb-mode"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "738b8d467867f80a71351933f70461f5b56f24d5c93e0cf216e59229c968d330"
+dependencies = [
+ "cipher 0.4.4",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1244,6 +1253,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2095,6 +2113,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest",
+ "keccak",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2637,6 +2665,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "bytes",
+ "cfb-mode",
  "chacha20poly1305",
  "hkdf",
  "hmac",
@@ -2644,6 +2673,7 @@ dependencies = [
  "rand 0.9.5",
  "sha1",
  "sha2",
+ "sha3",
  "vp-common",
 ]
 
@@ -2700,12 +2730,14 @@ version = "1.0.0"
 name = "vp-protocol"
 version = "1.0.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "async-trait",
  "base64 0.22.1",
  "blake3",
  "boringtun",
  "bytes",
+ "cfb-mode",
  "chacha20 0.10.2",
  "chacha20poly1305",
  "cipher 0.5.2",
@@ -2730,6 +2762,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2",
+ "sha3",
  "smoltcp",
  "tokio",
  "tracing",

@@ -152,6 +152,7 @@ impl VlessOutbound {
             &cfg.grpc_opts,
             &cfg.client_fingerprint,
             &cfg.reality_opts,
+            &cfg.http_opts,
         )?;
         Ok(VlessOutbound {
             name: name.unwrap_or("vless").into(),
@@ -407,6 +408,7 @@ mod tests {
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            http_opts: None,
             reality_opts: None,
             udp: false,
         })
@@ -461,6 +463,7 @@ mod tests {
             network: None,
             ws_opts: None,
             grpc_opts: None,
+            http_opts: None,
             reality_opts: None,
             udp: false,
         })

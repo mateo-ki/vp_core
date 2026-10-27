@@ -305,6 +305,7 @@ impl AnytlsOutbound {
                 skip_cert_verify: cfg.skip_cert_verify,
                 fingerprint: cfg.client_fingerprint.clone(),
                 ws: None,
+                http: None,
                 grpc: None,
                 reality: None,
             },

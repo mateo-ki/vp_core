@@ -114,9 +114,10 @@ fn decode_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
     }
 }
 
-fn token(conn: &quinn::Connection, uuid: &str, password: &str) -> Result<[u8; 32]> {
+fn token(conn: &quinn::Connection, uuid16: &[u8; 16], password: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
-    conn.export_keying_material(&mut out, uuid.as_bytes(), password.as_bytes())
+    // tuic v5 规范：label = 16 字节原始 UUID（官方实现 uuid.as_ref()），不是带连字符的字符串
+    conn.export_keying_material(&mut out, uuid16.as_ref(), password.as_bytes())
         .map_err(|_| Error::Proto("tuic: token 导出失败"))?;
     Ok(out)
 }
@@ -170,7 +171,7 @@ impl TuicOutbound {
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic open_uni: {e}"))))?;
         let uuid16 = parse_uuid16(&self.uuid)?;
-        let tok = token(&conn, &self.uuid, &self.password)?;
+        let tok = token(&conn, &uuid16, &self.password)?;
         let mut auth = Vec::with_capacity(2 + 16 + 32);
         auth.push(VER);
         auth.push(T_AUTH);
@@ -352,7 +353,8 @@ fn tuic_client_config(skip_verify: bool) -> quinn::ClientConfig {
             .dangerous()
             .set_certificate_verifier(Arc::new(TuicNoVerify));
     }
-    crypto.alpn_protocols = vec![b"tuic".to_vec()];
+    // tuic v5 规范：QUIC ALPN 固定为 h3（官方实现均要求；发 "tuic" 会被服务端拒绝握手）
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
     let mut cfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("tuic cfg"),
     ));
@@ -454,7 +456,7 @@ impl Inbound for TuicInbound {
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| Error::Config(format!("tuic tls: {e}")))?;
-        crypto.alpn_protocols = vec![b"tuic".to_vec()];
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
         let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
                 .map_err(|e| Error::Config(format!("tuic server cfg: {e}")))?,
@@ -565,7 +567,7 @@ impl TuicInbound {
             .iter()
             .filter_map(|(uuid, pw)| {
                 let u16b = parse_uuid16(uuid).ok()?;
-                let t = token(&conn, uuid, pw).ok()?;
+                let t = token(&conn, &u16b, pw).ok()?;
                 Some((u16b, t))
             })
             .collect();

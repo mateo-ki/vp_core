@@ -341,21 +341,40 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 .list()
                 .into_iter()
                 .map(|c| {
+                    let (rule_type, rule_payload) = match c.meta.rule.as_deref() {
+                        Some(r) => {
+                            let base = r.split(" => ").next().unwrap_or(r).trim();
+                            if let Some((t, p)) = base.split_once(',') {
+                                (Some(t.trim().to_string()), Some(p.trim().to_string()))
+                            } else {
+                                (Some(base.to_string()), None)
+                            }
+                        }
+                        None => (None, None),
+                    };
+                    let chains: Vec<String> = c
+                        .meta
+                        .chain
+                        .as_deref()
+                        .map(|s| s.split(" > ").map(String::from).collect())
+                        .unwrap_or_default();
                     json!({
                         "id": c.meta.id.to_string(),
                         "metadata": {
                             "network": c.meta.network,
                             "type": c.meta.inbound,
                             "host": c.meta.host,
-                            "destinationPort": c.meta.dst_port,
+                            "destinationIP": "",
+                            "destinationPort": c.meta.dst_port.to_string(),
                             "source": c.meta.src,
                             "process": c.meta.process,
                         },
                         "upload": c.upload,
                         "download": c.download,
                         "start": vp_core::conn_table::iso8601(c.meta.start),
-                        "chains": [c.meta.chain],
-                        "rule": c.meta.rule,
+                        "chains": chains,
+                        "rule": rule_type,
+                        "rulePayload": rule_payload,
                     })
                 })
                 .collect();

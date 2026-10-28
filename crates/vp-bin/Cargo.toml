@@ -19,6 +19,7 @@ vp-tun.workspace = true
 tokio.workspace = true
 clap.workspace = true
 ureq.workspace = true
+serde_yaml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc.workspace = true

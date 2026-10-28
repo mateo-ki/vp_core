@@ -78,10 +78,10 @@ const CH_SUITES: [u8; 28] = [
     0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30, 0xc0, 0x13,
     0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
 ];
-/// Chrome 签名算法（ecdsa_sha256, rsa_pss_*, rsa_pkcs1_*, …）
-const CH_SIG_ALGS: [u8; 18] = [
+/// Chrome 签名算法（ecdsa_sha256, rsa_pss_*, rsa_pkcs1_*, ed25519, …）
+const CH_SIG_ALGS: [u8; 20] = [
     0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01,
-    0x02, 0x01,
+    0x08, 0x07, 0x02, 0x01,
 ];
 
 struct ClientHello {
@@ -292,31 +292,72 @@ fn aes_256_gcm_seal(
     Ok(())
 }
 
-/// Extract(salt, ikm)
+/// Extract(salt, ikm) - REALITY ClientHello auth
 fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Result<ring::hkdf::Prk> {
     Ok(ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt).extract(ikm))
 }
 
-/// Derive-Secret(secret, label, messages)
-fn derive_secret(prk: &ring::hkdf::Prk, label: &str, transcript_hash: &[u8]) -> Result<Vec<u8>> {
-    hkdf_expand_label(prk, label, transcript_hash, 32)
+#[derive(Clone, Copy)]
+pub struct SuiteDef {
+    pub alg: &'static ring::aead::Algorithm,
+    pub key_len: usize,
+    pub hkdf_alg: ring::hkdf::Algorithm,
+    pub digest_alg: &'static ring::digest::Algorithm,
+    pub hmac_alg: ring::hmac::Algorithm,
+    pub hash_len: usize,
 }
 
-fn sha256(data: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, data)
-        .as_ref()
-        .to_vec()
+impl SuiteDef {
+    pub fn extract(&self, salt: &[u8], ikm: &[u8]) -> ring::hkdf::Prk {
+        ring::hkdf::Salt::new(self.hkdf_alg, salt).extract(ikm)
+    }
+
+    pub fn digest(&self, data: &[u8]) -> Vec<u8> {
+        ring::digest::digest(self.digest_alg, data)
+            .as_ref()
+            .to_vec()
+    }
+
+    pub fn derive_secret(
+        &self,
+        prk: &ring::hkdf::Prk,
+        label: &str,
+        transcript_hash: &[u8],
+    ) -> Result<Vec<u8>> {
+        hkdf_expand_label(prk, label, transcript_hash, self.hash_len)
+    }
 }
 
 const SUITE_AES128: u16 = 0x1301;
 const SUITE_AES256: u16 = 0x1302;
 const SUITE_CHACHA: u16 = 0x1303;
 
-fn suite_alg(suite: u16) -> Option<(&'static ring::aead::Algorithm, usize)> {
+pub fn suite_def(suite: u16) -> Option<SuiteDef> {
     match suite {
-        SUITE_AES128 => Some((&ring::aead::AES_128_GCM, 16)),
-        SUITE_AES256 => Some((&ring::aead::AES_256_GCM, 32)),
-        SUITE_CHACHA => Some((&ring::aead::CHACHA20_POLY1305, 32)),
+        SUITE_AES128 => Some(SuiteDef {
+            alg: &ring::aead::AES_128_GCM,
+            key_len: 16,
+            hkdf_alg: ring::hkdf::HKDF_SHA256,
+            digest_alg: &ring::digest::SHA256,
+            hmac_alg: ring::hmac::HMAC_SHA256,
+            hash_len: 32,
+        }),
+        SUITE_AES256 => Some(SuiteDef {
+            alg: &ring::aead::AES_256_GCM,
+            key_len: 32,
+            hkdf_alg: ring::hkdf::HKDF_SHA384,
+            digest_alg: &ring::digest::SHA384,
+            hmac_alg: ring::hmac::HMAC_SHA384,
+            hash_len: 48,
+        }),
+        SUITE_CHACHA => Some(SuiteDef {
+            alg: &ring::aead::CHACHA20_POLY1305,
+            key_len: 32,
+            hkdf_alg: ring::hkdf::HKDF_SHA256,
+            digest_alg: &ring::digest::SHA256,
+            hmac_alg: ring::hmac::HMAC_SHA256,
+            hash_len: 32,
+        }),
         _ => None,
     }
 }
@@ -327,18 +368,20 @@ struct Direction {
     key: Vec<u8>,
     iv: [u8; 12],
     seq: u64,
+    suite: SuiteDef,
 }
 
 impl Direction {
-    fn new(alg: &'static ring::aead::Algorithm, secret: &[u8]) -> Result<Self> {
-        let prk = ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, secret);
-        let key = hkdf_expand_label(&prk, "key", &[], alg.key_len())?;
+    fn new(suite: SuiteDef, secret: &[u8]) -> Result<Self> {
+        let prk = ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, secret);
+        let key = hkdf_expand_label(&prk, "key", &[], suite.alg.key_len())?;
         let iv = hkdf_expand_label(&prk, "iv", &[], 12)?;
         Ok(Direction {
-            alg,
+            alg: suite.alg,
             key,
             iv: iv.try_into().unwrap(),
             seq: 0,
+            suite,
         })
     }
 
@@ -395,16 +438,16 @@ impl Direction {
 
     /// 密钥更新（KeyUpdate）：traffic upd
     fn update(&mut self) -> Result<()> {
-        let prk = ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, &self.key.clone());
-        let secret = hkdf_expand_label(&prk, "traffic upd", &[], 32)?;
-        *self = Direction::new(self.alg, &secret)?;
+        let prk = ring::hkdf::Prk::new_less_safe(self.suite.hkdf_alg, &self.key.clone());
+        let secret = hkdf_expand_label(&prk, "traffic upd", &[], self.suite.hash_len)?;
+        *self = Direction::new(self.suite, &secret)?;
         Ok(())
     }
 }
 
 /// 由流量密钥（transcript 密钥）派生 Direction
-fn traffic_direction(alg: &'static ring::aead::Algorithm, secret: &[u8]) -> Result<Direction> {
-    Direction::new(alg, secret)
+fn traffic_direction(suite: SuiteDef, secret: &[u8]) -> Result<Direction> {
+    Direction::new(suite, secret)
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +957,7 @@ where
             break;
         }
     }
-    let (alg, _key_len) = suite_alg(suite)
+    let suite = suite_def(suite)
         .ok_or_else(|| Error::ProtoMsg(format!("utls: 服务器选择了不支持的套件 {suite:#06x}")))?;
 
     // 3. x25519 → 握手密钥
@@ -924,15 +967,15 @@ where
         .map_err(|_| Error::Proto("utls: peer_share 必须为 32 字节"))?;
     let peer_pub = x25519_dalek::PublicKey::from(peer_share_arr);
     let shared = ch.priv_key.diffie_hellman(&peer_pub);
-    let zeros = [0u8; 32];
-    let early = hkdf_extract(&zeros, &zeros)?;
-    let empty_hash = sha256(&[]);
-    let d1 = derive_secret(&early, "derived", &empty_hash)?;
-    let hs = hkdf_extract(&d1, shared.as_bytes())?;
-    let th_sh = sha256(&transcript);
-    let c_hs_secret = derive_secret(&hs, "c hs traffic", &th_sh)?;
-    let s_hs_secret = derive_secret(&hs, "s hs traffic", &th_sh)?;
-    let mut s_dir = traffic_direction(alg, &s_hs_secret)?;
+    let zeros = vec![0u8; suite.hash_len];
+    let early = suite.extract(&zeros, &zeros);
+    let empty_hash = suite.digest(&[]);
+    let d1 = suite.derive_secret(&early, "derived", &empty_hash)?;
+    let hs = suite.extract(&d1, shared.as_bytes());
+    let th_sh = suite.digest(&transcript);
+    let c_hs_secret = suite.derive_secret(&hs, "c hs traffic", &th_sh)?;
+    let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh)?;
+    let mut s_dir = traffic_direction(suite, &s_hs_secret)?;
 
     // 4. 加密握手：EE → Certificate(→CertificateStatus) → CertificateVerify → Finished
     let mut it = MsgIter::new();
@@ -1001,22 +1044,22 @@ where
                     let mut cv_msg = vec![0x20u8; 64];
                     cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
                     cv_msg.push(0);
-                    cv_msg.extend_from_slice(&sha256(
-                        &transcript[..transcript.len() - msg.len() - 4],
-                    ));
+                    cv_msg.extend_from_slice(
+                        &suite.digest(&transcript[..transcript.len() - msg.len() - 4]),
+                    );
                     verify_cert_verify(&leaf.0, scheme, &sig, &cv_msg)?;
                 }
                 HS_FINISHED => {
                     // verify_data = HMAC(finished_key(s_hs), hash(transcript 不含本消息))
                     let fk = hkdf_expand_label(
-                        &ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, &s_hs_secret),
+                        &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
                         "finished",
                         &[],
-                        32,
+                        suite.hash_len,
                     )?;
                     let expected = ring::hmac::sign(
-                        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &fk),
-                        &sha256(&transcript[..transcript.len() - msg.len() - 4]),
+                        &ring::hmac::Key::new(suite.hmac_alg, &fk),
+                        &suite.digest(&transcript[..transcript.len() - msg.len() - 4]),
                     );
                     if msg.len() != expected.as_ref().len() || msg.as_slice() != expected.as_ref() {
                         return Err(Error::Proto("utls: Finished 校验失败"));
@@ -1049,33 +1092,30 @@ where
     }
 
     // 6. 主密钥 → 应用流量密钥；客户端 Finished
-    let d2 = derive_secret(&hs, "derived", &empty_hash)?;
-    let master = hkdf_extract(&d2, &zeros)?;
-    let th_fin = sha256(&transcript);
-    let c_ap_secret = derive_secret(&master, "c ap traffic", &th_fin)?;
-    let s_ap_secret = derive_secret(&master, "s ap traffic", &th_fin)?;
-    let tx_dir = traffic_direction(alg, &c_ap_secret)?;
-    let rx_dir = traffic_direction(alg, &s_ap_secret)?;
+    let d2 = suite.derive_secret(&hs, "derived", &empty_hash)?;
+    let master = suite.extract(&d2, &zeros);
+    let th_fin = suite.digest(&transcript);
+    let c_ap_secret = suite.derive_secret(&master, "c ap traffic", &th_fin)?;
+    let s_ap_secret = suite.derive_secret(&master, "s ap traffic", &th_fin)?;
+    let tx_dir = traffic_direction(suite, &c_ap_secret)?;
+    let rx_dir = traffic_direction(suite, &s_ap_secret)?;
 
     // 客户端 Finished（c_hs finished key，transcript 含服务器 Finished）
     let c_fk = hkdf_expand_label(
-        &ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, &c_hs_secret),
+        &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &c_hs_secret),
         "finished",
         &[],
-        32,
+        suite.hash_len,
     )?;
-    let verify_data = ring::hmac::sign(
-        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &c_fk),
-        &th_fin,
-    )
-    .as_ref()
-    .to_vec();
+    let verify_data = ring::hmac::sign(&ring::hmac::Key::new(suite.hmac_alg, &c_fk), &th_fin)
+        .as_ref()
+        .to_vec();
     let mut fin_msg = vec![HS_FINISHED, 0, 0, verify_data.len() as u8];
     fin_msg.extend_from_slice(&verify_data);
 
     // 加密握手记录：外层 0x17（密文），AAD 为记录头
     // 注意：客户端 Finished 必须用 c_hs（握手）密钥加密，应用数据才用 c_ap
-    let mut c_hs_dir = traffic_direction(alg, &c_hs_secret)?;
+    let mut c_hs_dir = traffic_direction(suite, &c_hs_secret)?;
     let mut content = fin_msg.clone();
     content.push(REC_HANDSHAKE); // inner type
     let mut rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
@@ -1804,15 +1844,16 @@ mod tests {
             transcript.extend_from_slice(&sh_body);
 
             // 4. 派生握手密钥
-            let zeros = [0u8; 32];
-            let early = hkdf_extract(&zeros, &zeros).unwrap();
-            let empty_hash = sha256(&[]);
-            let d1 = derive_secret(&early, "derived", &empty_hash).unwrap();
-            let hs = hkdf_extract(&d1, tls_shared.as_bytes()).unwrap();
-            let th_sh = sha256(&transcript);
-            let c_hs_secret = derive_secret(&hs, "c hs traffic", &th_sh).unwrap();
-            let s_hs_secret = derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
-            let mut s_hs_dir = traffic_direction(&ring::aead::AES_256_GCM, &s_hs_secret).unwrap();
+            let suite = suite_def(0x1302).unwrap();
+            let zeros = vec![0u8; suite.hash_len];
+            let early = suite.extract(&zeros, &zeros);
+            let empty_hash = suite.digest(&[]);
+            let d1 = suite.derive_secret(&early, "derived", &empty_hash).unwrap();
+            let hs = suite.extract(&d1, tls_shared.as_bytes());
+            let th_sh = suite.digest(&transcript);
+            let c_hs_secret = suite.derive_secret(&hs, "c hs traffic", &th_sh).unwrap();
+            let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
+            let mut s_hs_dir = traffic_direction(suite, &s_hs_secret).unwrap();
 
             // 5. EncryptedHandshake 消息
             let ee = vec![HS_EE, 0, 0, 2, 0, 0];
@@ -1866,7 +1907,7 @@ mod tests {
             let mut cv_msg = vec![0x20u8; 64];
             cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
             cv_msg.push(0);
-            cv_msg.extend_from_slice(&sha256(&transcript));
+            cv_msg.extend_from_slice(&suite.digest(&transcript));
             let cv_sig = ed_pair.sign(&cv_msg);
 
             let mut cv = Vec::new();
@@ -1885,15 +1926,15 @@ mod tests {
 
             // Server Finished
             let fk = hkdf_expand_label(
-                &ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, &s_hs_secret),
+                &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
                 "finished",
                 &[],
-                32,
+                suite.hash_len,
             )
             .unwrap();
             let srv_verify_data = ring::hmac::sign(
-                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &fk),
-                &sha256(&transcript),
+                &ring::hmac::Key::new(suite.hmac_alg, &fk),
+                &suite.digest(&transcript),
             )
             .as_ref()
             .to_vec();
@@ -1920,7 +1961,7 @@ mod tests {
             conn.write_all(&enc_rec).await.unwrap();
 
             // 6. 读客户端 Finished
-            let mut c_hs_dir = traffic_direction(&ring::aead::AES_256_GCM, &c_hs_secret).unwrap();
+            let mut c_hs_dir = traffic_direction(suite, &c_hs_secret).unwrap();
             let c_fin_frame = read_record(&mut conn, Some(&mut c_hs_dir)).await.unwrap();
             match c_fin_frame {
                 Frame::Data { inner, data } => {
@@ -1931,13 +1972,17 @@ mod tests {
             }
 
             // 7. 派生应用流量密钥
-            let d2 = derive_secret(&hs, "derived", &empty_hash).unwrap();
-            let master = hkdf_extract(&d2, &zeros).unwrap();
-            let th_fin = sha256(&transcript);
-            let s_ap_secret = derive_secret(&master, "s ap traffic", &th_fin).unwrap();
-            let c_ap_secret = derive_secret(&master, "c ap traffic", &th_fin).unwrap();
-            let mut s_ap_dir = traffic_direction(&ring::aead::AES_256_GCM, &s_ap_secret).unwrap();
-            let mut c_ap_dir = traffic_direction(&ring::aead::AES_256_GCM, &c_ap_secret).unwrap();
+            let d2 = suite.derive_secret(&hs, "derived", &empty_hash).unwrap();
+            let master = suite.extract(&d2, &zeros);
+            let th_fin = suite.digest(&transcript);
+            let s_ap_secret = suite
+                .derive_secret(&master, "s ap traffic", &th_fin)
+                .unwrap();
+            let c_ap_secret = suite
+                .derive_secret(&master, "c ap traffic", &th_fin)
+                .unwrap();
+            let mut s_ap_dir = traffic_direction(suite, &s_ap_secret).unwrap();
+            let mut c_ap_dir = traffic_direction(suite, &c_ap_secret).unwrap();
 
             // 8. 双向数据收发
             let req_frame = read_record(&mut conn, Some(&mut c_ap_dir)).await.unwrap();
@@ -2078,14 +2123,15 @@ mod tests {
 
             transcript.extend_from_slice(&sh_body);
 
-            let zeros = [0u8; 32];
-            let early = hkdf_extract(&zeros, &zeros).unwrap();
-            let empty_hash = sha256(&[]);
-            let d1 = derive_secret(&early, "derived", &empty_hash).unwrap();
-            let hs = hkdf_extract(&d1, tls_shared.as_bytes()).unwrap();
-            let th_sh = sha256(&transcript);
-            let s_hs_secret = derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
-            let mut s_hs_dir = traffic_direction(&ring::aead::AES_256_GCM, &s_hs_secret).unwrap();
+            let suite = suite_def(0x1302).unwrap();
+            let zeros = vec![0u8; suite.hash_len];
+            let early = suite.extract(&zeros, &zeros);
+            let empty_hash = suite.digest(&[]);
+            let d1 = suite.derive_secret(&early, "derived", &empty_hash).unwrap();
+            let hs = suite.extract(&d1, tls_shared.as_bytes());
+            let th_sh = suite.digest(&transcript);
+            let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
+            let mut s_hs_dir = traffic_direction(suite, &s_hs_secret).unwrap();
 
             let ee = vec![HS_EE, 0, 0, 2, 0, 0];
             transcript.extend_from_slice(&ee);
@@ -2136,7 +2182,7 @@ mod tests {
             let mut cv_msg = vec![0x20u8; 64];
             cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
             cv_msg.push(0);
-            cv_msg.extend_from_slice(&sha256(&transcript));
+            cv_msg.extend_from_slice(&suite.digest(&transcript));
             let cv_sig = ed_pair.sign(&cv_msg);
 
             let mut cv = Vec::new();
@@ -2154,15 +2200,15 @@ mod tests {
             transcript.extend_from_slice(&cv);
 
             let fk = hkdf_expand_label(
-                &ring::hkdf::Prk::new_less_safe(ring::hkdf::HKDF_SHA256, &s_hs_secret),
+                &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
                 "finished",
                 &[],
-                32,
+                suite.hash_len,
             )
             .unwrap();
             let srv_verify_data = ring::hmac::sign(
-                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &fk),
-                &sha256(&transcript),
+                &ring::hmac::Key::new(suite.hmac_alg, &fk),
+                &suite.digest(&transcript),
             )
             .as_ref()
             .to_vec();

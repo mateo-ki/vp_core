@@ -2640,6 +2640,7 @@ version = "1.0.2"
 dependencies = [
  "clap",
  "mimalloc",
+ "serde_yaml",
  "tokio",
  "tracing",
  "tracing-subscriber",

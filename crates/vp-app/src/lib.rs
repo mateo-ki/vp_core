@@ -229,8 +229,10 @@ impl App {
         config_path: Option<std::path::PathBuf>,
         tun_fd: Option<i32>,
     ) -> Result<Arc<App>> {
+        let t_start = std::time::Instant::now();
         let mut cfg: vp_config::Config =
             vp_config::parse(&text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
+        let t_parse = t_start.elapsed();
         if let Some(fd) = tun_fd {
             let mut tun = cfg.tun.take().unwrap_or_default();
             tun.enable = true;
@@ -243,6 +245,7 @@ impl App {
                 errs.join("\n  - ")
             )));
         }
+        let t_validate = t_start.elapsed();
 
         if let Some(tuning) = &cfg.tuning {
             let rcv = tuning.so_rcvbuf.or(tuning.socket_buffer_size).unwrap_or(0);
@@ -253,7 +256,9 @@ impl App {
         }
 
         let geosite = load_geosite(&base_dir, cfg.geosite_url.as_deref()).await;
+        let t_geosite = t_start.elapsed();
         let geoip = load_geoip(&base_dir, cfg.geoip_url.as_deref()).await;
+        let t_geoip = t_start.elapsed();
 
         let dns = Arc::new(if cfg.dns.enable {
             let policies =
@@ -271,6 +276,7 @@ impl App {
         } else {
             Resolver::system()
         });
+        let t_dns = t_start.elapsed();
         // 节点自身的域名拨号走全局解析器（多上游并集 + 缓存 + 竞速拨号，
         // 对抗节点域名被污染/多 A 记录中混有失效地址导致的"时通时不通"）
         vp_transport::set_global_node_resolver(dns.clone(), cfg.ipv6);
@@ -306,13 +312,12 @@ impl App {
 
         // 规则
         let providers = load_providers(&cfg, &base_dir).await?;
-        let known: Vec<String> = outbound_names
-            .iter()
-            .cloned()
+        let known: std::collections::HashSet<String> = outbound_names
+            .into_iter()
             .chain(cfg.proxy_groups.iter().map(|g| g.name.clone()))
             .collect();
         let rules = {
-            let is_known = |t: &str| known.iter().any(|k| k == t) || vp_config::is_builtin(t);
+            let is_known = |t: &str| known.contains(t) || vp_config::is_builtin(t);
             let env = CompileEnv {
                 is_known_target: &is_known,
                 geosite: &geosite,
@@ -324,6 +329,16 @@ impl App {
                 Error::Config(format!("规则编译失败:\n  - {}", errs.join("\n  - ")))
             })?
         };
+        let t_rules = t_start.elapsed();
+        tracing::debug!(
+            "assemble 阶段耗时: parse={:?}, validate={:?}, geosite={:?}, geoip={:?}, dns={:?}, rules={:?}",
+            t_parse,
+            t_validate - t_parse,
+            t_geosite - t_validate,
+            t_geoip - t_geosite,
+            t_dns - t_geoip,
+            t_rules - t_dns
+        );
 
         let mut group_specs = Vec::new();
         for g in &cfg.proxy_groups {

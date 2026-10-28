@@ -194,12 +194,19 @@ async fn main() {
                 eprintln!("读取 {} 失败: {e}", config.display());
                 std::process::exit(2);
             });
-            // 先探明日志级别（配置或覆盖）
-            let fmt = vp_config::Format::from_path(&config.to_string_lossy());
+            // 极速提取日志级别，避免启动时对数万行配置进行多余的重复全量解析
             let level = log_level.clone().unwrap_or_else(|| {
-                vp_config::parse(&text, fmt)
-                    .ok()
-                    .map(|c| c.log_level)
+                text.lines()
+                    .find_map(|l| {
+                        let l = l.trim();
+                        if let Some(rest) = l.strip_prefix("log-level:") {
+                            Some(rest.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+                        } else if let Some(rest) = l.strip_prefix("log_level:") {
+                            Some(rest.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_else(|| "info".into())
             });
             init_logging(&level);

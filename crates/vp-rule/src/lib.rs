@@ -275,18 +275,145 @@ pub struct CompileEnv<'a> {
 
 pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec<String>> {
     let mut errs = Vec::new();
-    let mut compiled = Vec::with_capacity(rules.len());
+    let mut compiled = Vec::with_capacity(rules.len().min(1024));
+    let mut cur_domain: Option<PendingDomainBatch> = None;
+    let mut cur_ip: Option<PendingIpBatch> = None;
+
+    let flush_domain = |cur: &mut Option<PendingDomainBatch>, out: &mut Vec<CompiledRule>| {
+        if let Some(batch) = cur.take() {
+            let raw = if batch.count > 1 {
+                format!("DOMAIN-SET({} 条合并)", batch.count).into()
+            } else {
+                batch.raw_first
+            };
+            out.push(CompiledRule {
+                raw,
+                target: batch.target,
+                matcher: Matcher::DomainSuffix(Arc::new(batch.trie)),
+                no_resolve: batch.no_resolve,
+            });
+        }
+    };
+
+    let flush_ip = |cur: &mut Option<PendingIpBatch>, out: &mut Vec<CompiledRule>| {
+        if let Some(batch) = cur.take() {
+            let raw = if batch.count > 1 {
+                format!("IP-CIDR-SET({} 条合并)", batch.count).into()
+            } else {
+                batch.raw_first
+            };
+            out.push(CompiledRule {
+                raw,
+                target: batch.target,
+                matcher: Matcher::IpCidr {
+                    set: Arc::new(batch.builder.build()),
+                    src: batch.src,
+                },
+                no_resolve: batch.no_resolve,
+            });
+        }
+    };
+
     for (i, raw) in rules.iter().enumerate() {
+        // 快速无分配路径：针对 99% 的常见直白规则 (DOMAIN / DOMAIN-SUFFIX / IP-CIDR)
+        if !raw.contains('(') {
+            let mut parts = raw.split(',').map(str::trim).filter(|p| !p.is_empty());
+            if let (Some(ty), Some(payload), Some(target)) = (parts.next(), parts.next(), parts.next()) {
+                let is_domain = ty.eq_ignore_ascii_case("DOMAIN");
+                let is_suffix = ty.eq_ignore_ascii_case("DOMAIN-SUFFIX");
+                let is_ip_cidr = ty.eq_ignore_ascii_case("IP-CIDR") || ty.eq_ignore_ascii_case("IP-CIDR6");
+                let is_src_ip = ty.eq_ignore_ascii_case("SRC-IP-CIDR");
+
+                if is_domain || is_suffix {
+                    flush_ip(&mut cur_ip, &mut compiled);
+                    let no_resolve = parts.any(|p| p.eq_ignore_ascii_case("no-resolve"));
+                    match check_target(target, env, raw) {
+                        Ok(target_arc) => {
+                            if let Some(cur) = &mut cur_domain {
+                                if cur.target == target_arc && cur.no_resolve == no_resolve {
+                                    if is_domain {
+                                        cur.trie.insert_exact(payload);
+                                    } else {
+                                        cur.trie.insert_suffix_all(payload);
+                                    }
+                                    cur.count += 1;
+                                    continue;
+                                }
+                            }
+                            flush_domain(&mut cur_domain, &mut compiled);
+                            let mut trie = DomainTrie::new();
+                            if is_domain {
+                                trie.insert_exact(payload);
+                            } else {
+                                trie.insert_suffix_all(payload);
+                            }
+                            cur_domain = Some(PendingDomainBatch {
+                                target: target_arc,
+                                no_resolve,
+                                trie,
+                                count: 1,
+                                raw_first: raw.as_str().into(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            errs.push(format!("rules[{i}]: {e}"));
+                            continue;
+                        }
+                    }
+                } else if is_ip_cidr || is_src_ip {
+                    flush_domain(&mut cur_domain, &mut compiled);
+                    let no_resolve = parts.any(|p| p.eq_ignore_ascii_case("no-resolve"));
+                    match check_target(target, env, raw) {
+                        Ok(target_arc) => {
+                            if let Some(cur) = &mut cur_ip {
+                                if cur.target == target_arc && cur.no_resolve == no_resolve && cur.src == is_src_ip {
+                                    for cidr in payload.split(',') {
+                                        let _ = cur.builder.insert_cidr(cidr.trim());
+                                    }
+                                    cur.count += 1;
+                                    continue;
+                                }
+                            }
+                            flush_ip(&mut cur_ip, &mut compiled);
+                            let mut builder = ipset::IpIntervalSetBuilder::new();
+                            for cidr in payload.split(',') {
+                                let _ = builder.insert_cidr(cidr.trim());
+                            }
+                            cur_ip = Some(PendingIpBatch {
+                                target: target_arc,
+                                no_resolve,
+                                src: is_src_ip,
+                                builder,
+                                count: 1,
+                                raw_first: raw.as_str().into(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            errs.push(format!("rules[{i}]: {e}"));
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 遇到非 DOMAIN/IP 规则或复杂逻辑规则，先 flush 当前批次
+        flush_domain(&mut cur_domain, &mut compiled);
+        flush_ip(&mut cur_ip, &mut compiled);
         match compile_one(raw, env, 0) {
             Ok(cr) => compiled.push(cr),
             Err(e) => errs.push(format!("rules[{i}]: {e}")),
         }
     }
+    flush_domain(&mut cur_domain, &mut compiled);
+    flush_ip(&mut cur_ip, &mut compiled);
+
     if errs.is_empty() {
-        let optimized = optimize_rules(compiled);
-        let needs_ip = optimized.iter().any(|r| r.needs_dst_ip());
+        let needs_ip = compiled.iter().any(|r| r.needs_dst_ip());
         Ok(RuleEngine {
-            rules: optimized,
+            rules: compiled,
             needs_ip,
         })
     } else {
@@ -302,8 +429,18 @@ struct PendingDomainBatch {
     raw_first: Arc<str>,
 }
 
+struct PendingIpBatch {
+    target: Arc<str>,
+    no_resolve: bool,
+    src: bool,
+    builder: ipset::IpIntervalSetBuilder,
+    count: usize,
+    raw_first: Arc<str>,
+}
+
 /// 合并相邻且指向同一目标、同 no_resolve 的 DOMAIN 与 DOMAIN-SUFFIX 规则，
 /// 将数千条散乱规则合并为一个共享 DomainTrie，大幅压降堆内存并提速路由匹配。
+#[allow(dead_code)]
 fn optimize_rules(rules: Vec<CompiledRule>) -> Vec<CompiledRule> {
     let mut out = Vec::with_capacity(rules.len());
     let mut cur_domain: Option<PendingDomainBatch> = None;
@@ -484,7 +621,7 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
         .iter()
         .skip(3)
         .any(|p| p.trim().eq_ignore_ascii_case("no-resolve"));
-    let matcher = parse_plain_rule(&format!("{ty},{payload}"), env, depth, raw)?;
+    let matcher = parse_matcher(&ty, payload, env, depth, raw)?;
     Ok(CompiledRule {
         raw: raw.into(),
         target,
@@ -497,7 +634,7 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
 fn parse_plain_rule(
     s: &str,
     env: &CompileEnv,
-    _depth: usize,
+    depth: usize,
     full: &str,
 ) -> Result<Matcher, String> {
     let parts = split_top_level(s);
@@ -506,7 +643,17 @@ fn parse_plain_rule(
     }
     let ty = parts[0].trim().to_ascii_uppercase();
     let payload = parts[1].trim();
-    match ty.as_str() {
+    parse_matcher(&ty, payload, env, depth, full)
+}
+
+fn parse_matcher(
+    ty: &str,
+    payload: &str,
+    env: &CompileEnv,
+    _depth: usize,
+    full: &str,
+) -> Result<Matcher, String> {
+    match ty {
         "DOMAIN" => {
             let mut t = DomainTrie::new();
             t.insert_exact(payload);

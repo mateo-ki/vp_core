@@ -3,7 +3,9 @@
 //! - insert_suffix_sub：仅子域（".x" 语义）
 //! - insert_exact：仅自身（DOMAIN / geosite Full）
 //!
-//! 三种标记可共存于同一节点；子节点按标签排序，查询二分，热路径零分配。
+//! 三种标记可共存于同一节点；哈希表索引子节点，插入与匹配均为 O(1)，启动构建零阻塞。
+
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitKind {
@@ -14,7 +16,7 @@ pub enum HitKind {
 
 #[derive(Debug, Default, Clone)]
 struct Node {
-    children: Vec<(Box<str>, Node)>,
+    children: HashMap<Box<str>, Node>,
     exact: bool,
     suffix_all: bool,
     suffix_sub: bool,
@@ -37,13 +39,7 @@ impl Node {
             return;
         }
         for (label, other_child) in other.children {
-            match self
-                .children
-                .binary_search_by(|(k, _)| (**k).as_bytes().cmp(label.as_bytes()))
-            {
-                Ok(i) => self.children[i].1.merge(other_child),
-                Err(i) => self.children.insert(i, (label, other_child)),
-            }
+            self.children.entry(label).or_default().merge(other_child);
         }
     }
 }
@@ -80,11 +76,7 @@ impl DomainTrie {
             .rsplit('.')
             .filter(|l| !l.is_empty())
         {
-            let i = node
-                .children
-                .binary_search_by(|(k, _)| (**k).as_bytes().cmp(label.as_bytes()))
-                .ok()?;
-            node = &node.children[i].1;
+            node = node.children.get(label)?;
         }
         Some(node)
     }
@@ -97,17 +89,7 @@ impl DomainTrie {
                 // 父级根域已经是全子域匹配，子级规则完全冗余，直接剪枝跳过！
                 return;
             }
-            let i = match node
-                .children
-                .binary_search_by(|(k, _)| (**k).as_bytes().cmp(label.as_bytes()))
-            {
-                Ok(i) => i,
-                Err(i) => {
-                    node.children.insert(i, (label.into(), Node::default()));
-                    i
-                }
-            };
-            node = &mut node.children[i].1;
+            node = node.children.entry(label.into()).or_default();
         }
         f(node);
         if node.suffix_all && !node.children.is_empty() {
@@ -152,11 +134,7 @@ impl DomainTrie {
             if node.suffix_sub {
                 return Some(HitKind::SuffixSub);
             }
-            let i = node
-                .children
-                .binary_search_by(|(k, _)| (**k).as_bytes().cmp(label.as_bytes()))
-                .ok()?;
-            node = &node.children[i].1;
+            node = node.children.get(label)?;
         }
         if node.suffix_all {
             Some(HitKind::SuffixAll)

@@ -1047,7 +1047,10 @@ async fn load_geosite(base_dir: &Path, url: Option<&str>) -> Option<GeoSiteDb> {
         for name in ["geosite.dat", "GeoSite.dat"] {
             let p = d.join(name);
             if p.exists() {
-                if let Ok(bytes) = std::fs::read(&p) {
+                if let Ok(db) = GeoSiteDb::load_file(&p) {
+                    info!("geosite 已加载(mmap零拷贝): {}", p.display());
+                    return Some(db);
+                } else if let Ok(bytes) = std::fs::read(&p) {
                     if let Ok(db) = GeoSiteDb::load(&bytes) {
                         info!("geosite 已加载: {}", p.display());
                         return Some(db);

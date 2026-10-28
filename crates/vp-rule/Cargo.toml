@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 vp-common.workspace = true
 maxminddb = { workspace = true, optional = true }
+memmap2.workspace = true
 regex = { workspace = true, optional = true }
 tracing.workspace = true
 serde_yaml.workspace = true

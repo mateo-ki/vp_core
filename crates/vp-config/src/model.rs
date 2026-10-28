@@ -392,6 +392,53 @@ impl ProxyKind {
             ProxyKind::Reject => "reject",
         }
     }
+
+    /// 提取节点服务器地址与端口（用于在出站惰性懒加载前提供节点元数据）
+    pub fn remote_addr(&self) -> Option<(String, u16)> {
+        match self {
+            ProxyKind::Ss(s) => Some((s.server.clone(), s.port)),
+            ProxyKind::Ssr(s) => Some((s.server.clone(), s.port)),
+            ProxyKind::Vmess(v) => Some((v.server.clone(), v.port)),
+            ProxyKind::Vless(v) => Some((v.server.clone(), v.port)),
+            ProxyKind::Trojan(t) => Some((t.server.clone(), t.port)),
+            ProxyKind::Snell(s) => Some((s.server.clone(), s.port)),
+            ProxyKind::Anytls(a) => Some((a.server.clone(), a.port)),
+            ProxyKind::Ssh(s) => Some((s.server.clone(), s.port)),
+            ProxyKind::Brook(b) => Some((b.server.clone(), b.port)),
+            ProxyKind::Mieru(m) => Some((m.server.clone(), m.port)),
+            ProxyKind::Naive(n) => Some((n.server.clone(), n.port)),
+            ProxyKind::Socks5(s) => Some((s.server.clone(), s.port)),
+            ProxyKind::Tuic(t) => Some((t.server.clone(), t.port)),
+            ProxyKind::Hysteria2(h) => Some((h.server.clone(), h.port)),
+            ProxyKind::Http(h) | ProxyKind::Https(h) => Some((h.server.clone(), h.port)),
+            ProxyKind::Wireguard(w) => Some((w.server.clone(), w.port)),
+            ProxyKind::Direct | ProxyKind::Reject => None,
+        }
+    }
+
+    /// 探测协议是否支持原生 UDP 转发
+    pub fn support_udp(&self) -> bool {
+        match self {
+            ProxyKind::Ss(s) => s.udp,
+            ProxyKind::Ssr(s) => s.udp,
+            ProxyKind::Vmess(v) => v.udp,
+            ProxyKind::Vless(v) => v.udp,
+            ProxyKind::Trojan(t) => t.udp,
+            ProxyKind::Snell(s) => s.udp,
+            ProxyKind::Anytls(_) => true,
+            ProxyKind::Ssh(_) => false,
+            ProxyKind::Brook(b) => b.udp,
+            ProxyKind::Mieru(_) => false,
+            ProxyKind::Naive(_) => true,
+            ProxyKind::Socks5(s) => s.udp,
+            ProxyKind::Tuic(_) => true,
+            ProxyKind::Hysteria2(_) => true,
+            ProxyKind::Http(_) | ProxyKind::Https(_) => false,
+            ProxyKind::Wireguard(_) => true,
+            ProxyKind::Direct => true,
+            ProxyKind::Reject => false,
+        }
+    }
 }
 
 /// TLS 相关公共字段说明（各协议结构体中显式重复声明以保持 serde 派生简单）：

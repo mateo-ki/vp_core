@@ -10,7 +10,8 @@ use crate::ipset::{IpIntervalSet, IpIntervalSetBuilder};
 
 #[derive(Clone)]
 pub enum GeoIpDb {
-    Mmdb(Arc<maxminddb::Reader<Vec<u8>>>),
+    MmdbMmap(Arc<maxminddb::Reader<memmap2::Mmap>>),
+    MmdbMem(Arc<maxminddb::Reader<Vec<u8>>>),
     Dat(Arc<HashMap<String, Arc<IpIntervalSet>>>),
 }
 
@@ -25,7 +26,7 @@ struct CountryLookup {
 }
 
 impl GeoIpDb {
-    /// 自动识别并加载 .mmdb 或 .dat (v2ray protobuf)
+    /// 自动识别并加载 .mmdb 或 .dat (v2ray protobuf)，优先采用零拷贝 mmap 映射
     pub fn load(path: &Path) -> Result<Self, String> {
         let is_dat = path
             .extension()
@@ -34,15 +35,29 @@ impl GeoIpDb {
             .unwrap_or(false);
 
         if is_dat {
-            let bytes = std::fs::read(path)
-                .map_err(|e| format!("读取 GeoIP dat 文件 {} 失败: {e}", path.display()))?;
-            let dat_map = parse_geoip_dat(&bytes)
-                .map_err(|e| format!("解析 GeoIP dat 文件 {} 失败: {e}", path.display()))?;
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("打开 GeoIP dat 文件 {} 失败: {e}", path.display()))?;
+            let dat_map = match unsafe { memmap2::Mmap::map(&file) } {
+                Ok(mmap) => parse_geoip_dat(&mmap)
+                    .map_err(|e| format!("解析 GeoIP dat 文件 {} 失败: {e}", path.display()))?,
+                Err(_) => {
+                    let bytes = std::fs::read(path)
+                        .map_err(|e| format!("读取 GeoIP dat 文件 {} 失败: {e}", path.display()))?;
+                    parse_geoip_dat(&bytes)
+                        .map_err(|e| format!("解析 GeoIP dat 文件 {} 失败: {e}", path.display()))?
+                }
+            };
             Ok(GeoIpDb::Dat(Arc::new(dat_map)))
         } else {
-            let reader = maxminddb::Reader::open_readfile(path)
-                .map_err(|e| format!("打开 GeoIP 数据库 {} 失败: {e}", path.display()))?;
-            Ok(GeoIpDb::Mmdb(Arc::new(reader)))
+            // 优先采用零拷贝 mmap，由 OS 页缓存管理虚拟内存，内存压力下自动回收，彻底消除 10~15MB 堆占用
+            match maxminddb::Reader::open_mmap(path) {
+                Ok(reader) => Ok(GeoIpDb::MmdbMmap(Arc::new(reader))),
+                Err(_) => {
+                    let reader = maxminddb::Reader::open_readfile(path)
+                        .map_err(|e| format!("打开 GeoIP 数据库 {} 失败: {e}", path.display()))?;
+                    Ok(GeoIpDb::MmdbMem(Arc::new(reader)))
+                }
+            }
         }
     }
 
@@ -62,7 +77,11 @@ impl GeoIpDb {
             return Some(GeoIpMatcher::LanOrPrivate);
         }
         match self {
-            GeoIpDb::Mmdb(reader) => Some(GeoIpMatcher::Mmdb {
+            GeoIpDb::MmdbMmap(reader) => Some(GeoIpMatcher::MmdbMmap {
+                code,
+                reader: reader.clone(),
+            }),
+            GeoIpDb::MmdbMem(reader) => Some(GeoIpMatcher::MmdbMem {
                 code,
                 reader: reader.clone(),
             }),
@@ -76,7 +95,11 @@ impl GeoIpDb {
 #[derive(Clone)]
 pub enum GeoIpMatcher {
     LanOrPrivate,
-    Mmdb {
+    MmdbMmap {
+        code: String,
+        reader: Arc<maxminddb::Reader<memmap2::Mmap>>,
+    },
+    MmdbMem {
         code: String,
         reader: Arc<maxminddb::Reader<Vec<u8>>>,
     },
@@ -99,7 +122,13 @@ impl GeoIpMatcher {
                         }
                     }
             }
-            GeoIpMatcher::Mmdb { code, reader } => {
+            GeoIpMatcher::MmdbMmap { code, reader } => {
+                let hit: Option<CountryLookup> = reader.lookup(ip).ok().flatten();
+                hit.and_then(|c| c.country)
+                    .and_then(|c| c.iso_code)
+                    .is_some_and(|iso| iso.eq_ignore_ascii_case(code))
+            }
+            GeoIpMatcher::MmdbMem { code, reader } => {
                 let hit: Option<CountryLookup> = reader.lookup(ip).ok().flatten();
                 hit.and_then(|c| c.country)
                     .and_then(|c| c.iso_code)

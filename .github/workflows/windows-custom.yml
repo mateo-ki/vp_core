@@ -68,6 +68,12 @@ jobs:
           Expand-Archive wintun.zip wintun-unpacked
           Copy-Item wintun-unpacked/wintun/bin/amd64/wintun.dll $pkg
           Copy-Item wintun-unpacked/wintun/LICENSE.txt "$pkg/WINTUN-LICENSE.txt"
+          if ($env:INCLUDE_GUI -eq 'true') {
+            $test = Start-Process "$pkg/vpcore-config.exe" -ArgumentList '--self-test' -PassThru
+            if (!$test.WaitForExit(60000)) { $test.Kill(); throw 'GUI self-test timed out' }
+            Get-Content "$pkg/gui-self-test.txt"
+            if ($test.ExitCode -ne 0) { throw 'GUI self-test failed' }
+          }
           git rev-parse HEAD | Set-Content "$pkg/SOURCE-COMMIT.txt"
           Get-ChildItem $pkg -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
             "$($_.Hash)  $(Split-Path $_.Path -Leaf)"

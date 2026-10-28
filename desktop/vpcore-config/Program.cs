@@ -8,11 +8,20 @@ static class Program {
         using var mutex = new Mutex(true, @"Local\VpcoreConfig", out var first);
         if (!first) { MessageBox.Show("配置工具已运行，请从系统托盘打开。"); return; }
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm(args.Contains("--background")));
+        if (args.Contains("--self-test")) {
+            var testRoot = Path.Combine(Path.GetTempPath(), "vpcore-test-" + Guid.NewGuid());
+            using var form = new MainForm(false, testRoot);
+            form.Shown += async (_, _) => {
+                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop"); }
+                catch (Exception e) { Environment.ExitCode = 1; File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), e.ToString()); }
+                finally { form.ExitTest(); }
+            };
+            Application.Run(form);
+        } else Application.Run(new MainForm(args.Contains("--background")));
     }
 }
 sealed class MainForm : Form {
-    readonly string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VP_Core");
+    readonly string root;
     string Config => Path.Combine(root, "config.yaml");
     string Core => Path.Combine(AppContext.BaseDirectory, "vpcore.exe");
     readonly TextBox yaml = new() { Multiline = true, ScrollBars = ScrollBars.Both, WordWrap = false, Dock = DockStyle.Fill, Font = new Font("Consolas", 11) };
@@ -24,7 +33,8 @@ sealed class MainForm : Form {
     readonly CheckBox startup = new() { Text = "登录 Windows 后后台启动", AutoSize = true };
     Process? core;
     bool exiting, busy;
-    public MainForm(bool background) {
+    public MainForm(bool background, string? dataRoot = null) {
+        root = dataRoot ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "VP_Core");
         Text = "VP_Core · 配置与运行"; Width = 1000; Height = 740; MinimumSize = new Size(780, 580);
         Directory.CreateDirectory(root);
         if (!File.Exists(Config)) File.WriteAllText(Config, "mixed-port: 7890\nallow-lan: false\nmode: rule\nlog-level: info\nipv6: false\nproxies: []\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n");
@@ -57,7 +67,8 @@ sealed class MainForm : Form {
         Button("重启内核",async()=>{await Stop(); await Start();});
         Button("打开配置目录",()=>{Process.Start(new ProcessStartInfo(root){UseShellExecute=true});return Task.CompletedTask;});
         buttons.Controls.Add(status); Controls.Add(tabs); Controls.Add(buttons);
-        tabs.Selecting += (_,e)=>{try {if(e.TabPage==basic)LoadFields(); else if(tabs.SelectedTab==basic)ApplyFields();}catch(Exception x){e.Cancel=true;MessageBox.Show(x.Message);}};
+        tabs.Deselecting += (_,e)=>{if(e.TabPage==basic)try{ApplyFields();}catch(Exception x){e.Cancel=true;MessageBox.Show(x.Message);}};
+        tabs.Selecting += (_,e)=>{if(e.TabPage==basic)try{LoadFields();}catch(Exception x){e.Cancel=true;MessageBox.Show(x.Message);}};
         var menu = new ContextMenuStrip(); menu.Items.Add("打开配置",null,(_,_)=>{Show();WindowState=FormWindowState.Normal;Activate();});
         menu.Items.Add("退出并停止内核",null,async(_,_)=>{try {await Stop();exiting=true;Close();}catch(Exception e){MessageBox.Show(e.Message);}}); tray.ContextMenuStrip=menu;
         tray.DoubleClick+=(_,_)=>{Show();WindowState=FormWindowState.Normal;Activate();};
@@ -66,6 +77,21 @@ sealed class MainForm : Form {
         Shown+=async(_,_)=>{if(background)Hide(); if(autoRun.Checked)try{await Start();}catch(Exception e){Log(e.Message);tray.ShowBalloonTip(5000,"内核启动失败",e.Message,ToolTipIcon.Error);}};
         LoadFields();
     }
+    public async Task SelfTest() {
+        yaml.Text = "mixed-port: 0\nmode: rule\nrules: [MATCH,DIRECT]\nx-custom:\n  preserved: yes\n";
+        // MATCH,DIRECT is one scalar rule, not two entries.
+        yaml.Text = yaml.Text.Replace("[MATCH,DIRECT]", "[\"MATCH,DIRECT\"]");
+        LoadFields(); fields["mode"].Text = "direct"; ApplyFields();
+        var node = (YamlMappingNode)Parse().Documents[0].RootNode;
+        if (!node.Children.ContainsKey(new YamlScalarNode("x-custom"))) throw new Exception("Unknown configuration was lost");
+        if (node.Children[new YamlScalarNode("mode")].ToString() != "direct") throw new Exception("Mode edit failed");
+        fields["mixed-port"].Text = "99999";
+        bool rejected = false; try { ApplyFields(); } catch { rejected = true; }
+        if (!rejected) throw new Exception("Invalid port was accepted");
+        fields["mixed-port"].Text = "0";
+        await Save(); await Start(); await Stop();
+    }
+    public void ExitTest() { exiting=true; Close(); }
     void Guard(Action action){try{action();}catch(Exception e){MessageBox.Show(e.Message);}}
     YamlStream Parse(){var s=new YamlStream();s.Load(new StringReader(yaml.Text));if(s.Documents.Count!=1||s.Documents[0].RootNode is not YamlMappingNode)throw new Exception("配置必须为单个 YAML 对象。");return s;}
     void LoadFields(){var m=(YamlMappingNode)Parse().Documents[0].RootNode;foreach(var (k,c) in fields){var value=m.Children.TryGetValue(new YamlScalarNode(k),out var v)?v.ToString(): k is "mode"?"rule":k is "log-level"?"info":k.EndsWith("port")?"0":"";if(c is CheckBox b)b.Checked=value=="true";else c.Text=value;}}

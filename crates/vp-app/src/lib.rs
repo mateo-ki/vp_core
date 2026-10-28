@@ -271,6 +271,9 @@ impl App {
         } else {
             Resolver::system()
         });
+        // 节点自身的域名拨号走全局解析器（多上游并集 + 缓存 + 竞速拨号，
+        // 对抗节点域名被污染/多 A 记录中混有失效地址导致的"时通时不通"）
+        vp_transport::set_global_node_resolver(dns.clone(), cfg.ipv6);
         let deps = OutboundDeps {
             dns: dns.clone(),
             ipv6: cfg.ipv6,

@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::net::TcpStream;
 
 use vp_common::{DstAddr, Error, Host, Result};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session, UdpPacket};
@@ -59,17 +58,18 @@ impl Outbound for DirectOutbound {
             }
         }
         let addrs = self.resolve(dst).await?;
-        let mut last = Error::Addr(format!("无法解析 {dst}"));
-        for a in addrs {
-            match TcpStream::connect(&a).await {
-                Ok(s) => {
-                    vp_transport::tune(&s);
-                    return Ok(Box::new(s));
-                }
-                Err(e) => last = e.into(),
-            }
+        if addrs.is_empty() {
+            return Err(Error::Addr(format!("无法解析 {dst}")));
         }
-        Err(last)
+        // 多地址（CDN/双栈）并发竞速：避免单个失效地址吃光系统级连接超时
+        let tcp = vp_transport::dial_addrs_multi(
+            &addrs,
+            &dst.host.to_string(),
+            dst.port,
+            std::time::Duration::from_secs(8),
+        )
+        .await?;
+        Ok(Box::new(tcp))
     }
 
     fn support_udp(&self) -> bool {

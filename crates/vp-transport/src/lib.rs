@@ -241,24 +241,154 @@ pub async fn wrap_transport(
     Ok(stream)
 }
 
+/// 节点拨号专用的全局解析器（进程内唯一 DNS 配置，随配置加载注入）。
+/// 只用于拨号"代理节点自身的服务器域名"，不影响业务目标的分流解析（那是 DIRECT/规则的事）。
+static NODE_RESOLVER: std::sync::RwLock<Option<(std::sync::Arc<vp_dns::Resolver>, bool)>> =
+    std::sync::RwLock::new(None);
+
+/// 注入节点拨号解析器与 IPv6 偏好（vp-app 加载配置后调用；配置热重载会再次覆盖）。
+pub fn set_global_node_resolver(resolver: std::sync::Arc<vp_dns::Resolver>, ipv6: bool) {
+    if let Ok(mut slot) = NODE_RESOLVER.write() {
+        *slot = Some((resolver, ipv6));
+    }
+}
+
+fn global_node_resolver() -> Option<(std::sync::Arc<vp_dns::Resolver>, bool)> {
+    NODE_RESOLVER.read().ok().and_then(|slot| slot.clone())
+}
+
+/// 多地址竞速 TCP 拨号。
+///
+/// 节点域名常返回多条 A 记录，且解析结果可能混入被污染/已失效的地址（GFW 的"邻居 IP"
+/// 污染会返回与真实记录同网段的假地址）。顺序拨号时排在前面的一条假地址就能吃光整体
+/// 超时预算，表现成节点"时通时不通"。这里把内置 DNS 与系统解析的并集地址并发竞速：
+/// 后续地址错峰启动（保留解析器给出的优先序偏好），任一地址建立连接即胜出并取消其余。
+pub async fn dial_tcp_multi(
+    host: &str,
+    port: u16,
+    budget: Duration,
+) -> Result<tokio::net::TcpStream> {
+    use std::net::SocketAddr;
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    // 1) 内置 DNS（多上游并发 + 缓存 + 污染过滤）：节点域名优先走它
+    if let Some((resolver, ipv6)) = global_node_resolver() {
+        match resolver.resolve_domain(host, ipv6).await {
+            Ok(ips) => {
+                addrs.extend(ips.iter().map(|ip| SocketAddr::new(*ip, port)));
+            }
+            Err(e) => {
+                tracing::debug!("节点域名 {host} 内置 DNS 解析失败，回退系统解析: {e}");
+            }
+        }
+    }
+    // 2) 系统解析并入并集：内置 DNS 若整轮被污染，系统答案里可能仍有活地址
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(it) => addrs.extend(it),
+        Err(e) if addrs.is_empty() => {
+            return Err(vp_common::Error::Dns(format!("解析 {host} 失败: {e}")));
+        }
+        Err(_) => {}
+    }
+    addrs.dedup();
+    if addrs.is_empty() {
+        return Err(vp_common::Error::Dns(format!(
+            "解析 {host} 未得到任何地址"
+        )));
+    }
+    if addrs.len() == 1 {
+        let tcp = tokio::time::timeout(budget, tokio::net::TcpStream::connect(addrs[0]))
+            .await
+            .map_err(|_| {
+                vp_common::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("连接 {host}:{port} 超时"),
+                ))
+            })??;
+        tune(&tcp);
+        return Ok(tcp);
+    }
+    dial_addrs_multi(&addrs, host, port, budget).await
+}
+
+/// 对既定地址列表竞速拨号（[`dial_tcp_multi`] 的核心，独立出来便于测试）。
+pub async fn dial_addrs_multi(
+    addrs: &[std::net::SocketAddr],
+    host: &str,
+    port: u16,
+    budget: Duration,
+) -> Result<tokio::net::TcpStream> {
+    const STAGGER: Duration = Duration::from_millis(150);
+    let total = addrs.len();
+    let mut tasks: tokio::task::JoinSet<(std::net::SocketAddr, std::io::Result<tokio::net::TcpStream>)> =
+        tokio::task::JoinSet::new();
+    for (idx, addr) in addrs.iter().enumerate() {
+        let addr = *addr;
+        let delay = STAGGER * (idx as u32).min(4);
+        tasks.spawn(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let res = tokio::net::TcpStream::connect(addr).await;
+            (addr, res)
+        });
+    }
+
+    let mut failed = 0usize;
+    let mut last_err: Option<std::io::Error> = None;
+    let winner = tokio::time::timeout(budget, async {
+        while let Some(res) = tasks.join_next().await {
+            match res {
+                Ok((addr, Ok(tcp))) => return Some((addr, tcp)),
+                Ok((addr, Err(e))) => {
+                    tracing::debug!("竞速拨号 {addr} 失败: {e}");
+                    failed += 1;
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    // 拨号任务 panic：按失败处理，继续等其余地址
+                    failed += 1;
+                }
+            }
+        }
+        None
+    })
+    .await;
+
+    match winner {
+        Ok(Some((addr, tcp))) => {
+            tasks.abort_all();
+            tracing::debug!(
+                "竞速拨号 {host}:{port} 经 {addr} 建立连接（{failed}/{total} 个地址此前失败）"
+            );
+            tune(&tcp);
+            Ok(tcp)
+        }
+        Ok(None) => {
+            let detail = last_err
+                .as_ref()
+                .map(|e| format!("，最后错误: {e}"))
+                .unwrap_or_default();
+            Err(vp_common::Error::Io(std::io::Error::other(format!(
+                "连接 {host}:{port} 失败：{total} 个地址均不可达{detail}"
+            ))))
+        }
+        Err(_) => {
+            tasks.abort_all();
+            Err(vp_common::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("连接 {host}:{port} 超时（{failed}/{total} 个地址已失败）"),
+            )))
+        }
+    }
+}
+
 /// 拨号：TCP → 传输层封装（wrap_transport）
 pub async fn dial(
     server_host: &str,
     server_port: u16,
     cfg: &TransportConfig,
 ) -> Result<Box<dyn ProxyStream>> {
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(8),
-        tokio::net::TcpStream::connect((server_host, server_port)),
-    )
-    .await
-    .map_err(|_| {
-        vp_common::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("连接 {server_host}:{server_port} 超时"),
-        ))
-    })??;
-    tune(&tcp);
+    let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
     wrap_transport(Box::new(tcp), server_host, cfg).await
 }
 
@@ -286,6 +416,44 @@ mod tests {
         c.read_exact(&mut b).await.unwrap();
         assert_eq!(&b, b"ok");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_multi_single_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_s, _) = listener.accept().await.unwrap();
+        });
+        let c = dial_tcp_multi("127.0.0.1", addr.port(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(c.peer_addr().unwrap().port(), addr.port());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_multi_races_around_dead_address() {
+        // 首位放一个不可路由的黑洞地址（模拟被污染/失效的 A 记录），
+        // 竞速应绕过它从活地址建立连接，而不是被它吃光预算。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = listener.local_addr().unwrap();
+        let dead: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (_s, _) = listener.accept().await.unwrap();
+        });
+        let c = dial_addrs_multi(&[dead, live], "race.test", live.port(), Duration::from_secs(6))
+            .await
+            .unwrap();
+        assert_eq!(c.peer_addr().unwrap(), live);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_tcp_multi_reports_failure_when_all_dead() {
+        let dead: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
+        let res = dial_addrs_multi(&[dead], "dead.test", 9, Duration::from_millis(700)).await;
+        assert!(res.is_err(), "全黑洞地址应当失败: {res:?}");
     }
 
     #[test]

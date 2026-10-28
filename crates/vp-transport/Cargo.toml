@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 vp-common.workspace = true
 vp-core.workspace = true
+vp-dns.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true

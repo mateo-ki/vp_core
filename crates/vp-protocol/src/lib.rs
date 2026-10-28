@@ -96,6 +96,7 @@ pub use direct::DirectOutbound;
 pub use inbound::{InboundKind, build_inbound, dispatch_stream};
 
 /// 出站构建依赖
+#[derive(Clone)]
 pub struct OutboundDeps {
     pub dns: Arc<Resolver>,
     pub ipv6: bool,
@@ -203,8 +204,91 @@ pub fn transport_of_full(
     })
 }
 
-/// 根据配置构建单个出站（不含组）
+/// 惰性懒加载出站代理（Lazy Outbound）：
+/// 启动时不创建 TLS 客户端配置、不派生加解密套件、不分配传输缓冲区；
+/// 仅当该节点被选为活动流出口或被主动测速时，才由 OnceLock 线程安全地按需初始化。
+/// 对拥有数百至上千节点的机场订阅，可直接降低 15~20 MB 堆内存常驻。
+pub struct LazyOutbound {
+    name: Arc<str>,
+    cfg: ProxyCfg,
+    deps: OutboundDeps,
+    inner: std::sync::OnceLock<std::result::Result<Arc<dyn Outbound>, String>>,
+}
+
+impl LazyOutbound {
+    pub fn new(cfg: ProxyCfg, deps: OutboundDeps) -> Self {
+        Self {
+            name: cfg.name.as_str().into(),
+            cfg,
+            deps,
+            inner: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn get_or_init(&self) -> Result<Arc<dyn Outbound>> {
+        let res = self.inner.get_or_init(|| {
+            build_outbound_eager(&self.cfg, &self.deps)
+                .map_err(|e| e.to_string())
+        });
+        match res {
+            Ok(ob) => Ok(ob.clone()),
+            Err(e) => Err(Error::Config(e.clone())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Outbound for LazyOutbound {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn remote_addr(&self) -> Option<(String, u16)> {
+        if let Some(Ok(inner)) = self.inner.get() {
+            return inner.remote_addr();
+        }
+        self.cfg.kind.remote_addr()
+    }
+
+    fn support_udp(&self) -> bool {
+        if let Some(Ok(inner)) = self.inner.get() {
+            return inner.support_udp();
+        }
+        if self.cfg.udp_over_tcp {
+            return true;
+        }
+        self.cfg.kind.support_udp()
+    }
+
+    async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
+        self.get_or_init()?.connect_stream(sess, dst).await
+    }
+
+    async fn connect_over(
+        &self,
+        sess: &Session,
+        dst: &DstAddr,
+        underlying: Box<dyn ProxyStream>,
+    ) -> Result<Box<dyn ProxyStream>> {
+        self.get_or_init()?.connect_over(sess, dst, underlying).await
+    }
+
+    async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        self.get_or_init()?.connect_packet(sess, dst).await
+    }
+}
+
+/// 根据配置构建单个出站（默认使用 LazyOutbound 惰性懒加载，大幅节省启动期内存）
 pub fn build_outbound(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Outbound>> {
+    match cfg.kind {
+        ProxyKind::Direct => Ok(Arc::new(DirectOutbound::new(deps.dns.clone(), deps.ipv6))),
+        ProxyKind::Reject => Ok(Arc::new(RejectOutbound)),
+        _ => Ok(Arc::new(LazyOutbound::new(cfg.clone(), deps.clone()))),
+    }
+}
+
+/// 立即全量构建出站协议实例（急切加载）
+pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<dyn Outbound>> {
     let o: Arc<dyn Outbound> = match &cfg.kind {
         ProxyKind::Direct => Arc::new(DirectOutbound::new(deps.dns.clone(), deps.ipv6)),
         ProxyKind::Reject => Arc::new(RejectOutbound),

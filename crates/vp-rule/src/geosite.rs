@@ -163,34 +163,110 @@ impl<'a> PbReader<'a> {
     }
 }
 
-/// geosite 库：加载一次，按 tag 惰性编译 trie 并缓存
+/// geosite 底层数据源（支持 mmap 零拷贝映射或内存块）
+#[derive(Clone)]
+pub enum GeoSiteBuffer {
+    Mmap(Arc<memmap2::Mmap>),
+    Bytes(Arc<[u8]>),
+}
+
+impl AsRef<[u8]> for GeoSiteBuffer {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            GeoSiteBuffer::Mmap(m) => m.as_ref(),
+            GeoSiteBuffer::Bytes(b) => b.as_ref(),
+        }
+    }
+}
+
+impl std::ops::Deref for GeoSiteBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+/// 快速扫描 .dat 二进制，建立 tag -> Vec<(offset, len)> 稀疏索引表（仅几 KB 内存，零堆字符串反序列化）
+pub fn build_tag_index(bytes: &[u8]) -> Result<HashMap<String, Vec<(usize, usize)>>, String> {
+    let mut index: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut r = PbReader::new(bytes);
+    while let Some((field, wire)) = r.next_tag()? {
+        if field == 1 && wire == 2 {
+            // entry = 1 (GeoSite message)
+            let len = r.varint()? as usize;
+            let start = r.pos;
+            if start + len > bytes.len() {
+                return Err("protobuf: geosite entry 越界".into());
+            }
+            let entry_bytes = &bytes[start..start + len];
+            r.pos += len;
+
+            // 仅解码 entry_bytes 内的 field 1: country_code，跳过全部域名明细
+            let mut er = PbReader::new(entry_bytes);
+            while let Some((efield, ewire)) = er.next_tag()? {
+                if efield == 1 && ewire == 2 {
+                    let code_raw = er.bytes()?;
+                    let code = String::from_utf8_lossy(code_raw).trim().to_ascii_lowercase();
+                    if !code.is_empty() {
+                        index.entry(code).or_default().push((start, len));
+                    }
+                    break;
+                } else {
+                    er.skip(ewire)?;
+                }
+            }
+        } else {
+            r.skip(wire)?;
+        }
+    }
+    Ok(index)
+}
+
+/// geosite 库：按需标签索引（Lazy Tag Indexing）+ 零拷贝 mmap，仅按需反序列化被规则命中的 tag
 #[derive(Clone)]
 pub struct GeoSiteDb {
-    sites: Arc<HashMap<String, Vec<(SiteEntryKind, String)>>>,
+    buffer: GeoSiteBuffer,
+    tag_index: Arc<HashMap<String, Vec<(usize, usize)>>>,
     cache: Arc<RwLock<HashMap<String, Arc<CompiledSite>>>>,
 }
 
 impl GeoSiteDb {
-    pub fn load(bytes: &[u8]) -> Result<Self, String> {
-        let raw = parse_dat(bytes)?;
-        let mut sites = HashMap::new();
-        for s in raw {
-            sites
-                .entry(s.code.to_ascii_lowercase())
-                .or_insert_with(Vec::new)
-                .extend(s.entries);
-        }
+    /// 从文件加载 geosite.dat（优先使用 memmap2 零拷贝内核页映射，失败自动回退标准读取）
+    pub fn load_file(path: &std::path::Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("打开 GeoSite 文件 {} 失败: {e}", path.display()))?;
+        let buf = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(mmap) => GeoSiteBuffer::Mmap(Arc::new(mmap)),
+            Err(_) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("读取 GeoSite 文件 {} 失败: {e}", path.display()))?;
+                GeoSiteBuffer::Bytes(Arc::from(bytes.into_boxed_slice()))
+            }
+        };
+        let tag_index = build_tag_index(&buf)?;
         Ok(GeoSiteDb {
-            sites: Arc::new(sites),
+            buffer: buf,
+            tag_index: Arc::new(tag_index),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    /// 从内存字节加载（快速构建索引，按需解码）
+    pub fn load(bytes: &[u8]) -> Result<Self, String> {
+        let buf = GeoSiteBuffer::Bytes(Arc::from(bytes.to_vec().into_boxed_slice()));
+        let tag_index = build_tag_index(&buf)?;
+        Ok(GeoSiteDb {
+            buffer: buf,
+            tag_index: Arc::new(tag_index),
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub fn has(&self, tag: &str) -> bool {
-        self.sites.contains_key(&tag.to_ascii_lowercase())
+        self.tag_index.contains_key(&tag.to_ascii_lowercase())
     }
 
-    /// 编译某 tag 为域名匹配集（trie + 正则），结果自动常驻缓存
+    /// 编译某 tag 为域名匹配集（trie + 正则），仅首次请求该 tag 时跳转解码对应片段，结果自动常驻缓存
     pub fn compile(&self, tag: &str) -> Option<Arc<CompiledSite>> {
         let tag_lower = tag.to_ascii_lowercase();
         {
@@ -199,22 +275,31 @@ impl GeoSiteDb {
                 return Some(hit.clone());
             }
         }
-        let entries = self.sites.get(&tag_lower)?;
+        let ranges = self.tag_index.get(&tag_lower)?;
         let mut trie = DomainTrie::new();
         let mut keywords: Vec<Box<str>> = Vec::new();
         let mut regexes: Vec<regex::Regex> = Vec::new();
-        for (kind, value) in entries {
-            match kind {
-                SiteEntryKind::Root => trie.insert_suffix_all(value),
-                SiteEntryKind::Full => trie.insert_exact(value),
-                SiteEntryKind::Plain => keywords.push(value.to_ascii_lowercase().into()),
-                SiteEntryKind::Regex => {
-                    if let Ok(re) = regex::Regex::new(&format!("(?i){value}")) {
-                        regexes.push(re);
+
+        for &(offset, len) in ranges {
+            if offset + len <= self.buffer.len() {
+                let msg = &self.buffer[offset..offset + len];
+                if let Ok(site) = parse_site(msg) {
+                    for (kind, value) in site.entries {
+                        match kind {
+                            SiteEntryKind::Root => trie.insert_suffix_all(&value),
+                            SiteEntryKind::Full => trie.insert_exact(&value),
+                            SiteEntryKind::Plain => keywords.push(value.to_ascii_lowercase().into()),
+                            SiteEntryKind::Regex => {
+                                if let Ok(re) = regex::Regex::new(&format!("(?i){value}")) {
+                                    regexes.push(re);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+
         let compiled = Arc::new(CompiledSite {
             trie,
             keywords,

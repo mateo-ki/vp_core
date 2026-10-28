@@ -56,16 +56,45 @@ enum Cmd {
         /// 本地 mixed 监听端口
         #[arg(short, long, default_value_t = 7890)]
         port: u16,
+        /// 代理地址（例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890，缺省自动读取 HTTP_PROXY/ALL_PROXY 环境变量）
+        #[arg(short = 'x', long)]
+        proxy: Option<String>,
+        /// 自定义 User-Agent（缺省使用 Clash.Meta 标头以兼容各机场面板）
+        #[arg(long)]
+        user_agent: Option<String>,
     },
     /// 应急清理所有系统 TUN 历史残留路由（恢复网络）
     CleanRoutes,
 }
 
-/// HTTP GET 拉取（ureq 默认跟随重定向）
-fn fetch(url: String) -> Result<String, String> {
-    let resp = ureq::get(&url)
-        .timeout(std::time::Duration::from_secs(30))
-        .set("User-Agent", "vpcore/sub")
+/// HTTP GET 拉取（ureq 默认跟随重定向，支持代理与标准客户端 User-Agent）
+fn fetch(url: String, proxy: Option<String>, user_agent: Option<String>) -> Result<String, String> {
+    let mut builder = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(30));
+
+    // 优先使用 CLI 指定的代理，否则检查环境变量 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY
+    let proxy_str = proxy.or_else(|| {
+        std::env::var("HTTPS_PROXY")
+            .or_else(|_| std::env::var("https_proxy"))
+            .or_else(|_| std::env::var("HTTP_PROXY"))
+            .or_else(|_| std::env::var("http_proxy"))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .or_else(|_| std::env::var("all_proxy"))
+            .ok()
+    });
+
+    if let Some(ref p) = proxy_str {
+        if let Ok(proxy_obj) = ureq::Proxy::new(p) {
+            builder = builder.proxy(proxy_obj);
+        }
+    }
+
+    let agent = builder.build();
+    let ua = user_agent.unwrap_or_else(|| "clash.meta/v1.18.10".into());
+
+    let resp = agent
+        .get(&url)
+        .set("User-Agent", &ua)
+        .set("Accept", "*/*")
         .call()
         .map_err(|e| format!("{e}"))?;
     let mut body = String::new();
@@ -134,10 +163,16 @@ async fn main() {
                 }
             }
         }
-        Cmd::Sub { url, output, port } => {
+        Cmd::Sub {
+            url,
+            output,
+            port,
+            proxy,
+            user_agent,
+        } => {
             init_logging("warn");
             // 拉取（跟随重定向的最小 HTTP GET）
-            let body = tokio::task::spawn_blocking(move || fetch(url))
+            let body = tokio::task::spawn_blocking(move || fetch(url, proxy, user_agent))
                 .await
                 .unwrap()
                 .unwrap_or_else(|e| {
@@ -145,25 +180,97 @@ async fn main() {
                     std::process::exit(2);
                 });
             let nodes = vp_protocol::sub::parse_subscription(&body);
-            if nodes.is_empty() {
+            let (cfg, count, sample_names) = if !nodes.is_empty() {
+                let count = nodes.len();
+                let sample_names: Vec<String> =
+                    nodes.iter().take(5).map(|n| n.name().to_string()).collect();
+                (
+                    vp_protocol::sub::build_config(&nodes, port),
+                    count,
+                    sample_names,
+                )
+            } else if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&body) {
+                // 支持直接返回 Clash YAML 订阅的情况
+                let list_val = doc
+                    .as_mapping()
+                    .and_then(|m| m.get("proxies").or_else(|| m.get("payload")));
+                if let Some(serde_yaml::Value::Sequence(seq)) = list_val {
+                    if seq.is_empty() {
+                        eprintln!("订阅中没有可识别的节点");
+                        std::process::exit(1);
+                    }
+                    let count = seq.len();
+                    let mut sample_names = Vec::new();
+                    for item in seq.iter().take(5) {
+                        if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                            sample_names.push(name.to_string());
+                        }
+                    }
+                    // 若原始文档包含 proxy-groups，则直接使用原文档并注入 mixed-port
+                    let has_groups = doc
+                        .as_mapping()
+                        .and_then(|m| m.get("proxy-groups"))
+                        .is_some();
+                    let final_cfg = if has_groups {
+                        format!("mixed-port: {port}\n{body}")
+                    } else {
+                        let mut names = Vec::new();
+                        for item in seq {
+                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                                names.push(name.to_string());
+                            }
+                        }
+                        let proxies_yaml = serde_yaml::to_string(seq).unwrap_or_default();
+                        let mut out = format!(
+                            "mixed-port: {port}\nmode: rule\nlog-level: info\n\nproxies:\n"
+                        );
+                        for line in proxies_yaml.lines() {
+                            out.push_str("  ");
+                            out.push_str(line);
+                            out.push('\n');
+                        }
+                        out.push_str("\nproxy-groups:\n");
+                        out.push_str("  - name: PROXY\n    type: select\n    proxies: [自动选择");
+                        for n in &names {
+                            out.push_str(&format!(", \"{}\"", n));
+                        }
+                        out.push_str("]\n");
+                        out.push_str("  - name: 自动选择\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies: [");
+                        out.push_str(
+                            &names
+                                .iter()
+                                .map(|n| format!("\"{n}\""))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        out.push_str("]\n");
+                        out.push_str("\nrules:\n  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve\n  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve\n  - MATCH,PROXY\n");
+                        out
+                    };
+                    (final_cfg, count, sample_names)
+                } else {
+                    eprintln!("订阅中没有可识别的节点");
+                    std::process::exit(1);
+                }
+            } else {
                 eprintln!("订阅中没有可识别的节点");
                 std::process::exit(1);
-            }
-            let cfg = vp_protocol::sub::build_config(&nodes, port);
+            };
+
             std::fs::write(&output, cfg).unwrap_or_else(|e| {
                 eprintln!("写入 {} 失败: {e}", output.display());
                 std::process::exit(2);
             });
             println!(
                 "✓ {} 个节点 → {}（mixed-port {port}）",
-                nodes.len(),
+                count,
                 output.display()
             );
-            for n in nodes.iter().take(5) {
-                println!("  - {}", n.name());
+            for n in sample_names {
+                println!("  - {n}");
             }
-            if nodes.len() > 5 {
-                println!("  ... 共 {} 个", nodes.len());
+            if count > 5 {
+                println!("  ... 共 {count} 个");
             }
         }
         Cmd::Test { config } => {

@@ -611,71 +611,114 @@ impl Inbound for SsInbound {
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
         // TCP 与 UDP 必须同端口；随机端口撞车（Windows 动态端口范围）时整体重试
         let mut last_err: Option<std::io::Error> = None;
+        let mut _held_udp = Vec::new();
+        let mut _held_tcp = Vec::new();
+
         for attempt in 0..40 {
-            let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
-            let bound = listener.local_addr()?.port();
-            match tokio::net::UdpSocket::bind((self.bind.as_str(), bound)).await {
-                Ok(udp) => {
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = this.serve_udp(udp).await {
-                            warn!("ss udp 入站结束: {e}");
-                        }
-                    });
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            match listener.accept().await {
-                                Ok((stream, src)) => {
-                                    vp_transport::tune(&stream);
-                                    let this = this.clone();
-                                    let ctx = ctx.clone();
-                                    tokio::spawn(async move {
-                                        let handled = match &this.shadow_tls {
-                                            Some(st) => {
-                                                match crate::shadowtls::server_handshake(
-                                                    stream,
-                                                    &st.password,
-                                                    &st.host,
-                                                    st.port,
-                                                )
-                                                .await
-                                                {
-                                                    Ok(wrapped) => {
-                                                        this.serve(wrapped, src, &ctx).await
-                                                    }
-                                                    Err(
-                                                        crate::shadowtls::ServerHandshakeError::Fallback,
-                                                    ) => Ok(()),
-                                                    Err(e) => {
-                                                        warn!("shadowtls 入站握手失败: {e}");
-                                                        Ok(())
-                                                    }
-                                                }
-                                            }
-                                            None => this.serve(stream, src, &ctx).await,
-                                        };
-                                        if let Err(e) = handled {
-                                            warn!("ss 入站会话结束: {e}");
-                                        }
-                                    });
-                                }
-                                Err(e) => {
-                                    warn!("ss 入站 accept 失败: {e}");
-                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                }
-                            }
-                        }
-                    });
-                    return Ok(bound);
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    // 退避，降低并发测试时的连续撞车
-                    tokio::time::sleep(std::time::Duration::from_millis(5 + attempt as u64 * 10))
+            let (listener, udp, bound) = if self.port == 0 {
+                // Windows 下 UDP 端口权限更严格，先尝试绑定 UDP 随机端口
+                let udp = match tokio::net::UdpSocket::bind((self.bind.as_str(), 0)).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            5 + attempt as u64 * 10,
+                        ))
                         .await;
+                        continue;
+                    }
+                };
+                let port = match udp.local_addr() {
+                    Ok(a) => a.port(),
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                };
+                match tokio::net::TcpListener::bind((self.bind.as_str(), port)).await {
+                    Ok(l) => (l, udp, port),
+                    Err(e) => {
+                        last_err = Some(e);
+                        // 暂留 udp 避免下一次重试立即拿到同一个冲突端口
+                        _held_udp.push(udp);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            5 + attempt as u64 * 10,
+                        ))
+                        .await;
+                        continue;
+                    }
                 }
-            }
+            } else {
+                let listener =
+                    match tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await {
+                        Ok(l) => l,
+                        Err(e) => return Err(e.into()),
+                    };
+                let bound = listener.local_addr()?.port();
+                match tokio::net::UdpSocket::bind((self.bind.as_str(), bound)).await {
+                    Ok(u) => (listener, u, bound),
+                    Err(e) => {
+                        last_err = Some(e);
+                        _held_tcp.push(listener);
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            5 + attempt as u64 * 10,
+                        ))
+                        .await;
+                        continue;
+                    }
+                }
+            };
+
+            let this = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = this.serve_udp(udp).await {
+                    warn!("ss udp 入站结束: {e}");
+                }
+            });
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, src)) => {
+                            vp_transport::tune(&stream);
+                            let this = this.clone();
+                            let ctx = ctx.clone();
+                            tokio::spawn(async move {
+                                let handled = match &this.shadow_tls {
+                                    Some(st) => {
+                                        match crate::shadowtls::server_handshake(
+                                            stream,
+                                            &st.password,
+                                            &st.host,
+                                            st.port,
+                                        )
+                                        .await
+                                        {
+                                            Ok(wrapped) => this.serve(wrapped, src, &ctx).await,
+                                            Err(
+                                                crate::shadowtls::ServerHandshakeError::Fallback,
+                                            ) => Ok(()),
+                                            Err(e) => {
+                                                warn!("shadowtls 入站握手失败: {e}");
+                                                Ok(())
+                                            }
+                                        }
+                                    }
+                                    None => this.serve(stream, src, &ctx).await,
+                                };
+                                if let Err(e) = handled {
+                                    warn!("ss 入站会话结束: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!("ss 入站 accept 失败: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            });
+            return Ok(bound);
         }
         Err(vp_common::Error::Io(last_err.unwrap_or_else(|| {
             std::io::Error::other("udp bind 重试耗尽")

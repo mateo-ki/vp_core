@@ -194,13 +194,20 @@ pub async fn wrap_transport(
         // rustls 标准栈——Mihomo 的 Go TLS 同样不是真 uTLS，指纹差异不影响可用性。
         let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() {
             let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
+            let alpn = if cfg.grpc.is_some() {
+                vec!["h2".into()]
+            } else if cfg.ws.is_some() {
+                vec!["http/1.1".into()]
+            } else {
+                Vec::new()
+            };
             let s = utls::utls_connect(
                 stream,
                 server_host,
                 &utls::UtlsConfig {
                     fingerprint: utls::Fingerprint::parse(fp)?,
                     server_name: cfg.server_name.clone(),
-                    alpn: Vec::new(),
+                    alpn,
                     skip_cert_verify: cfg.skip_cert_verify,
                     reality: cfg.reality.clone(),
                 },
@@ -208,13 +215,20 @@ pub async fn wrap_transport(
             .await?;
             Box::new(s)
         } else {
+            let alpn = if cfg.grpc.is_some() {
+                vec!["h2".into()]
+            } else if cfg.ws.is_some() {
+                vec!["http/1.1".into()]
+            } else {
+                Vec::new()
+            };
             let s = tls::tls_connect(
                 stream,
                 server_host,
                 &tls::TlsClientConfig {
                     skip_cert_verify: cfg.skip_cert_verify,
                     server_name: cfg.server_name.clone(),
-                    alpn: Vec::new(),
+                    alpn,
                 },
             )
             .await?;

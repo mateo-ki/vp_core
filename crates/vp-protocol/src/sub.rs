@@ -836,27 +836,68 @@ pub fn parse_provider_proxies(
         return Ok(Vec::new());
     }
 
-    // 1. 尝试直接作为 YAML 反序列化
-    let mut proxies: Vec<vp_config::ProxyCfg> = if let Ok(doc) =
-        serde_yaml::from_str::<std::collections::HashMap<String, Vec<vp_config::ProxyCfg>>>(text)
-    {
-        doc.get("proxies").cloned().unwrap_or_default()
-    } else if let Ok(list) = serde_yaml::from_str::<Vec<vp_config::ProxyCfg>>(text) {
-        list
-    } else {
-        // 2. 尝试作为订阅节点链接（Base64 或 raw URI 列表）解析
+    // 1. 尝试直接作为 YAML 反序列化（支持 proxies 块、payload 块、或顶层列表）
+    let mut proxies: Vec<vp_config::ProxyCfg> =
+        if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(text) {
+            if let Some(map) = val.as_mapping() {
+                let list_val = map.get("proxies").or_else(|| map.get("payload"));
+                if let Some(lv) = list_val {
+                    if let Some(seq) = lv.as_sequence() {
+                        let mut list = Vec::new();
+                        for item in seq {
+                            match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
+                                Ok(p) => list.push(p),
+                                Err(e) => tracing::warn!("proxy-provider 跳过无法识别的节点: {e}"),
+                            }
+                        }
+                        list
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else if let Some(seq) = val.as_sequence() {
+                let mut list = Vec::new();
+                for item in seq {
+                    match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
+                        Ok(p) => list.push(p),
+                        Err(e) => tracing::warn!("proxy-provider 跳过无法识别的节点: {e}"),
+                    }
+                }
+                list
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+    // 2. 如果 YAML 未解析出节点，尝试作为订阅节点链接（Base64 或 raw URI 列表）解析
+    if proxies.is_empty() {
         let nodes = parse_subscription(text);
-        if nodes.is_empty() {
-            return Err("无法解析为 YAML 节点列表或订阅链接".into());
+        if !nodes.is_empty() {
+            let mut y = String::from("proxies:\n");
+            for n in &nodes {
+                y.push_str(&n.to_yaml());
+                y.push('\n');
+            }
+            if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&y) {
+                if let Some(seq) = doc.get("proxies").and_then(|v| v.as_sequence()) {
+                    for item in seq {
+                        match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
+                            Ok(p) => proxies.push(p),
+                            Err(e) => tracing::warn!("订阅节点转换配置跳过: {e}"),
+                        }
+                    }
+                }
+            }
         }
-        let mut y = String::from("proxies:\n");
-        for n in &nodes {
-            y.push_str(&n.to_yaml());
-        }
-        let doc: std::collections::HashMap<String, Vec<vp_config::ProxyCfg>> =
-            serde_yaml::from_str(&y).map_err(|e| format!("节点转换为配置失败: {e}"))?;
-        doc.get("proxies").cloned().unwrap_or_default()
-    };
+    }
+
+    if proxies.is_empty() {
+        return Err("无法解析为 YAML 节点列表或订阅链接".into());
+    }
 
     // 3. 正则过滤 (filter)
     if let Some(f) = filter {
@@ -1164,5 +1205,29 @@ proxies:
         let from_b64 = parse_provider_proxies(&b64, Some("SG")).unwrap();
         assert_eq!(from_b64.len(), 1);
         assert_eq!(from_b64[0].name, "SG-01");
+
+        // 3. payload: 块格式与单节点容错测试
+        let payload_yaml = r#"
+payload:
+  - name: "HK-Payload"
+    type: ss
+    server: 1.1.1.1
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw1
+  - name: "Invalid-Node"
+    type: unknown_bad_proto
+    server: 2.2.2.2
+  - name: "US-Payload"
+    type: ss
+    server: 3.3.3.3
+    port: 8388
+    cipher: aes-128-gcm
+    password: pw3
+"#;
+        let from_payload = parse_provider_proxies(payload_yaml, None).unwrap();
+        assert_eq!(from_payload.len(), 2);
+        assert_eq!(from_payload[0].name, "HK-Payload");
+        assert_eq!(from_payload[1].name, "US-Payload");
     }
 }

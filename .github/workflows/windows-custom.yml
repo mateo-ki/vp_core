@@ -1,0 +1,81 @@
+name: Windows custom build
+
+on:
+  push:
+    branches: [codex/windows-config-v1.0.2]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source tag or commit (v1.0.2 for original core; custom branch for GUI)'
+        required: true
+        default: codex/windows-config-v1.0.2
+      include_gui:
+        description: 'Build desktop/vpcore-config/vpcore-config.csproj (must exist on source ref)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Test and compile core
+        run: |
+          cargo test --locked -p vp-config
+          if ($LASTEXITCODE -ne 0) { throw 'Configuration tests failed' }
+          cargo build --locked --release -p vp-bin --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Core build failed' }
+      - uses: actions/setup-dotnet@v4
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.include_gui }}
+        with:
+          dotnet-version: '8.0.x'
+      - name: Compile configuration tool
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.include_gui }}
+        run: |
+          $project = 'desktop/vpcore-config/vpcore-config.csproj'
+          if (!(Test-Path $project)) { throw 'GUI source is missing on the selected source ref' }
+          dotnet publish $project -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o gui-output
+          if ($LASTEXITCODE -ne 0) { throw 'GUI build failed' }
+      - name: Package and smoke test
+        env:
+          INCLUDE_GUI: ${{ github.event_name != 'workflow_dispatch' || inputs.include_gui }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = 'dist/vpcore-windows-x64-custom'
+          New-Item -ItemType Directory -Force $pkg | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/vpcore.exe $pkg
+          & "$pkg/vpcore.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'Executable smoke test failed' }
+          Copy-Item README.md $pkg
+          Copy-Item config.yaml "$pkg/config.example.yaml"
+          if (Test-Path LICENSE) { Copy-Item LICENSE $pkg }
+          if ($env:INCLUDE_GUI -eq 'true') { Copy-Item gui-output/* $pkg -Recurse }
+          Invoke-WebRequest https://www.wintun.net/builds/wintun-0.14.1.zip -OutFile wintun.zip
+          Expand-Archive wintun.zip wintun-unpacked
+          Copy-Item wintun-unpacked/wintun/bin/amd64/wintun.dll $pkg
+          Copy-Item wintun-unpacked/wintun/LICENSE.txt "$pkg/WINTUN-LICENSE.txt"
+          git rev-parse HEAD | Set-Content "$pkg/SOURCE-COMMIT.txt"
+          Get-ChildItem $pkg -File | Get-FileHash -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash)  $(Split-Path $_.Path -Leaf)"
+          } | Set-Content "$pkg/SHA256SUMS.txt"
+          Compress-Archive "$pkg/*" dist/vpcore-windows-x64-custom.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpcore-windows-x64-custom
+          path: dist/vpcore-windows-x64-custom.zip
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,20 @@
+# VP_Core Windows 配置工具
+
+基于 v1.0.2 (899d7131)，Windows x64。解压完整包到固定目录后运行 vpcore-config.exe。
+
+- 基础参数可视化编辑；DNS、TUN、节点、策略组及规则通过完整 YAML 页编辑。
+- 导入 YAML 后先校验再保存。配置及备份保存在 %LOCALAPPDATA%\VP_Core。
+- 默认配置为直连，需要导入自己的代理配置才能代理流量。
+- 关闭窗口进入托盘；托盘“退出并停止内核”正常停止内核并清理路由。
+- “登录 Windows 后后台启动”仅启动工具；同时勾选“打开工具后自动启动内核”才能自动运行内核。
+- 自启使用当前用户 Run 注册表项，不是开机未登录运行的系统服务。禁用自启后再移动或删除程序。
+- TUN 需要管理员权限；此版本不提供管理员计划任务，因此普通登录自启不支持 TUN 自动提权。
+- 界面不会修改 Windows 系统代理；按配置端口设置需要使用代理的应用。
+- 保存 YAML 会重写格式，不保留注释；原配置自动备份为 config.yaml.bak。
+- 日志仅保留在窗口中，不长期写盘。
+
+## 构建
+
+GitHub Actions: Windows custom build。开发分支 push 自动构建；手动运行时选择包含 GUI 源码的分支，勾选 include_gui。
+产物含 vpcore.exe、vpcore-config.exe、wintun.dll 和 SHA256SUMS.txt。
+自包含 GUI 无需用户安装 .NET。Windows 实机的托盘、自启、TUN 联调仍需验收。

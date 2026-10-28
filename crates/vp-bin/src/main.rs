@@ -21,6 +21,9 @@ struct Cli {
 enum Cmd {
     /// 启动内核
     Run {
+        /// GUI 托管模式：stdin 收到 stop 或管道关闭时正常退出
+        #[arg(long)]
+        managed_stdin: bool,
         /// 配置文件（.yaml / .yml / .json）
         #[arg(short, long)]
         config: PathBuf,
@@ -186,6 +189,7 @@ async fn main() {
             }
         }
         Cmd::Run {
+            managed_stdin,
             config,
             directory,
             log_level,
@@ -231,6 +235,23 @@ async fn main() {
             // 启动初始化完成后立即修剪工作集，归还解析配置产生的临时内存页
             trim_working_set();
 
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            if managed_stdin {
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::stdin().lock().lines() {
+                        match line {
+                            Ok(line) if line.trim() != "stop" => continue,
+                            _ => break,
+                        }
+                    }
+                    let _ = stop_tx.send(());
+                });
+            } else {
+                // Keep the channel pending in ordinary CLI mode.
+                std::mem::forget(stop_tx);
+            }
+
             // 跨平台文件变动检测（每秒检查一次 mtime）+ Unix SIGHUP / SIGINT·SIGTERM
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             ticker.tick().await; // 消耗初始即刻 tick
@@ -249,6 +270,7 @@ async fn main() {
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
+                        _ = &mut stop_rx => break,
                         _ = term.recv() => break,
                         Some(_) = hup.recv() => {
                             match app.reload().await {
@@ -289,6 +311,7 @@ async fn main() {
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
+                        _ = &mut stop_rx => break,
                         _ = ticker.tick() => {
                             trim_ticks += 1;
                             if trim_ticks >= 300 {

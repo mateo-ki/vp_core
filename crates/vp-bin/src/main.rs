@@ -1,5 +1,8 @@
 //! vpcore CLI。
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -83,6 +86,18 @@ fn init_logging(level: &str) {
         tracing::error!("panic（已隔离）: {info}");
     }));
 }
+
+#[cfg(windows)]
+fn trim_working_set() {
+    unsafe {
+        windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn trim_working_set() {}
 
 #[tokio::main]
 async fn main() {
@@ -205,6 +220,8 @@ async fn main() {
             if let Some(c) = &app.controller {
                 println!("  controller: http://{c}");
             }
+            // 启动初始化完成后立即修剪工作集，归还解析配置产生的临时内存页
+            trim_working_set();
 
             // 跨平台文件变动检测（每秒检查一次 mtime）+ Unix SIGHUP / SIGINT·SIGTERM
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -212,6 +229,7 @@ async fn main() {
             let mut last_mtime = std::fs::metadata(&config)
                 .ok()
                 .and_then(|m| m.modified().ok());
+            let mut trim_ticks = 0u32;
 
             #[cfg(unix)]
             {
@@ -226,16 +244,27 @@ async fn main() {
                         _ = term.recv() => break,
                         Some(_) = hup.recv() => {
                             match app.reload().await {
-                                Ok(()) => println!("✓ SIGHUP：配置已平滑热重载"),
+                                Ok(()) => {
+                                    println!("✓ SIGHUP：配置已平滑热重载");
+                                    trim_working_set();
+                                }
                                 Err(e) => eprintln!("✗ SIGHUP：热重载失败（保留旧配置）: {e}"),
                             }
                         }
                         _ = ticker.tick() => {
+                            trim_ticks += 1;
+                            if trim_ticks >= 300 {
+                                trim_ticks = 0;
+                                trim_working_set();
+                            }
                             if let Ok(m) = std::fs::metadata(&config).and_then(|m| m.modified()) {
                                 if last_mtime.is_some_and(|last| m > last) {
                                     last_mtime = Some(m);
                                     match app.reload().await {
-                                        Ok(()) => println!("✓ 配置文件变动，已平滑热重载"),
+                                        Ok(()) => {
+                                            println!("✓ 配置文件变动，已平滑热重载");
+                                            trim_working_set();
+                                        }
                                         Err(e) => eprintln!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
                                     }
                                 } else if last_mtime.is_none() {
@@ -253,11 +282,19 @@ async fn main() {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
                         _ = ticker.tick() => {
+                            trim_ticks += 1;
+                            if trim_ticks >= 300 {
+                                trim_ticks = 0;
+                                trim_working_set();
+                            }
                             if let Ok(m) = std::fs::metadata(&config).and_then(|m| m.modified()) {
                                 if last_mtime.is_some_and(|last| m > last) {
                                     last_mtime = Some(m);
                                     match app.reload().await {
-                                        Ok(()) => println!("✓ 配置文件变动，已平滑热重载"),
+                                        Ok(()) => {
+                                            println!("✓ 配置文件变动，已平滑热重载");
+                                            trim_working_set();
+                                        }
                                         Err(e) => eprintln!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
                                     }
                                 } else if last_mtime.is_none() {

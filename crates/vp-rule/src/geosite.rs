@@ -82,6 +82,49 @@ fn parse_site(msg: &[u8]) -> Result<RawSite, String> {
     Ok(RawSite { code, entries })
 }
 
+/// 流式直接解码 entry 进 Trie、关键词和正则，零中间 String 与 Vec 分配
+fn decode_site_into(
+    msg: &[u8],
+    trie: &mut DomainTrie,
+    keywords: &mut Vec<Box<str>>,
+    regexes: &mut Vec<regex::Regex>,
+) -> Result<(), String> {
+    let mut r = PbReader::new(msg);
+    while let Some((field, wire)) = r.next_tag()? {
+        match (field, wire) {
+            (2, 2) => {
+                let d = r.bytes()?;
+                let mut kind = 0u64;
+                let mut val_bytes: Option<&[u8]> = None;
+                let mut dr = PbReader::new(d);
+                while let Some((f, w)) = dr.next_tag()? {
+                    match (f, w) {
+                        (1, 0) => kind = dr.varint()?,
+                        (2, 2) => val_bytes = Some(dr.bytes()?),
+                        _ => dr.skip(w)?,
+                    }
+                }
+                if let Some(bytes) = val_bytes {
+                    let val = String::from_utf8_lossy(bytes);
+                    match kind {
+                        0 => keywords.push(val.to_ascii_lowercase().into()),
+                        1 => {
+                            if let Ok(re) = regex::Regex::new(&format!("(?i){val}")) {
+                                regexes.push(re);
+                            }
+                        }
+                        2 => trie.insert_suffix_all(&val),
+                        3 => trie.insert_exact(&val),
+                        _ => keywords.push(val.to_ascii_lowercase().into()),
+                    }
+                }
+            }
+            _ => r.skip(wire)?,
+        }
+    }
+    Ok(())
+}
+
 pub(crate) struct PbReader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -283,22 +326,12 @@ impl GeoSiteDb {
         for &(offset, len) in ranges {
             if offset + len <= self.buffer.len() {
                 let msg = &self.buffer[offset..offset + len];
-                if let Ok(site) = parse_site(msg) {
-                    for (kind, value) in site.entries {
-                        match kind {
-                            SiteEntryKind::Root => trie.insert_suffix_all(&value),
-                            SiteEntryKind::Full => trie.insert_exact(&value),
-                            SiteEntryKind::Plain => keywords.push(value.to_ascii_lowercase().into()),
-                            SiteEntryKind::Regex => {
-                                if let Ok(re) = regex::Regex::new(&format!("(?i){value}")) {
-                                    regexes.push(re);
-                                }
-                            }
-                        }
-                    }
-                }
+                let _ = decode_site_into(msg, &mut trie, &mut keywords, &mut regexes);
             }
         }
+
+        keywords.shrink_to_fit();
+        regexes.shrink_to_fit();
 
         let compiled = Arc::new(CompiledSite {
             trie,

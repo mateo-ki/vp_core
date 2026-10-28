@@ -1300,6 +1300,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1377,6 +1386,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b0ca1155a9ecc25aa12e8313a119f32edf0255fea2f44839c4ac0a12b2ac157"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -2591,7 +2609,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vp-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2618,9 +2636,10 @@ dependencies = [
 
 [[package]]
 name = "vp-bin"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "clap",
+ "mimalloc",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2630,11 +2649,12 @@ dependencies = [
  "vp-config",
  "vp-protocol",
  "vp-tun",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "vp-common"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "rand 0.9.5",
@@ -2643,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "vp-config"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "json5",
  "serde",
@@ -2656,7 +2676,7 @@ dependencies = [
 
 [[package]]
 name = "vp-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2668,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "vp-crypto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2689,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "vp-dns"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "httparse",
@@ -2707,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "vp-ffi"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "tokio",
  "tracing",
@@ -2720,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "vp-plugin"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "libloading 0.8.9",
  "serde",
@@ -2734,11 +2754,11 @@ dependencies = [
 
 [[package]]
 name = "vp-plugin-sdk"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "vp-protocol"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2792,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "vp-router"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2809,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "vp-rule"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "maxminddb",
  "memmap2",
@@ -2823,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "vp-transport"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2852,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "vp-tun"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3152,7 +3172,7 @@ dependencies = [
 
 [[package]]
 name = "xor_mask"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",

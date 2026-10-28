@@ -283,14 +283,74 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
         }
     }
     if errs.is_empty() {
-        let needs_ip = compiled.iter().any(|r| r.needs_dst_ip());
+        let optimized = optimize_rules(compiled);
+        let needs_ip = optimized.iter().any(|r| r.needs_dst_ip());
         Ok(RuleEngine {
-            rules: compiled,
+            rules: optimized,
             needs_ip,
         })
     } else {
         Err(errs)
     }
+}
+
+/// 合并相邻且指向同一目标、同 no_resolve 的 DOMAIN 与 DOMAIN-SUFFIX 规则，
+/// 将数千条散乱规则合并为一个共享 DomainTrie，大幅压降堆内存并提速路由匹配。
+fn optimize_rules(rules: Vec<CompiledRule>) -> Vec<CompiledRule> {
+    let mut out = Vec::with_capacity(rules.len());
+    let mut cur_domain: Option<(Arc<str>, bool, DomainTrie, usize, Arc<str>)> = None;
+
+    let flush_domain = |cur: &mut Option<(Arc<str>, bool, DomainTrie, usize, Arc<str>)>, out: &mut Vec<CompiledRule>| {
+        if let Some((target, no_resolve, trie, count, raw_first)) = cur.take() {
+            let raw = if count > 1 {
+                format!("DOMAIN-SET({count} 条合并)").into()
+            } else {
+                raw_first
+            };
+            out.push(CompiledRule {
+                raw,
+                target,
+                matcher: Matcher::DomainSuffix(Arc::new(trie)),
+                no_resolve,
+            });
+        }
+    };
+
+    for r in rules {
+        match r.matcher {
+            Matcher::Domain(trie) => {
+                let trie = Arc::try_unwrap(trie).unwrap_or_else(|a| (*a).clone());
+                if let Some((cur_target, cur_no_resolve, cur_trie, count, _)) = &mut cur_domain {
+                    if *cur_target == r.target && *cur_no_resolve == r.no_resolve {
+                        cur_trie.merge(trie);
+                        *count += 1;
+                        continue;
+                    }
+                }
+                flush_domain(&mut cur_domain, &mut out);
+                cur_domain = Some((r.target, r.no_resolve, trie, 1, r.raw));
+            }
+            Matcher::DomainSuffix(trie) => {
+                let trie = Arc::try_unwrap(trie).unwrap_or_else(|a| (*a).clone());
+                if let Some((cur_target, cur_no_resolve, cur_trie, count, _)) = &mut cur_domain {
+                    if *cur_target == r.target && *cur_no_resolve == r.no_resolve {
+                        cur_trie.merge(trie);
+                        *count += 1;
+                        continue;
+                    }
+                }
+                flush_domain(&mut cur_domain, &mut out);
+                cur_domain = Some((r.target, r.no_resolve, trie, 1, r.raw));
+            }
+            _ => {
+                flush_domain(&mut cur_domain, &mut out);
+                out.push(r);
+            }
+        }
+    }
+    flush_domain(&mut cur_domain, &mut out);
+    out.shrink_to_fit();
+    out
 }
 
 fn check_target(target: &str, env: &CompileEnv, raw: &str) -> Result<Arc<str>, String> {
@@ -727,6 +787,43 @@ mod tests {
                 .unwrap()
                 .target,
             "REJECT"
+        );
+    }
+
+    #[test]
+    fn test_adjacent_domain_rules_merging() {
+        let e = engine(&[
+            "DOMAIN,example.com,PROXY",
+            "DOMAIN-SUFFIX,google.com,PROXY",
+            "DOMAIN-SUFFIX,youtube.com,PROXY",
+            "DOMAIN,twitter.com,PROXY",
+            "MATCH,DIRECT",
+        ]);
+        // 4 条连续 domain 规则合并为 1 条 DOMAIN-SET 规则，总共 2 条规则！
+        assert_eq!(e.len(), 2);
+        assert_eq!(
+            e.r#match(&ctx(Some("example.com"), None)).unwrap().target,
+            "PROXY"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("mail.google.com"), None)).unwrap().target,
+            "PROXY"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("www.youtube.com"), None)).unwrap().target,
+            "PROXY"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("twitter.com"), None)).unwrap().target,
+            "PROXY"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("sub.twitter.com"), None)).unwrap().target,
+            "DIRECT"
+        );
+        assert_eq!(
+            e.r#match(&ctx(Some("baidu.com"), None)).unwrap().target,
+            "DIRECT"
         );
     }
 

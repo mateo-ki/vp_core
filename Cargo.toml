@@ -89,6 +89,7 @@ chacha20poly1305 = "0.10"
 poly1305 = "0.8"
 universal-hash = "0.5"
 blake3 = "1"
+blake2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
 x25519-dalek = { version = "2.0.0-rc.3", default-features = false, features = ["static_secrets"] }

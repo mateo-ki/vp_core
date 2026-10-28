@@ -404,36 +404,68 @@ pub fn parse_frame(buf: &[u8]) -> Option<(u64, Vec<u8>, usize)> {
 // 客户端（认证请求）
 // ---------------------------------------------------------------------------
 
-/// 打开 H3 必需的 uni 流（控制流发空 SETTINGS；QPACK 流保持）
-async fn open_h3_streams(conn: &quinn::Connection) -> Result<()> {
-    // 控制流
+/// HTTP/3 关键单向流句柄（控制流与 QPACK 编解码流）
+/// 必须由上层会话长久持有，一旦 drop，Quinn 将向对端发送 RESET_STREAM，
+/// 导致对端触发 RFC 9114 H3_CLOSED_CRITICAL_STREAM (0x0104 = 260) 并强行切断连接。
+#[derive(Debug)]
+pub struct H3CriticalStreams {
+    pub ctl: quinn::SendStream,
+    pub qpack_enc: quinn::SendStream,
+    pub qpack_dec: quinn::SendStream,
+}
+
+/// 打开 H3 必需的 uni 流（控制流发空 SETTINGS；QPACK 流保持打开）
+async fn open_h3_streams(conn: &quinn::Connection) -> Result<H3CriticalStreams> {
+    // 控制流 (0x00)
     let mut ctl = conn.open_uni().await.map_err(quic_io_err)?;
     let mut buf = Vec::new();
     write_varint(&mut buf, STREAM_CONTROL);
     write_varint(&mut buf, FRAME_SETTINGS);
     write_varint(&mut buf, 0); // 空 SETTINGS
     ctl.write_all(&buf).await.map_err(quic_io_err)?;
-    // QPACK encoder/decoder 流（保持打开即可）
-    for t in [STREAM_QPACK_ENCODER, STREAM_QPACK_DECODER] {
-        let mut s = conn.open_uni().await.map_err(quic_io_err)?;
-        let mut b = Vec::new();
-        write_varint(&mut b, t);
-        s.write_all(&b).await.map_err(quic_io_err)?;
-        // 不 finish：保持打开
-    }
-    Ok(())
+
+    // QPACK encoder (0x02)
+    let mut qpack_enc = conn.open_uni().await.map_err(quic_io_err)?;
+    let mut b_enc = Vec::new();
+    write_varint(&mut b_enc, STREAM_QPACK_ENCODER);
+    qpack_enc.write_all(&b_enc).await.map_err(quic_io_err)?;
+
+    // QPACK decoder (0x03)
+    let mut qpack_dec = conn.open_uni().await.map_err(quic_io_err)?;
+    let mut b_dec = Vec::new();
+    write_varint(&mut b_dec, STREAM_QPACK_DECODER);
+    qpack_dec.write_all(&b_dec).await.map_err(quic_io_err)?;
+
+    Ok(H3CriticalStreams {
+        ctl,
+        qpack_enc,
+        qpack_dec,
+    })
 }
 
 fn quic_io_err(e: impl std::fmt::Debug) -> Error {
     Error::Io(std::io::Error::other(format!("quic: {e:?}")))
 }
 
-/// 发送认证请求并等待响应状态码；返回响应头
+/// 后台自动接收并消耗对端（服务端）主动建立的单向流（如对端控制流 / SETTINGS）
+pub fn spawn_uni_drainer(conn: quinn::Connection) {
+    tokio::spawn(async move {
+        while let Ok(mut recv) = conn.accept_uni().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(Some(_)) = recv.read(&mut buf).await {}
+            });
+        }
+    });
+}
+
+/// 发送认证请求并等待响应状态码；返回 (响应头, 关键流集合)
 pub async fn auth_roundtrip(
     conn: &quinn::Connection,
     headers: &[(&str, &str)],
-) -> Result<Vec<(String, String)>> {
-    open_h3_streams(conn).await?;
+) -> Result<(Vec<(String, String)>, H3CriticalStreams)> {
+    let critical = open_h3_streams(conn).await?;
+    spawn_uni_drainer(conn.clone());
     let (mut send, mut recv) = conn.open_bi().await.map_err(quic_io_err)?;
     send.write_all(&headers_frame(headers))
         .await
@@ -458,7 +490,8 @@ pub async fn auth_roundtrip(
                     "h3min: 期望 HEADERS 帧，得到 {ty}"
                 )));
             }
-            return decode_header_block(&payload);
+            let resp_headers = decode_header_block(&payload)?;
+            return Ok((resp_headers, critical));
         }
         if buf.len() > 16 * 1024 {
             return Err(Error::Proto("h3min: 响应过大"));

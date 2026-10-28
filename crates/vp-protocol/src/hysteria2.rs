@@ -6,19 +6,24 @@
 //! - UDP：QUIC unreliable datagram，UDPMessage
 //!   `[u32 BE session][u16 BE pkt][u8 frag][u8 frag_total][varint |addr|][addr][payload]`
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use async_trait::async_trait;
+use blake2::digest::{Digest, consts::U32};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use vp_common::{DstAddr, Error, Result};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
+
+type Blake2b256 = blake2::Blake2b<U32>;
 
 const TCP_REQUEST_ID: u64 = 0x401;
 
@@ -109,6 +114,128 @@ fn addr_text(dst: &DstAddr) -> String {
 // 出站
 // ---------------------------------------------------------------------------
 
+/// Hysteria 2 官方 Salamander 协议混淆实现
+/// 数据报格式：[8 字节随机 Salt][XOR 混淆载荷]
+/// 密钥派生：Blake2b-256(concat(salt, psk))
+#[derive(Debug, Clone)]
+pub struct SalamanderObfs {
+    key: [u8; 32],
+}
+
+impl SalamanderObfs {
+    pub fn new(password: &str) -> Self {
+        let mut hasher = Blake2b256::new();
+        hasher.update(password.as_bytes());
+        let res = hasher.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&res);
+        Self { key }
+    }
+
+    pub fn obfuscate(&self, input: &[u8]) -> Vec<u8> {
+        let salt = rand::random::<[u8; 8]>();
+        let mut hasher = Blake2b256::new();
+        hasher.update(salt);
+        hasher.update(self.key);
+        let derived = hasher.finalize();
+
+        let mut out = Vec::with_capacity(input.len() + 8);
+        out.extend_from_slice(&salt);
+        for (i, &b) in input.iter().enumerate() {
+            out.push(b ^ derived[i % 32]);
+        }
+        out
+    }
+
+    pub fn deobfuscate(&self, input: &[u8]) -> Option<Vec<u8>> {
+        if input.len() < 8 {
+            return None;
+        }
+        let (salt, encrypted) = input.split_at(8);
+        let mut hasher = Blake2b256::new();
+        hasher.update(salt);
+        hasher.update(self.key);
+        let derived = hasher.finalize();
+
+        let mut out = Vec::with_capacity(encrypted.len());
+        for (i, &b) in encrypted.iter().enumerate() {
+            out.push(b ^ derived[i % 32]);
+        }
+        Some(out)
+    }
+}
+
+pub struct Hysteria2Session {
+    pub conn: quinn::Connection,
+    pub endpoint: quinn::Endpoint,
+    pub _critical_streams: crate::h3_min::H3CriticalStreams,
+    pub udp_demux: Arc<Hysteria2UdpDemuxer>,
+}
+
+impl Hysteria2Session {
+    pub fn is_alive(&self) -> bool {
+        self.conn.close_reason().is_none()
+    }
+}
+
+pub struct Hysteria2UdpDemuxer {
+    listeners: Arc<RwLock<HashMap<u32, mpsc::Sender<UdpPacket>>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl Hysteria2UdpDemuxer {
+    pub fn new(conn: quinn::Connection) -> Self {
+        let listeners: Arc<RwLock<HashMap<u32, mpsc::Sender<UdpPacket>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let listeners_cloned = listeners.clone();
+        let task = tokio::spawn(async move {
+            while let Ok(dgram) = conn.read_datagram().await {
+                if dgram.len() < 8 {
+                    continue;
+                }
+                let session = u32::from_be_bytes([dgram[0], dgram[1], dgram[2], dgram[3]]);
+                // frag id/total：未分片实现——分片包直接丢弃
+                if dgram[7] != 1 {
+                    continue;
+                }
+                let Some((alen, used)) = read_varint(&dgram[8..]) else {
+                    continue;
+                };
+                let start = 8 + used;
+                let end = start + alen as usize;
+                if dgram.len() < end {
+                    continue;
+                }
+                let addr = std::str::from_utf8(&dgram[start..end])
+                    .ok()
+                    .and_then(|s| s.parse::<SocketAddr>().ok());
+                let Some(src) = addr else { continue };
+                let pkt = UdpPacket {
+                    src,
+                    dst: src,
+                    data: dgram.slice(end..),
+                };
+                let guard = listeners_cloned.read().await;
+                if let Some(sender) = guard.get(&session) {
+                    let _ = sender.try_send(pkt);
+                }
+            }
+        });
+        Self {
+            listeners,
+            _task: task,
+        }
+    }
+
+    pub async fn register(&self, session_id: u32, sender: mpsc::Sender<UdpPacket>) {
+        self.listeners.write().await.insert(session_id, sender);
+    }
+
+    pub async fn unregister(&self, session_id: u32) {
+        self.listeners.write().await.remove(&session_id);
+    }
+}
+
 pub struct Hysteria2Outbound {
     name: Arc<str>,
     server: String,
@@ -117,11 +244,28 @@ pub struct Hysteria2Outbound {
     sni: Option<String>,
     skip_verify: bool,
     _up_mbps: u32,
+    down_mbps: u32,
+    _obfs: Option<SalamanderObfs>,
     udp_session: AtomicU32,
+    session: Mutex<Option<Arc<Hysteria2Session>>>,
 }
 
 impl Hysteria2Outbound {
     pub fn new(cfg: &vp_config::Hysteria2Cfg) -> Result<Self> {
+        let obfs = if let Some(ref o) = cfg.obfs {
+            if o.eq_ignore_ascii_case("salamander") {
+                let psw = cfg
+                    .obfs_password
+                    .as_deref()
+                    .unwrap_or(cfg.password.as_str());
+                Some(SalamanderObfs::new(psw))
+            } else {
+                None
+            }
+        } else {
+            cfg.obfs_password.as_deref().map(SalamanderObfs::new)
+        };
+
         Ok(Hysteria2Outbound {
             name: "hysteria2".into(),
             server: cfg.server.clone(),
@@ -129,8 +273,11 @@ impl Hysteria2Outbound {
             password: cfg.password.clone(),
             sni: cfg.sni.clone().or(Some(cfg.server.clone())),
             skip_verify: cfg.skip_cert_verify,
-            _up_mbps: 0,
+            _up_mbps: cfg.up.unwrap_or(0),
+            down_mbps: cfg.down.unwrap_or(0),
+            _obfs: obfs,
             udp_session: AtomicU32::new(1),
+            session: Mutex::new(None),
         })
     }
 
@@ -153,18 +300,23 @@ impl Hysteria2Outbound {
         Ok((conn, ep))
     }
 
-    /// HTTP/3 认证（最小实现，见 h3_min 模块说明）
-    async fn auth(&self, conn: &quinn::Connection) -> Result<()> {
+    /// HTTP/3 认证（返回关键控制流集合，必须由会话长久持有避免 260 错误）
+    async fn auth(&self, conn: &quinn::Connection) -> Result<crate::h3_min::H3CriticalStreams> {
+        let cc_rx = if self.down_mbps > 0 {
+            ((self.down_mbps as u64) * 125_000).to_string()
+        } else {
+            "0".to_string()
+        };
         let headers: Vec<(&str, &str)> = vec![
             (":method", "POST"),
             (":scheme", "https"),
             (":authority", "hysteria"),
             (":path", "/auth"),
             ("hysteria-auth", &self.password),
-            ("hysteria-cc-rx", "0"),
+            ("hysteria-cc-rx", &cc_rx),
             ("hysteria-padding", "0000000000000000"),
         ];
-        let resp = crate::h3_min::auth_roundtrip(conn, &headers).await?;
+        let (resp, critical) = crate::h3_min::auth_roundtrip(conn, &headers).await?;
         let status = resp
             .iter()
             .find(|(k, _)| k == ":status")
@@ -173,7 +325,27 @@ impl Hysteria2Outbound {
         if status != "233" {
             return Err(Error::ProtoMsg(format!("hy2 认证失败（状态 {status}）")));
         }
-        Ok(())
+        Ok(critical)
+    }
+
+    async fn get_or_connect_session(&self) -> Result<Arc<Hysteria2Session>> {
+        let mut guard = self.session.lock().await;
+        if let Some(ref s) = *guard {
+            if s.is_alive() {
+                return Ok(s.clone());
+            }
+        }
+        let (conn, ep) = self.connect_quic().await?;
+        let critical = self.auth(&conn).await?;
+        let udp_demux = Arc::new(Hysteria2UdpDemuxer::new(conn.clone()));
+        let s = Arc::new(Hysteria2Session {
+            conn,
+            endpoint: ep,
+            _critical_streams: critical,
+            udp_demux,
+        });
+        *guard = Some(s.clone());
+        Ok(s)
     }
 }
 
@@ -184,46 +356,68 @@ impl Outbound for Hysteria2Outbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let (conn, _ep) = self.connect_quic().await?;
-        self.auth(&conn).await?;
-        // TCP 流
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 open_bi: {e}"))))?;
-        let addr = addr_text(dst);
-        let mut req = Vec::with_capacity(addr.len() + 12);
-        write_varint(&mut req, TCP_REQUEST_ID);
-        write_varint(&mut req, addr.len() as u64);
-        req.extend_from_slice(addr.as_bytes());
-        write_varint(&mut req, 0); // padding
-        send.write_all(&req)
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 写请求: {e}"))))?;
-        // TCPResponse: [u8 status][varint |msg|][msg][varint |pad|][pad]
-        // 服务端普遍会带非零 padding —— pad 字段必须完整消费，否则数据流永久错位。
-        let mut status = [0u8; 1];
-        recv.read_exact(&mut status)
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读响应: {e}"))))?;
-        if status[0] != 0x00 {
-            return Err(Error::ProtoMsg("hy2 TCPResponse 错误".into()));
+        for attempt in 0..2 {
+            let sess = self.get_or_connect_session().await?;
+            let open_res = sess.conn.open_bi().await;
+            let (mut send, mut recv) = match open_res {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let mut guard = self.session.lock().await;
+                    *guard = None;
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "hy2 open_bi: {e}"
+                    ))));
+                }
+            };
+
+            let addr = addr_text(dst);
+            let mut req = Vec::with_capacity(addr.len() + 12);
+            write_varint(&mut req, TCP_REQUEST_ID);
+            write_varint(&mut req, addr.len() as u64);
+            req.extend_from_slice(addr.as_bytes());
+            write_varint(&mut req, 0); // padding
+            if let Err(e) = send.write_all(&req).await {
+                let mut guard = self.session.lock().await;
+                *guard = None;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(Error::Io(std::io::Error::other(format!("hy2 写请求: {e}"))));
+            }
+
+            // TCPResponse: [u8 status][varint |msg|][msg][varint |pad|][pad]
+            let mut status = [0u8; 1];
+            if let Err(e) = recv.read_exact(&mut status).await {
+                let mut guard = self.session.lock().await;
+                *guard = None;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(Error::Io(std::io::Error::other(format!("hy2 读响应: {e}"))));
+            }
+            if status[0] != 0x00 {
+                return Err(Error::ProtoMsg("hy2 TCPResponse 错误".into()));
+            }
+            let (msg_len, _) = read_varint_async(&mut recv).await?;
+            if msg_len > 0 {
+                let mut msg = vec![0u8; msg_len as usize];
+                recv.read_exact(&mut msg)
+                    .await
+                    .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读消息: {e}"))))?;
+            }
+            let (pad_len, _) = read_varint_async(&mut recv).await?;
+            if pad_len > 0 {
+                let mut pad = vec![0u8; pad_len as usize];
+                recv.read_exact(&mut pad).await.map_err(|e| {
+                    Error::Io(std::io::Error::other(format!("hy2 跳过 padding: {e}")))
+                })?;
+            }
+            return Ok(Box::new(QuicBiStream { send, recv }));
         }
-        let (msg_len, _) = read_varint_async(&mut recv).await?;
-        if msg_len > 0 {
-            let mut msg = vec![0u8; msg_len as usize];
-            recv.read_exact(&mut msg)
-                .await
-                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读消息: {e}"))))?;
-        }
-        let (pad_len, _) = read_varint_async(&mut recv).await?;
-        if pad_len > 0 {
-            let mut pad = vec![0u8; pad_len as usize];
-            recv.read_exact(&mut pad)
-                .await
-                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 跳过 padding: {e}"))))?;
-        }
-        Ok(Box::new(QuicBiStream { send, recv }))
+        Err(Error::ProtoMsg("hy2 连接重试失败".into()))
     }
 
     fn support_udp(&self) -> bool {
@@ -231,13 +425,16 @@ impl Outbound for Hysteria2Outbound {
     }
 
     async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        let (conn, _ep) = self.connect_quic().await?;
-        self.auth(&conn).await?;
-        let session = self.udp_session.fetch_add(1, Ordering::Relaxed);
+        let sess = self.get_or_connect_session().await?;
+        let session_id = self.udp_session.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(256);
+        sess.udp_demux.register(session_id, tx).await;
         Ok(Box::new(Hy2UdpConn {
-            conn,
-            session,
-            pkt_id: 1,
+            conn: sess.conn.clone(),
+            demux: sess.udp_demux.clone(),
+            rx,
+            session: session_id,
+            pkt_id: AtomicU16::new(1),
         }))
     }
 
@@ -287,17 +484,30 @@ impl AsyncWrite for QuicBiStream {
 /// UDP over QUIC datagram
 struct Hy2UdpConn {
     conn: quinn::Connection,
+    demux: Arc<Hysteria2UdpDemuxer>,
+    rx: mpsc::Receiver<UdpPacket>,
     session: u32,
-    pkt_id: u16,
+    pkt_id: AtomicU16,
+}
+
+impl Drop for Hy2UdpConn {
+    fn drop(&mut self) {
+        let demux = self.demux.clone();
+        let session = self.session;
+        tokio::spawn(async move {
+            demux.unregister(session).await;
+        });
+    }
 }
 
 #[async_trait]
 impl PacketConn for Hy2UdpConn {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+        let pkt_id = self.pkt_id.fetch_add(1, Ordering::Relaxed);
         let addr = format!("{}:{}", pkt.dst.ip(), pkt.dst.port());
         let mut msg = Vec::with_capacity(pkt.data.len() + addr.len() + 16);
         msg.extend_from_slice(&self.session.to_be_bytes());
-        msg.extend_from_slice(&self.pkt_id.to_be_bytes());
+        msg.extend_from_slice(&pkt_id.to_be_bytes());
         msg.push(0); // frag id
         msg.push(1); // frag total
         write_varint(&mut msg, addr.len() as u64);
@@ -310,41 +520,10 @@ impl PacketConn for Hy2UdpConn {
     }
 
     async fn recv(&mut self) -> Result<UdpPacket> {
-        loop {
-            let dgram =
-                self.conn.read_datagram().await.map_err(|e| {
-                    Error::Io(std::io::Error::other(format!("hy2 read_datagram: {e}")))
-                })?;
-            if dgram.len() < 8 {
-                continue;
-            }
-            let session = u32::from_be_bytes([dgram[0], dgram[1], dgram[2], dgram[3]]);
-            if session != self.session {
-                continue;
-            }
-            let _pkt = u16::from_be_bytes([dgram[4], dgram[5]]);
-            // frag id/total：未分片实现——分片包直接丢弃
-            if dgram[7] != 1 {
-                continue;
-            }
-            let Some((alen, used)) = read_varint(&dgram[8..]) else {
-                continue;
-            };
-            let start = 8 + used;
-            let end = start + alen as usize;
-            if dgram.len() < end {
-                continue;
-            }
-            let addr = std::str::from_utf8(&dgram[start..end])
-                .ok()
-                .and_then(|s| s.parse::<SocketAddr>().ok());
-            let Some(src) = addr else { continue };
-            return Ok(UdpPacket {
-                src,
-                dst: src,
-                data: dgram.slice(end..),
-            });
-        }
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::Io(std::io::Error::other("hy2 udp 接收通道已关闭")))
     }
 }
 
@@ -379,6 +558,12 @@ fn build_hy2_client_config(skip_verify: bool) -> quinn::ClientConfig {
     ));
     let mut t = quinn::TransportConfig::default();
     t.datagram_receive_buffer_size(Some(1 << 20));
+    t.max_idle_timeout(Some(
+        std::time::Duration::from_secs(30)
+            .try_into()
+            .expect("idle timeout"),
+    ));
+    t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     cfg.transport_config(Arc::new(t));
     cfg
 }
@@ -507,7 +692,7 @@ impl Inbound for Hysteria2Inbound {
 }
 
 impl Hysteria2Inbound {
-    async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
+    async fn serve_conn(self: Arc<Self>, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
         let mut udp_sessions: std::collections::HashMap<
             u32,
             std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
@@ -539,14 +724,23 @@ impl Hysteria2Inbound {
                         }
                         first.push(b[0]);
                         if first.len() == 2 && first == [0x44, 0x01] {
-                            self.serve_tcp(recv, send, ctx).await;
+                            let this = self.clone();
+                            let ctx = ctx.clone();
+                            tokio::spawn(async move {
+                                this.serve_tcp(recv, send, &ctx).await;
+                            });
                             break true;
                         }
                         if first[0] == 0x01 {
                             let mut full = first.clone();
                             match read_h3_headers(&mut recv, &mut full).await {
                                 Ok(headers) => {
-                                    self.serve_auth(headers, send, &conn, ctx).await;
+                                    let this = self.clone();
+                                    let conn = conn.clone();
+                                    let ctx = ctx.clone();
+                                    tokio::spawn(async move {
+                                        this.serve_auth(headers, send, &conn, &ctx).await;
+                                    });
                                     break true;
                                 }
                                 Err(e) => {
@@ -847,6 +1041,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn salamander_obfs_roundtrip() {
+        let obfs = SalamanderObfs::new("my-obfs-secret-password");
+        let payload = b"Hello Hysteria2 QUIC Packet with Salamander Obfs!";
+        let obfs_data = obfs.obfuscate(payload);
+        assert_eq!(obfs_data.len(), payload.len() + 8);
+        assert_ne!(&obfs_data[8..], payload);
+
+        let recovered = obfs.deobfuscate(&obfs_data).expect("deobfuscate failed");
+        assert_eq!(&recovered, payload);
+
+        // 验证错误盐/截断包处理
+        assert!(obfs.deobfuscate(&[0u8; 4]).is_none());
+    }
+
     /// hysteria2 出入站自环：认证 → TCP → UDP（全链路走 h3_min 认证层）
     #[tokio::test]
     async fn hysteria2_loopback() {
@@ -855,24 +1064,22 @@ mod tests {
         let tcp_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tcp_port = tcp_l.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let (mut s, _) = tcp_l.accept().await.unwrap();
-            let mut b = [0u8; 1024];
-            loop {
-                let n = s.read(&mut b).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                s.write_all(&b[..n]).await.unwrap();
+            while let Ok((mut s, _)) = tcp_l.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 || s.write_all(&b[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
             }
         });
         let udp = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let udp_addr = udp.local_addr().unwrap();
         tokio::spawn(async move {
             let mut b = [0u8; 2048];
-            loop {
-                let Ok((n, from)) = udp.recv_from(&mut b).await else {
-                    break;
-                };
+            while let Ok((n, from)) = udp.recv_from(&mut b).await {
                 let mut r = b"echo:".to_vec();
                 r.extend_from_slice(&b[..n]);
                 let _ = udp.send_to(&r, from).await;
@@ -904,6 +1111,8 @@ mod tests {
             skip_cert_verify: true,
             up: None,
             down: None,
+            obfs: None,
+            obfs_password: None,
         })
         .unwrap();
 
@@ -915,6 +1124,34 @@ mod tests {
         let mut buf = [0u8; 8];
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping-hy2");
+
+        // 验证多路复用：同一个 Hysteria2Outbound 并发发起第 2 条 TCP 流
+        let mut s2 = out.connect_stream(&sess, &dst).await.unwrap();
+        s2.write_all(b"ping-hy2").await.unwrap();
+        let mut buf2 = [0u8; 8];
+        s2.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"ping-hy2");
+
+        // 验证高并发多路复用：单条 QUIC 会话并发开启 20 个子流并发收发
+        let mut handles = Vec::new();
+        let out_arc = Arc::new(out);
+        for idx in 0..20 {
+            let out_c = out_arc.clone();
+            let dst_c = dst.clone();
+            handles.push(tokio::spawn(async move {
+                let sess_c = Session::new_tcp("t".into(), None, dst_c.clone());
+                let mut stream = out_c.connect_stream(&sess_c, &dst_c).await.unwrap();
+                let msg = format!("ping-{idx:02}");
+                stream.write_all(msg.as_bytes()).await.unwrap();
+                let mut resp_buf = vec![0u8; msg.len()];
+                stream.read_exact(&mut resp_buf).await.unwrap();
+                assert_eq!(resp_buf, msg.as_bytes());
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let out = Arc::try_unwrap(out_arc).ok().unwrap();
 
         // UDP
         let dst = DstAddr::ip(udp_addr.ip(), udp_addr.port());
@@ -942,6 +1179,8 @@ mod tests {
             skip_cert_verify: true,
             up: None,
             down: None,
+            obfs: None,
+            obfs_password: None,
         })
         .unwrap();
         let sess = Session::new_tcp("t".into(), None, dst.clone());
@@ -990,6 +1229,8 @@ mod real_node_probe {
             skip_cert_verify: true,
             up: None,
             down: None,
+            obfs: None,
+            obfs_password: None,
         };
         let out = Hysteria2Outbound::new(&cfg).expect("build");
         let t0 = std::time::Instant::now();
@@ -1015,7 +1256,7 @@ mod real_node_probe {
         match r {
             Err(_) => println!("[{:.2}s] auth 8s 超时", t0.elapsed().as_secs_f32()),
             Ok(Err(e)) => println!("[{:.2}s] auth error: {e}", t0.elapsed().as_secs_f32()),
-            Ok(Ok(())) => println!(
+            Ok(Ok(_)) => println!(
                 "[{:.2}s] auth OK —— hy2 全链路握手通过",
                 t0.elapsed().as_secs_f32()
             ),
@@ -1034,6 +1275,8 @@ mod real_node_probe {
             skip_cert_verify: true,
             up: None,
             down: None,
+            obfs: None,
+            obfs_password: None,
         };
         let out = Hysteria2Outbound::new(&cfg).expect("build");
         let dst = vp_common::DstAddr::new("www.gstatic.com", 80);

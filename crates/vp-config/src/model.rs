@@ -49,6 +49,48 @@ where
     de_u64_lenient(deserializer).map(|v| v as u16)
 }
 
+fn de_opt_bandwidth_mbps<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let opt = Option::<LenientNum>::deserialize(deserializer)?;
+    let Some(item) = opt else {
+        return Ok(None);
+    };
+    match item {
+        LenientNum::Num(n) => Ok(Some(n as u32)),
+        LenientNum::Str(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                return Ok(None);
+            }
+            let lower = s.to_ascii_lowercase();
+            let (num_part, unit) = if let Some(idx) = lower.find(|c: char| c.is_alphabetic()) {
+                (&lower[..idx], lower[idx..].trim())
+            } else {
+                (lower.as_str(), "")
+            };
+            let num: f64 = num_part
+                .trim()
+                .parse()
+                .map_err(|_| D::Error::custom(format!("无效带宽数字: {s}")))?;
+            let mbps = if unit.contains("gb") {
+                (num * 1000.0) as u32
+            } else if unit.contains("kb") {
+                (num / 1000.0).max(1.0) as u32
+            } else if unit.contains("mb") || unit.contains('m') {
+                num as u32
+            } else if unit.contains("bps") || unit.contains('b') {
+                (num / 1_000_000.0).max(1.0) as u32
+            } else {
+                num as u32
+            };
+            Ok(Some(mbps))
+        }
+    }
+}
+
 fn default_mode() -> Mode {
     Mode::Rule
 }
@@ -790,10 +832,24 @@ pub struct Hysteria2Cfg {
     pub sni: Option<String>,
     #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
     pub skip_cert_verify: bool,
-    #[serde(default)]
+    #[serde(
+        alias = "up-mbps",
+        alias = "up_mbps",
+        default,
+        deserialize_with = "de_opt_bandwidth_mbps"
+    )]
     pub up: Option<u32>,
-    #[serde(default)]
+    #[serde(
+        alias = "down-mbps",
+        alias = "down_mbps",
+        default,
+        deserialize_with = "de_opt_bandwidth_mbps"
+    )]
     pub down: Option<u32>,
+    #[serde(alias = "obfs-type", alias = "obfs_type", default)]
+    pub obfs: Option<String>,
+    #[serde(alias = "obfs-password", alias = "obfs_password", default)]
+    pub obfs_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

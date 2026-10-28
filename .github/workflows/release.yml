@@ -218,6 +218,6 @@ jobs:
         with:
           files: |
             release_assets/*
-          generate_release_notes: true
+          generate_release_notes: false
           draft: false
           prerelease: false

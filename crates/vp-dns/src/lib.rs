@@ -621,7 +621,9 @@ fn webpki_connector(skip_verify: bool) -> tokio_rustls::TlsConnector {
     static VERIFY: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
     static NO_VERIFY: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
     if skip_verify {
-        NO_VERIFY.get_or_init(|| build_webpki_connector(true)).clone()
+        NO_VERIFY
+            .get_or_init(|| build_webpki_connector(true))
+            .clone()
     } else {
         VERIFY.get_or_init(|| build_webpki_connector(false)).clone()
     }

@@ -109,9 +109,8 @@ pub fn get_tls_connector(skip_cert_verify: bool, alpn: &[String]) -> TlsConnecto
         }
     }
 
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<(bool, Vec<String>), TlsConnector>>,
-    > = std::sync::OnceLock::new();
+    type TlsCache = std::sync::RwLock<std::collections::HashMap<(bool, Vec<String>), TlsConnector>>;
+    static CACHE: std::sync::OnceLock<TlsCache> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
     let key = (skip_cert_verify, alpn.to_vec());
     {

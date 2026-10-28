@@ -226,10 +226,9 @@ impl LazyOutbound {
     }
 
     fn get_or_init(&self) -> Result<Arc<dyn Outbound>> {
-        let res = self.inner.get_or_init(|| {
-            build_outbound_eager(&self.cfg, &self.deps)
-                .map_err(|e| e.to_string())
-        });
+        let res = self
+            .inner
+            .get_or_init(|| build_outbound_eager(&self.cfg, &self.deps).map_err(|e| e.to_string()));
         match res {
             Ok(ob) => Ok(ob.clone()),
             Err(e) => Err(Error::Config(e.clone())),
@@ -270,7 +269,9 @@ impl Outbound for LazyOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        self.get_or_init()?.connect_over(sess, dst, underlying).await
+        self.get_or_init()?
+            .connect_over(sess, dst, underlying)
+            .await
     }
 
     async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {

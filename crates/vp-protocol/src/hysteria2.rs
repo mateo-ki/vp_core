@@ -352,9 +352,13 @@ fn hysteria_client_config(skip_verify: bool, _sni: Option<&str>) -> quinn::Clien
     static VERIFY: std::sync::OnceLock<quinn::ClientConfig> = std::sync::OnceLock::new();
     static NO_VERIFY: std::sync::OnceLock<quinn::ClientConfig> = std::sync::OnceLock::new();
     if skip_verify {
-        NO_VERIFY.get_or_init(|| build_hy2_client_config(true)).clone()
+        NO_VERIFY
+            .get_or_init(|| build_hy2_client_config(true))
+            .clone()
     } else {
-        VERIFY.get_or_init(|| build_hy2_client_config(false)).clone()
+        VERIFY
+            .get_or_init(|| build_hy2_client_config(false))
+            .clone()
     }
 }
 

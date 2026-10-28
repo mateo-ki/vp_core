@@ -92,7 +92,7 @@ impl SubNode {
 }
 
 fn q(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', ""))
+    serde_json::to_string(s).expect("string serialization is infallible")
 }
 
 /// 解析任意分享链接
@@ -125,10 +125,7 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
     } else if let Some(rest) = line.strip_prefix("naive://") {
         parse_naive(rest, true)
     } else {
-        Err(Error::Config(format!(
-            "无法识别的分享链接: {}",
-            &line[..line.len().min(32)]
-        )))
+        Err(Error::Config("无法识别的分享链接格式".into()))
     }
 }
 
@@ -472,8 +469,8 @@ fn parse_mieru(rest: &str) -> Result<SubNode> {
             ("type".into(), "mieru".into()),
             ("server".into(), host),
             ("port".into(), port),
-            ("username".into(), q(username)),
-            ("password".into(), q(password)),
+            ("username".into(), q(&urldecode(username))),
+            ("password".into(), q(&urldecode(password))),
         ],
     })
 }
@@ -912,6 +909,15 @@ mod tests {
         // 订阅打包
         let nodes = parse_subscription("brook://pw@b.com:443#n1");
         assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn mieru_encoded_credentials() {
+        let n = parse_uri("mieru://alice:p%40ss%3A%22word@m.com:8964#encoded").unwrap();
+        let yaml = format!("proxies:\n{}", n.to_yaml());
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(value["proxies"][0]["password"].as_str(), Some("p@ss:\"word"));
+        assert!(parse_uri("未知链接未知链接未知链接未知链接未知链接").is_err());
     }
 
     #[test]

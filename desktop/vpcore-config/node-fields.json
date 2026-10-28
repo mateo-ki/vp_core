@@ -1,0 +1,1804 @@
+{
+  "ss": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "cipher",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "plugin",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "plugin-opts/host",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "plugin-opts/password",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "plugin-opts/port",
+      "Kind": "number",
+      "Required": false,
+      "Value": "443"
+    },
+    {
+      "Path": "plugin-opts/version",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "ssr": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "cipher",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "protocol-param",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "obfs",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "obfs-param",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "vmess": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "uuid",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "alterId",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "cipher",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "servername",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "client-fingerprint",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "network",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/path",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/headers",
+      "Kind": "map",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/max-early-data",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "grpc-opts/grpc-service-name",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/method",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/path",
+      "Kind": "list",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/headers",
+      "Kind": "map",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "vless": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "uuid",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "flow",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "servername",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "client-fingerprint",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "network",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/path",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/headers",
+      "Kind": "map",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/max-early-data",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "grpc-opts/grpc-service-name",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "reality-opts/public-key",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "reality-opts/short-id",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "reality-opts/spider-x",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/method",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/path",
+      "Kind": "list",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/headers",
+      "Kind": "map",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "trojan": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "servername",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "client-fingerprint",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "network",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/path",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/headers",
+      "Kind": "map",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "ws-opts/max-early-data",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "grpc-opts/grpc-service-name",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "reality-opts/public-key",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "reality-opts/short-id",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "reality-opts/spider-x",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/method",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/path",
+      "Kind": "list",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "http-opts/headers",
+      "Kind": "map",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "snell": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "psk",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "version",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "obfs",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "host",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "obfs-opts/mode",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "obfs-opts/host",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "obfs-opts/path",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "anytls": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "servername",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "client-fingerprint",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "ssh": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "username",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "private-key",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "host-key",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "brook": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "mieru": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "username",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "naive": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "username",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "servername",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "client-fingerprint",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "socks5": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "username",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "tuic": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "uuid",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "sni",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "congestion-controller",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_relay_mode",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "hysteria2": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "sni",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "up",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "down",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "http": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "username",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "sni",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "https": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "username",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "password",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "tls",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "skip-cert-verify",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "sni",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "wireguard": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "server",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "port",
+      "Kind": "number",
+      "Required": true,
+      "Value": "443"
+    },
+    {
+      "Path": "private-key",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "public-key",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "pre-shared-key",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "persistent-keepalive",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "ip",
+      "Kind": "text",
+      "Required": true,
+      "Value": ""
+    },
+    {
+      "Path": "ipv6",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "mtu",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "direct": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ],
+  "reject": [
+    {
+      "Path": "name",
+      "Kind": "text",
+      "Required": true,
+      "Value": "新节点"
+    },
+    {
+      "Path": "dialer-proxy",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "udp_over_tcp",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/enabled",
+      "Kind": "bool",
+      "Required": false,
+      "Value": "false"
+    },
+    {
+      "Path": "smux/protocol",
+      "Kind": "text",
+      "Required": false,
+      "Value": ""
+    },
+    {
+      "Path": "smux/max-connections",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    },
+    {
+      "Path": "smux/max-streams",
+      "Kind": "number",
+      "Required": false,
+      "Value": "0"
+    }
+  ]
+}

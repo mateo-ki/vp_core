@@ -12,7 +12,7 @@ static class Program {
             var testRoot = Path.Combine(Path.GetTempPath(), "vpcore-test-" + Guid.NewGuid());
             using var form = new MainForm(false, testRoot);
             form.Shown += async (_, _) => {
-                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop"); }
+                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop, 19 protocol forms, VLESS/Mieru imports, duplicate names, invalid import rollback"); }
                 catch (Exception e) { Environment.ExitCode = 1; File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), e.ToString()); }
                 finally { form.ExitTest(); }
             };
@@ -20,7 +20,7 @@ static class Program {
         } else Application.Run(new MainForm(args.Contains("--background")));
     }
 }
-sealed class MainForm : Form {
+sealed partial class MainForm : Form {
     readonly string root;
     string Config => Path.Combine(root, "config.yaml");
     string Core => Path.Combine(AppContext.BaseDirectory, "vpcore.exe");
@@ -42,14 +42,14 @@ sealed class MainForm : Form {
         var tabs = new TabControl { Dock = DockStyle.Fill };
         var basic = new TabPage("可视化配置"); var advanced = new TabPage("完整 YAML / 节点与规则"); var logging = new TabPage("运行日志");
         var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(18) };
-        basic.Controls.Add(panel); advanced.Controls.Add(yaml); logging.Controls.Add(logs); tabs.TabPages.AddRange([basic, advanced, logging]);
+        basic.Controls.Add(panel); advanced.Controls.Add(yaml); logging.Controls.Add(logs); var nodePage=CreateNodePage(); tabs.TabPages.AddRange([basic, nodePage, advanced, logging]);
         foreach(var (key,label) in new[]{("mixed-port","混合端口"),("port","HTTP 端口（0 禁用）"),("socks-port","SOCKS 端口（0 禁用）"),("mode","模式：rule / global / direct"),("log-level","日志级别"),("external-controller","控制器地址（空为禁用）"),("secret","控制器密钥")}) {
             var row = new FlowLayoutPanel { Width = 820, Height = 34 };
             row.Controls.Add(new Label { Text = label, Width = 250, Padding = new Padding(0,6,0,0) });
             var input = new TextBox { Width = 430, UseSystemPasswordChar = key == "secret" }; fields[key]=input; row.Controls.Add(input); panel.Controls.Add(row);
         }
         foreach(var (key,label) in new[]{("allow-lan","允许局域网访问"),("ipv6","启用 IPv6")}) { var c = new CheckBox { Text = label, AutoSize=true }; fields[key]=c; panel.Controls.Add(c); }
-        panel.Controls.Add(new Label { Text = "DNS、TUN、节点、策略组和规则可在完整 YAML 页编辑。TUN 需以管理员身份运行。", AutoSize=true });
+        panel.Controls.Add(new Label { Text = "节点可在节点管理页编辑或从剪贴板导入；DNS、TUN、策略组和规则可在完整 YAML 页编辑。TUN 需以管理员身份运行。", AutoSize=true });
         panel.Controls.Add(autoRun); panel.Controls.Add(startup);
         autoRun.Checked = File.Exists(Path.Combine(root,"autorun"));
         using(var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run")) startup.Checked = k?.GetValue("VpcoreConfig") != null;
@@ -68,7 +68,7 @@ sealed class MainForm : Form {
         Button("打开配置目录",()=>{Process.Start(new ProcessStartInfo(root){UseShellExecute=true});return Task.CompletedTask;});
         buttons.Controls.Add(status); Controls.Add(tabs); Controls.Add(buttons);
         tabs.Deselecting += (_,e)=>{if(e.TabPage==basic)try{ApplyFields();}catch(Exception x){e.Cancel=true;MessageBox.Show(x.Message);}};
-        tabs.Selecting += (_,e)=>{if(e.TabPage==basic)try{LoadFields();}catch(Exception x){e.Cancel=true;MessageBox.Show(x.Message);}};
+        tabs.Selecting += (_,e)=>{try{if(e.TabPage==basic)LoadFields();if(e.TabPage==nodePage)RefreshNodes();}catch(Exception x){e.Cancel=true;MessageBox.Show(x.Message);}};
         var menu = new ContextMenuStrip(); menu.Items.Add("打开配置",null,(_,_)=>{Show();WindowState=FormWindowState.Normal;Activate();});
         menu.Items.Add("退出并停止内核",null,async(_,_)=>{try {await Stop();exiting=true;Close();}catch(Exception e){MessageBox.Show(e.Message);}}); tray.ContextMenuStrip=menu;
         tray.DoubleClick+=(_,_)=>{Show();WindowState=FormWindowState.Normal;Activate();};
@@ -90,6 +90,15 @@ sealed class MainForm : Form {
         if (!rejected) throw new Exception("Invalid port was accepted");
         fields["mixed-port"].Text = "0";
         await Save(); await Start(); await Stop();
+        if(Nodes.Catalog.Count!=19)throw new Exception("Protocol schema coverage mismatch");
+        await ImportNodes("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&sni=example.com#test-vless\nmieru://alice:password@example.com:8964?transport=tcp#test-mieru",false);
+        await ImportNodes("mieru://alice:password@example.com:8964?transport=tcp#test-mieru",false);
+        var imported=Nodes.Sequence((YamlMappingNode)Parse().Documents[0].RootNode,"proxies");
+        if(imported.Children.Count!=3 || Nodes.Get((YamlMappingNode)imported.Children[2],"name")!="test-mieru (2)")throw new Exception("Clipboard import or name collision handling failed");
+        var before=yaml.Text;bool failed=false;try{await ImportNodes("not-a-supported-link",false);}catch{failed=true;}
+        if(!failed||yaml.Text!=before)throw new Exception("Invalid import changed the configuration");
+        foreach(var type in Nodes.Catalog.Keys){using var editor=new NodeEditor(new YamlMappingNode{{"type",type},{"name","test"}});}
+
     }
     public void ExitTest() { exiting=true; Close(); }
     void Guard(Action action){try{action();}catch(Exception e){MessageBox.Show(e.Message);}}

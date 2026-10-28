@@ -44,6 +44,13 @@ enum Cmd {
         #[arg(short = 'd', short_alias = 'D', long, alias = "dir")]
         directory: Option<PathBuf>,
     },
+    /// 将本地分享链接列表转换为 proxies YAML（不发起网络请求）
+    ImportLinks {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// 全组测速
     Test {
         #[arg(short, long)]
@@ -106,6 +113,38 @@ fn trim_working_set() {}
 async fn main() {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::ImportLinks { input, output } => {
+            let result = (|| -> Result<(), String> {
+                let text = std::fs::read_to_string(input).map_err(|e| e.to_string())?;
+                if text.len() > 4 * 1024 * 1024 {
+                    return Err("导入内容超过 4 MB".into());
+                }
+                let mut yaml = String::from("proxies:\n");
+                let mut count = 0;
+                for (i, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let node = vp_protocol::sub::parse_uri(line).map_err(|_| {
+                        format!("第 {} 行链接无效或格式不支持", i + 1)
+                    })?;
+                    yaml.push_str(&node.to_yaml());
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err("没有可导入的链接".into());
+                }
+                std::fs::write(output, yaml).map_err(|e| e.to_string())?;
+                println!("已解析 {count} 个节点");
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
+
         Cmd::Validate {
             config,
             directory: _,

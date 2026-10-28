@@ -29,12 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || github.sha }}
+          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
       - name: Test and compile core
         run: |
+          cargo test --locked -p vp-protocol sub::tests
+          if ($LASTEXITCODE -ne 0) { throw 'Subscription parser tests failed' }
           cargo test --locked -p vp-config
           if ($LASTEXITCODE -ne 0) { throw 'Configuration tests failed' }
           cargo build --locked --release -p vp-bin --target x86_64-pc-windows-msvc

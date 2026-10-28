@@ -2834,6 +2834,7 @@ dependencies = [
  "tracing-subscriber",
  "vp-common",
  "vp-core",
+ "vp-dns",
  "webpki-roots 0.26.11",
  "x25519-dalek",
 ]

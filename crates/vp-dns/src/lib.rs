@@ -292,23 +292,42 @@ impl Resolver {
             };
         }
 
+        // 并发查询全部上游，取各上游答案的并集（保持配置顺序去重）。
+        // 单一上游可能给出整轮被污染/失效的答案（如 GFW 对节点域名的"邻居 IP"污染），
+        // 多上游并集后配合拨号竞速，任一上游给出活地址即可用。
         let mut set = tokio::task::JoinSet::new();
-        for server in servers {
+        for (idx, server) in servers.iter().enumerate() {
             let server = server.clone();
             let domain = domain.to_string();
-            set.spawn(async move { query_server(&server, &domain, qtype).await });
+            set.spawn(async move { (idx, query_server(&server, &domain, qtype).await) });
         }
 
+        let mut merged: Vec<(usize, Vec<IpAddr>)> = Vec::new();
         let mut last_err = None;
         while let Some(res) = set.join_next().await {
             match res {
-                Ok(Ok(ips)) if !ips.is_empty() => return Ok(ips),
-                Ok(Ok(_)) => last_err = Some(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
-                Ok(Err(e)) => last_err = Some(e),
+                Ok((idx, Ok(ips))) if !ips.is_empty() => merged.push((idx, ips)),
+                Ok((_, Ok(_))) => {
+                    last_err = Some(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录")))
+                }
+                Ok((_, Err(e))) => last_err = Some(e),
                 Err(e) => last_err = Some(Error::Dns(format!("DNS 任务失败: {e}"))),
             }
         }
-        Err(last_err.unwrap_or_else(|| Error::Dns("全部 DNS 服务器查询失败".into())))
+        if merged.is_empty() {
+            return Err(last_err.unwrap_or_else(|| Error::Dns("全部 DNS 服务器查询失败".into())));
+        }
+        merged.sort_by_key(|(idx, _)| *idx);
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (_, ips) in merged {
+            for ip in ips {
+                if seen.insert(ip) {
+                    out.push(ip);
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn system_lookup(&self, domain: &str) -> Result<Arc<Vec<IpAddr>>> {

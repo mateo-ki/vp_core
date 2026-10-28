@@ -38,20 +38,10 @@ pub struct Socks5Outbound {
     pub udp: bool,
 }
 
-/// 节点拨号（8s 超时）：与 vp_transport::dial 的 TCP 超时语义对齐
+/// 节点拨号（8s 超时，多地址竞速）：与 vp_transport::dial 的 TCP 超时语义对齐。
+/// 节点域名若解析出多条记录（含被污染/失效地址），竞速可避免单条假地址吃光预算。
 async fn connect_node(server: &str, port: u16) -> Result<TcpStream> {
-    let tcp = tokio::time::timeout(
-        std::time::Duration::from_secs(8),
-        TcpStream::connect((server, port)),
-    )
-    .await
-    .map_err(|_| {
-        Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("连接 {server}:{port} 超时"),
-        ))
-    })??;
-    Ok(tcp)
+    vp_transport::dial_tcp_multi(server, port, std::time::Duration::from_secs(8)).await
 }
 
 impl Socks5Outbound {

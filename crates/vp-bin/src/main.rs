@@ -199,13 +199,14 @@ async fn main() {
                 text.lines()
                     .find_map(|l| {
                         let l = l.trim();
-                        if let Some(rest) = l.strip_prefix("log-level:") {
-                            Some(rest.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
-                        } else if let Some(rest) = l.strip_prefix("log_level:") {
-                            Some(rest.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
-                        } else {
-                            None
-                        }
+                        let rest = l
+                            .strip_prefix("log-level:")
+                            .or_else(|| l.strip_prefix("log_level:"))?;
+                        Some(
+                            rest.trim()
+                                .trim_matches(|c| c == '\'' || c == '"')
+                                .to_string(),
+                        )
                     })
                     .unwrap_or_else(|| "info".into())
             });

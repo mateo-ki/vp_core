@@ -201,6 +201,37 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Release Notes
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release_assets
+          if [ -f "RELEASE_NOTES.md" ]; then
+            python3 -c "
+          import re, sys
+          ver = sys.argv[1]
+          with open('RELEASE_NOTES.md', 'r', encoding='utf-8') as f:
+              content = f.read()
+          pattern = r'(?ms)(^#[ \t]+[^\r\n]*?\bv' + re.escape(ver) + r'\b[^\r\n]*\r?\n.*?)(?=\r?\n---\r?\n|\Z)'
+          m = re.search(pattern, content)
+          if m:
+              with open('release_assets/release_notes.md', 'w', encoding='utf-8') as out:
+                  out.write(m.group(1).strip())
+              print('Extracted release notes for v' + ver)
+          else:
+              print('No matching notes found for v' + ver)
+          " "$VERSION"
+          fi
+          if [ -s "release_assets/release_notes.md" ]; then
+            echo "has_notes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_notes=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Download all built artifacts
         uses: actions/download-artifact@v4
         with:
@@ -216,6 +247,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          name: VP_Core ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.has_notes == 'true' && 'release_assets/release_notes.md' || '' }}
           files: |
             release_assets/*
           generate_release_notes: false

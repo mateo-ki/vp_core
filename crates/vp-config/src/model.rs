@@ -571,7 +571,14 @@ pub struct VmessCfg {
         default
     )]
     pub server_name: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
@@ -609,7 +616,14 @@ pub struct VlessCfg {
         default
     )]
     pub server_name: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
@@ -654,7 +668,14 @@ pub struct TrojanCfg {
         default
     )]
     pub server_name: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
@@ -786,7 +807,14 @@ pub struct AnytlsCfg {
         default
     )]
     pub server_name: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
@@ -812,7 +840,14 @@ pub struct NaiveCfg {
         default
     )]
     pub server_name: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
@@ -830,7 +865,14 @@ pub struct Hysteria2Cfg {
     pub password: String,
     #[serde(default)]
     pub sni: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(
         alias = "up-mbps",
@@ -861,7 +903,14 @@ pub struct TuicCfg {
     pub password: String,
     #[serde(default)]
     pub sni: Option<String>,
-    #[serde(alias = "skip-cert-verify", alias = "skip_cert_verify", default)]
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
     pub skip_cert_verify: bool,
     #[serde(
         alias = "congestion-controller",

@@ -22,11 +22,6 @@
   - 增强外部订阅提供者 payload 结构反序列化容错。
 - **出站证书跳过参数对齐**：
   - 为所有出站协议（SS、SSR、VMess、VLESS、Trojan、Hysteria 2、TUIC 等）补充 `skip-cert-verify` / `allowInsecure` / `insecure` 别名兼容。
-
-## 社区
-
-本开源项目已链接并认可 [LINUX DO 社区](https://linux.do)。
-
 ---
 
 # 🚀 VP_Core v1.0.2 发布说明 / Release Notes
@@ -39,7 +34,3 @@
   - 修复 2.4 万+ 条规则加载时的内存拷贝瓶颈，实现百毫秒级急速启动。
 - **配置快速解析**：
   - 优化日志级别扫描与配置文件加载路径，消除冗余反序列化开销。
-
-## 社区
-
-本开源项目已链接并认可 [LINUX DO 社区](https://linux.do)。

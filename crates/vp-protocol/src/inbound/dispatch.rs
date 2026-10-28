@@ -60,7 +60,11 @@ pub async fn dispatch_stream(
 
     let res = ctx.router.pick(&sess).await;
     let outbound = res.outbound.clone();
-    tracing::debug!("dispatch_stream: picked outbound={} via={}", outbound.name(), res.via);
+    tracing::debug!(
+        "dispatch_stream: picked outbound={} via={}",
+        outbound.name(),
+        res.via
+    );
 
     let meta = ConnMeta {
         id: sess.id,

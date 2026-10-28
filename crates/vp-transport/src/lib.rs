@@ -291,9 +291,7 @@ pub async fn dial_tcp_multi(
     }
     addrs.dedup();
     if addrs.is_empty() {
-        return Err(vp_common::Error::Dns(format!(
-            "解析 {host} 未得到任何地址"
-        )));
+        return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
     }
     if addrs.len() == 1 {
         let tcp = tokio::time::timeout(budget, tokio::net::TcpStream::connect(addrs[0]))
@@ -319,8 +317,10 @@ pub async fn dial_addrs_multi(
 ) -> Result<tokio::net::TcpStream> {
     const STAGGER: Duration = Duration::from_millis(150);
     let total = addrs.len();
-    let mut tasks: tokio::task::JoinSet<(std::net::SocketAddr, std::io::Result<tokio::net::TcpStream>)> =
-        tokio::task::JoinSet::new();
+    let mut tasks: tokio::task::JoinSet<(
+        std::net::SocketAddr,
+        std::io::Result<tokio::net::TcpStream>,
+    )> = tokio::task::JoinSet::new();
     for (idx, addr) in addrs.iter().enumerate() {
         let addr = *addr;
         let delay = STAGGER * (idx as u32).min(4);
@@ -442,9 +442,14 @@ mod tests {
         let server = tokio::spawn(async move {
             let (_s, _) = listener.accept().await.unwrap();
         });
-        let c = dial_addrs_multi(&[dead, live], "race.test", live.port(), Duration::from_secs(6))
-            .await
-            .unwrap();
+        let c = dial_addrs_multi(
+            &[dead, live],
+            "race.test",
+            live.port(),
+            Duration::from_secs(6),
+        )
+        .await
+        .unwrap();
         assert_eq!(c.peer_addr().unwrap(), live);
         server.await.unwrap();
     }

@@ -294,24 +294,32 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
     }
 }
 
+struct PendingDomainBatch {
+    target: Arc<str>,
+    no_resolve: bool,
+    trie: DomainTrie,
+    count: usize,
+    raw_first: Arc<str>,
+}
+
 /// 合并相邻且指向同一目标、同 no_resolve 的 DOMAIN 与 DOMAIN-SUFFIX 规则，
 /// 将数千条散乱规则合并为一个共享 DomainTrie，大幅压降堆内存并提速路由匹配。
 fn optimize_rules(rules: Vec<CompiledRule>) -> Vec<CompiledRule> {
     let mut out = Vec::with_capacity(rules.len());
-    let mut cur_domain: Option<(Arc<str>, bool, DomainTrie, usize, Arc<str>)> = None;
+    let mut cur_domain: Option<PendingDomainBatch> = None;
 
-    let flush_domain = |cur: &mut Option<(Arc<str>, bool, DomainTrie, usize, Arc<str>)>, out: &mut Vec<CompiledRule>| {
-        if let Some((target, no_resolve, trie, count, raw_first)) = cur.take() {
-            let raw = if count > 1 {
-                format!("DOMAIN-SET({count} 条合并)").into()
+    let flush_domain = |cur: &mut Option<PendingDomainBatch>, out: &mut Vec<CompiledRule>| {
+        if let Some(batch) = cur.take() {
+            let raw = if batch.count > 1 {
+                format!("DOMAIN-SET({} 条合并)", batch.count).into()
             } else {
-                raw_first
+                batch.raw_first
             };
             out.push(CompiledRule {
                 raw,
-                target,
-                matcher: Matcher::DomainSuffix(Arc::new(trie)),
-                no_resolve,
+                target: batch.target,
+                matcher: Matcher::DomainSuffix(Arc::new(batch.trie)),
+                no_resolve: batch.no_resolve,
             });
         }
     };
@@ -320,27 +328,39 @@ fn optimize_rules(rules: Vec<CompiledRule>) -> Vec<CompiledRule> {
         match r.matcher {
             Matcher::Domain(trie) => {
                 let trie = Arc::try_unwrap(trie).unwrap_or_else(|a| (*a).clone());
-                if let Some((cur_target, cur_no_resolve, cur_trie, count, _)) = &mut cur_domain {
-                    if *cur_target == r.target && *cur_no_resolve == r.no_resolve {
-                        cur_trie.merge(trie);
-                        *count += 1;
+                if let Some(cur) = &mut cur_domain {
+                    if cur.target == r.target && cur.no_resolve == r.no_resolve {
+                        cur.trie.merge(trie);
+                        cur.count += 1;
                         continue;
                     }
                 }
                 flush_domain(&mut cur_domain, &mut out);
-                cur_domain = Some((r.target, r.no_resolve, trie, 1, r.raw));
+                cur_domain = Some(PendingDomainBatch {
+                    target: r.target,
+                    no_resolve: r.no_resolve,
+                    trie,
+                    count: 1,
+                    raw_first: r.raw,
+                });
             }
             Matcher::DomainSuffix(trie) => {
                 let trie = Arc::try_unwrap(trie).unwrap_or_else(|a| (*a).clone());
-                if let Some((cur_target, cur_no_resolve, cur_trie, count, _)) = &mut cur_domain {
-                    if *cur_target == r.target && *cur_no_resolve == r.no_resolve {
-                        cur_trie.merge(trie);
-                        *count += 1;
+                if let Some(cur) = &mut cur_domain {
+                    if cur.target == r.target && cur.no_resolve == r.no_resolve {
+                        cur.trie.merge(trie);
+                        cur.count += 1;
                         continue;
                     }
                 }
                 flush_domain(&mut cur_domain, &mut out);
-                cur_domain = Some((r.target, r.no_resolve, trie, 1, r.raw));
+                cur_domain = Some(PendingDomainBatch {
+                    target: r.target,
+                    no_resolve: r.no_resolve,
+                    trie,
+                    count: 1,
+                    raw_first: r.raw,
+                });
             }
             _ => {
                 flush_domain(&mut cur_domain, &mut out);
@@ -806,11 +826,15 @@ mod tests {
             "PROXY"
         );
         assert_eq!(
-            e.r#match(&ctx(Some("mail.google.com"), None)).unwrap().target,
+            e.r#match(&ctx(Some("mail.google.com"), None))
+                .unwrap()
+                .target,
             "PROXY"
         );
         assert_eq!(
-            e.r#match(&ctx(Some("www.youtube.com"), None)).unwrap().target,
+            e.r#match(&ctx(Some("www.youtube.com"), None))
+                .unwrap()
+                .target,
             "PROXY"
         );
         assert_eq!(
@@ -818,7 +842,9 @@ mod tests {
             "PROXY"
         );
         assert_eq!(
-            e.r#match(&ctx(Some("sub.twitter.com"), None)).unwrap().target,
+            e.r#match(&ctx(Some("sub.twitter.com"), None))
+                .unwrap()
+                .target,
             "DIRECT"
         );
         assert_eq!(

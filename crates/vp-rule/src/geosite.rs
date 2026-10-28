@@ -249,7 +249,9 @@ pub fn build_tag_index(bytes: &[u8]) -> Result<HashMap<String, Vec<(usize, usize
             while let Some((efield, ewire)) = er.next_tag()? {
                 if efield == 1 && ewire == 2 {
                     let code_raw = er.bytes()?;
-                    let code = String::from_utf8_lossy(code_raw).trim().to_ascii_lowercase();
+                    let code = String::from_utf8_lossy(code_raw)
+                        .trim()
+                        .to_ascii_lowercase();
                     if !code.is_empty() {
                         index.entry(code).or_default().push((start, len));
                     }

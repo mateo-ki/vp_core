@@ -219,9 +219,9 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             for g in router.groups().values() {
                 let states = g.member_states();
                 for (m, delay, alive) in states {
-                    let entry = proxies.entry(m.to_string()).or_insert_with(|| {
-                        json!({ "type": "Static", "name": m.to_string(), "all": [] })
-                    });
+                    let entry = proxies.entry(m.to_string()).or_insert_with(
+                        || json!({ "type": "Static", "name": m.to_string(), "all": [] }),
+                    );
                     if let Some(obj) = entry.as_object_mut() {
                         obj.insert("alive".into(), json!(alive));
                         if let Some(ms) = delay {
@@ -784,7 +784,12 @@ rules: ['MATCH,PROXY']
         assert!(resp.0 == 204, "{resp:?}");
 
         // 验证 URL 编码策略组名访问（例如 %50%52%4F%58%59 即 PROXY）
-        let resp = http_get("127.0.0.1:19091", "/proxies/%50%52%4F%58%59", Some("s3cret")).await;
+        let resp = http_get(
+            "127.0.0.1:19091",
+            "/proxies/%50%52%4F%58%59",
+            Some("s3cret"),
+        )
+        .await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("PROXY"));
         let _ = app;
@@ -792,7 +797,10 @@ rules: ['MATCH,PROXY']
 
     #[test]
     fn test_url_decode_percent_utf8() {
-        assert_eq!(url_decode("%E7%BE%8E%E5%9B%BD%E8%8A%82%E7%82%B9"), "美国节点");
+        assert_eq!(
+            url_decode("%E7%BE%8E%E5%9B%BD%E8%8A%82%E7%82%B9"),
+            "美国节点"
+        );
         assert_eq!(url_decode("%E6%B5%8B%E8%AF%95+name"), "测试 name");
         assert_eq!(url_decode("PROXY"), "PROXY");
     }

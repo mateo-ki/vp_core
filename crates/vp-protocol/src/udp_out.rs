@@ -28,7 +28,8 @@ pub async fn socks5_udp_connect(
     username: &Option<String>,
     password: &Option<String>,
 ) -> Result<Socks5PacketConn> {
-    let mut ctrl = vp_transport::dial_tcp_multi(server, port, std::time::Duration::from_secs(8)).await?;
+    let mut ctrl =
+        vp_transport::dial_tcp_multi(server, port, std::time::Duration::from_secs(8)).await?;
     // 握手（同 TCP 流程，目标为 0.0.0.0:0）
     let has_auth = username.is_some();
     if has_auth {

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using Microsoft.Win32;
 using YamlDotNet.RepresentationModel;
 
@@ -12,7 +13,7 @@ static class Program {
             var testRoot = Path.Combine(Path.GetTempPath(), "vpcore-test-" + Guid.NewGuid());
             using var form = new MainForm(false, testRoot);
             form.Shown += async (_, _) => {
-                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop, 19 protocol forms, VLESS/Mieru and official Mieru imports, duplicate names, invalid import rollback"); }
+                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop, 19 protocol forms, VLESS/Mieru and official Mieru imports, duplicate names, invalid import rollback, UTF-8 stdout/stderr and ANSI-free logs"); }
                 catch (Exception e) { Environment.ExitCode = 1; File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), e.ToString()); }
                 finally { form.ExitTest(); }
             };
@@ -90,6 +91,7 @@ sealed partial class MainForm : Form {
         if (!rejected) throw new Exception("Invalid port was accepted");
         fields["mixed-port"].Text = "0";
         await Save(); await Start(); await Stop();
+        await TestLogEncoding();
         if(Nodes.Catalog.Count!=19)throw new Exception("Protocol schema coverage mismatch");
         await ImportNodes("vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&sni=example.com#test-vless\nmieru://alice:password@example.com:8964?transport=tcp#test-mieru",false);
         await ImportNodes("mieru://alice:password@example.com:8964?transport=tcp#test-mieru",false);
@@ -110,9 +112,9 @@ sealed partial class MainForm : Form {
     YamlStream Parse(){var s=new YamlStream();s.Load(new StringReader(yaml.Text));if(s.Documents.Count!=1||s.Documents[0].RootNode is not YamlMappingNode)throw new Exception("配置必须为单个 YAML 对象。");return s;}
     void LoadFields(){var m=(YamlMappingNode)Parse().Documents[0].RootNode;foreach(var (k,c) in fields){var value=m.Children.TryGetValue(new YamlScalarNode(k),out var v)?v.ToString(): k is "mode"?"rule":k is "log-level"?"info":k.EndsWith("port")?"0":"";if(c is CheckBox b)b.Checked=value=="true";else c.Text=value;}}
     void ApplyFields(){var s=Parse();var m=(YamlMappingNode)s.Documents[0].RootNode;foreach(var(k,c)in fields){var value=c is CheckBox b?b.Checked.ToString().ToLowerInvariant():c.Text.Trim();if(k.EndsWith("port")&&(!ushort.TryParse(value,out _)))throw new Exception("端口范围必须为 0–65535。");if(k=="mode"&&!new[]{"rule","global","direct"}.Contains(value))throw new Exception("运行模式无效。");if((k=="external-controller"&&value=="") || (k.EndsWith("port") && value=="0")){m.Children.Remove(new YamlScalarNode(k));continue;}m.Children[new YamlScalarNode(k)]=new YamlScalarNode(value);}using var w=new StringWriter();s.Save(w,false);yaml.Text=w.ToString();}
-    ProcessStartInfo Info(params string[] args){var i=new ProcessStartInfo(Core){WorkingDirectory=root,UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true,RedirectStandardInput=true};foreach(var a in args)i.ArgumentList.Add(a);return i;}
-    async Task Save(){if(((TabControl)Controls[0]).SelectedIndex==0)ApplyFields();Parse();var tmp=Path.Combine(root,"validate-"+Guid.NewGuid()+".yaml");try{await File.WriteAllTextAsync(tmp,yaml.Text);using var p=Process.Start(Info("validate","-c",tmp))??throw new Exception("无法启动校验器");var stdout=p.StandardOutput.ReadToEndAsync();var stderr=p.StandardError.ReadToEndAsync();using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(30));try{await p.WaitForExitAsync(timeout.Token);}catch{p.Kill(true);throw;}var result=(await stdout)+(await stderr);if(p.ExitCode!=0)throw new Exception(result);if(File.Exists(Config))File.Copy(Config,Config+".bak",true);File.Move(tmp,Config,true);Log("配置已保存；运行中的内核会自动检测并重载。"+result);}finally{if(File.Exists(tmp))File.Delete(tmp);}}
+    ProcessStartInfo Info(params string[] args){var i=new ProcessStartInfo(Core){WorkingDirectory=root,UseShellExecute=false,CreateNoWindow=true,RedirectStandardOutput=true,RedirectStandardError=true,RedirectStandardInput=true,StandardOutputEncoding=new UTF8Encoding(false),StandardErrorEncoding=new UTF8Encoding(false),StandardInputEncoding=new UTF8Encoding(false)};i.Environment["NO_COLOR"]="1";foreach(var a in args)i.ArgumentList.Add(a);return i;}
+    async Task Save(){if(((TabControl)Controls[0]).SelectedIndex==0)ApplyFields();Parse();var tmp=Path.Combine(root,"validate-"+Guid.NewGuid()+".yaml");try{await File.WriteAllTextAsync(tmp,yaml.Text);using var p=Process.Start(Info("validate","-c",tmp))??throw new Exception("无法启动校验器");var stdout=p.StandardOutput.ReadToEndAsync();var stderr=p.StandardError.ReadToEndAsync();using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(30));try{await p.WaitForExitAsync(timeout.Token);}catch{p.Kill(true);throw;}var result=LogText.Plain((await stdout)+(await stderr));if(p.ExitCode!=0)throw new Exception(result);if(File.Exists(Config))File.Copy(Config,Config+".bak",true);File.Move(tmp,Config,true);Log("配置已保存；运行中的内核会自动检测并重载。"+Environment.NewLine+result.TrimEnd());}finally{if(File.Exists(tmp))File.Delete(tmp);}}
     async Task Start(){if(core is {HasExited:false})return;await Save();core=new Process {StartInfo=Info("run","-c",Config,"-d",root,"--managed-stdin"),EnableRaisingEvents=true};core.OutputDataReceived+=(_,e)=>{if(e.Data!=null)Log(e.Data);};core.ErrorDataReceived+=(_,e)=>{if(e.Data!=null)Log(e.Data);};core.Exited+=(_,_)=>{if(!IsDisposed&&IsHandleCreated)BeginInvoke((Action)(()=>status.Text="内核已退出"));};core.Start();core.BeginOutputReadLine();core.BeginErrorReadLine();status.Text="内核进程运行中";await Task.Delay(500);if(core.HasExited)throw new Exception("内核启动后退出，请查看运行日志。");}
     async Task Stop(){if(core is not {HasExited:false})return;await core.StandardInput.WriteLineAsync("stop");await core.StandardInput.FlushAsync();using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(20));try{await core.WaitForExitAsync(timeout.Token);}catch(OperationCanceledException){throw new Exception("内核未在 20 秒内退出。请查看日志；未强制结束，以便保留 TUN 路由清理机会。");}core.Dispose();core=null;status.Text="内核已停止";}
-    void Log(string text){if(IsDisposed||!IsHandleCreated)return;BeginInvoke((Action)(()=>{if(logs.TextLength>200000)logs.Clear();logs.AppendText(text+Environment.NewLine);}));}
+    void Log(string text){text=LogText.Plain(text);if(IsDisposed||!IsHandleCreated)return;BeginInvoke((Action)(()=>{if(logs.TextLength>200000)logs.Clear();logs.AppendText(text+Environment.NewLine);}));}
 }

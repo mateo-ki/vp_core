@@ -1221,12 +1221,22 @@ mod real_node_probe {
     #[tokio::test]
     #[ignore = "真实节点调试：需要外网"]
     async fn hy2_real_quic_probe() {
+        let server = std::env::var("HY2_TEST_SERVER").unwrap_or_else(|_| "localhost".into());
+        let port = std::env::var("HY2_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+        let password = std::env::var("HY2_TEST_PASSWORD").unwrap_or_default();
+        let sni = std::env::var("HY2_TEST_SNI").ok();
+        let skip_verify = std::env::var("HY2_SKIP_VERIFY")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
         let cfg = vp_config::Hysteria2Cfg {
-            server: "snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into(),
-            port: 21540,
-            password: "6c055d29-d726-4a3e-b875-28b5a5e92e12".into(),
-            sni: Some("snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into()),
-            skip_cert_verify: true,
+            server,
+            port,
+            password,
+            sni,
+            skip_cert_verify: skip_verify,
             up: None,
             down: None,
             obfs: None,
@@ -1262,17 +1272,28 @@ mod real_node_probe {
             ),
         }
     }
+
     /// hy2 数据面探针：connect_stream 后直接发 HTTP GET 并转储响应字节。
     #[tokio::test]
     #[ignore = "真实节点调试：需要外网"]
     async fn hy2_real_data_probe() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = std::env::var("HY2_TEST_SERVER").unwrap_or_else(|_| "localhost".into());
+        let port = std::env::var("HY2_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+        let password = std::env::var("HY2_TEST_PASSWORD").unwrap_or_default();
+        let sni = std::env::var("HY2_TEST_SNI").ok();
+        let skip_verify = std::env::var("HY2_SKIP_VERIFY")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
         let cfg = vp_config::Hysteria2Cfg {
-            server: "snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into(),
-            port: 21540,
-            password: "6c055d29-d726-4a3e-b875-28b5a5e92e12".into(),
-            sni: Some("snasdhj.fanajkshy40.fandjlsadhlkadhlkqwdsadasjhas.com".into()),
-            skip_cert_verify: true,
+            server,
+            port,
+            password,
+            sni,
+            skip_cert_verify: skip_verify,
             up: None,
             down: None,
             obfs: None,
@@ -1281,13 +1302,22 @@ mod real_node_probe {
         let out = Hysteria2Outbound::new(&cfg).expect("build");
         let dst = vp_common::DstAddr::new("www.gstatic.com", 80);
         let sess = Session::new_tcp("probe".into(), None, dst.clone());
-        let mut s = tokio::time::timeout(
+        let mut s = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             out.connect_stream(&sess, &dst),
         )
         .await
-        .expect("connect 10s 超时")
-        .expect("connect error");
+        {
+            Err(_) => {
+                println!("connect 10s 超时");
+                return;
+            }
+            Ok(Err(e)) => {
+                println!("connect error: {e}");
+                return;
+            }
+            Ok(Ok(s)) => s,
+        };
         s.write_all(
             b"GET /generate_204 HTTP/1.1\r\nHost: www.gstatic.com\r\nConnection: close\r\n\r\n",
         )
@@ -1298,7 +1328,12 @@ mod real_node_probe {
         match n {
             Err(_) => println!("读 8s 超时"),
             Ok(Ok(0)) => println!("EOF"),
-            Ok(Ok(n)) => println!("{} 字节: {:02x?}", n, &buf[..n]),
+            Ok(Ok(n)) => println!(
+                "{} 字节: {:02x?} ({})",
+                n,
+                &buf[..n],
+                String::from_utf8_lossy(&buf[..n])
+            ),
             Ok(Err(e)) => println!("read error: {e}"),
         }
     }

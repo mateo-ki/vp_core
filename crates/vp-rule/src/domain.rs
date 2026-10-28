@@ -20,6 +20,34 @@ struct Node {
     suffix_sub: bool,
 }
 
+impl Node {
+    fn merge(&mut self, other: Node) {
+        if other.exact {
+            self.exact = true;
+        }
+        if other.suffix_all {
+            self.suffix_all = true;
+        }
+        if other.suffix_sub {
+            self.suffix_sub = true;
+        }
+        if self.suffix_all {
+            self.children.clear();
+            self.children.shrink_to_fit();
+            return;
+        }
+        for (label, other_child) in other.children {
+            match self
+                .children
+                .binary_search_by(|(k, _)| (**k).as_bytes().cmp(label.as_bytes()))
+            {
+                Ok(i) => self.children[i].1.merge(other_child),
+                Err(i) => self.children.insert(i, (label, other_child)),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct DomainTrie {
     root: Node,
@@ -29,6 +57,11 @@ pub struct DomainTrie {
 impl DomainTrie {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn merge(&mut self, other: DomainTrie) {
+        self.size += other.size;
+        self.root.merge(other.root);
     }
 
     pub fn len(&self) -> usize {
@@ -60,6 +93,10 @@ impl DomainTrie {
         let lowered = domain.to_ascii_lowercase();
         let mut node = &mut self.root;
         for label in lowered.rsplit('.').filter(|l| !l.is_empty()) {
+            if node.suffix_all {
+                // 父级根域已经是全子域匹配，子级规则完全冗余，直接剪枝跳过！
+                return;
+            }
             let i = match node
                 .children
                 .binary_search_by(|(k, _)| (**k).as_bytes().cmp(label.as_bytes()))
@@ -73,6 +110,11 @@ impl DomainTrie {
             node = &mut node.children[i].1;
         }
         f(node);
+        if node.suffix_all && !node.children.is_empty() {
+            // 当前节点是全子域匹配，清空所有子树节点，立即释放堆内存
+            node.children.clear();
+            node.children.shrink_to_fit();
+        }
         self.size += 1;
     }
 

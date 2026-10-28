@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -106,6 +106,7 @@ boringtun = { version = "0.6", default-features = false }
 smoltcp = { version = "0.11", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 maxminddb = { version = "0.24", features = ["mmap"] }
 memmap2 = "0.9"
+mimalloc = { version = "0.1", default-features = false }
 
 # CLI
 ureq = { version = "2", features = ["tls"] }
@@ -124,6 +125,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",
     "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
 ] }
 
 # 仅测试

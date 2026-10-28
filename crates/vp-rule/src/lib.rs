@@ -318,10 +318,13 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
         // 快速无分配路径：针对 99% 的常见直白规则 (DOMAIN / DOMAIN-SUFFIX / IP-CIDR)
         if !raw.contains('(') {
             let mut parts = raw.split(',').map(str::trim).filter(|p| !p.is_empty());
-            if let (Some(ty), Some(payload), Some(target)) = (parts.next(), parts.next(), parts.next()) {
+            if let (Some(ty), Some(payload), Some(target)) =
+                (parts.next(), parts.next(), parts.next())
+            {
                 let is_domain = ty.eq_ignore_ascii_case("DOMAIN");
                 let is_suffix = ty.eq_ignore_ascii_case("DOMAIN-SUFFIX");
-                let is_ip_cidr = ty.eq_ignore_ascii_case("IP-CIDR") || ty.eq_ignore_ascii_case("IP-CIDR6");
+                let is_ip_cidr =
+                    ty.eq_ignore_ascii_case("IP-CIDR") || ty.eq_ignore_ascii_case("IP-CIDR6");
                 let is_src_ip = ty.eq_ignore_ascii_case("SRC-IP-CIDR");
 
                 if is_domain || is_suffix {
@@ -367,7 +370,10 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
                     match check_target(target, env, raw) {
                         Ok(target_arc) => {
                             if let Some(cur) = &mut cur_ip {
-                                if cur.target == target_arc && cur.no_resolve == no_resolve && cur.src == is_src_ip {
+                                if cur.target == target_arc
+                                    && cur.no_resolve == no_resolve
+                                    && cur.src == is_src_ip
+                                {
                                     for cidr in payload.split(',') {
                                         let _ = cur.builder.insert_cidr(cidr.trim());
                                     }

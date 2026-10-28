@@ -2764,6 +2764,7 @@ dependencies = [
  "aes-gcm",
  "async-trait",
  "base64 0.22.1",
+ "blake2",
  "blake3",
  "boringtun",
  "bytes",

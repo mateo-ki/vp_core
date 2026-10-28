@@ -916,7 +916,10 @@ mod tests {
         let n = parse_uri("mieru://alice:p%40ss%3A%22word@m.com:8964#encoded").unwrap();
         let yaml = format!("proxies:\n{}", n.to_yaml());
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(value["proxies"][0]["password"].as_str(), Some("p@ss:\"word"));
+        assert_eq!(
+            value["proxies"][0]["password"].as_str(),
+            Some("p@ss:\"word")
+        );
         assert!(parse_uri("未知链接未知链接未知链接未知链接未知链接").is_err());
     }
 

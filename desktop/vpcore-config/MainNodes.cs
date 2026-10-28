@@ -22,14 +22,23 @@ sealed partial class MainForm {
     async Task ImportNodes(string text,bool preview){
         if(text.Length>4*1024*1024)throw new Exception("导入文本不能超过 4 MB");
         YamlSequenceNode incoming;
+        var warnings=new List<string>();
+        var official=new YamlSequenceNode();
+        var lines=text.Split('\n').Select(l=>l.Trim()).Where(l=>l!="").ToArray();
+        var ordinary=new List<string>();
+        foreach(var line in lines){if(MieruLinks.IsOfficial(line)){foreach(var node in MieruLinks.Parse(line,warnings).Children)official.Add(node);}else ordinary.Add(line);}
+        if(official.Children.Count>0)text=string.Join("\n",ordinary);
+        if(official.Children.Count>0&&ordinary.Count==0)incoming=new YamlSequenceNode();
+        else
         if(text.TrimStart().StartsWith("proxies:")||text.TrimStart().StartsWith("- ")){var s=new YamlStream();s.Load(new StringReader(text));if(s.Documents.Count!=1)throw new Exception("只接受单个 YAML 文档");incoming=s.Documents[0].RootNode is YamlSequenceNode list?list:Nodes.Sequence((YamlMappingNode)s.Documents[0].RootNode,"proxies");}
         else {
             var input=Path.Combine(root,"links-"+Guid.NewGuid()+".txt");var output=input+".yaml";
             try{await File.WriteAllTextAsync(input,text);using var p=Process.Start(Info("import-links","-i",input,"-o",output))??throw new Exception("无法启动内核解析器");var stdout=p.StandardOutput.ReadToEndAsync();var stderr=p.StandardError.ReadToEndAsync();using var timeout=new CancellationTokenSource(TimeSpan.FromSeconds(30));try{await p.WaitForExitAsync(timeout.Token);}catch{p.Kill(true);throw;}await stdout;var error=await stderr;if(p.ExitCode!=0)throw new Exception(error);var s=new YamlStream();s.Load(new StringReader(await File.ReadAllTextAsync(output)));incoming=Nodes.Sequence((YamlMappingNode)s.Documents[0].RootNode,"proxies");}
             finally{File.Delete(input);File.Delete(output);}
         }
+        foreach(var node in official.Children)incoming.Add(node);
         if(incoming.Children.Count==0||incoming.Children.Any(n=>n is not YamlMappingNode))throw new Exception("剪贴板中没有有效的节点列表");
-        if(preview){var summary=string.Join(Environment.NewLine,incoming.OfType<YamlMappingNode>().Take(20).Select(n=>$"{Nodes.Get(n,"name")} [{Nodes.Get(n,"type")}]: {Nodes.Get(n,"server")}"));if(MessageBox.Show($"导入 {incoming.Children.Count} 个节点？同名节点将自动重命名。\n\n"+summary,"导入预览",MessageBoxButtons.YesNo)!=DialogResult.Yes)return;}
+        if(preview){var summary=string.Join(Environment.NewLine,incoming.OfType<YamlMappingNode>().Take(20).Select(n=>$"{Nodes.Get(n,"name")} [{Nodes.Get(n,"type")}]: {Nodes.Get(n,"server")}"));if(MessageBox.Show($"导入 {incoming.Children.Count} 个节点？同名节点将自动重命名。\n\n"+summary+"\n\n"+string.Join("\n",warnings.Distinct()),"导入预览",MessageBoxButtons.YesNo)!=DialogResult.Yes)return;}
         var original=yaml.Text;
         try{var config=Parse();Nodes.Merge((YamlMappingNode)config.Documents[0].RootNode,incoming);WriteYaml(config);LoadFields();await Save();RefreshNodes();Log($"已导入 {incoming.Children.Count} 个节点。");}
         catch{yaml.Text=original;LoadFields();RefreshNodes();throw;}

@@ -126,9 +126,8 @@ async fn main() {
                     if line.is_empty() {
                         continue;
                     }
-                    let node = vp_protocol::sub::parse_uri(line).map_err(|_| {
-                        format!("第 {} 行链接无效或格式不支持", i + 1)
-                    })?;
+                    let node = vp_protocol::sub::parse_uri(line)
+                        .map_err(|_| format!("第 {} 行链接无效或格式不支持", i + 1))?;
                     yaml.push_str(&node.to_yaml());
                     count += 1;
                 }

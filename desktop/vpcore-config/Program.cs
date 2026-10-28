@@ -12,7 +12,7 @@ static class Program {
             var testRoot = Path.Combine(Path.GetTempPath(), "vpcore-test-" + Guid.NewGuid());
             using var form = new MainForm(false, testRoot);
             form.Shown += async (_, _) => {
-                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop, 19 protocol forms, VLESS/Mieru imports, duplicate names, invalid import rollback"); }
+                try { await form.SelfTest(); File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), "PASS: YAML preservation, validation, managed start/stop, 19 protocol forms, VLESS/Mieru and official Mieru imports, duplicate names, invalid import rollback"); }
                 catch (Exception e) { Environment.ExitCode = 1; File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "gui-self-test.txt"), e.ToString()); }
                 finally { form.ExitTest(); }
             };
@@ -95,6 +95,11 @@ sealed partial class MainForm : Form {
         await ImportNodes("mieru://alice:password@example.com:8964?transport=tcp#test-mieru",false);
         var imported=Nodes.Sequence((YamlMappingNode)Parse().Documents[0].RootNode,"proxies");
         if(imported.Children.Count!=3 || Nodes.Get((YamlMappingNode)imported.Children[2],"name")!="test-mieru (2)")throw new Exception("Clipboard import or name collision handling failed");
+        await ImportNodes("mierus://alice:p%40ss@example.com?profile=official&port=8964&protocol=TCP",false);
+        var officialSample="mieru://CpsBCgdkZWZhdWx0ElgKBWJhb3ppEg1tYW5saWFucGVuZmVuGkA0MGFiYWM0MGY1OWRhNTVkYWQ2YTk5ODMxYTUxMTY1MjJmYmM4MGUzODViYjFhYjE0ZGM1MmRiMzY4ZjczOGE0Gi8SCWxvY2FsaG9zdBoFCIo0EAIaDRACGgk5OTk5LTk5OTkaBQjZMhABGgUIoCYQASD4CioCCAQSB2RlZmF1bHQYnUYguAgwBTgA";
+        var warnings=new List<string>();var officialNodes=MieruLinks.Parse(officialSample,warnings);
+        if(officialNodes.Children.Count!=2||warnings.Count==0)throw new Exception("Official Mieru standard import failed");
+        await ImportNodes(officialSample,false);
         var before=yaml.Text;bool failed=false;try{await ImportNodes("not-a-supported-link",false);}catch{failed=true;}
         if(!failed||yaml.Text!=before)throw new Exception("Invalid import changed the configuration");
         foreach(var type in Nodes.Catalog.Keys){using var editor=new NodeEditor(new YamlMappingNode{{"type",type},{"name","test"}});}

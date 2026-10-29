@@ -125,10 +125,26 @@ impl DnsServer {
         self.forward(sock, pkt, from, resolver).await
     }
 
+    /// fake-ip 过滤名单匹配（mihomo 语法）：
+    /// - `+.x` → x 及任意层级子域；`*.x` → x 的单层子域（`*` 恰好匹配一段）
+    /// - 裸域名 → 该域名及其任意层级子域（本内核语义，保留向后兼容）
+    /// - `rule:` 前缀（mihomo 扩展语法）暂不支持，忽略该条
     fn filtered(&self, domain: &str) -> bool {
         let d = domain.to_ascii_lowercase();
         self.fake_ip_filter.iter().any(|f| {
-            d == f.to_ascii_lowercase() || d.ends_with(&format!(".{}", f.to_ascii_lowercase()))
+            let f = f.trim().to_ascii_lowercase();
+            if f.is_empty() || f.starts_with("rule:") {
+                return false;
+            }
+            if let Some(rest) = f.strip_prefix("+.") {
+                return d == rest || d.ends_with(&format!(".{rest}"));
+            }
+            if !f.contains('*') {
+                return d == f || d.ends_with(&format!(".{f}"));
+            }
+            let pl: Vec<&str> = f.split('.').collect();
+            let dl: Vec<&str> = d.split('.').collect();
+            pl.len() == dl.len() && pl.iter().zip(dl.iter()).all(|(p, x)| *p == "*" || p == x)
         })
     }
 
@@ -238,5 +254,38 @@ mod tests {
         let ip = parse_ptr("4.3.2.1.in-addr.arpa").unwrap();
         assert_eq!(ip.to_string(), "1.2.3.4");
         assert!(parse_ptr("x.in-addr.arpa").is_none());
+    }
+
+    #[test]
+    fn fake_ip_filter_patterns() {
+        let srv = DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(Resolver::new(vec![])),
+            None,
+            vec![
+                "*.lan".into(),
+                "+.local".into(),
+                "+.msftconnecttest.com".into(),
+                "mydevice.example".into(),
+                "rule:geosite:cn".into(),
+            ],
+            false,
+        );
+        // *.lan：单层子域命中，裸域与多层不命中
+        assert!(srv.filtered("pc.lan"));
+        assert!(!srv.filtered("lan"));
+        assert!(!srv.filtered("a.b.lan"));
+        // +.local：裸域与任意层级子域命中
+        assert!(srv.filtered("local"));
+        assert!(srv.filtered("a.local"));
+        assert!(srv.filtered("a.b.local"));
+        assert!(srv.filtered("x.MSFTCONNECTTEST.com")); // 大小写不敏感
+        // 裸域名：域名本身与任意层级子域命中
+        assert!(srv.filtered("mydevice.example"));
+        assert!(srv.filtered("a.mydevice.example"));
+        // rule: 前缀暂不支持，不命中
+        assert!(!srv.filtered("baidu.com"));
+        // 未列出的域名不命中
+        assert!(!srv.filtered("www.example.org"));
     }
 }

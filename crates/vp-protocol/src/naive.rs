@@ -290,10 +290,12 @@ impl NaiveOutbound {
                 server_name: cfg.server_name.clone(),
                 skip_cert_verify: cfg.skip_cert_verify,
                 fingerprint: cfg.client_fingerprint.clone(),
+                alpn: Vec::new(),
                 ws: None,
                 http: None,
                 grpc: None,
                 reality: None,
+                ech: None,
             },
             udp: cfg.udp,
         })

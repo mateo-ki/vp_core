@@ -66,6 +66,7 @@ async fn build_core() -> (u16 /*mixed port*/, Arc<Router>, u16 /*echo port*/) {
         is_known_target: &|t| matches!(t, "DIRECT" | "REJECT" | "PROXY"),
         geosite: &None,
         geoip: &None,
+        asn: &None,
         providers: &HashMap::new(),
         sub_rules: &HashMap::new(),
     };

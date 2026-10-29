@@ -10,6 +10,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 use vp_common::{Error, Result};
 
 pub mod ss;
+pub mod ss_stream;
 pub mod vmess_kdf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

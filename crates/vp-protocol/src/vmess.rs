@@ -898,7 +898,7 @@ impl VmessOutbound {
         let uuid = kdf::parse_uuid(&cfg.uuid)?;
         let cmd_key = kdf::uuid_to_cmd_key(&uuid);
         let security = Security::from_cipher(&cfg.cipher)?;
-        let t = crate::transport_of_full(
+        let mut t = crate::transport_of_full(
             cfg.tls,
             &cfg.server_name,
             cfg.skip_cert_verify,
@@ -908,7 +908,9 @@ impl VmessOutbound {
             &cfg.client_fingerprint,
             &None,
             &cfg.http_opts,
+            &cfg.ech_opts,
         )?;
+        t.alpn = cfg.alpn.clone().unwrap_or_default();
         Ok(VmessOutbound {
             name: name.unwrap_or("vmess").into(),
             server: cfg.server.clone(),
@@ -1190,11 +1192,13 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             udp: false,
+            ech_opts: None,
         })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), echo_addr.port());
@@ -1234,11 +1238,13 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             udp: false,
+            ech_opts: None,
         })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), 80);

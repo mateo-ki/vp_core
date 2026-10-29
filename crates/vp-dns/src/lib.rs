@@ -58,6 +58,8 @@ pub struct Resolver {
     policies: Vec<PolicyRule>,
     fallback_filter: Option<CompiledFallbackFilter>,
     cache: Mutex<CacheInner>,
+    /// ECH 配置缓存（域名 → HTTPS 记录 ech SvcParam 字节；None=确认无/查询失败）
+    ech_cache: Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>,
     /// 无 nameserver 配置时走系统解析
     pub use_system: bool,
 }
@@ -94,6 +96,7 @@ impl Resolver {
             policies: Vec::new(),
             fallback_filter: None,
             cache: Mutex::new(CacheInner::default()),
+            ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system,
         }
     }
@@ -116,6 +119,7 @@ impl Resolver {
             policies,
             fallback_filter,
             cache: Mutex::new(CacheInner::default()),
+            ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system,
         }
     }
@@ -127,6 +131,7 @@ impl Resolver {
             policies: Vec::new(),
             fallback_filter: None,
             cache: Mutex::new(CacheInner::default()),
+            ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system: true,
         }
     }
@@ -274,6 +279,54 @@ impl Resolver {
                 ttl: MIN_TTL,
             },
         );
+    }
+
+    /// 查询域名的 HTTPS(type65) 记录，取 ech SvcParam（ECHConfigList 原始字节）。
+    /// 结果缓存（None 也缓存，避免对不支持域名反复查询）。ECH 连接前调用，低频路径。
+    pub async fn query_https_ech(&self, domain: &str) -> Option<Arc<Vec<u8>>> {
+        let key = domain.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(hit) = self.ech_cache.lock().unwrap().get(&key) {
+            return hit.clone();
+        }
+        let servers: &[ServerAddr] = if self.servers.is_empty() {
+            &self.fallbacks
+        } else {
+            &self.servers
+        };
+        let mut found: Option<Arc<Vec<u8>>> = None;
+        for server in servers {
+            let mut current = key.clone();
+            for _ in 0..4 {
+                let Ok(msg) = query_server_raw(server, &current, QType::Https).await else {
+                    break;
+                };
+                if msg.rcode != 0 {
+                    break;
+                }
+                if let Some(ech) = wire::extract_ech_config(&msg) {
+                    found = Some(Arc::new(ech));
+                    break;
+                }
+                match wire::extract_cname(&msg) {
+                    // 递归上游通常直接给出最终 HTTPS 记录；无则跟随一次 CNAME
+                    Some(cname) if cname != current => current = cname,
+                    _ => break,
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        tracing::debug!(
+            "HTTPS 记录 ECH 配置 {key}: {}",
+            found.as_ref().map_or("无（ECH 不可用）", |_| "已获取")
+        );
+        let mut c = self.ech_cache.lock().unwrap();
+        if c.len() >= 1024 {
+            c.clear();
+        }
+        c.insert(key, found.clone());
+        found
     }
 
     async fn query_servers(
@@ -497,19 +550,49 @@ pub fn compile_fallback_filter(
 }
 
 async fn query_server(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
+    let mut current_domain = domain.to_string();
+    let mut hops = 0;
+    loop {
+        let msg = query_server_raw(server, &current_domain, qtype).await?;
+        if msg.rcode != 0 {
+            return Err(Error::Dns(format!("DNS 错误码 {}", msg.rcode)));
+        }
+        let ips = wire::extract_ips(&msg, qtype.code());
+        if !ips.is_empty() {
+            return Ok(ips.into_iter().map(|(ip, _)| ip).collect());
+        }
+        // 如果应答中只有 CNAME 且没有目标 IP，继续递归跟踪 CNAME
+        if let Some(cname) = wire::extract_cname(&msg) {
+            hops += 1;
+            if hops > 8 {
+                return Err(Error::Dns(format!("CNAME 跳转过深: {domain} -> {cname}")));
+            }
+            current_domain = cname;
+            continue;
+        }
+        return Ok(Vec::new());
+    }
+}
+
+/// 单次查询（未跟随 CNAME 的原始应答；供 HTTPS/ECH 等非 IP 记录复用）
+async fn query_server_raw(
+    server: &ServerAddr,
+    current_domain: &str,
+    qtype: QType,
+) -> Result<wire::Message> {
     match server.proto {
-        Proto::Udp => query_udp(server.addr.expect("udp 必为 IP"), domain, qtype).await,
-        Proto::Tcp => query_tcp(server.addr.expect("tcp 必为 IP"), domain, qtype).await,
+        Proto::Udp => query_udp(server.addr.expect("udp 必为 IP"), current_domain, qtype).await,
+        Proto::Tcp => query_tcp(server.addr.expect("tcp 必为 IP"), current_domain, qtype).await,
         Proto::Tls => {
             query_tls(
                 server.addr.expect("tls 必为 IP"),
                 &server.host,
-                domain,
+                current_domain,
                 qtype,
             )
             .await
         }
-        Proto::Doh => with_timeout(query_doh(server, domain, qtype)).await,
+        Proto::Doh => with_timeout(query_doh(server, current_domain, qtype)).await,
     }
 }
 
@@ -534,7 +617,7 @@ fn query_id() -> u16 {
     u16::from_be_bytes(b)
 }
 
-async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
+async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
     let bind: SocketAddr = if addr.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
@@ -547,17 +630,10 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<Vec<I
     sock.send(&q).await?;
     let mut buf = vec![0u8; 1500];
     let n = with_timeout(sock.recv(&mut buf)).await?;
-    let msg = wire::parse_response(&buf[..n]).ok_or(Error::Proto("DNS 响应解析失败"))?;
-    if msg.rcode != 0 {
-        return Err(Error::Dns(format!("DNS 错误码 {}", msg.rcode)));
-    }
-    Ok(wire::extract_ips(&msg, qtype.code())
-        .into_iter()
-        .map(|(ip, _)| ip)
-        .collect())
+    wire::parse_response(&buf[..n]).ok_or(Error::Proto("DNS 响应解析失败"))
 }
 
-async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
+async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = with_timeout(TcpStream::connect(addr)).await?;
     let id = query_id();
@@ -571,14 +647,7 @@ async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<Vec<I
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut resp = vec![0u8; len];
     with_timeout(stream.read_exact(&mut resp)).await?;
-    let msg = wire::parse_response(&resp).ok_or(Error::Proto("DNS 响应解析失败"))?;
-    if msg.rcode != 0 {
-        return Err(Error::Dns(format!("DNS 错误码 {}", msg.rcode)));
-    }
-    Ok(wire::extract_ips(&msg, qtype.code())
-        .into_iter()
-        .map(|(ip, _)| ip)
-        .collect())
+    wire::parse_response(&resp).ok_or(Error::Proto("DNS 响应解析失败"))
 }
 
 /// DoT（RFC 7858）：TLS 上的 DNS，2 字节长度前缀帧
@@ -587,7 +656,7 @@ async fn query_tls(
     sni_host: &str,
     domain: &str,
     qtype: QType,
-) -> Result<Vec<IpAddr>> {
+) -> Result<wire::Message> {
     use tokio::io::AsyncWriteExt;
 
     let connector = webpki_connector(false);
@@ -606,14 +675,7 @@ async fn query_tls(
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut resp = vec![0u8; len];
     with_timeout(stream_read_exact(&mut tls, &mut resp)).await?;
-    let msg = wire::parse_response(&resp).ok_or(Error::Proto("DoT 响应解析失败"))?;
-    if msg.rcode != 0 {
-        return Err(Error::Dns(format!("DoT 错误码 {}", msg.rcode)));
-    }
-    Ok(wire::extract_ips(&msg, qtype.code())
-        .into_iter()
-        .map(|(ip, _)| ip)
-        .collect())
+    wire::parse_response(&resp).ok_or(Error::Proto("DoT 响应解析失败"))
 }
 
 /// webpki 根证书连接器（DoT/DoH 共用）；skip=true 容忍自签
@@ -717,7 +779,7 @@ async fn stream_read_exact<S: tokio::io::AsyncRead + Unpin>(
 // DoH（RFC 8484）
 // ---------------------------------------------------------------------------
 
-async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
+async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 1) 解析 DoH 服务器自身（IP 直连 / 域名走系统解析，避免递归）
@@ -732,7 +794,7 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Ve
             })
             .await
             .map_err(|e| Error::Dns(format!("DoH 服务器解析失败: {e}")))?
-            .map_err(|e| Error::Dns(format!("DoH 服务器 {domain} 解析失败: {e}")))?;
+            .map_err(|e| Error::Dns(format!("DoH 服务器 {} 解析失败: {e}", server.host)))?;
             addrs.next().ok_or(Error::Dns("DoH 服务器无地址".into()))?
         }
     };
@@ -782,14 +844,7 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Ve
     }
     let body = read_http_body(&mut tls, &headers).await?;
 
-    let msg = wire::parse_response(&body).ok_or(Error::Proto("DoH: DNS 消息解析失败"))?;
-    if msg.rcode != 0 {
-        return Err(Error::Dns(format!("DoH 错误码 {}", msg.rcode)));
-    }
-    Ok(wire::extract_ips(&msg, qtype.code())
-        .into_iter()
-        .map(|(ip, _)| ip)
-        .collect())
+    wire::parse_response(&body).ok_or(Error::Proto("DoH: DNS 消息解析失败"))
 }
 
 /// 解析 HTTP/1.1 响应头：返回 (状态码, 小写头名 → 值)
@@ -831,7 +886,7 @@ async fn read_http_body<S: tokio::io::AsyncRead + Unpin>(
         s.read_exact(&mut body).await?;
         return Ok(body);
     }
-    if get("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
+    if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
         // chunked：读 [size hex]\r\n[data]\r\n ... 0\r\n[\r\n]
         let mut body = Vec::new();
         let mut line = Vec::new();
@@ -997,6 +1052,48 @@ mod tests {
         assert_eq!(ips[0].to_string(), "9.9.9.9");
     }
 
+    /// 真实 DoH 联测（国内直连 AliDNS）：cargo test -p vp-dns -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn doh_live_alidns() {
+        let r = Resolver::new(vec!["https://dns.alidns.com/dns-query".into()]);
+        assert!(!r.use_system);
+        let ips = r
+            .resolve_domain("www.baidu.com", false)
+            .await
+            .expect("AliDNS DoH 解析 www.baidu.com 失败");
+        println!("AliDNS DoH 解析成功: {ips:?}");
+        assert!(!ips.is_empty());
+    }
+
+    /// 真实 DoH 联测（国内直连腾讯 doh.pub）：cargo test -p vp-dns -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn doh_live_tencent() {
+        let r = Resolver::new(vec!["https://doh.pub/dns-query".into()]);
+        assert!(!r.use_system);
+        let ips = r
+            .resolve_domain("www.baidu.com", false)
+            .await
+            .expect("Tencent DoH 解析 www.baidu.com 失败");
+        println!("Tencent DoH 解析成功: {ips:?}");
+        assert!(!ips.is_empty());
+    }
+
+    /// 真实 DoT 联测（国内直连 AliDNS DoT 853）：cargo test -p vp-dns -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn dot_live_alidns() {
+        let r = Resolver::new(vec!["tls://223.5.5.5:853".into()]);
+        assert!(!r.use_system);
+        let ips = r
+            .resolve_domain("www.baidu.com", false)
+            .await
+            .expect("AliDNS DoT 解析 www.baidu.com 失败");
+        println!("AliDNS DoT 解析成功: {ips:?}");
+        assert!(!ips.is_empty());
+    }
+
     /// 真实 DoH 联测（需外网直连）：cargo test -p vp-dns -- --ignored
     #[tokio::test]
     #[ignore]
@@ -1010,6 +1107,48 @@ mod tests {
         let r2 = Resolver::new(vec!["https://dns.google/dns-query".into()]);
         let ips2 = r2.resolve_domain("www.google.com", false).await.unwrap();
         assert!(!ips2.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cname_only_server_following() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let _h = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    break;
+                };
+                if n < 12 {
+                    continue;
+                }
+                let Some((_id, name, _)) = wire::parse_query(&buf[..n]) else {
+                    continue;
+                };
+                let mut m = Vec::new();
+                m.extend_from_slice(&buf[..2]); // ID
+                m.extend_from_slice(&[0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]); // 1 answer
+                m.extend_from_slice(&buf[12..n]); // question
+                if name.contains("alias") {
+                    // 返回纯 CNAME alias.com -> target.com
+                    m.extend_from_slice(&[
+                        0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 30, 0, 12, 6, b't', b'a', b'r', b'g',
+                        b'e', b't', 3, b'c', b'o', b'm', 0,
+                    ]);
+                } else {
+                    // 返回 A 7.7.7.7
+                    m.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 7, 7, 7, 7]);
+                }
+                let _ = sock.send_to(&m, from).await;
+            }
+        });
+        let r = Resolver::new(vec![format!("udp://{addr}")]);
+        let ips = r
+            .resolve_domain("alias.com", false)
+            .await
+            .expect("CNAME 跟随解析失败");
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0].to_string(), "7.7.7.7");
     }
 
     async fn spawn_mock_dns(ip: [u8; 4]) -> (SocketAddr, tokio::task::JoinHandle<()>) {

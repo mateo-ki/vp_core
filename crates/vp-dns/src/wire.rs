@@ -6,11 +6,16 @@ pub const TYPE_A: u16 = 1;
 pub const TYPE_CNAME: u16 = 5;
 pub const TYPE_AAAA: u16 = 28;
 pub const TYPE_PTR: u16 = 12;
+/// SVCB/HTTPS（RFC 9460）：ECH 配置随 HTTPS 记录下发
+pub const TYPE_HTTPS: u16 = 65;
+/// SvcParam 键：ech（ECHConfigList 原始字节）
+pub const SVCB_KEY_ECH: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QType {
     A,
     Aaaa,
+    Https,
 }
 
 impl QType {
@@ -18,6 +23,7 @@ impl QType {
         match self {
             QType::A => TYPE_A,
             QType::Aaaa => TYPE_AAAA,
+            QType::Https => TYPE_HTTPS,
         }
     }
 }
@@ -59,6 +65,8 @@ pub enum RData {
     A(Ipv4Addr),
     Aaaa(Ipv6Addr),
     Cname(String),
+    /// SVCB/HTTPS 记录：(priority, SvcParams[(key, value)])
+    Https(u16, Vec<(u16, Vec<u8>)>),
     Other,
 }
 
@@ -94,7 +102,7 @@ impl<'a> Reader<'a> {
     }
 
     /// 读域名（支持压缩指针，防循环）
-    fn name(&mut self, depth: u8) -> Option<String> {
+    fn name(&mut self) -> Option<String> {
         let mut labels = Vec::new();
         let mut pos = self.pos;
         let mut jumped = false;
@@ -116,11 +124,11 @@ impl<'a> Reader<'a> {
                     }
                     pos = target;
                     hops += 1;
-                    if hops > 16 || depth > 0 {
+                    if hops > 16 {
                         return None;
                     }
                 }
-                l => {
+                l if l <= 63 => {
                     pos += 1;
                     let end = pos.checked_add(l as usize)?;
                     if end > self.buf.len() {
@@ -132,6 +140,7 @@ impl<'a> Reader<'a> {
                         return None;
                     }
                 }
+                _ => return None,
             }
         }
         if !jumped {
@@ -152,7 +161,7 @@ pub fn parse_query(buf: &[u8]) -> Option<(u16, String, u16)> {
         return None;
     }
     let mut r = Reader { buf, pos: 12 };
-    let name = r.name(0)?;
+    let name = r.name()?;
     let qtype = r.u16()?;
     let _class = r.u16()?;
     Some((id, name, qtype))
@@ -249,18 +258,22 @@ pub fn parse_response(buf: &[u8]) -> Option<Message> {
     let _ar = r.u16()?;
     let rcode = flags & 0x0f;
     for _ in 0..qd {
-        r.name(0)?;
+        r.name()?;
         r.u16()?; // qtype
         r.u16()?; // qclass
     }
     let mut answers = Vec::with_capacity(an.min(64) as usize);
     for _ in 0..an {
-        let name = r.name(0)?;
+        let name = r.name()?;
         let rtype = r.u16()?;
         let _class = r.u16()?;
         let ttl = r.u32()?;
         let rdlen = r.u16()? as usize;
         let rdata_start = r.pos;
+        let next_pos = rdata_start.checked_add(rdlen)?;
+        if next_pos > r.buf.len() {
+            return None;
+        }
         let data = match rtype {
             TYPE_A if rdlen == 4 => RData::A(Ipv4Addr::new(r.u8()?, r.u8()?, r.u8()?, r.u8()?)),
             TYPE_AAAA if rdlen == 16 => {
@@ -270,14 +283,32 @@ pub fn parse_response(buf: &[u8]) -> Option<Message> {
                 }
                 RData::Aaaa(Ipv6Addr::from(o))
             }
-            TYPE_CNAME => RData::Cname(r.name(1)?),
-            _ => {
-                r.pos = rdata_start.checked_add(rdlen)?;
-                RData::Other
+            TYPE_CNAME => match r.name() {
+                Some(target) => RData::Cname(target),
+                None => RData::Other,
+            },
+            TYPE_HTTPS => {
+                // RFC 9460：priority(u16) + target(域名) + SvcParams[(key u16)(len u16)(value)]
+                let priority = r.u16().unwrap_or(0);
+                let _target = r.name().unwrap_or_default();
+                let mut params = Vec::new();
+                while r.pos + 4 <= next_pos {
+                    let key = r.u16().unwrap_or(0);
+                    let len = r.u16().unwrap_or(0) as usize;
+                    let end = r.pos + len;
+                    if end > next_pos {
+                        break;
+                    }
+                    let val = r.buf[r.pos..end].to_vec();
+                    r.pos = end;
+                    params.push((key, val));
+                }
+                RData::Https(priority, params)
             }
+            _ => RData::Other,
         };
-        // 对齐到 rdata 末尾（name() 可能未消费完整 rdata）
-        r.pos = rdata_start + rdlen;
+        // 始终对齐到 rdata 末尾（即便 r.name() 未消费完整 rdata 或遇到其它记录）
+        r.pos = next_pos;
         answers.push(Answer {
             name,
             rtype,
@@ -299,6 +330,31 @@ pub fn extract_ips(msg: &Message, want: u16) -> Vec<(IpAddr, u32)> {
         }
     }
     out
+}
+
+/// 提取应答中的首个 CNAME 目标域名（用于非递归上游返回纯 CNAME 时的重定向跟随）
+pub fn extract_cname(msg: &Message) -> Option<String> {
+    for a in &msg.answers {
+        if let RData::Cname(ref target) = a.data {
+            return Some(target.clone());
+        }
+    }
+    None
+}
+
+/// 从 HTTPS(type65) 应答中提取 ech SvcParam（RFC 9460 §9：值为 ECHConfigList 原始字节，
+/// rustls `EchConfig::new` 直接可用）
+pub fn extract_ech_config(msg: &Message) -> Option<Vec<u8>> {
+    for a in &msg.answers {
+        if let RData::Https(_, params) = &a.data {
+            for (key, val) in params {
+                if *key == SVCB_KEY_ECH && !val.is_empty() {
+                    return Some(val.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -357,5 +413,77 @@ mod tests {
         for cut in 4..q.len() {
             assert!(parse_response(&q[..cut]).is_none());
         }
+    }
+
+    #[test]
+    fn https_record_ech_extraction() {
+        // 手工构造 HTTPS 应答：an=1，rdata = priority=1 + target=root + params{alpn=h2, ech=0xdead..}
+        let ech_val: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0xfe];
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0xaa, 0x01, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+        m.extend_from_slice(&[3, b'w', b'w', b'w', 1, b'x', 3, b'c', b'o', b'm', 0]);
+        m.extend_from_slice(&[0, 65, 0, 1]); // qtype HTTPS
+        // answer：名字用压缩指针 0xc00c
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&1u16.to_be_bytes()); // priority
+        rdata.push(0); // target = root
+        // SvcParam alpn (key=1)：h2
+        rdata.extend_from_slice(&1u16.to_be_bytes());
+        rdata.extend_from_slice(&2u16.to_be_bytes());
+        rdata.extend_from_slice(b"h2");
+        // SvcParam ech (key=5)
+        rdata.extend_from_slice(&SVCB_KEY_ECH.to_be_bytes());
+        rdata.extend_from_slice(&(ech_val.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(&ech_val);
+        m.extend_from_slice(&[0xc0, 0x0c, 0, 65, 0, 1, 0, 0, 0, 60]);
+        m.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        m.extend_from_slice(&rdata);
+        let msg = parse_response(&m).unwrap();
+        assert_eq!(msg.answers.len(), 1);
+        assert!(matches!(msg.answers[0].data, RData::Https(1, _)));
+        assert_eq!(extract_ech_config(&msg).unwrap(), ech_val);
+        // 无 ech 参数时返回 None：去掉 ech SvcParam（key2+len2+val6=10 字节）并修正 rdata 长度
+        let ech_param_len = 2 + 2 + ech_val.len();
+        let rdata_len = 2 + 1 + (2 + 2 + 2); // priority + target + alpn 参数
+        let mut no_ech = m.clone();
+        no_ech.truncate(no_ech.len() - ech_param_len);
+        let len_pos = no_ech.len() - rdata_len - 2;
+        no_ech[len_pos..len_pos + 2].copy_from_slice(&(rdata_len as u16).to_be_bytes());
+        let msg2 = parse_response(&no_ech).unwrap();
+        assert_eq!(extract_ech_config(&msg2), None);
+    }
+
+    #[test]
+    fn cname_with_compression_pointer_real_doh() {
+        // 来自腾讯 DoH (1.12.12.12 / doh.pub) 查询 www.baidu.com 的真实应答报文
+        // 包含 CNAME www.a.shifen.com（末尾指向 com 压缩指针 0xc016）及 A 记录 183.2.172.177
+        let hex = "1234818000010002000000010377777705626169647503636f6d0000010001c00c000500010000044b000f0377777701610673686966656ec016c02b000100010000001f0004b702acb1";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let msg = parse_response(&bytes).expect("DoH 真实报文解析失败");
+        assert_eq!(msg.id, 0x1234);
+        assert_eq!(msg.rcode, 0);
+        assert_eq!(msg.answers.len(), 2);
+        assert_eq!(msg.answers[0].name, "www.baidu.com");
+        assert!(matches!(msg.answers[0].data, RData::Cname(ref c) if c == "www.a.shifen.com"));
+        assert_eq!(msg.answers[1].name, "www.a.shifen.com");
+        let ips = extract_ips(&msg, TYPE_A);
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0].0.to_string(), "183.2.172.177");
+    }
+
+    #[test]
+    fn cname_extraction_for_non_recursive_resolvers() {
+        let mut m = Vec::new();
+        m.extend_from_slice(&[0, 1, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0]);
+        m.extend_from_slice(&[1, b'a', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
+        m.extend_from_slice(&[
+            0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 30, 0, 7, 1, b'b', 3, b'c', b'o', b'm', 0,
+        ]);
+        let msg = parse_response(&m).unwrap();
+        assert_eq!(extract_ips(&msg, TYPE_A).len(), 0);
+        assert_eq!(extract_cname(&msg), Some("b.com".to_string()));
     }
 }

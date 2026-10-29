@@ -1,6 +1,9 @@
 //! vp-transport：传输层（TCP / TLS / WebSocket / HTTP 伪装）。
 
+use std::sync::Arc;
+
 pub mod grpc;
+pub mod hpke;
 pub mod http;
 pub mod quic;
 pub mod tls;
@@ -148,6 +151,17 @@ fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// 节点声明的 ECH（Encrypted Client Hello）请求（Clash `ech-opts` / 分享链接 `ech=` 参数）
+#[derive(Debug, Clone)]
+pub struct EchRequest {
+    /// 节点配置直接携带的 ECHConfigList（base64 解码后）；优先于 DNS 查询
+    pub config: Option<Vec<u8>>,
+    /// DNS HTTPS(type65) 记录查询名；缺省用 SNI/服务器域名
+    pub query_name: Option<String>,
+    /// 查询 ECH 记录专用的 DoH URL（分享链接 `ech=name+doh` 携带）；优先于全局解析器
+    pub doh: Option<String>,
+}
+
 /// 传输配置（各协议出站共用）
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -156,6 +170,8 @@ pub struct TransportConfig {
     pub skip_cert_verify: bool,
     /// uTLS 指纹（"chrome"）：设置时 TLS 走手写指纹客户端
     pub fingerprint: Option<String>,
+    /// 节点显式声明的 ALPN；为空时按传输类型推导（grpc→h2，ws→http/1.1）
+    pub alpn: Vec<String>,
     /// network: "ws" 时启用 WebSocket
     pub ws: Option<WsConfig>,
     /// network: "http" 时启用 HTTP 伪装传输
@@ -164,6 +180,22 @@ pub struct TransportConfig {
     pub grpc: Option<grpc::GrpcConfig>,
     /// REALITY 认证扩展
     pub reality: Option<RealityConfig>,
+    /// ECH（Encrypted Client Hello）
+    pub ech: Option<EchRequest>,
+}
+
+/// ALPN 取值：节点显式声明的优先，否则按传输类型推导（grpc→h2，ws→http/1.1）
+fn explicit_or_derived_alpn(cfg: &TransportConfig, grpc: &[String], ws: &[String]) -> Vec<String> {
+    if !cfg.alpn.is_empty() {
+        return cfg.alpn.clone();
+    }
+    if cfg.grpc.is_some() {
+        return grpc.to_vec();
+    }
+    if cfg.ws.is_some() {
+        return ws.to_vec();
+    }
+    Vec::new()
 }
 
 /// 在任意底层流之上层叠传输层封装（gRPC / TLS / uTLS / REALITY / WebSocket）
@@ -181,6 +213,7 @@ pub async fn wrap_transport(
                 skip_cert_verify: cfg.skip_cert_verify,
                 server_name: cfg.server_name.clone(),
                 alpn: vec!["h2".into()],
+                ech_config: None,
             },
         )
         .await?;
@@ -192,15 +225,39 @@ pub async fn wrap_transport(
         // 里的 auth 载荷。普通 TLS 站点（尤其 CDN 前置的 ws/grpc 节点）实测与手写 uTLS
         // 存在互操作缺陷（服务端 TLS 栈半卡：ws 帧头可达、payload 永不到达），一律走
         // rustls 标准栈——Mihomo 的 Go TLS 同样不是真 uTLS，指纹差异不影响可用性。
+        // ECH 配置解析（ech-opts.config 优先，其次 DoH / DNS HTTPS 记录；解析器带缓存）
+        let ech_config: Option<Arc<Vec<u8>>> = match &cfg.ech {
+            Some(req) => match &req.config {
+                Some(bytes) => Some(Arc::new(bytes.clone())),
+                None => {
+                    let qname = req
+                        .query_name
+                        .clone()
+                        .or_else(|| cfg.server_name.clone())
+                        .unwrap_or_else(|| server_host.to_string());
+                    // 分享链接携带的 DoH（如 https://dns.alidns.com/dns-query）最可信：
+                    // 系统/内置解析器在污染网络下常拿不到 HTTPS(type65) 记录
+                    if let Some(doh) = &req.doh {
+                        let r = vp_dns::Resolver::new(vec![doh.clone()]);
+                        r.query_https_ech(&qname).await
+                    } else {
+                        match tls::global_resolver() {
+                            Some(res) => res.query_https_ech(&qname).await,
+                            None => {
+                                tracing::debug!(
+                                    "ech-opts 已启用但全局 DNS 未就绪，跳过 ECH: {server_host}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                }
+            },
+            None => None,
+        };
         let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() {
             let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
-            let alpn = if cfg.grpc.is_some() {
-                vec!["h2".into()]
-            } else if cfg.ws.is_some() {
-                vec!["http/1.1".into()]
-            } else {
-                Vec::new()
-            };
+            let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = utls::utls_connect(
                 stream,
                 server_host,
@@ -215,13 +272,7 @@ pub async fn wrap_transport(
             .await?;
             Box::new(s)
         } else {
-            let alpn = if cfg.grpc.is_some() {
-                vec!["h2".into()]
-            } else if cfg.ws.is_some() {
-                vec!["http/1.1".into()]
-            } else {
-                Vec::new()
-            };
+            let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = tls::tls_connect(
                 stream,
                 server_host,
@@ -229,6 +280,7 @@ pub async fn wrap_transport(
                     skip_cert_verify: cfg.skip_cert_verify,
                     server_name: cfg.server_name.clone(),
                     alpn,
+                    ech_config,
                 },
             )
             .await?;
@@ -403,7 +455,15 @@ pub async fn dial(
     cfg: &TransportConfig,
 ) -> Result<Box<dyn ProxyStream>> {
     let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
-    wrap_transport(Box::new(tcp), server_host, cfg).await
+    match wrap_transport(Box::new(tcp), server_host, cfg).await {
+        // ECH 被服务端拒绝：底层流已废弃，重拨一次（tls 层已把该主机记入回退名单，
+        // 本次重拨自动走普通 TLS）
+        Err(e) if e.to_string().contains("ECH_REJECTED_FALLBACK") => {
+            let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
+            wrap_transport(Box::new(tcp), server_host, cfg).await
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]

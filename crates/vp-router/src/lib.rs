@@ -252,14 +252,27 @@ impl RouterTrait for Router {
                 match matched {
                     Some((target, rule_str)) => {
                         let hit = RuleHit {
-                            rule: rule_str,
+                            rule: rule_str.clone(),
                             target: target.clone(),
                         };
-                        let ob = self
-                            .outbounds
-                            .get(&target)
-                            .cloned()
-                            .unwrap_or_else(|| self.global_outbound.clone());
+                        let ob = match self.outbounds.get(&target).cloned() {
+                            Some(ob) => ob,
+                            None => {
+                                // 目标不存在时禁止静默回退：无可用节点直接报错，避免"配错目标却走了 DIRECT"这类排障黑洞
+                                tracing::error!(
+                                    "规则命中目标 {target} 不存在（规则: {rule_str}），连接中止"
+                                );
+                                return Resolution {
+                                    outbound: self
+                                        .outbounds
+                                        .get("REJECT")
+                                        .cloned()
+                                        .unwrap_or(self.global_outbound.clone()),
+                                    via: "REJECT".into(),
+                                    rule: Some(hit),
+                                };
+                            }
+                        };
                         (ob, Some(hit))
                     }
                     None => {
@@ -341,6 +354,8 @@ mod tests {
             geosite: &None,
             #[cfg(feature = "geoip")]
             geoip: &None,
+            #[cfg(feature = "geoip")]
+            asn: &None,
             providers: &HashMap::new(),
             sub_rules: &HashMap::new(),
         };
@@ -419,6 +434,8 @@ mod tests {
                 geosite: &None,
                 #[cfg(feature = "geoip")]
                 geoip: &None,
+                #[cfg(feature = "geoip")]
+                asn: &None,
                 providers: &HashMap::new(),
                 sub_rules: &HashMap::new(),
             },

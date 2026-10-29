@@ -45,7 +45,7 @@ impl TrojanOutbound {
     }
 
     fn internal_new(name: Option<&str>, cfg: &TrojanCfg) -> Result<Self> {
-        let t = crate::transport_of_full(
+        let mut t = crate::transport_of_full(
             cfg.tls,
             &cfg.server_name,
             cfg.skip_cert_verify,
@@ -55,7 +55,9 @@ impl TrojanOutbound {
             &cfg.client_fingerprint,
             &cfg.reality_opts,
             &cfg.http_opts,
+            &cfg.ech_opts,
         )?;
+        t.alpn = cfg.alpn.clone().unwrap_or_default();
         Ok(TrojanOutbound {
             name: name.unwrap_or("trojan").into(),
             server: cfg.server.clone(),
@@ -296,11 +298,13 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             reality_opts: None,
+            ech_opts: None,
             udp: false,
         })
         .unwrap();

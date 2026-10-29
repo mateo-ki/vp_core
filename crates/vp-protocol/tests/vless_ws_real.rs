@@ -108,7 +108,9 @@ async fn ws_tls_transport_only() {
         tls,
         server_name,
         skip_cert_verify: false,
+        ech: None,
         fingerprint: None,
+        alpn: Vec::new(),
         ws: Some(ws::WsConfig {
             path: ws_opts
                 .as_ref()

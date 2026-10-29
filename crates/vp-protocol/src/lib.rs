@@ -8,6 +8,7 @@ pub mod brook;
 pub mod chained;
 pub mod direct;
 pub mod h3_min;
+pub mod hysteria;
 pub mod hysteria2;
 pub mod inbound;
 pub mod mieru;
@@ -132,6 +133,7 @@ pub fn transport_of(
         fingerprint,
         &None,
         &None,
+        &None,
     )
 }
 
@@ -146,6 +148,7 @@ pub fn transport_of_full(
     fingerprint: &Option<String>,
     reality_opts: &Option<vp_config::RealityOpts>,
     http_opts: &Option<vp_config::HttpOpts>,
+    ech_opts: &Option<vp_config::EchOpts>,
 ) -> Result<TransportConfig> {
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
@@ -192,15 +195,37 @@ pub fn transport_of_full(
         )?),
         None => None,
     };
+    let ech = match ech_opts {
+        Some(e) if e.enable => {
+            let config = match &e.config {
+                Some(c) => match crate::sub::decode_base64_flexible(c) {
+                    Some(b) if !b.is_empty() => Some(b),
+                    _ => {
+                        tracing::warn!("ech-opts.config 不是合法 base64，忽略并改用 DNS 获取");
+                        None
+                    }
+                },
+                None => None,
+            };
+            Some(vp_transport::EchRequest {
+                config,
+                query_name: e.query_server_name.clone(),
+                doh: e.doh.clone(),
+            })
+        }
+        _ => None,
+    };
     Ok(TransportConfig {
         tls: tls || reality.is_some(),
         server_name: server_name.clone(),
         skip_cert_verify,
         fingerprint: fingerprint.clone(),
+        alpn: Vec::new(),
         ws,
         http,
         grpc,
         reality,
+        ech,
     })
 }
 
@@ -293,6 +318,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
     let o: Arc<dyn Outbound> = match &cfg.kind {
         ProxyKind::Direct => Arc::new(DirectOutbound::new(deps.dns.clone(), deps.ipv6)),
         ProxyKind::Reject => Arc::new(RejectOutbound),
+        ProxyKind::Hysteria(h) => Arc::new(hysteria::Hysteria1Outbound::new(h)?),
         ProxyKind::Hysteria2(h) => Arc::new(hysteria2::Hysteria2Outbound::new(h)?),
         ProxyKind::Tuic(t) => Arc::new(tuic::TuicOutbound::new(t)?),
         ProxyKind::Socks5(SocksCfg {
@@ -379,6 +405,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     let o = match cfg.kind {
         ProxyKind::Wireguard(_)
+        | ProxyKind::Hysteria(_)
         | ProxyKind::Hysteria2(_)
         | ProxyKind::Tuic(_)
         | ProxyKind::Brook(_)
@@ -390,6 +417,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
     // smux 多路复用包装（仅流型协议出站生效）
     let o = match cfg.kind {
         ProxyKind::Wireguard(_)
+        | ProxyKind::Hysteria(_)
         | ProxyKind::Hysteria2(_)
         | ProxyKind::Tuic(_)
         | ProxyKind::Direct

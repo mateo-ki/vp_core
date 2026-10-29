@@ -22,9 +22,12 @@ fn aead_throughput_report() {
         assert_eq!(pt.len(), SIZE);
         best = best.min(dt);
     }
-    println!("[AEAD] aes-128-gcm: {:.0} MB/s (加+解合计)", SIZE as f64 * 2.0 / best / 1048576.0);
+    println!(
+        "[AEAD] aes-128-gcm: {:.0} MB/s (加+解合计)",
+        SIZE as f64 * 2.0 / best / 1048576.0
+    );
 
-    use chacha20poly1305::{ChaCha20Poly1305};
+    use chacha20poly1305::ChaCha20Poly1305;
     let key2 = [0x42u8; 32];
     let cipher2 = ChaCha20Poly1305::new_from_slice(&key2).unwrap();
     let mut best2 = f64::MAX;
@@ -36,5 +39,8 @@ fn aead_throughput_report() {
         assert_eq!(pt.len(), SIZE);
         best2 = best2.min(dt);
     }
-    println!("[AEAD] chacha20-ietf-poly1305: {:.0} MB/s (加+解合计)", SIZE as f64 * 2.0 / best2 / 1048576.0);
+    println!(
+        "[AEAD] chacha20-ietf-poly1305: {:.0} MB/s (加+解合计)",
+        SIZE as f64 * 2.0 / best2 / 1048576.0
+    );
 }

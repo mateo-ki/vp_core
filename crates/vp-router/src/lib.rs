@@ -159,7 +159,6 @@ impl Router {
         }
     }
 
-
     pub fn groups(&self) -> &HashMap<String, Arc<Group>> {
         &self.groups
     }

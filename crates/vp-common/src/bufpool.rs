@@ -99,12 +99,7 @@ pub fn get_buf() -> PooledBuf {
         .unwrap()
         .pop()
         .map(|b| (b, true))
-        .unwrap_or_else(|| {
-            (
-                vec![0u8; BUF_SIZE].try_into().expect("exact size"),
-                false,
-            )
-        });
+        .unwrap_or_else(|| (vec![0u8; BUF_SIZE].try_into().expect("exact size"), false));
     if hit {
         POOL_HIT.fetch_add(1, Ordering::Relaxed);
     } else {

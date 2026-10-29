@@ -123,8 +123,7 @@ async fn reload_into(
     };
 
     // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
-    let new_cfg: vp_config::Config =
-        vp_config::parse(text, fmt).map_err(|e| format!("{e}"))?;
+    let new_cfg: vp_config::Config = vp_config::parse(text, fmt).map_err(|e| format!("{e}"))?;
     crate::sync_tun_state(
         &st.tun_runtime,
         &st.router,

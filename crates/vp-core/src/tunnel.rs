@@ -14,9 +14,9 @@ use tokio::task::JoinHandle;
 use vp_common::bufpool::BUF_SIZE;
 use vp_common::{Stats, get_buf};
 
+use crate::conn_table::{ConnMeta, ConnTable};
 #[cfg(target_os = "linux")]
 use crate::splice;
-use crate::conn_table::{ConnMeta, ConnTable};
 use crate::stream::ProxyStream;
 
 #[derive(Default)]
@@ -144,7 +144,7 @@ async fn write_chain_vectored<'a, W: AsyncWrite + Unpin>(
                 Err(_) => return false,
             }
         } else {
-            let iov: Vec<IoSlice<'a>> = parts.iter().map(|p| IoSlice::new(*p)).collect();
+            let iov: Vec<IoSlice<'a>> = parts.iter().map(|p| IoSlice::new(p)).collect();
             match w.write_vectored(&iov).await {
                 Ok(n) => n,
                 Err(_) => return false,
@@ -167,13 +167,6 @@ async fn write_chain_vectored<'a, W: AsyncWrite + Unpin>(
     }
 }
 
-/// 拥有式泵：结束后关闭对端写侧。
-///
-/// syscall 形状（决定裸转发单核吞吐的关键）：
-/// - 常规路径 = 1 次读 + 1 次写；读不满（交互式小包）绝不预读，尾延迟零代价。
-/// - 读满整块说明发送方在持续灌数据 —— 继续链上读，最多 [MAX_CHAIN] 块并成**一次**
-///   vectored 写：128KB 生意只需要 4 读 + 1 写（旧实现要 8 次 syscall）。
-/// - 链块惰性租借：交互式连接全程只有主块，内存不变；块用完归还全局池。
 /// 链读用的"探一眼"读：只 poll 一次。有数据带回 Data/EOF；
 /// 没数据（Pending）转成 Empty 立即返回。绝不在手里攒着未送达数据时阻塞
 /// 等下一块 —— 请求-响应式对端（发完 2 整块就停下来等回包）会因此死锁：
@@ -207,11 +200,11 @@ enum Probe {
 /// 拥有式泵：结束后关闭对端写侧。
 ///
 /// syscall 形状（决定裸转发单核吞吐的关键）：
-/// - 常规路径 = 1 次读 + 1 次写；读不满（交互式小包）绝不预读，尾延迟零代价。
-/// - 读满整块说明发送方在持续灌数据 —— 用"探一眼"读继续链上收集，最多
-///   [MAX_CHAIN] 块并成**一次** vectored 写：128KB 生意只需要 4 读 + 1 写。
-///   链读收集不到更多（对端停顿）就立刻把已攒数据写出去，不持数据等待。
-/// - 链块惰性租借：交互式连接全程只有主块，内存不变；块用完归还全局池。
+///   - 常规路径 = 1 次读 + 1 次写；读不满（交互式小包）绝不预读，尾延迟零代价。
+///   - 读满整块说明发送方在持续灌数据 —— 用"探一眼"读继续链上收集，最多
+///     [MAX_CHAIN] 块并成**一次** vectored 写：128KB 生意只需要 4 读 + 1 写。
+///     链读收集不到更多（对端停顿）就立刻把已攒数据写出去，不持数据等待。
+///   - 链块惰性租借：交互式连接全程只有主块，内存不变；块用完归还全局池。
 async fn pump<R, W>(
     mut r: R,
     mut w: W,
@@ -447,9 +440,6 @@ mod tests {
     /// 真实回环 TCP，双向 512KB + 半关闭传播，两端字节数必须精确对账。
     #[tokio::test]
     async fn relay_over_raw_sockets_transfers_both_ways() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
         let lis_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let lis_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let cli = tokio::net::TcpStream::connect(lis_a.local_addr().unwrap())

@@ -9,9 +9,9 @@ pub mod outbound;
 pub mod process;
 pub mod router;
 pub mod session;
+pub mod sniff;
 #[cfg(target_os = "linux")]
 pub mod splice;
-pub mod sniff;
 pub mod stream;
 pub mod tunnel;
 

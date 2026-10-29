@@ -120,12 +120,17 @@ pub struct ConnPermit<'a> {
 impl Drop for ConnPermit<'_> {
     fn drop(&mut self) {
         self.budget.total_active.fetch_sub(1, Ordering::AcqRel);
-        if let Some(c) = self.budget.per_inbound.lock().unwrap().get_mut(&self.inbound) {
+        if let Some(c) = self
+            .budget
+            .per_inbound
+            .lock()
+            .unwrap()
+            .get_mut(&self.inbound)
+        {
             *c = c.saturating_sub(1);
         }
     }
 }
-
 
 #[cfg(test)]
 mod budget_tests {

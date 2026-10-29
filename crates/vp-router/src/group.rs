@@ -226,7 +226,10 @@ impl Group {
     /// 启动后台健康检查（url-test / fallback 且非 lazy）。
     /// 返回任务句柄：Router 被热替换时由持有方 abort，否则旧组任务永久滞留
     /// （热更新泄漏：任务持有 Arc<Group>，旧 Router 永远无法释放）。
-    pub fn start_health_checks(self: &Arc<Self>, group_index: usize) -> Option<tokio::task::JoinHandle<()>> {
+    pub fn start_health_checks(
+        self: &Arc<Self>,
+        group_index: usize,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if self.ty != GroupType::UrlTest && self.ty != GroupType::Fallback {
             return None;
         }

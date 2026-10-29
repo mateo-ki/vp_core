@@ -96,7 +96,9 @@ impl SubNode {
             }
         }
         if let Some((_, cfg)) = self.fields.iter().find(|(k, _)| k == "__ech_cfg") {
-            out.push_str(&format!("\n    ech-opts:\n      enable: true\n      config: {cfg}"));
+            out.push_str(&format!(
+                "\n    ech-opts:\n      enable: true\n      config: {cfg}"
+            ));
         }
         out.push('\n');
         out
@@ -1181,8 +1183,14 @@ mod tests {
         assert!(y.contains("servername: loukas.ccwu.cc"), "{y}");
         assert!(y.contains("ech-opts:"), "{y}");
         assert!(y.contains("enable: true"), "{y}");
-        assert!(y.contains("query-server-name: \"cloudflare-ech.com\""), "{y}");
-        assert!(y.contains("doh: \"https://dns.alidns.com/dns-query\""), "{y}");
+        assert!(
+            y.contains("query-server-name: \"cloudflare-ech.com\""),
+            "{y}"
+        );
+        assert!(
+            y.contains("doh: \"https://dns.alidns.com/dns-query\""),
+            "{y}"
+        );
         assert!(y.contains("Host: \"loukas.ccwu.cc\""), "{y}");
     }
 
@@ -1190,7 +1198,10 @@ mod tests {
     fn vless_uri_ech_bare_query_name() {
         let uri = "vless://11111111-2222-4333-8444-555555555555@cf.example.com:443?security=tls&type=tcp&ech=cloudflare-ech.com&sni=cf.example.com#t";
         let y = parse_uri(uri).unwrap().to_yaml();
-        assert!(y.contains("query-server-name: \"cloudflare-ech.com\""), "{y}");
+        assert!(
+            y.contains("query-server-name: \"cloudflare-ech.com\""),
+            "{y}"
+        );
         assert!(!y.contains("doh:"), "{y}");
     }
 

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vp_protocol::{build_outbound_eager, OutboundDeps};
+use vp_protocol::{OutboundDeps, build_outbound_eager};
 
 async fn probe_inner(cfg: vp_config::ProxyCfg, deps: Arc<OutboundDeps>) -> Result<u64, String> {
     let t0 = Instant::now();
@@ -18,13 +18,10 @@ async fn probe_inner(cfg: vp_config::ProxyCfg, deps: Arc<OutboundDeps>) -> Resul
     let dst = vp_common::DstAddr::new("www.gstatic.com", 80);
     let sess = vp_core::session::Session::new_tcp("probe".into(), None, dst.clone());
     let t1 = Instant::now();
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(20),
-        ob.connect_stream(&sess, &dst),
-    )
-    .await
-    .map_err(|_| "握手超时".to_string())?
-    .map_err(|e| format!("连接失败: {e}"))?;
+    let mut stream = tokio::time::timeout(Duration::from_secs(20), ob.connect_stream(&sess, &dst))
+        .await
+        .map_err(|_| "握手超时".to_string())?
+        .map_err(|e| format!("连接失败: {e}"))?;
     let handshake_ms = t1.elapsed().as_millis() as u64;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,9 +46,7 @@ async fn probe_inner(cfg: vp_config::ProxyCfg, deps: Arc<OutboundDeps>) -> Resul
             String::from_utf8_lossy(&buf[..buf.len().min(80)])
         ));
     }
-    println!(
-        "    [阶段] 构建 {build_ms} ms · 握手 {handshake_ms} ms · HTTP 往返 {http_ms} ms"
-    );
+    println!("    [阶段] 构建 {build_ms} ms · 握手 {handshake_ms} ms · HTTP 往返 {http_ms} ms");
     Ok(handshake_ms + http_ms)
 }
 

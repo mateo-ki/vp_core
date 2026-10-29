@@ -205,7 +205,6 @@ pub struct SsrOutbound {
     udp: bool,
 }
 
-
 // ---------------------------------------------------------------------------
 // tls1.2_ticket_auth 混淆（对齐 breakwa11/shadowsocksr obfsplugin 客户端语义）
 // ---------------------------------------------------------------------------
@@ -262,8 +261,8 @@ impl TlsTicket {
         let mut key_material = Vec::with_capacity(self.key.len() + 32);
         key_material.extend_from_slice(&self.key);
         key_material.extend_from_slice(&self.client_id);
-        let mut mac = <hmac::Hmac<Sha1> as hmac::Mac>::new_from_slice(&key_material)
-            .expect("hmac key");
+        let mut mac =
+            <hmac::Hmac<Sha1> as hmac::Mac>::new_from_slice(&key_material).expect("hmac key");
         mac.update(data);
         let out = mac.finalize().into_bytes();
         out[..10].try_into().expect("10 bytes")
@@ -442,7 +441,6 @@ impl TlsTicket {
     }
 }
 
-
 impl SsrOutbound {
     pub fn new(cfg: &vp_config::SsrCfg) -> Result<Self> {
         Self::new_named("ssr", cfg, Arc::new(Resolver::system()))
@@ -487,7 +485,6 @@ impl SsrOutbound {
             udp: cfg.udp,
         })
     }
-
 
     /// 应用混淆层报头（对首个发送段做伪装前缀）
     fn apply_obfs_header(&self, payload: &[u8]) -> Vec<u8> {

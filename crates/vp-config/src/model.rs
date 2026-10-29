@@ -161,6 +161,14 @@ pub struct Config {
     pub log_level: String,
     #[serde(default)]
     pub ipv6: bool,
+    /// 连接资源预算（审计报告任务2；缺省不限）
+    #[serde(
+        alias = "resource-limits",
+        alias = "resource_limits",
+        default,
+        deserialize_with = "null_to_default"
+    )]
+    pub resource_limits: ResourceLimitsConfig,
     #[serde(alias = "external-controller", alias = "external_controller", default)]
     pub external_controller: Option<String>,
     #[serde(default)]
@@ -214,6 +222,26 @@ pub struct Config {
     /// 性能与套接字缓冲区调优
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
+}
+
+/// 连接资源预算配置（resource-limits 节）
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ResourceLimitsConfig {
+    #[serde(
+        alias = "max-connections",
+        alias = "max_connections",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_connections: Option<u32>,
+    #[serde(
+        alias = "max-connections-per-inbound",
+        alias = "max_connections_per_inbound",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_connections_per_inbound: Option<u32>,
 }
 
 /// 性能与套接字参数调优配置

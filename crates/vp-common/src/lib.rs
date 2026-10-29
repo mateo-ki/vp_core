@@ -8,7 +8,7 @@ pub mod stats;
 pub use addr::{DstAddr, Host};
 pub use bufpool::get_buf;
 pub use error::{Error, Result};
-pub use stats::{Stats, StatsSnapshot};
+pub use stats::{ConnBudget, ConnPermit, ResourceLimits, Stats, StatsSnapshot};
 
 /// 生成密码学随机字节
 pub fn rand_bytes(buf: &mut [u8]) {

@@ -128,10 +128,13 @@ impl Group {
                     let key = match &sess.dst.host {
                         vp_common::Host::Domain(d) => d.as_str(),
                         vp_common::Host::Ip(ip) => {
-                            // 简单 FNV
-                            let b = match ip {
-                                std::net::IpAddr::V4(v) => v.octets().to_vec(),
-                                std::net::IpAddr::V6(v) => v.octets().to_vec(),
+                            // 简单 FNV：固定数组栈上完成，热路径零堆分配
+                            let b: [u8; 16] = match ip {
+                                std::net::IpAddr::V4(v) => {
+                                    let o = v.octets();
+                                    [o[0], o[1], o[2], o[3], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+                                }
+                                std::net::IpAddr::V6(v) => v.octets(),
                             };
                             return fnv_index(&b, n);
                         }
@@ -220,13 +223,15 @@ impl Group {
         }
     }
 
-    /// 启动后台健康检查（url-test / fallback 且非 lazy）
-    pub fn start_health_checks(self: &Arc<Self>, group_index: usize) {
+    /// 启动后台健康检查（url-test / fallback 且非 lazy）。
+    /// 返回任务句柄：Router 被热替换时由持有方 abort，否则旧组任务永久滞留
+    /// （热更新泄漏：任务持有 Arc<Group>，旧 Router 永远无法释放）。
+    pub fn start_health_checks(self: &Arc<Self>, group_index: usize) -> Option<tokio::task::JoinHandle<()>> {
         if self.ty != GroupType::UrlTest && self.ty != GroupType::Fallback {
-            return;
+            return None;
         }
         let g = self.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             // lazy 策略组不主动发起全量首轮探活，只有在真实请求触发或手动测速时才探活；
             // 避免 49 个甚至更多策略组在启动时并发雪崩。
             if g.lazy {
@@ -241,7 +246,7 @@ impl Group {
                 tokio::time::sleep(Duration::from_secs(g.interval)).await;
                 g.probe_all().await;
             }
-        });
+        }))
     }
 
     async fn probe_all(&self) {
@@ -581,6 +586,34 @@ mod tests {
 
     fn sess() -> Session {
         Session::new_tcp("test".into(), None, dst())
+    }
+
+    /// 回归（审计报告任务1）：健康检查任务必须有明确生命周期。
+    /// 热替换语义 = 旧代任务 abort 后退出；不 abort 则任务持有 Arc<Group> 永久滞留。
+    #[tokio::test]
+    async fn health_task_lifecycle_on_swap() {
+        let m1 = MockOutbound::new("a");
+        let g = Group::new(
+            GroupSpec {
+                name: "UT".into(),
+                ty: GroupType::UrlTest,
+                members: vec!["a".into()],
+                test_url: Some("http://127.0.0.1:9/generate_204".into()),
+                interval: 3600,
+                tolerance: 0,
+                lazy: false,
+                lb_strategy: LbStrategy::RoundRobin,
+            },
+            vec![m1],
+        );
+
+        let h = g.start_health_checks(0).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!h.is_finished(), "非 lazy 组的健康检查任务应保持运行");
+
+        h.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(h.is_finished(), "abort 后旧代健康检查任务应退出");
     }
 
     #[tokio::test]

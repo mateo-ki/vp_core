@@ -36,6 +36,8 @@ pub struct Router {
     dns: Arc<Resolver>,
     ipv6: bool,
     global_outbound: Arc<dyn Outbound>,
+    /// 健康检查等后台任务句柄：热替换时 abort，防止旧 Router 任务滞留
+    background_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Router {
@@ -128,6 +130,14 @@ impl Router {
             .or_else(|| resolved.get("DIRECT").cloned())
             .ok_or(vp_common::Error::Config("无可用出站".into()))?;
 
+        // 健康检查句柄在构造 Router 前收集：热替换旧 Router 时统一 abort，
+        // 否则旧组任务持有 Arc<Group> 永久滞留（热更新泄漏）。
+        let mut background_tasks = Vec::new();
+        for (idx, g) in groups.values().enumerate() {
+            if let Some(h) = g.start_health_checks(idx) {
+                background_tasks.push(h);
+            }
+        }
         let router = Arc::new(Router {
             outbounds: resolved,
             groups,
@@ -136,13 +146,19 @@ impl Router {
             dns: spec.dns,
             ipv6: spec.ipv6,
             global_outbound,
+            background_tasks,
         });
-
-        for (idx, g) in router.groups.values().enumerate() {
-            g.start_health_checks(idx);
-        }
         Ok(router)
     }
+
+    /// 终止本 Router 的全部后台任务（热替换旧 Router 时调用；
+    /// 已建立的连接不受影响 —— 它们持有的是出站/组对象，探测只是旁路）。
+    pub fn abort_background_tasks(&self) {
+        for h in &self.background_tasks {
+            h.abort();
+        }
+    }
+
 
     pub fn groups(&self) -> &HashMap<String, Arc<Group>> {
         &self.groups
@@ -168,8 +184,16 @@ impl Router {
         &self.rules
     }
 
-    /// 仅替换规则引擎（复用现有 groups 与出站表，保持延迟历史与已选手工状态）
+    /// 仅替换规则引擎（复用现有 groups 与出站表，保持延迟历史与已选手工状态）。
+    /// 组对象虽复用，但任务按"Router 一代"归属：本代重启健康检查，
+    /// 旧代任务在 swap 时被 abort（重叠窗口极短，探测有全局信号量兜底）。
     pub fn clone_with_rules(&self, rules: RuleEngine) -> Arc<Router> {
+        let mut background_tasks = Vec::new();
+        for (idx, g) in self.groups.values().enumerate() {
+            if let Some(h) = g.start_health_checks(idx) {
+                background_tasks.push(h);
+            }
+        }
         Arc::new(Router {
             outbounds: self.outbounds.clone(),
             groups: self.groups.clone(),
@@ -178,6 +202,7 @@ impl Router {
             dns: self.dns.clone(),
             ipv6: self.ipv6,
             global_outbound: self.global_outbound.clone(),
+            background_tasks,
         })
     }
 

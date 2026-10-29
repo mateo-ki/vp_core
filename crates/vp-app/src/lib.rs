@@ -30,7 +30,12 @@ impl RouterHandle {
     }
 
     pub fn swap(&self, router: Arc<InnerRouter>) {
-        *self.inner.write().unwrap() = router;
+        let old = {
+            let mut guard = self.inner.write().unwrap();
+            std::mem::replace(&mut *guard, router)
+        };
+        // 旧 Router 的健康检查等后台任务随即终止，防止热更新后任务滞留
+        old.abort_background_tasks();
     }
 
     pub fn current(&self) -> Arc<InnerRouter> {
@@ -53,6 +58,133 @@ pub struct ConfigMeta {
     pub base_dir: std::path::PathBuf,
 }
 
+/// TUN 运行时：热重载可动态增删的 TUN 三件套。
+/// 数据面任务 + fake-ip DNS 服务器任务 + auto-route 路由守卫。
+pub struct TunRuntime {
+    pub data_plane: tokio::task::JoinHandle<()>,
+    pub dns_server: Option<tokio::task::JoinHandle<()>>,
+    pub route_guard: Option<vp_tun::auto_route::AutoRouteGuard>,
+}
+
+impl TunRuntime {
+    /// 热停用 TUN：先 drop 路由守卫（Drop 内自动恢复路由表），再停 DNS 劫持与数据面。
+    pub fn shutdown(self) {
+        drop(self.route_guard);
+        if let Some(h) = self.dns_server {
+            h.abort();
+        }
+        self.data_plane.abort();
+    }
+}
+
+/// 热重载后的 TUN 差量同步：新配置 `tun.enable` 与运行时不一致时，动态启停 TUN 入站。
+/// 开关一致则为空操作（mtu 等参数变化仍需走重启路径，这里只处理免重启的开关切换）。
+/// 失败时保持原状（旧配置、旧 TUN 状态原样保留），由调用方向控制端回报错误。
+pub async fn sync_tun_state(
+    tun_runtime: &Arc<RwLock<Option<TunRuntime>>>,
+    router: &Arc<RouterHandle>,
+    stats: &Arc<Stats>,
+    conns: &Arc<ConnTable>,
+    dns: &Arc<Resolver>,
+    new_cfg: &vp_config::Config,
+) -> Result<()> {
+    let want_on = new_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
+    let is_on = tun_runtime.read().unwrap().is_some();
+    if want_on == is_on {
+        return Ok(());
+    }
+    if want_on {
+        let ctx = InboundCtx {
+            router: router.clone(),
+            stats: stats.clone(),
+            conns: conns.clone(),
+        };
+        let rt = start_tun_runtime(new_cfg, dns.clone(), ctx).await?;
+        info!("TUN 模式已热开启（无重启）");
+        *tun_runtime.write().unwrap() = Some(rt);
+    } else if let Some(rt) = tun_runtime.write().unwrap().take() {
+        info!("TUN 模式已热关闭（无重启），路由表已恢复");
+        rt.shutdown();
+    }
+    Ok(())
+}
+
+/// 启动 TUN 三件套（fake-ip DNS 服务器、TUN 数据面、auto-route 路由守卫）。
+/// 启动与热重载共用：设备创建失败返回 Err；DNS 监听 / auto-route 失败仅告警
+/// （与既有启动语义一致：TUN 建不起来不该拦住整个内核）。
+async fn start_tun_runtime(
+    cfg: &vp_config::Config,
+    dns: Arc<Resolver>,
+    ctx: InboundCtx,
+) -> Result<TunRuntime> {
+    let tun_cfg = cfg
+        .tun
+        .as_ref()
+        .ok_or_else(|| Error::Config("配置缺少 tun 段".into()))?;
+    if !tun_cfg.enable {
+        return Err(Error::Config("tun.enable = false".into()));
+    }
+    let pool = vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range)
+        .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range)))?;
+    let dns_listen: std::net::SocketAddr = "0.0.0.0:53"
+        .parse()
+        .map_err(|e| Error::Config(format!("DNS 监听非法: {e}")))?;
+    let dns_srv = vp_dns::DnsServer::new(
+        dns_listen,
+        dns,
+        Some(Arc::new(pool.clone())),
+        cfg.dns.fake_ip_filter.clone(),
+        cfg.ipv6,
+    );
+    let dns_handle = match dns_srv.spawn_handle().await {
+        Ok((bound, handle)) => {
+            info!("dns 服务器（fake-ip 劫持）监听 {bound}");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!("dns 服务器启动失败: {e}");
+            None
+        }
+    };
+    let t = vp_tun::TunConfig {
+        address: tun_cfg
+            .address
+            .parse()
+            .map_err(|e| Error::Config(format!("tun 地址非法: {e}")))?,
+        netmask: tun_cfg
+            .netmask
+            .parse()
+            .map_err(|e| Error::Config(format!("tun 掩码非法: {e}")))?,
+        mtu: tun_cfg.mtu,
+        fake_ip_range: tun_cfg.fake_ip_range.clone(),
+        dns_hijack: true,
+        fd: tun_cfg.fd,
+        ring_capacity: tun_cfg.ring_capacity,
+    };
+    let tun_in = Arc::new(vp_tun::TunInbound::new(t, "tun"));
+    let data_plane = tun_in
+        .clone()
+        .start_with_handle(ctx)
+        .await
+        .map_err(|e| Error::Other(format!("TUN 启动失败（需要管理员权限）: {e}")))?;
+    info!("TUN 模式已启动（{}）", tun_cfg.address);
+    let mut route_guard = None;
+    if tun_cfg.auto_route {
+        match vp_tun::auto_route::enable(&tun_cfg.address, &tun_cfg.netmask) {
+            Ok(guard) => {
+                info!("auto-route 已启用");
+                route_guard = Some(guard);
+            }
+            Err(e) => warn!("auto-route 启用失败（需管理员权限）: {e}"),
+        }
+    }
+    Ok(TunRuntime {
+        data_plane,
+        dns_server: dns_handle,
+        route_guard,
+    })
+}
+
 pub struct App {
     pub router: Arc<RouterHandle>,
     pub stats: Arc<Stats>,
@@ -61,8 +193,10 @@ pub struct App {
     pub controller: Option<String>,
     /// 重载用：配置元数据
     pub config_meta: Arc<RwLock<Option<ConfigMeta>>>,
-    /// TUN 路由守卫：持有并在 App Drop 时自动恢复路由表
-    pub _route_guard: Option<vp_tun::auto_route::AutoRouteGuard>,
+    /// TUN 运行时：Some = TUN 已启用。热重载按配置差量动态增删（免重启热切换）。
+    pub tun_runtime: Arc<RwLock<Option<TunRuntime>>>,
+    /// 全局 DNS 解析器：热开启 TUN 时复用它建 fake-ip 劫持服务器
+    pub dns: Arc<Resolver>,
 }
 
 impl App {
@@ -178,6 +312,20 @@ impl App {
             None,
         )
         .await?;
+
+        // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
+        let new_cfg: vp_config::Config = vp_config::parse(&new_text, new_fmt)
+            .map_err(|e| Error::Config(format!("{e}")))?;
+        sync_tun_state(
+            &self.tun_runtime,
+            &self.router,
+            &self.stats,
+            &self.conns,
+            &self.dns,
+            &new_cfg,
+        )
+        .await?;
+
         self.router.swap(new_app.router.current());
 
         *self.config_meta.write().unwrap() = Some(ConfigMeta {
@@ -208,6 +356,20 @@ impl App {
             None,
         )
         .await?;
+
+        // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
+        let new_cfg: vp_config::Config = vp_config::parse(new_text, meta.fmt)
+            .map_err(|e| Error::Config(format!("{e}")))?;
+        sync_tun_state(
+            &self.tun_runtime,
+            &self.router,
+            &self.stats,
+            &self.conns,
+            &self.dns,
+            &new_cfg,
+        )
+        .await?;
+
         self.router.swap(new_app.router.current());
 
         *self.config_meta.write().unwrap() = Some(ConfigMeta {
@@ -386,6 +548,11 @@ impl App {
 
         let router_handle = Arc::new(RouterHandle::new(router));
         let stats = Arc::new(Stats::default());
+        // 连接资源预算（审计报告任务2）：缺省不限，配置后生效
+        stats.conn_budget.configure(vp_common::ResourceLimits {
+            max_connections: cfg.resource_limits.max_connections,
+            max_connections_per_inbound: cfg.resource_limits.max_connections_per_inbound,
+        });
         let conns = Arc::new(ConnTable::new());
 
         // 规则提供者定时后台更新任务
@@ -503,7 +670,7 @@ impl App {
 
         // 入站
         let mut listen_ports = Vec::new();
-        let mut tun_route_guard = None;
+        let mut tun_runtime_opt: Option<TunRuntime> = None;
         if start_listeners {
             let bind = if cfg.allow_lan {
                 if cfg.bind_address == "*" {
@@ -570,61 +737,15 @@ impl App {
             // TUN 模式
             if let Some(tun_cfg) = &cfg.tun {
                 if tun_cfg.enable {
-                    let pool =
-                        vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range).ok_or_else(|| {
-                            Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range))
-                        })?;
-                    let dns_listen: std::net::SocketAddr = "0.0.0.0:53"
-                        .parse()
-                        .map_err(|e| Error::Config(format!("DNS 监听非法: {e}")))?;
-                    let dns_srv = vp_dns::DnsServer::new(
-                        dns_listen,
-                        dns.clone(),
-                        Some(Arc::new(pool.clone())),
-                        cfg.dns.fake_ip_filter.clone(),
-                        cfg.ipv6,
-                    );
-                    match dns_srv.spawn().await {
-                        Ok(bound) => info!("dns 服务器（fake-ip 劫持）监听 {bound}"),
-                        Err(e) => warn!("dns 服务器启动失败: {e}"),
-                    }
-                    let t = vp_tun::TunConfig {
-                        address: tun_cfg
-                            .address
-                            .parse()
-                            .map_err(|e| Error::Config(format!("tun 地址非法: {e}")))?,
-                        netmask: tun_cfg
-                            .netmask
-                            .parse()
-                            .map_err(|e| Error::Config(format!("tun 掩码非法: {e}")))?,
-                        mtu: tun_cfg.mtu,
-                        fake_ip_range: tun_cfg.fake_ip_range.clone(),
-                        dns_hijack: true,
-                        fd: tun_cfg.fd,
-                        ring_capacity: tun_cfg.ring_capacity,
+                    let ctx = InboundCtx {
+                        router: router_handle.clone(),
+                        stats: stats.clone(),
+                        conns: conns.clone(),
                     };
-                    let tun_in: Arc<dyn vp_core::Inbound> =
-                        Arc::new(vp_tun::TunInbound::new(t, "tun"));
-                    let mut route_guard = None;
-                    match tun_in.clone().start(inb_ctx.clone()).await {
-                        Ok(_) => {
-                            info!("TUN 模式已启动（{}）", tun_cfg.address);
-                            if tun_cfg.auto_route {
-                                match vp_tun::auto_route::enable(&tun_cfg.address, &tun_cfg.netmask)
-                                {
-                                    Ok(guard) => {
-                                        info!("auto-route 已启用");
-                                        route_guard = Some(guard);
-                                    }
-                                    Err(e) => warn!("auto-route 启用失败（需管理员权限）: {e}"),
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("TUN 启动失败（需要管理员权限）: {e}");
-                        }
+                    match start_tun_runtime(&cfg, dns.clone(), ctx).await {
+                        Ok(rt) => tun_runtime_opt = Some(rt),
+                        Err(e) => warn!("TUN 启动失败（需要管理员权限）: {e}"),
                     }
-                    tun_route_guard = route_guard;
                 }
             }
         }
@@ -636,6 +757,9 @@ impl App {
             base_dir: base_dir.to_path_buf(),
         })));
 
+        // TUN 运行时：App 与外部控制器共享同一份（热重载差量同步用）
+        let tun_runtime = Arc::new(RwLock::new(tun_runtime_opt));
+
         // 控制器
         let controller = cfg.external_controller.clone();
         if let Some(addr) = &controller {
@@ -646,6 +770,8 @@ impl App {
                     conns: conns.clone(),
                     secret: cfg.secret.clone().filter(|s| !s.is_empty()),
                     config_meta: config_meta.clone(),
+                    tun_runtime: tun_runtime.clone(),
+                    dns: dns.clone(),
                 };
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 api::spawn_on(listener, Arc::new(app_ref));
@@ -660,7 +786,8 @@ impl App {
             listen_ports,
             controller,
             config_meta,
-            _route_guard: tun_route_guard,
+            tun_runtime,
+            dns,
         };
         Ok(Arc::new(app))
     }

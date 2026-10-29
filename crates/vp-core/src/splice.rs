@@ -46,6 +46,28 @@ impl AsRawFd for FdView {
     }
 }
 
+/// socket 侧就绪端点：tokio 的 readable()/writable() 返回 ()，就绪标志只被
+/// tokio 自身读路径清除 —— splice 绕过它会导致旧缓存自旋。标准解法：
+/// `dup()` 出**新 fd 号**注册 AsyncFd（同 socket 的第二次合法注册），
+/// 用 try_io 获得完整的"WouldBlock 即清除就绪"语义。原 fd 不再被轮询。
+struct SockEnd {
+    _afd: AsyncFd<FdView>,
+    fd: FdGuard,
+}
+
+impl SockEnd {
+    fn dup_of(s: &TcpStream) -> io::Result<Self> {
+        let fd = unsafe { libc::dup(s.as_raw_fd()) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(SockEnd {
+            _afd: AsyncFd::new(FdView(fd))?,
+            fd: FdGuard(fd),
+        })
+    }
+}
+
 struct PipeEnd {
     /// 先声明：Drop 时先解注册再关 fd。
     _afd: AsyncFd<FdView>,
@@ -81,6 +103,28 @@ impl Pipe {
     }
 }
 
+/// socket → 目标：EAGAIN 时清除就绪并等待新事件，绝不自旋。
+async fn splice_from(end: &SockEnd, to_fd: RawFd, len: usize) -> io::Result<isize> {
+    loop {
+        let mut g = end._afd.readable().await?;
+        match g.try_io(|s| splice_try(s.as_raw_fd(), to_fd, len)) {
+            Ok(r) => return r,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+/// 源 → socket：EAGAIN 时清除可写就绪并等待新空间。
+async fn splice_into(end: &SockEnd, from_fd: RawFd, len: usize) -> io::Result<isize> {
+    loop {
+        let mut g = end._afd.writable().await?;
+        match g.try_io(|s| splice_try(from_fd, s.as_raw_fd(), len)) {
+            Ok(r) => return r,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
 fn splice_try(fd_in: RawFd, fd_out: RawFd, len: usize) -> io::Result<isize> {
     let n = unsafe {
         libc::splice(
@@ -99,15 +143,15 @@ fn splice_try(fd_in: RawFd, fd_out: RawFd, len: usize) -> io::Result<isize> {
     }
 }
 
-fn shutdown_write(s: &TcpStream) {
-    unsafe { libc::shutdown(s.as_raw_fd(), libc::SHUT_WR) };
+fn shutdown_write(s: &SockEnd) {
+    unsafe { libc::shutdown(s.fd.0, libc::SHUT_WR) };
 }
 
 /// 单方向零拷贝泵：input → pipe → output，直到 input EOF。
 /// 与通用 pump 相同的统计语义（per-iteration 一次 fetch_add）。
 async fn pump_dir(
-    input: &TcpStream,
-    output: &TcpStream,
+    input: &SockEnd,
+    output: &SockEnd,
     pipe: &Pipe,
     counter: &AtomicU64,
     stats: Option<&Arc<Stats>>,
@@ -115,15 +159,7 @@ async fn pump_dir(
 ) -> io::Result<()> {
     loop {
         // 1) 填管道：input → pipe.w（管道此时必为空，EAGAIN 仅意味着暂无数据）
-        let n = loop {
-            match splice_try(input.as_raw_fd(), pipe.w.fd.0, CHUNK) {
-                Ok(n) => break n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    input.readable().await?;
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let n = splice_from(input, pipe.w.fd.0, CHUNK).await?;
         if n == 0 {
             // EOF：半关闭对端写侧，收场
             shutdown_write(output);
@@ -132,13 +168,8 @@ async fn pump_dir(
         // 2) 排空：pipe.r → output，恰好 n 字节
         let mut left = n as usize;
         while left > 0 {
-            match splice_try(pipe.r.fd.0, output.as_raw_fd(), left) {
-                Ok(m) => left -= m as usize,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    output.writable().await?;
-                }
-                Err(e) => return Err(e),
-            }
+            let m = splice_into(output, pipe.r.fd.0, left).await?;
+            left -= m as usize;
         }
         counter.fetch_add(n as u64, Ordering::Relaxed);
         if let Some(st) = stats {
@@ -156,12 +187,14 @@ async fn pump_dir(
 pub async fn relay_pair(a: &TcpStream, b: &TcpStream, stats: Option<Arc<Stats>>) -> io::Result<(u64, u64)> {
     let up_pipe = Pipe::new()?;
     let down_pipe = Pipe::new()?;
+    let a_end = SockEnd::dup_of(a)?;
+    let b_end = SockEnd::dup_of(b)?;
     let up = Arc::new(AtomicU64::new(0));
     let down = Arc::new(AtomicU64::new(0));
 
     let (r1, r2) = tokio::join!(
-        pump_dir(a, b, &up_pipe, &up, stats.as_ref(), true),
-        pump_dir(b, a, &down_pipe, &down, stats.as_ref(), false),
+        pump_dir(&a_end, &b_end, &up_pipe, &up, stats.as_ref(), true),
+        pump_dir(&b_end, &a_end, &down_pipe, &down, stats.as_ref(), false),
     );
     r1?;
     r2?;

@@ -56,6 +56,17 @@ RustCrypto 的 SIMD 内联循环，加密吞吐掉 4-5 倍）。
 **结论：同数量级，路由 pick 每连接仅 1 次，保留 RwLock 不换库**。
 注：基准的写方在锁内做 1000 次字符串分配，对 RwLock 略有不公平。
 
+## 3.6 splice Linux 真机验证（2026-10-30）
+
+- 环境：WSL2 Ubuntu 24.04（离线工具链 + cargo vendor，因本机 WSL 的
+  IPv4 回环被代理/VPN 软件破坏，测试绑定 [::1]）
+- 结果：vp-core **12/12 通过**（含 splice 端到端 512KB 双向 + 半关闭 +
+  字节对账）；vp-common 7/7；vp-protocol 97 通过（7 个失败为 ::1
+  替换导致的 hy/naive 地址解析伪影，Windows 全绿）
+- 真机发现并修复 1 个真实挂起：tokio readable()/writable() 的就绪标志
+  只被自身读路径清除，splice 绕过导致自旋 —— dup() 新 fd 注册 AsyncFd
+  用 try_io 语义解决（commit d71db62）
+
 ## 4. 回归守护
 
 - 泵链读防死锁回归：`cargo test -p vp-core --lib tunnel::`

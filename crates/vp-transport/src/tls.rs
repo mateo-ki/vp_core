@@ -117,7 +117,10 @@ fn ech_retry_configs() -> &'static std::sync::Mutex<std::collections::HashMap<St
 }
 
 fn note_ech_retry_config(host: &str, list: Arc<Vec<u8>>) {
-    ech_retry_configs().lock().unwrap().insert(host.to_string(), list);
+    ech_retry_configs()
+        .lock()
+        .unwrap()
+        .insert(host.to_string(), list);
 }
 
 fn take_ech_retry_config(host: &str) -> Option<Arc<Vec<u8>>> {
@@ -126,8 +129,8 @@ fn take_ech_retry_config(host: &str) -> Option<Arc<Vec<u8>>> {
 
 /// 从 tokio-rustls 握手错误中提取服务端下发的 ECHConfigList（重编码回 wire 格式）
 fn ech_retry_list_from(err: &std::io::Error) -> Option<Arc<Vec<u8>>> {
-    use tokio_rustls::rustls::internal::msgs::codec::Codec as _;
     use tokio_rustls::rustls::Error;
+    use tokio_rustls::rustls::internal::msgs::codec::Codec as _;
 
     let rl = err.get_ref()?.downcast_ref::<Error>()?;
     let Error::PeerIncompatible(

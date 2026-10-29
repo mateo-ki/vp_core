@@ -12,7 +12,7 @@ pub fn resolve_process(network: &str, src: Option<std::net::SocketAddr>) -> Opti
     let src = src?;
     #[cfg(windows)]
     {
-        return windows_lookup::lookup(network, src).map(Arc::from);
+        windows_lookup::lookup(network, src).map(Arc::from)
     }
     #[cfg(not(windows))]
     {
@@ -28,13 +28,13 @@ mod windows_lookup {
 
     use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPTABLE_OWNER_PID,
-        MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPTABLE_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+        TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
 
     /// 按协议与源地址在系统连接表里找归属 PID
@@ -152,8 +152,9 @@ mod windows_lookup {
         }
         let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
-        let ok =
-            unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size) };
+        let ok = unsafe {
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size)
+        };
         unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
         if ok == 0 || size == 0 {
             return None;

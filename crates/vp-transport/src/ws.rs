@@ -158,10 +158,8 @@ pub struct WsStream<S> {
     closed: bool,
 }
 
-impl<S> vp_core::ProxyStream for WsStream<S> where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-}
+impl<S> vp_core::ProxyStream for WsStream<S> where S: AsyncRead + AsyncWrite + Unpin + Send + 'static
+{}
 
 impl<S> WsStream<S> {
     pub fn new(inner: S, is_client: bool) -> Self {

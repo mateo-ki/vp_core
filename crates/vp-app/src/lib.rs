@@ -314,8 +314,8 @@ impl App {
         .await?;
 
         // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
-        let new_cfg: vp_config::Config = vp_config::parse(&new_text, new_fmt)
-            .map_err(|e| Error::Config(format!("{e}")))?;
+        let new_cfg: vp_config::Config =
+            vp_config::parse(&new_text, new_fmt).map_err(|e| Error::Config(format!("{e}")))?;
         sync_tun_state(
             &self.tun_runtime,
             &self.router,
@@ -358,8 +358,8 @@ impl App {
         .await?;
 
         // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
-        let new_cfg: vp_config::Config = vp_config::parse(new_text, meta.fmt)
-            .map_err(|e| Error::Config(format!("{e}")))?;
+        let new_cfg: vp_config::Config =
+            vp_config::parse(new_text, meta.fmt).map_err(|e| Error::Config(format!("{e}")))?;
         sync_tun_state(
             &self.tun_runtime,
             &self.router,

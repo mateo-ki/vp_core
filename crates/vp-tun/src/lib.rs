@@ -100,10 +100,10 @@ impl TunInbound {
         let tag = self.tag.clone();
         let cfg = self.cfg.clone();
         let dev = create_tun_device(&cfg).await?;
-        let pool = Arc::new(
-            FakeIpPool::new(&cfg.fake_ip_range)
-                .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", cfg.fake_ip_range)))?,
-        );
+        let pool =
+            Arc::new(FakeIpPool::new(&cfg.fake_ip_range).ok_or_else(|| {
+                Error::Config(format!("fake-ip 网段非法: {}", cfg.fake_ip_range))
+            })?);
         let resolver = Arc::new(Resolver::system());
         info!(
             "TUN 已启动: {} mtu={} fakeip={}",
@@ -125,7 +125,10 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
             use std::os::fd::FromRawFd;
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let tokio_file = tokio::fs::File::from_std(file);
-            info!("TUN 移动端模式（外部 FD={fd}）: fakeip={}", cfg.fake_ip_range);
+            info!(
+                "TUN 移动端模式（外部 FD={fd}）: fakeip={}",
+                cfg.fake_ip_range
+            );
             return Ok(Box::new(tokio_file));
         }
         #[cfg(not(unix))]

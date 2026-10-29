@@ -687,7 +687,7 @@ pub struct SsrStream<S> {
 }
 
 impl<S> vp_core::ProxyStream for SsrStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
 {
 }
 

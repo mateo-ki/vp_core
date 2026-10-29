@@ -51,7 +51,11 @@ pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_ke
         rcvbuf,
         sndbuf,
         tcp_nodelay,
-        keepalive_secs: if tcp_keepalive_secs == 0 { 60 } else { tcp_keepalive_secs },
+        keepalive_secs: if tcp_keepalive_secs == 0 {
+            60
+        } else {
+            tcp_keepalive_secs
+        },
     };
 }
 

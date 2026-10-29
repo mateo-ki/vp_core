@@ -10,8 +10,8 @@
 //! 仅作本地分析工具，不进 CI。
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -122,7 +122,9 @@ fn summarize(name: &'static str, samples: &[(f64, f64)]) -> (f64, f64) {
 async fn main() {
     println!(
         "每阶段 {} 轮 × {}MB，缓冲 {}KB，进程 CPU 差分\n",
-        ROUNDS, MB_PER_ROUND, BUF / 1024
+        ROUNDS,
+        MB_PER_ROUND,
+        BUF / 1024
     );
 
     let a = phase_a().await;
@@ -289,8 +291,7 @@ async fn phase_c() -> Vec<(f64, f64)> {
         let _ = es.set_nodelay(true);
 
         let mid = tokio::spawn(async move {
-            let _ =
-                vp_core::tunnel::relay(Box::new(cs), Box::new(es), Default::default()).await;
+            let _ = vp_core::tunnel::relay(Box::new(cs), Box::new(es), Default::default()).await;
         });
 
         let c0 = process_cpu_secs();

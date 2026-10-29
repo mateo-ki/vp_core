@@ -11,12 +11,15 @@ use arc_swap::ArcSwap;
 
 #[derive(Clone)]
 struct FakeRouter {
+    #[allow(dead_code)] // 载荷本体：读路径只 clone Arc，字段存在为凑真实体积
     rules: Vec<String>,
 }
 
 fn make() -> Arc<FakeRouter> {
     Arc::new(FakeRouter {
-        rules: (0..1000).map(|i| format!("MATCH,DIRECT,#rule-{i}")).collect(),
+        rules: (0..1000)
+            .map(|i| format!("MATCH,DIRECT,#rule-{i}"))
+            .collect(),
     })
 }
 

@@ -75,7 +75,7 @@ pub struct HttpStream<S> {
 }
 
 impl<S> vp_core::ProxyStream for HttpStream<S> where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static
 {
 }
 

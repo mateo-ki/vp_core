@@ -125,7 +125,7 @@ pub struct SnellStream<S> {
 }
 
 impl<S> vp_core::ProxyStream for SnellStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
 {
 }
 

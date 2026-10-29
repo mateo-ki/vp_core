@@ -15,8 +15,8 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::unix::AsyncFd;
 use tokio::net::TcpStream;
@@ -184,7 +184,11 @@ async fn pump_dir(
 
 /// 裸 socket 双向零拷贝转发：返回 (up, down) 字节数。
 /// 两个方向在同一个任务里 join（任一方向 EOF → shutdown 对端写侧，与通用泵语义一致）。
-pub async fn relay_pair(a: &TcpStream, b: &TcpStream, stats: Option<Arc<Stats>>) -> io::Result<(u64, u64)> {
+pub async fn relay_pair(
+    a: &TcpStream,
+    b: &TcpStream,
+    stats: Option<Arc<Stats>>,
+) -> io::Result<(u64, u64)> {
     let up_pipe = Pipe::new()?;
     let down_pipe = Pipe::new()?;
     let a_end = SockEnd::dup_of(a)?;

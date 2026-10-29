@@ -16,29 +16,43 @@ pub use http::{HttpConfig, HttpStream, http_handshake_client};
 pub use tls::{TlsClientConfig, connect_tls, tls_acceptor, tls_connect};
 pub use ws::{WsConfig, WsStream, ws_handshake_client, ws_handshake_server};
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use vp_common::Result;
 use vp_core::ProxyStream;
 
-static GLOBAL_SO_RCVBUF: AtomicUsize = AtomicUsize::new(0);
-static GLOBAL_SO_SNDBUF: AtomicUsize = AtomicUsize::new(0);
-static GLOBAL_TCP_NODELAY: AtomicBool = AtomicBool::new(true);
-static GLOBAL_TCP_KEEPALIVE_SECS: AtomicU64 = AtomicU64::new(60);
+/// 套接字调优快照（报告任务7 第一阶段）：四个独立 Atomic 合并为单一
+/// `RwLock<SocketTuning>`，tune() 一次读取拿到**一致**的配置快照，
+/// 不再出现"半新半旧"的混合参数。真正的多 Runtime 实例化（每 AppRuntime
+/// 一份 SocketTuning）等出现第二个 Runtime 时再做——单实例进程里
+/// 全局快照与实例语义等价。
+#[derive(Debug, Clone, Copy)]
+pub struct SocketTuning {
+    pub rcvbuf: usize,
+    pub sndbuf: usize,
+    pub tcp_nodelay: bool,
+    pub keepalive_secs: u64,
+}
+
+static TUNING: std::sync::RwLock<SocketTuning> = std::sync::RwLock::new(SocketTuning {
+    rcvbuf: 0,
+    sndbuf: 0,
+    tcp_nodelay: true,
+    keepalive_secs: 60,
+});
+
+/// 当前生效的调优快照（一致读取）
+pub fn tuning_snapshot() -> SocketTuning {
+    *TUNING.read().unwrap()
+}
 
 /// 全局配置套接字发送与接收缓冲区及 TCP 调优参数
 pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_keepalive_secs: u64) {
-    GLOBAL_SO_RCVBUF.store(rcvbuf, Ordering::Relaxed);
-    GLOBAL_SO_SNDBUF.store(sndbuf, Ordering::Relaxed);
-    GLOBAL_TCP_NODELAY.store(tcp_nodelay, Ordering::Relaxed);
-    GLOBAL_TCP_KEEPALIVE_SECS.store(
-        if tcp_keepalive_secs == 0 {
-            60
-        } else {
-            tcp_keepalive_secs
-        },
-        Ordering::Relaxed,
-    );
+    *TUNING.write().unwrap() = SocketTuning {
+        rcvbuf,
+        sndbuf,
+        tcp_nodelay,
+        keepalive_secs: if tcp_keepalive_secs == 0 { 60 } else { tcp_keepalive_secs },
+    };
 }
 
 /// 套接字调优：内核持有的所有 TCP 连接统一设置。
@@ -47,19 +61,17 @@ pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_ke
 /// - TCP keepalive：探测对端僵死连接，避免句柄泄漏（稳定的保障）
 pub fn tune(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
-    let nodelay = GLOBAL_TCP_NODELAY.load(Ordering::Relaxed);
-    let _ = sock.set_tcp_nodelay(nodelay);
+    let t = tuning_snapshot();
+    let _ = sock.set_tcp_nodelay(t.tcp_nodelay);
 
-    let rcv = GLOBAL_SO_RCVBUF.load(Ordering::Relaxed);
-    if rcv > 0 {
-        let _ = sock.set_recv_buffer_size(rcv);
+    if t.rcvbuf > 0 {
+        let _ = sock.set_recv_buffer_size(t.rcvbuf);
     }
-    let snd = GLOBAL_SO_SNDBUF.load(Ordering::Relaxed);
-    if snd > 0 {
-        let _ = sock.set_send_buffer_size(snd);
+    if t.sndbuf > 0 {
+        let _ = sock.set_send_buffer_size(t.sndbuf);
     }
 
-    let keepalive_secs = GLOBAL_TCP_KEEPALIVE_SECS.load(Ordering::Relaxed);
+    let keepalive_secs = t.keepalive_secs;
     let ka = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(keepalive_secs))
         .with_interval(Duration::from_secs(15));

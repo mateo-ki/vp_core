@@ -119,6 +119,9 @@ libloading = "0.8"
 # 规则正则（可裁剪）
 regex = "1"
 
+# 并发原语（RouterHandle 热替换对比基准用）
+arc-swap = "1"
+
 # 平台
 libc = "0.2"
 windows-sys = { version = "0.59", features = [

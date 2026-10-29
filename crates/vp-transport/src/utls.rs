@@ -603,6 +603,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// ServerHello 解析结果
+#[derive(Debug)]
 struct ServerHello {
     suite: u16,
     peer_share: Vec<u8>,
@@ -621,13 +622,15 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
     let sid_len = c.u8()? as usize;
     c.take(sid_len)?;
     let suite = c.u16()?;
-    if c.u8()? != 0 {
-        return Err(Error::Proto("utls: SH compression 非法"));
-    }
+    // legacy_compression_methods 是带长度前缀的向量（RFC 8446 §4.1.3）：
+    // 真实服务端发送 01 00（长度=1 + null 压缩），读长度后跳过方法体
+    let comp_len = c.u8()? as usize;
+    c.take(comp_len)?;
     let ext_len = c.u16()? as usize;
     let exts = c.take(ext_len)?;
     let mut peer_share = None;
     let mut selected_psk = false;
+    let mut negotiated_tls13 = false;
     let mut e = Cursor::new(exts);
     while !e.done() {
         let ty = e.u16()?;
@@ -656,10 +659,17 @@ fn parse_server_hello(msg: &[u8]) -> Result<ServerHello> {
                         "utls: 服务器选择了 TLS 1.2，本指纹客户端仅支持 TLS 1.3".into(),
                     ));
                 }
+                negotiated_tls13 = true;
             }
             41 => selected_psk = true,
             _ => {}
         }
+    }
+    // TLS 1.3 服务器必须回带 supported_versions；缺失即 TLS ≤ 1.2
+    if !negotiated_tls13 {
+        return Err(Error::Unsupported(
+            "utls: 服务器为 TLS 1.2（未协商 TLS 1.3），本指纹客户端仅支持 TLS 1.3".into(),
+        ));
     }
     let peer_share = peer_share.ok_or(Error::Proto("utls: SH 缺 x25519 key_share"))?;
     Ok(ServerHello {
@@ -1084,10 +1094,14 @@ where
         // REALITY 握手：证书已通过 HMAC-SHA512 强认证，跳过系统 WebPKI 校验
     } else if !cfg.skip_cert_verify {
         let verifier = global_webpki_verifier()?;
-        let name = ServerName::try_from(sni.clone())
-            .map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;
+        // SNI 原样发送（与 Mihomo 一致）；证书校验域名在 SNI 非法时回退为服务器域名
+        let verify_name = ServerName::try_from(sni.clone()).or_else(|_| {
+            tracing::warn!("配置的 SNI {sni:?} 不是合法域名，证书校验回退为服务器域名 {host:?}");
+            ServerName::try_from(host.to_string())
+                .map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))
+        })?;
         verifier
-            .verify_server_cert(&leaf, &inter, &name, &[], UnixTime::now())
+            .verify_server_cert(&leaf, &inter, &verify_name, &[], UnixTime::now())
             .map_err(|e| Error::Io(std::io::Error::other(format!("证书校验失败: {e}"))))?;
     }
 
@@ -1489,6 +1503,56 @@ mod tests {
         assert_eq!(CH_SUITES.len(), 28);
     }
 
+    /// 真实服务端（Go crypto/tls，即 Xray REALITY 底层）的 ServerHello 形态：
+    /// compression methods 是带长度前缀的向量 `01 00`（此前解析器把长度字节
+    /// 当成方法字节校验 0，导致对一切真实服务端报"SH compression 非法"）
+    #[test]
+    fn parse_real_server_hello_conformant() {
+        let mut sid = [0x5au8; 32];
+        let mut srv_pub = [0x11u8; 32];
+        vp_common::rand_bytes(&mut sid);
+        vp_common::rand_bytes(&mut srv_pub);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        msg.extend_from_slice(&[0x42u8; 32]); // random（非 HRR）
+        msg.push(32);
+        msg.extend_from_slice(&sid); // session_id 回显
+        msg.extend_from_slice(&[0x13, 0x02]); // cipher_suite AES_256_GCM
+        msg.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods：长度=1 + null
+        let mut exts = Vec::new();
+        ext(&mut exts, 43, &[0x03, 0x04]); // supported_versions: TLS 1.3
+        let mut ks = Vec::new();
+        ks.extend_from_slice(&[0x00, 0x1d]); // x25519
+        ks.extend_from_slice(&32u16.to_be_bytes());
+        ks.extend_from_slice(&srv_pub);
+        ext(&mut exts, 51, &ks); // key_share
+        ext(&mut exts, 41, &[]); // pre_shared_key（选择身份，空体）
+        msg.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&exts);
+
+        let sh = parse_server_hello(&msg).expect("真实形态 ServerHello 必须可解析");
+        assert_eq!(sh.suite, 0x1302);
+        assert_eq!(sh.peer_share, srv_pub.to_vec());
+        assert!(sh.selected_psk);
+    }
+
+    /// TLS 1.2 ServerHello（无 supported_versions / key_share）：应报"仅支持 TLS 1.3"
+    #[test]
+    fn parse_server_hello_tls12_rejected() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&[0x03, 0x03]);
+        msg.extend_from_slice(&[0x42u8; 32]);
+        msg.push(0); // 空 session_id
+        msg.extend_from_slice(&[0xc0, 0x2f]); // ECDHE_RSA_AES128（TLS1.2 套件）
+        msg.extend_from_slice(&[0x01, 0x00]); // compression
+        msg.extend_from_slice(&[0x00, 0x00]); // 无扩展
+        match parse_server_hello(&msg) {
+            Err(Error::Unsupported(_)) => {}
+            other => panic!("TLS 1.2 SH 应报 Unsupported，实际 {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn e2e_echo_self_signed() {
         init_log();
@@ -1818,7 +1882,8 @@ mod tests {
             sh_body.push(sid.len() as u8);
             sh_body.extend_from_slice(&sid);
             sh_body.extend_from_slice(&[0x13, 0x02]); // AES256
-            sh_body.push(0);
+            // legacy_compression_methods：长度前缀 + null（RFC 8446，与真实服务端一致）
+            sh_body.extend_from_slice(&[0x01, 0x00]);
 
             let mut sh_exts = Vec::new();
             ext(&mut sh_exts, 43, &[0x03, 0x04]); // supported_versions 1.3

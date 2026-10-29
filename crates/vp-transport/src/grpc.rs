@@ -264,6 +264,7 @@ mod tests {
         // 客户端
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let cfg = crate::tls::TlsClientConfig {
+            ech_config: None,
             skip_cert_verify: true,
             server_name: None,
             alpn: vec!["h2".into()],

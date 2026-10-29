@@ -58,6 +58,7 @@ async fn build_udp_router_with(
         is_known_target: &|t| matches!(t, "DIRECT" | "REJECT" | "PROXY"),
         geosite: &None,
         geoip: &None,
+        asn: &None,
         providers: &HashMap::new(),
         sub_rules: &HashMap::new(),
     };

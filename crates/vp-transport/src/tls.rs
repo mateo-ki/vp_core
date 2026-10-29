@@ -66,6 +66,82 @@ pub struct TlsClientConfig {
     pub skip_cert_verify: bool,
     pub server_name: Option<String>,
     pub alpn: Vec<String>,
+    /// ECHConfigList 字节（来自 DNS HTTPS 记录或 ech-opts.config）；
+    /// Some 时握手走 rustls ECH（TLS1.3-only），被服务端拒绝则自动回退普通 TLS
+    pub ech_config: Option<Arc<Vec<u8>>>,
+}
+
+/// 全局 DNS 解析器钩子（vp_app 启动时注入），供 ECH 配置的 HTTPS(type65) 记录查询使用
+static GLOBAL_RESOLVER: std::sync::RwLock<Option<Arc<vp_dns::Resolver>>> =
+    std::sync::RwLock::new(None);
+
+pub fn set_global_resolver(res: Arc<vp_dns::Resolver>) {
+    *GLOBAL_RESOLVER.write().unwrap() = Some(res);
+}
+
+pub fn global_resolver() -> Option<Arc<vp_dns::Resolver>> {
+    GLOBAL_RESOLVER.read().unwrap().clone()
+}
+
+/// ECH 被服务端拒绝过的主机：后续连接跳过 ECH 直接走普通 TLS（重拨后生效）
+fn ech_rejected_hosts() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+pub fn note_ech_rejected(host: &str) {
+    ech_rejected_hosts()
+        .lock()
+        .unwrap()
+        .insert(host.to_string());
+}
+
+fn ech_rejected(host: &str) -> bool {
+    ech_rejected_hosts().lock().unwrap().contains(host)
+}
+
+fn ech_undelete(host: &str) {
+    ech_rejected_hosts().lock().unwrap().remove(host);
+}
+
+/// 服务端拒绝 ECH 时随 alert 下发的 retry config（按主机缓存）。
+/// Cloudflare 等会轮换 ECH 密钥：DNS 拿到的配置过旧即被拒，此时服务端会给出
+/// 最新 retry config —— 用它重连是标准 ECH 流程，成功率远高于回退明文 TLS。
+fn ech_retry_configs() -> &'static std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>
+{
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn note_ech_retry_config(host: &str, list: Arc<Vec<u8>>) {
+    ech_retry_configs().lock().unwrap().insert(host.to_string(), list);
+}
+
+fn take_ech_retry_config(host: &str) -> Option<Arc<Vec<u8>>> {
+    ech_retry_configs().lock().unwrap().remove(host)
+}
+
+/// 从 tokio-rustls 握手错误中提取服务端下发的 ECHConfigList（重编码回 wire 格式）
+fn ech_retry_list_from(err: &std::io::Error) -> Option<Arc<Vec<u8>>> {
+    use tokio_rustls::rustls::internal::msgs::codec::Codec as _;
+    use tokio_rustls::rustls::Error;
+
+    let rl = err.get_ref()?.downcast_ref::<Error>()?;
+    let Error::PeerIncompatible(
+        tokio_rustls::rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(list)),
+    ) = rl
+    else {
+        return None;
+    };
+    if list.is_empty() {
+        return None;
+    }
+    // Vec<EchConfigPayload> 的 TLS 列表编码 = u16 总长 + 各配置（版本+长度+内容）
+    let wire = list.get_encoding();
+    Some(Arc::new(wire))
 }
 
 /// 全局共享根证书库：避免每次 TLS 握手重复解析 140+ 根证书
@@ -139,16 +215,127 @@ fn build_connector(skip_cert_verify: bool, alpn: &[String]) -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
+/// ECH 专用连接器：with_ech 强制 TLS1.3，密码学套件用自实现的 X25519+HKDF-SHA256+AES-GCM。
+/// 以 (skip, alpn, ECH 配置字节) 为键缓存（ECH 配置同一域名长期不变）。
+fn get_ech_connector(
+    skip_cert_verify: bool,
+    alpn: &[String],
+    ech_list: &[u8],
+) -> Result<TlsConnector> {
+    type EchCache =
+        std::sync::Mutex<std::collections::HashMap<(bool, Vec<String>, u64), Option<TlsConnector>>>;
+    static CACHE: std::sync::OnceLock<EchCache> = std::sync::OnceLock::new();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in ech_list {
+        hash = (hash ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    let key = (skip_cert_verify, alpn.to_vec(), hash);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&key) {
+        return match hit {
+            Some(c) => Ok(c.clone()),
+            None => Err(Error::Config("ECH 配置解析失败（缓存）".into())),
+        };
+    }
+    let built = build_ech_connector(skip_cert_verify, alpn, ech_list);
+    let cached = match &built {
+        Ok(c) => Some(c.clone()),
+        Err(_) => None,
+    };
+    cache.lock().unwrap().insert(key, cached);
+    built
+}
+
+fn build_ech_connector(
+    skip_cert_verify: bool,
+    alpn: &[String],
+    ech_list: &[u8],
+) -> Result<TlsConnector> {
+    let ech = rustls::client::EchConfig::new(ech_list.into(), super::hpke::ECH_HPKE_SUITES)
+        .map_err(|e| Error::Config(format!("ECH 配置解析失败: {e}")))?;
+    // builder_with_provider 才能到达 WantsVersions 阶段（with_ech 所在）。
+    // 进程默认 provider 可能尚未安装（普通 TLS 的 builder() 会懒安装），这里显式兜底 ring。
+    let provider = match rustls::crypto::CryptoProvider::get_default().cloned() {
+        Some(p) => p,
+        None => Arc::new(rustls::crypto::ring::default_provider()),
+    };
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_ech(rustls::client::EchMode::Enable(ech))
+        .map_err(|e| Error::Config(format!("ECH 客户端配置失败: {e}")))?
+        .with_root_certificates(global_root_store().clone())
+        .with_no_client_auth();
+    if skip_cert_verify {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(NoVerify));
+    }
+    if !alpn.is_empty() {
+        config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    }
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
 /// 客户端流包装为 TLS
 pub async fn tls_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
     host: &str,
     cfg: &TlsClientConfig,
 ) -> Result<ClientTlsStream<S>> {
-    let connector = get_tls_connector(cfg.skip_cert_verify, &cfg.alpn);
+    // 订阅源可能写入非法 SNI（如 "t.me/FuckTheWall" 这类频道链接）。rustls 的 ServerName
+    // 强校验 DNS 名，直接报错会让节点整体不可用；此时回退到服务器域名（Mihomo 等内核
+    // 不校验 SNI 格式，因此同一节点在 Mihomo 下可用）。
     let sni = cfg.server_name.clone().unwrap_or_else(|| host.to_string());
-    let name =
-        ServerName::try_from(sni.clone()).map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))?;
+    let name = ServerName::try_from(sni.clone()).or_else(|_| {
+        tracing::warn!("配置的 SNI {sni:?} 不是合法域名，已回退为服务器域名 {host:?}");
+        ServerName::try_from(host.to_string())
+            .map_err(|_| Error::Addr(format!("非法 SNI: {sni:?}")))
+    })?;
+
+    // ECH：ECHConfigList 由 wrap_transport 预解析（ech-opts.config 或 DNS HTTPS 记录）。
+    // 服务端上次拒绝时下发的 retry config 最新鲜，优先于 DNS 获取的配置；
+    // 曾被该主机拒绝过（且无 retry config）则直接跳过，避免每次连接都失败重试一轮。
+    let ech_list = match &cfg.ech_config {
+        Some(l) if !ech_rejected(host) => Some(l.clone()),
+        _ => None,
+    };
+    let ech_list = take_ech_retry_config(host).or(ech_list);
+    if let Some(list) = ech_list {
+        tracing::debug!(
+            "tls_connect ECH: host={host} sni={:?} alpn={:?} list_len={} list_head={:02x?}",
+            cfg.server_name,
+            cfg.alpn,
+            list.len(),
+            &list[..list.len().min(12)]
+        );
+        match get_ech_connector(cfg.skip_cert_verify, &cfg.alpn, &list) {
+            Ok(ech_conn) => match ech_conn.connect(name, stream).await {
+                Ok(s) => {
+                    tracing::debug!("ECH 握手成功: {host}");
+                    // 保留生效配置并解除回退标记：后续连接优先用它直连
+                    note_ech_retry_config(host, list);
+                    ech_undelete(host);
+                    return Ok(s);
+                }
+                Err(e) => {
+                    // 服务端拒绝/不支持 ECH：缓存其下发的 retry config（若有），
+                    // 标记主机，由 transport::dial 重拨（有 retry config 则再试 ECH，
+                    // 否则回退普通 TLS）
+                    if let Some(retry) = ech_retry_list_from(&e) {
+                        tracing::info!("ECH 被拒，已缓存服务端 retry config 重试: {host}");
+                        note_ech_retry_config(host, retry);
+                    }
+                    tracing::warn!("ECH 握手失败（{e}），回退普通 TLS: {host}");
+                    note_ech_rejected(host);
+                    return Err(Error::Io(std::io::Error::other("ECH_REJECTED_FALLBACK")));
+                }
+            },
+            Err(e) => {
+                tracing::warn!("{e}，回退普通 TLS: {host}");
+            }
+        }
+    }
+
+    let connector = get_tls_connector(cfg.skip_cert_verify, &cfg.alpn);
     let stream = connector
         .connect(name, stream)
         .await
@@ -184,6 +371,7 @@ pub async fn connect_tls<
         skip_cert_verify,
         server_name: server_name.map(|s| s.to_string()),
         alpn: Vec::new(),
+        ech_config: None,
     };
     let s = tls_connect(stream, host, &cfg).await?;
     Ok(Box::new(s))

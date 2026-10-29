@@ -1,3 +1,28 @@
+# 🚀 VP_Core v1.0.4 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.0.4**！本版重点攻坚并解决了 ShadowsocksR (SSR) 时序倒置缺陷，全面对齐 RFC 9180 HPKE 并实现 Encrypted Client Hello (ECH) 原生握手与重试机制，大幅提升边缘节点连通率：
+
+### 🔒 ECH (Encrypted Client Hello) 全链路原生打通
+- **RFC 9180 HPKE 规范级对齐**：
+  - 彻底矫正 HPKE 密钥交换自实现中的标签（`eae_prk`）与 `LabeledExtract` 逻辑，完全命中 RFC 9180 A.1.1 官方测试向量；
+  - 解决 Cloudflare 边缘服务器拒绝解密（`ServerRejectedEncryptedClientHello`）的问题；
+  - 实现 TLS 握手层服务器 ECH Retry Config 实时缓存与自动重试。
+- **VLESS 懒握手与订阅参数扩展**：
+  - 解决 Cloudflare Worker 等环境下的 VLESS 握手死锁，实现请求头与首包载荷合并发送；
+  - 支持 `ech=<query_server_name>+<doh_url>` 格式的 ECH 订阅参数解析，并通过指定 DoH 解析器提取 HTTPS 记录中的 ECHConfigList。
+
+### ⚡ ShadowsocksR (SSR) 收发路径时序重构
+- **矫正混淆层与流加密处理顺序**：
+  - 修复 `tls1.2_ticket_auth` 混淆层首包 ClientHello 误被底层流密码（`chacha20-ietf` / `rc4-md5`）加密为乱码的问题；
+  - 发送路径重排为：协议分帧 → SS 流加密 → TLS 记录封装（ClientHello 保持明文，`[IV]+密文` 正确封装入 0x17 记录）；
+  - 接收路径重排为：TLS 解帧 → 写入 SS 流缓冲区 → 提取 IV → 流解密，实测支持 `chacha20-ietf` 与 `rc4-md5` 生产节点高可用连接。
+
+### 🌐 协议与规则扩展
+- 增加 Hysteria 1 与 ASN 规则匹配能力；
+- 优化 SS Stream 密码算法套件及 UDP 转发。
+
+---
+
 # 🚀 VP_Core v1.0.3 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.0.3**！本版深度重构与完善了 **Hysteria 2** 协议栈，彻底解决官方服务端连接异常，引入连接池多路复用大幅降低延迟，并提升了 VLESS + REALITY 与多出站协议的兼容性：

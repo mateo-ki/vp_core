@@ -28,6 +28,10 @@ bytes.workspace = true
 socket2.workspace = true
 tracing.workspace = true
 serde.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+aes-gcm.workspace = true
 
 [features]
 default = ["tls"]

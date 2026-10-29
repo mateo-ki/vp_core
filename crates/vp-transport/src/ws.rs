@@ -67,6 +67,7 @@ where
     if !status_line.contains("101") {
         return Err(Error::ProtoMsg(format!("ws: 握手失败 {status_line}")));
     }
+    tracing::debug!("ws: 客户端握手完成（101）");
     Ok(WsStream::new(io, true))
 }
 

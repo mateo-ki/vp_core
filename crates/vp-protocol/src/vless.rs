@@ -1,9 +1,12 @@
 //! VLESS 出入站（version 0，port-then-address，atyp 1/2/3）。
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use bytes::{Buf, BytesMut};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use vp_common::{DstAddr, Error, Host, Result};
 use vp_config::VlessCfg;
@@ -143,7 +146,7 @@ impl VlessOutbound {
 
     fn internal_new(name: Option<&str>, cfg: &VlessCfg) -> Result<Self> {
         let uuid = parse_uuid(&cfg.uuid)?;
-        let t = crate::transport_of_full(
+        let mut t = crate::transport_of_full(
             cfg.tls,
             &cfg.server_name,
             cfg.skip_cert_verify,
@@ -153,7 +156,9 @@ impl VlessOutbound {
             &cfg.client_fingerprint,
             &cfg.reality_opts,
             &cfg.http_opts,
+            &cfg.ech_opts,
         )?;
+        t.alpn = cfg.alpn.clone().unwrap_or_default();
         Ok(VlessOutbound {
             name: name.unwrap_or("vless").into(),
             server: cfg.server.clone(),
@@ -180,24 +185,166 @@ impl VlessOutbound {
         full.push(VERSION);
         full.extend_from_slice(&self.uuid);
         full.extend_from_slice(&req);
-        io.write_all(&full).await?;
-        // 响应头：[ver][addon_len]
-        let mut resp = [0u8; 2];
-        io.read_exact(&mut resp).await?;
-        if resp[0] != VERSION {
-            return Err(Error::Proto("vless 响应版本不匹配"));
-        }
-        let addon_len = resp[1] as usize;
-        if addon_len > 0 {
-            let mut skip = vec![0u8; addon_len];
-            io.read_exact(&mut skip).await?;
-        }
+        tracing::debug!(
+            "vless 请求 {} 字节: {}",
+            full.len(),
+            full.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
 
         if is_vision {
+            io.write_all(&full).await?;
+            // 响应头：[ver][addon_len]
+            let mut resp = [0u8; 2];
+            io.read_exact(&mut resp).await?;
+            if resp[0] != VERSION {
+                return Err(Error::Proto("vless 响应版本不匹配"));
+            }
+            let addon_len = resp[1] as usize;
+            if addon_len > 0 {
+                let mut skip = vec![0u8; addon_len];
+                io.read_exact(&mut skip).await?;
+            }
             Ok(Box::new(VisionStream::new(io)))
         } else {
-            Ok(Box::new(io))
+            // 懒握手：vless 请求不单独成帧、也不阻塞等响应头，而是与消费方的
+            // 首个载荷合并同一帧写出。Cloudflare Worker 型服务端只在首条消息里
+            // 同时拿到 vless 头+初始载荷才建立上游；空的 vless 首帧会让其对端
+            // 静默等待（mihomo 的中继同样把早数据并入首帧）。响应侧的
+            // [ver][addon_len][addon] 头由 VlessStream 读取时透明剥离。
+            Ok(Box::new(VlessStream {
+                inner: io,
+                request: Some(full),
+                strip: RespStrip::default(),
+                decoded: BytesMut::new(),
+            }))
         }
+    }
+}
+
+/// vless 响应头剥离状态：先吃 [ver][addon_len]，再吃 addon_len 字节 addon
+#[derive(Default)]
+struct RespStrip {
+    /// 0 = 读 ver/addon_len 两字节；1 = 吃 addon；2 = 完成
+    phase: u8,
+    /// phase 0 中已读的头字节数（0=ver 待读，1=addon_len 待读）
+    header_idx: usize,
+    addon_left: usize,
+}
+
+impl RespStrip {
+    /// 从 data 头部剥离响应头，返回剩余透传字节
+    fn strip<'a>(&mut self, mut data: &'a [u8]) -> &'a [u8] {
+        while self.phase < 2 && !data.is_empty() {
+            match self.phase {
+                0 => {
+                    let b = data[0];
+                    data = &data[1..];
+                    if self.header_idx == 0 {
+                        // ver 字节（校验留给首连接——CF Worker 等兼容实现也回 0）
+                        self.header_idx = 1;
+                    } else {
+                        self.addon_left = b as usize;
+                        self.phase = if self.addon_left > 0 { 1 } else { 2 };
+                        self.header_idx = 0;
+                    }
+                }
+                1 => {
+                    let take = data.len().min(self.addon_left);
+                    data = &data[take..];
+                    self.addon_left -= take;
+                    if self.addon_left == 0 {
+                        self.phase = 2;
+                    }
+                }
+                _ => break,
+            }
+        }
+        data
+    }
+}
+
+/// 非 vision 的 vless 数据流（懒握手 + 响应头剥离）
+pub struct VlessStream<S> {
+    inner: S,
+    /// 待发送的 vless 请求（与首个载荷合并同帧）
+    request: Option<Vec<u8>>,
+    strip: RespStrip,
+    /// 剥离后待交付的明文余量
+    decoded: BytesMut,
+}
+
+impl<S> VlessStream<S> {
+    /// 若请求仍未发出（消费方先读后写），以独立帧发出（标准 vless 语义；
+    /// 写前读的协议极少见，正常代理流量总是先发载荷）
+    fn ensure_request_sent(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        if let Some(req) = self.request.take() {
+            let mut inner = Pin::new(&mut self.inner);
+            std::task::ready!(inner.as_mut().poll_write(cx, &req))?;
+            std::task::ready!(inner.as_mut().poll_flush(cx))?;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.request.is_some() {
+            std::task::ready!(this.ensure_request_sent(cx))?;
+        }
+        if this.strip.phase < 2 {
+            // 头未剥离完：经内部缓冲
+            while this.decoded.is_empty() {
+                let mut tmp = [0u8; 16 * 1024];
+                let mut rb = ReadBuf::new(&mut tmp);
+                std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                let filled = rb.filled();
+                if filled.is_empty() {
+                    return Poll::Ready(Ok(())); // EOF
+                }
+                let rest = this.strip.strip(filled);
+                this.decoded.extend_from_slice(rest);
+            }
+            let n = this.decoded.len().min(buf.remaining());
+            buf.put_slice(&this.decoded[..n]);
+            this.decoded.advance(n);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VlessStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let Some(mut req) = this.request.take() {
+            // 首写：vless 请求 + 载荷同帧
+            req.extend_from_slice(buf);
+            Pin::new(&mut this.inner)
+                .poll_write(cx, &req)
+                .map(|p| p.map(|_| buf.len()))
+        } else {
+            Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -405,11 +552,13 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             reality_opts: None,
+            ech_opts: None,
             udp: false,
         })
         .unwrap();
@@ -460,11 +609,13 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             reality_opts: None,
+            ech_opts: None,
             udp: false,
         })
         .unwrap();

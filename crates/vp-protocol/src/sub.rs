@@ -86,6 +86,18 @@ impl SubNode {
                 }
             }
         }
+        // ech-opts 块（若存在）：分享链接 `ech=<查询名>+<DoH URL>` 或节点自带 config
+        if let Some((_, qname)) = self.fields.iter().find(|(k, _)| k == "__ech_qname") {
+            out.push_str(&format!(
+                "\n    ech-opts:\n      enable: true\n      query-server-name: {qname}"
+            ));
+            if let Some((_, doh)) = self.fields.iter().find(|(k, _)| k == "__ech_doh") {
+                out.push_str(&format!("\n      doh: {doh}"));
+            }
+        }
+        if let Some((_, cfg)) = self.fields.iter().find(|(k, _)| k == "__ech_cfg") {
+            out.push_str(&format!("\n    ech-opts:\n      enable: true\n      config: {cfg}"));
+        }
         out.push('\n');
         out
     }
@@ -118,6 +130,8 @@ pub fn parse_uri(line: &str) -> Result<SubNode> {
         parse_snell(rest)
     } else if let Some(rest) = line.strip_prefix("ssr://") {
         parse_ssr(rest)
+    } else if let Some(rest) = line.strip_prefix("hysteria://") {
+        parse_hysteria1(rest)
     } else if let Some(rest) = line.strip_prefix("naive+https://") {
         parse_naive(rest, true)
     } else if let Some(rest) = line.strip_prefix("naive+http://") {
@@ -210,6 +224,7 @@ fn parse_vless(rest: &str) -> Result<SubNode> {
             .unwrap_or_else(|| "chrome".into());
         f.push(("client-fingerprint".into(), fp));
     }
+    push_ech_fields(&mut f, &p);
     f.push(("network".into(), network.clone()));
     if network == "ws" {
         f.push(("ws-opts".into(), "{...}".into())); // 占位，由下方特化输出
@@ -233,6 +248,37 @@ fn finish_ws(mut f: Vec<(String, String)>, p: &HashMap<String, String>) -> Resul
     f.push(("__ws_path".into(), q(&path)));
     f.push(("__ws_host".into(), q(&host)));
     Ok(SubNode { fields: f })
+}
+
+/// 分享链接 `ech=` 参数（Encrypted Client Hello）：
+/// - `<HTTPS(type65) 查询名>+<DoH URL>`（Cloudflare 优选订阅常见形式，如
+///   `cloudflare-ech.com+https://dns.alidns.com/dns-query`）；
+/// - 可 base64 解码的裸 ECHConfigList；
+/// - 仅查询名。
+fn push_ech_fields(f: &mut Vec<(String, String)>, p: &HashMap<String, String>) {
+    let Some(ech) = p
+        .get("ech")
+        .or_else(|| p.get("echConfig"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    if let Some((a, b)) = ech.split_once('+') {
+        if b.contains("://") {
+            if !a.trim().is_empty() {
+                f.push(("__ech_qname".into(), q(a.trim())));
+            }
+            f.push(("__ech_doh".into(), q(b.trim())));
+            return;
+        }
+    }
+    if decode_base64_flexible(ech).is_some_and(|b| !b.is_empty() && b.starts_with(&[0xfe, 0x0d])) {
+        // ECHConfigList 线格式以 0xfe0d 版本号开头，命中才当 config，避免误吞普通域名
+        f.push(("__ech_cfg".into(), q(ech)));
+    } else {
+        f.push(("__ech_qname".into(), q(ech)));
+    }
 }
 
 fn parse_vmess(rest: &str) -> Result<SubNode> {
@@ -326,6 +372,7 @@ fn parse_trojan(rest: &str) -> Result<SubNode> {
             .unwrap_or_else(|| "chrome".into());
         f.push(("client-fingerprint".into(), fp));
     }
+    push_ech_fields(&mut f, &p);
     f.push(("network".into(), network.clone()));
     if network == "ws" {
         f.push((
@@ -478,6 +525,87 @@ fn parse_mieru(rest: &str) -> Result<SubNode> {
     })
 }
 
+fn parse_hysteria1(rest: &str) -> Result<SubNode> {
+    // hysteria://host:port?auth=xxx&auth64=<base64>&peer=sni&insecure=1
+    //   &upmbps=50&downmbps=200&obfs=xplus&obfsParam=<base64 密码>#name
+    let (host, port, p, name) = match rest.split_once('#') {
+        Some((b, n)) => {
+            let (h, pt, pp) = split_hostport_q(b)?;
+            (h, pt, pp, urldecode(n))
+        }
+        None => {
+            let (h, pt, pp) = split_hostport_q(rest)?;
+            (h, pt, pp, String::new())
+        }
+    };
+    let mut f = vec![
+        ("name".into(), q(&name)),
+        ("type".into(), "hysteria".into()),
+        ("server".into(), host),
+        ("port".into(), port),
+    ];
+    if let Some(a) = p.get("auth") {
+        f.push(("auth".into(), q(a)));
+    }
+    if let Some(a) = p.get("auth64") {
+        let decoded = decode_base64_flexible(a).unwrap_or_default();
+        f.push(("auth".into(), q(&String::from_utf8_lossy(&decoded))));
+        f.push(("auth-str".into(), "str".into()));
+    }
+    if let Some(v) = p.get("upmbps").or_else(|| p.get("up")) {
+        f.push(("up".into(), v.clone()));
+    }
+    if let Some(v) = p.get("downmbps").or_else(|| p.get("down")) {
+        f.push(("down".into(), v.clone()));
+    }
+    if let Some(v) = p.get("peer") {
+        f.push(("sni".into(), q(v)));
+    }
+    if p.get("insecure")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        f.push(("skip-cert-verify".into(), "true".into()));
+    }
+    // obfsParam = base64 编码的混淆密码；obfs=xplus 仅为类型标记
+    if let Some(op) = p.get("obfsParam") {
+        if !op.is_empty() {
+            let pw = decode_base64_flexible(op)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_else(|| op.clone());
+            f.push(("obfs-password".into(), q(&pw)));
+        }
+    }
+    if let Some(alpn) = p.get("alpn") {
+        if !alpn.is_empty() && !alpn.eq_ignore_ascii_case("hysteria") {
+            f.push(("alpn".into(), q(alpn)));
+        }
+    }
+    Ok(SubNode { fields: f })
+}
+
+/// "host:port?query" -> (host, port, params)
+fn split_hostport_q(
+    s: &str,
+) -> Result<(String, String, std::collections::HashMap<String, String>)> {
+    let (main, qs) = match s.split_once('?') {
+        Some((m, q)) => (m, q),
+        None => (s, ""),
+    };
+    let params: std::collections::HashMap<String, String> = qs
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .filter_map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_string(), urldecode(v)))
+        })
+        .collect();
+    let (host, port) = main
+        .rsplit_once(':')
+        .ok_or(Error::Config("hysteria: 缺少端口".into()))?;
+    Ok((host.to_string(), port.to_string(), params))
+}
+
 fn parse_snell(rest: &str) -> Result<SubNode> {
     // snell://psk@host:port?version=4&obfs=http&host=bing.com&udp=1#name
     let (psk, host, port, p, name) = split_main(rest)?;
@@ -509,7 +637,7 @@ fn parse_snell(rest: &str) -> Result<SubNode> {
     Ok(SubNode { fields: f })
 }
 
-fn decode_base64_flexible(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_base64_flexible(s: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     let clean = s.trim().replace('-', "+").replace('_', "/");
     let pad = match clean.len() % 4 {
@@ -917,6 +1045,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hysteria1_uri() {
+        let n = parse_uri(
+            "hysteria://1.2.3.4:36712?auth=s3cret&peer=h.example.com&insecure=1&upmbps=50&downmbps=200&obfs=xplus&obfsParam=b2Jmc3Bhc3M=#HK-01",
+        )
+        .unwrap();
+        assert_eq!(n.name(), "HK-01");
+        let y = n.to_yaml();
+        assert!(y.contains("type: hysteria"), "{y}");
+        assert!(y.contains("auth: \"s3cret\""), "{y}");
+        assert!(y.contains("up: 50"), "{y}");
+        assert!(y.contains("down: 200"), "{y}");
+        assert!(y.contains("sni: \"h.example.com\""), "{y}");
+        assert!(y.contains("skip-cert-verify: true"), "{y}");
+        assert!(y.contains("obfs-password: \"obfspass\""), "{y}");
+        // 反序列化为 ProxyCfg 验证字段映射（to_yaml 自带列表标记，需补 proxies: 头）
+        let full = format!(
+            "proxies:
+{y}"
+        );
+        let doc: serde_yaml::Value = serde_yaml::from_str(&full).unwrap();
+        let cfg: vp_config::ProxyCfg = serde_yaml::from_value(
+            doc.get("proxies").and_then(|v| v.as_sequence()).unwrap()[0].clone(),
+        )
+        .unwrap();
+        match cfg.kind {
+            vp_config::ProxyKind::Hysteria(h) => {
+                assert_eq!(h.server, "1.2.3.4");
+                assert_eq!(h.port, 36712);
+                assert_eq!(h.auth.as_deref(), Some("s3cret"));
+                assert_eq!(h.up, Some(50));
+                assert_eq!(h.down, Some(200));
+                assert_eq!(h.obfs_password.as_deref(), Some("obfspass"));
+            }
+            other => panic!("应为 hysteria 节点: {other:?}"),
+        }
+    }
+
+    #[test]
     fn anytls_uri() {
         let n = parse_uri("anytls://pw123@a.com:8388?sni=a.com&insecure=1&udp=1&fp=chrome#at1")
             .unwrap();
@@ -1003,6 +1169,29 @@ mod tests {
 
         let nodes = parse_subscription(uri);
         assert_eq!(nodes.len(), 1);
+    }
+
+    #[test]
+    fn vless_uri_ech_name_plus_doh() {
+        // Cloudflare 优选 + ECH 的典型订阅行：ech=查询名+DoH URL
+        let uri = "vless://dffc2650-0fc4-450e-8c0e-19de6d5345b1@www.visa.cn:443?security=tls&type=ws&ech=cloudflare-ech.com%2Bhttps%3A%2F%2Fdns.alidns.com%2Fdns-query&host=loukas.ccwu.cc&fp=chrome&sni=loukas.ccwu.cc&path=%2F&encryption=none&alpn=#visa";
+        let n = parse_uri(uri).unwrap();
+        let y = n.to_yaml();
+        assert!(y.contains("type: vless"), "{y}");
+        assert!(y.contains("servername: loukas.ccwu.cc"), "{y}");
+        assert!(y.contains("ech-opts:"), "{y}");
+        assert!(y.contains("enable: true"), "{y}");
+        assert!(y.contains("query-server-name: \"cloudflare-ech.com\""), "{y}");
+        assert!(y.contains("doh: \"https://dns.alidns.com/dns-query\""), "{y}");
+        assert!(y.contains("Host: \"loukas.ccwu.cc\""), "{y}");
+    }
+
+    #[test]
+    fn vless_uri_ech_bare_query_name() {
+        let uri = "vless://11111111-2222-4333-8444-555555555555@cf.example.com:443?security=tls&type=tcp&ech=cloudflare-ech.com&sni=cf.example.com#t";
+        let y = parse_uri(uri).unwrap().to_yaml();
+        assert!(y.contains("query-server-name: \"cloudflare-ech.com\""), "{y}");
+        assert!(!y.contains("doh:"), "{y}");
     }
 
     #[test]

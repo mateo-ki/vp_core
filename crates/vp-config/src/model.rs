@@ -49,6 +49,32 @@ where
     de_u64_lenient(deserializer).map(|v| v as u16)
 }
 
+/// ALPN 宽容反序列化：接受字符串（逗号分隔或单值）或字符串列表
+fn de_alpn_list_lenient<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let val = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    let Some(val) = val else {
+        return Ok(Vec::new());
+    };
+    match val {
+        serde_yaml::Value::Sequence(items) => Ok(items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
+            .filter(|s| !s.is_empty())
+            .collect()),
+        serde_yaml::Value::String(s) => Ok(s
+            .split(',')
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .collect()),
+        serde_yaml::Value::Null => Ok(Vec::new()),
+        other => Err(D::Error::custom(format!("alpn 非法: {other:?}"))),
+    }
+}
+
 fn de_opt_bandwidth_mbps<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
 where
     D: Deserializer<'de>,
@@ -177,6 +203,9 @@ pub struct Config {
     pub geosite_url: Option<String>,
     #[serde(alias = "geoip-url", alias = "geoip_url", default)]
     pub geoip_url: Option<String>,
+    /// ASN 数据库（GeoLite2-ASN.mmdb）下载地址，用于 IP-ASN / SRC-IP-ASN 规则
+    #[serde(alias = "asn-url", alias = "asn_url", default)]
+    pub asn_url: Option<String>,
     #[serde(default)]
     pub tun: Option<TunCfg>,
     /// 协议服务端入站（自建服务器场景）
@@ -328,6 +357,9 @@ pub struct DnsConfig {
     pub fallback: Vec<String>,
     #[serde(alias = "fake-ip-range", alias = "fake_ip_range", default)]
     pub fake_ip_range: Option<String>,
+    /// fake-ip 过滤名单：命中域名返回真实 IP 而非假 IP（`+.x` / `*.x` / 裸域名）
+    #[serde(alias = "fake-ip-filter", alias = "fake_ip_filter", default)]
+    pub fake_ip_filter: Vec<String>,
     #[serde(alias = "nameserver-policy", alias = "nameserver_policy", default)]
     pub nameserver_policy: HashMap<String, serde_yaml::Value>,
     #[serde(alias = "fallback-filter", alias = "fallback_filter", default)]
@@ -401,6 +433,7 @@ pub enum ProxyKind {
     Naive(NaiveCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
+    Hysteria(Hysteria1Cfg),
     Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
     Https(HttpCfg),
@@ -425,6 +458,7 @@ impl ProxyKind {
             ProxyKind::Mieru(_) => "mieru",
             ProxyKind::Naive(_) => "naive",
             ProxyKind::Socks5(_) => "socks5",
+            ProxyKind::Hysteria(_) => "hysteria",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
             ProxyKind::Http(_) => "http",
@@ -451,6 +485,7 @@ impl ProxyKind {
             ProxyKind::Naive(n) => Some((n.server.clone(), n.port)),
             ProxyKind::Socks5(s) => Some((s.server.clone(), s.port)),
             ProxyKind::Tuic(t) => Some((t.server.clone(), t.port)),
+            ProxyKind::Hysteria(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Hysteria2(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Http(h) | ProxyKind::Https(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Wireguard(w) => Some((w.server.clone(), w.port)),
@@ -474,6 +509,7 @@ impl ProxyKind {
             ProxyKind::Naive(_) => true,
             ProxyKind::Socks5(s) => s.udp,
             ProxyKind::Tuic(_) => true,
+            ProxyKind::Hysteria(_) => true,
             ProxyKind::Hysteria2(_) => true,
             ProxyKind::Http(_) | ProxyKind::Https(_) => false,
             ProxyKind::Wireguard(_) => true,
@@ -490,6 +526,22 @@ impl ProxyKind {
 pub struct GrpcOpts {
     #[serde(alias = "grpc-service-name", alias = "grpc_service_name", default)]
     pub grpc_service_name: Option<String>,
+}
+
+/// ECH（Encrypted Client Hello）选项（Clash `ech-opts`）。
+/// config 为 base64 的 ECHConfigList；未提供时通过 DNS HTTPS(type65) 记录自动获取。
+/// doh 为查询 ECH 记录专用的 DoH 服务器 URL（如 https://dns.alidns.com/dns-query）——
+/// 系统解析器常拿不到 HTTPS 记录或被污染，分享链接 `ech=name+doh` 形式会携带。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EchOpts {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default)]
+    pub config: Option<String>,
+    #[serde(alias = "query-server-name", alias = "query_server_name", default)]
+    pub query_server_name: Option<String>,
+    #[serde(alias = "doh-url", alias = "doh_url", default)]
+    pub doh: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -584,6 +636,11 @@ pub struct VmessCfg {
     pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
+    /// TLS ALPN 列表（Clash 语义：["h2","http/1.1"]）
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
+    #[serde(alias = "ech-opts", alias = "ech_opts", default)]
+    pub ech_opts: Option<EchOpts>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
@@ -629,12 +686,17 @@ pub struct VlessCfg {
     pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
+    /// TLS ALPN 列表（Clash 语义：["h2","http/1.1"]）
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(alias = "reality-opts", alias = "reality_opts", default)]
     pub reality_opts: Option<RealityOpts>,
+    #[serde(alias = "ech-opts", alias = "ech_opts", default)]
+    pub ech_opts: Option<EchOpts>,
     #[serde(alias = "http-opts", alias = "http_opts", default)]
     pub http_opts: Option<HttpOpts>,
     #[serde(default)]
@@ -681,12 +743,17 @@ pub struct TrojanCfg {
     pub client_fingerprint: Option<String>,
     #[serde(default)]
     pub network: Option<String>,
+    /// TLS ALPN 列表（Clash 语义：["h2","http/1.1"]）
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
     #[serde(alias = "grpc-opts", alias = "grpc_opts", default)]
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(alias = "reality-opts", alias = "reality_opts", default)]
     pub reality_opts: Option<RealityOpts>,
+    #[serde(alias = "ech-opts", alias = "ech_opts", default)]
+    pub ech_opts: Option<EchOpts>,
     #[serde(alias = "http-opts", alias = "http_opts", default)]
     pub http_opts: Option<HttpOpts>,
     #[serde(default)]
@@ -892,6 +959,55 @@ pub struct Hysteria2Cfg {
     pub obfs: Option<String>,
     #[serde(alias = "obfs-password", alias = "obfs_password", default)]
     pub obfs_password: Option<String>,
+}
+
+/// Hysteria v1 出站配置（Clash/mihomo 语法）。
+/// 协议：QUIC（ALPN hysteria）+ struc 大端二进制帧 + XPlus 混淆。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Hysteria1Cfg {
+    pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
+    pub port: u16,
+    #[serde(alias = "auth-str", alias = "auth_str", default)]
+    pub auth_str: Option<String>,
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(
+        alias = "up-mbps",
+        alias = "up_mbps",
+        default,
+        deserialize_with = "de_opt_bandwidth_mbps"
+    )]
+    pub up: Option<u32>,
+    #[serde(
+        alias = "down-mbps",
+        alias = "down_mbps",
+        default,
+        deserialize_with = "de_opt_bandwidth_mbps"
+    )]
+    pub down: Option<u32>,
+    /// 传输层伪装：仅支持 udp（默认）；wechat-video / faketcp 不支持
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// 混淆：salamander（v1 的 XPlus 实现）
+    #[serde(default)]
+    pub obfs: Option<String>,
+    #[serde(alias = "obfs-password", alias = "obfs_password", default)]
+    pub obfs_password: Option<String>,
+    #[serde(alias = "sni", alias = "servername", alias = "server_name", default)]
+    pub sni: Option<String>,
+    /// ALPN：兼容字符串与列表两种写法（mihomo 为列表）；空则默认 ["hysteria"]
+    #[serde(alias = "alpn", default, deserialize_with = "de_alpn_list_lenient")]
+    pub alpn: Vec<String>,
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default
+    )]
+    pub skip_cert_verify: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

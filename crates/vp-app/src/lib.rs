@@ -258,6 +258,7 @@ impl App {
         let geosite = load_geosite(&base_dir, cfg.geosite_url.as_deref()).await;
         let t_geosite = t_start.elapsed();
         let geoip = load_geoip(&base_dir, cfg.geoip_url.as_deref()).await;
+        let asn = load_asn(&base_dir, cfg.asn_url.as_deref()).await;
         let t_geoip = t_start.elapsed();
 
         let dns = Arc::new(if cfg.dns.enable {
@@ -280,6 +281,8 @@ impl App {
         // 节点自身的域名拨号走全局解析器（多上游并集 + 缓存 + 竞速拨号，
         // 对抗节点域名被污染/多 A 记录中混有失效地址导致的"时通时不通"）
         vp_transport::set_global_node_resolver(dns.clone(), cfg.ipv6);
+        // ECH（ech-opts）的 HTTPS(type65) 记录查询也走全局解析器
+        vp_transport::tls::set_global_resolver(dns.clone());
         let deps = OutboundDeps {
             dns: dns.clone(),
             ipv6: cfg.ipv6,
@@ -322,6 +325,7 @@ impl App {
                 is_known_target: &is_known,
                 geosite: &geosite,
                 geoip: &geoip,
+                asn: &asn,
                 providers: &providers,
                 sub_rules: &cfg.sub_rules,
             };
@@ -411,6 +415,7 @@ impl App {
                         let known = known.clone();
                         let geosite = geosite.clone();
                         let geoip = geoip.clone();
+                        let asn = asn.clone();
 
                         tokio::spawn(async move {
                             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
@@ -461,6 +466,7 @@ impl App {
                                             is_known_target: &is_known,
                                             geosite: &geosite,
                                             geoip: &geoip,
+                                            asn: &asn,
                                             providers: &providers_guard,
                                             sub_rules: &sub_rules,
                                         };
@@ -575,7 +581,7 @@ impl App {
                         dns_listen,
                         dns.clone(),
                         Some(Arc::new(pool.clone())),
-                        vec![],
+                        cfg.dns.fake_ip_filter.clone(),
                         cfg.ipv6,
                     );
                     match dns_srv.spawn().await {
@@ -1129,6 +1135,37 @@ async fn load_geoip(base_dir: &Path, url: Option<&str>) -> Option<vp_rule::geoip
     None
 }
 
+/// 加载 ASN 数据库（GeoLite2-ASN.mmdb，用于 IP-ASN / SRC-IP-ASN 规则）
+async fn load_asn(base_dir: &Path, url: Option<&str>) -> Option<vp_rule::asn::AsnDb> {
+    let dirs = candidate_dirs(base_dir);
+    for d in &dirs {
+        for name in ["ASN.mmdb", "GeoLite2-ASN.mmdb", "asn.mmdb"] {
+            let p = d.join(name);
+            if p.exists() {
+                if let Ok(db) = vp_rule::asn::AsnDb::load(&p) {
+                    info!("asn 已加载: {}", p.display());
+                    return Some(db);
+                }
+            }
+        }
+    }
+    if let Some(u) = url {
+        let u = u.to_string();
+        let target = base_dir.join("ASN.mmdb");
+        info!("正在从远程拉取 asn: {u}");
+        let res = tokio::task::spawn_blocking(move || fetch_remote_binary(&u, "vpcore/asn")).await;
+        if let Ok(Ok(bytes)) = res {
+            let _ = std::fs::write(&target, &bytes);
+            if let Ok(db) = vp_rule::asn::AsnDb::load(&target) {
+                info!("asn 远程拉取成功并已写入: {}", target.display());
+                return Some(db);
+            }
+        }
+    }
+    info!("未找到 ASN 数据库文件 (ASN.mmdb / GeoLite2-ASN.mmdb)，IP-ASN 规则将优雅跳过");
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,11 +1269,13 @@ rules:
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             reality_opts: None,
+            ech_opts: None,
             udp: false,
         })
         .unwrap();
@@ -1332,11 +1371,13 @@ rules:
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             udp: false,
+            ech_opts: None,
         })
         .unwrap();
         let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -1399,11 +1440,13 @@ rules: ['MATCH,DIRECT']
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             network: None,
             ws_opts: None,
             grpc_opts: None,
             http_opts: None,
             reality_opts: None,
+            ech_opts: None,
             udp: false,
         })
         .unwrap();

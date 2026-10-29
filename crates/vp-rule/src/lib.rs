@@ -2,6 +2,8 @@
 //!
 //! 规则行解析（括号感知分割）→ 编译期构造匹配器 → 热路径零分配匹配。
 
+#[cfg(feature = "geoip")]
+pub mod asn;
 pub mod domain;
 #[cfg(feature = "geoip")]
 pub mod geoip;
@@ -72,6 +74,11 @@ pub enum Matcher {
     GeoSite(Arc<geosite::CompiledSite>),
     #[cfg(feature = "geoip")]
     GeoIp(Arc<geoip::GeoIpMatcher>),
+    #[cfg(feature = "geoip")]
+    IpAsn {
+        matcher: Arc<asn::AsnMatcher>,
+        src: bool,
+    },
     Port {
         src: bool,
         ranges: Arc<Vec<(u16, u16)>>,
@@ -111,6 +118,11 @@ impl Matcher {
             Matcher::GeoSite(s) => ctx.host.is_some_and(|h| s.matches(h)),
             #[cfg(feature = "geoip")]
             Matcher::GeoIp(g) => ctx.dst_ip.is_some_and(|ip| g.matches(ip)),
+            #[cfg(feature = "geoip")]
+            Matcher::IpAsn { matcher, src } => match (*src, ctx.src_ip, ctx.dst_ip) {
+                (true, Some(ip), _) | (false, _, Some(ip)) => matcher.matches(ip),
+                _ => false,
+            },
             Matcher::Port { src, ranges } => {
                 let p = if *src { ctx.src_port } else { ctx.dst_port };
                 ranges.iter().any(|&(lo, hi)| p >= lo && p <= hi)
@@ -164,6 +176,8 @@ impl Matcher {
             Matcher::IpCidr { src: false, .. } => true,
             #[cfg(feature = "geoip")]
             Matcher::GeoIp(_) => true,
+            #[cfg(feature = "geoip")]
+            Matcher::IpAsn { src: false, .. } => true,
             Matcher::RuleSetIp(_) => true,
             Matcher::RuleSetClassical(c) => !c.ips.is_empty(),
             Matcher::Logic { subs, .. } => subs.iter().any(|m| m.needs_dst_ip()),
@@ -267,6 +281,8 @@ pub struct CompileEnv<'a> {
     pub geosite: &'a Option<geosite::GeoSiteDb>,
     #[cfg(feature = "geoip")]
     pub geoip: &'a Option<geoip::GeoIpDb>,
+    #[cfg(feature = "geoip")]
+    pub asn: &'a Option<asn::AsnDb>,
     /// rule provider：name → (behavior, 文本内容)
     pub providers: &'a HashMap<String, (provider::Behavior, String)>,
     /// 子规则定义
@@ -698,6 +714,34 @@ fn parse_matcher(
                 src: true,
             })
         }
+        "IP-ASN" | "SRC-IP-ASN" => {
+            #[cfg(feature = "geoip")]
+            {
+                let db = match env.asn.as_ref() {
+                    Some(db) => db,
+                    None => {
+                        tracing::warn!(
+                            "未加载 ASN 数据库 (ASN.mmdb / GeoLite2-ASN.mmdb)，规则将被跳过: {full:?}"
+                        );
+                        return Ok(Matcher::NeverMatch);
+                    }
+                };
+                let Some(matcher) = db.matcher(payload) else {
+                    tracing::warn!("IP-ASN payload 非法（应为 ASN 号）: {full:?}");
+                    return Ok(Matcher::NeverMatch);
+                };
+                Ok(Matcher::IpAsn {
+                    matcher: Arc::new(matcher),
+                    src: ty == "SRC-IP-ASN",
+                })
+            }
+            #[cfg(not(feature = "geoip"))]
+            {
+                let _ = (ty, payload, env);
+                tracing::warn!("此构建未启用 geoip 支持，规则将被跳过: {full:?}");
+                Ok(Matcher::NeverMatch)
+            }
+        }
         "GEOIP" => {
             #[cfg(feature = "geoip")]
             {
@@ -784,7 +828,12 @@ fn parse_matcher(
                 provider::ProviderPayload::Classical(c) => Matcher::RuleSetClassical(Arc::from(c)),
             })
         }
-        other => Err(format!("未知规则类型 {other:?}")),
+        other => {
+            // 未知规则类型（如暂不支持的 IP-ASN 变体 / 拼写差异）：
+            // 警告后跳过而非拒绝启动，保证 mihomo 等来源的配置可平滑运行
+            tracing::warn!("未知规则类型 {other:?}，规则将被跳过: {full:?}");
+            Ok(Matcher::NeverMatch)
+        }
     }
 }
 
@@ -888,6 +937,8 @@ mod tests {
         static GEOSITE: Option<geosite::GeoSiteDb> = None;
         #[cfg(feature = "geoip")]
         static GEOIP: Option<geoip::GeoIpDb> = None;
+        #[cfg(feature = "geoip")]
+        static ASN: Option<asn::AsnDb> = None;
         static PROVIDERS: std::sync::OnceLock<HashMap<String, (provider::Behavior, String)>> =
             std::sync::OnceLock::new();
         let sub = SUB.get_or_init(|| {
@@ -900,6 +951,8 @@ mod tests {
             geosite: &GEOSITE,
             #[cfg(feature = "geoip")]
             geoip: &GEOIP,
+            #[cfg(feature = "geoip")]
+            asn: &ASN,
             providers: PROVIDERS.get_or_init(HashMap::new),
             sub_rules: sub,
         }
@@ -1093,6 +1146,8 @@ mod tests {
             geosite: &None,
             #[cfg(feature = "geoip")]
             geoip: &None,
+            #[cfg(feature = "geoip")]
+            asn: &None,
             providers: &providers,
             sub_rules: &HashMap::new(),
         };

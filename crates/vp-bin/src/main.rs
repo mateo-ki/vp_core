@@ -116,6 +116,15 @@ fn fetch(url: String, proxy: Option<String>, user_agent: Option<String>) -> Resu
     Ok(body)
 }
 
+struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S"))
+    }
+}
+
 fn init_logging(level: &str) {
     use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
@@ -123,6 +132,8 @@ fn init_logging(level: &str) {
     let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_timer(LocalTimer)
+        .with_target(false)
         .with_ansi(ansi)
         .init();
     // panic 不退出（任务级隔离），但记录到日志
@@ -374,12 +385,12 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            println!("vpcore {} 已启动", env!("CARGO_PKG_VERSION"));
+            tracing::info!("vpcore {} 已启动", env!("CARGO_PKG_VERSION"));
             for (tag, port) in &app.listen_ports {
-                println!("  {tag}: 127.0.0.1:{port}");
+                tracing::info!("监听服务: {tag}=127.0.0.1:{port}");
             }
             if let Some(c) = &app.controller {
-                println!("  controller: http://{c}");
+                tracing::info!("外部控制: http://{c}");
             }
             // 启动初始化完成后立即修剪工作集，归还解析配置产生的临时内存页
             trim_working_set();

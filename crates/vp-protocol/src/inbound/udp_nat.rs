@@ -99,7 +99,11 @@ impl UdpNat {
         let mut sess = Session::new_udp(self.tag.clone(), Some(client), dst.clone());
         sess.network = Network::Udp;
         let res = self.ctx.router.pick(&sess).await;
-        let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+        let rule_tag = res
+            .rule
+            .as_ref()
+            .map(|r| r.rule.as_str())
+            .unwrap_or("Match()");
         let chain_tag = if res.outbound.name() != res.via.as_ref() {
             format!("{}[{}]", res.via, res.outbound.name())
         } else {

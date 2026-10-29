@@ -86,13 +86,20 @@ pub async fn dispatch_stream(
         start: now_millis(),
     };
 
-    let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+    let rule_tag = res
+        .rule
+        .as_ref()
+        .map(|r| r.rule.as_str())
+        .unwrap_or("Match()");
     let chain_tag = if outbound.name() != res.via.as_ref() {
         format!("{}[{}]", res.via, outbound.name())
     } else {
         outbound.name().to_string()
     };
-    let src_str = sess.src.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
+    let src_str = sess
+        .src
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "-".into());
     tracing::info!(
         "[TCP] {} --> {} match {} using {}",
         src_str,

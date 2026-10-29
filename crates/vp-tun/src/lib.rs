@@ -275,13 +275,20 @@ async fn dispatch_tcp(
     }
 
     let res = ctx.router.pick(&sess).await;
-    let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+    let rule_tag = res
+        .rule
+        .as_ref()
+        .map(|r| r.rule.as_str())
+        .unwrap_or("Match()");
     let chain_tag = if res.outbound.name() != res.via.as_ref() {
         format!("{}[{}]", res.via, res.outbound.name())
     } else {
         res.outbound.name().to_string()
     };
-    let src_str = sess.src.map(|s| s.to_string()).unwrap_or_else(|| "tun".into());
+    let src_str = sess
+        .src
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "tun".into());
     tracing::info!(
         "[TCP] {} --> {} match {} using {}",
         src_str,
@@ -328,13 +335,20 @@ async fn dispatch_udp(
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let res = ctx.router.pick(&sess).await;
-    let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+    let rule_tag = res
+        .rule
+        .as_ref()
+        .map(|r| r.rule.as_str())
+        .unwrap_or("Match()");
     let chain_tag = if res.outbound.name() != res.via.as_ref() {
         format!("{}[{}]", res.via, res.outbound.name())
     } else {
         res.outbound.name().to_string()
     };
-    let src_str = sess.src.map(|s| s.to_string()).unwrap_or_else(|| "tun".into());
+    let src_str = sess
+        .src
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "tun".into());
     tracing::info!(
         "[UDP] {} --> {} match {} using {}",
         src_str,

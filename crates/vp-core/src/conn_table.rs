@@ -38,9 +38,26 @@ struct ConnEntry {
     aborts: Vec<AbortHandle>,
 }
 
-#[derive(Default)]
+/// 分片数：16 片把高并发建删连接时的锁竞争摊薄（报告任务4）。
+/// 连接表不在数据面热路径上（流量走独立原子计数器），分片是预防性优化；
+/// 语义与单锁版本完全一致，既有测试即回归。
+const SHARDS: usize = 16;
+
+fn shard_of(id: u64) -> usize {
+    // 乘法哈希取高位：连续 id 也能均匀落片
+    ((id as usize).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> (usize::BITS - 4) & (SHARDS - 1)
+}
+
 pub struct ConnTable {
-    inner: Mutex<HashMap<u64, ConnEntry>>,
+    shards: Vec<Mutex<HashMap<u64, ConnEntry>>>,
+}
+
+impl Default for ConnTable {
+    fn default() -> Self {
+        ConnTable {
+            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
+    }
 }
 
 /// register() 的返回：连接 id 与实时流量计数器
@@ -59,7 +76,7 @@ impl ConnTable {
         let id = meta.id;
         let up = Arc::new(AtomicU64::new(0));
         let down = Arc::new(AtomicU64::new(0));
-        self.inner.lock().unwrap().insert(
+        self.shards[shard_of(id)].lock().unwrap().insert(
             id,
             ConnEntry {
                 meta,
@@ -73,17 +90,17 @@ impl ConnTable {
 
     /// 转发任务 spawn 后挂载终止句柄
     pub fn attach_aborts(&self, id: u64, aborts: Vec<AbortHandle>) {
-        if let Some(e) = self.inner.lock().unwrap().get_mut(&id) {
+        if let Some(e) = self.shards[shard_of(id)].lock().unwrap().get_mut(&id) {
             e.aborts = aborts;
         }
     }
 
     pub fn remove(&self, id: u64) {
-        self.inner.lock().unwrap().remove(&id);
+        self.shards[shard_of(id)].lock().unwrap().remove(&id);
     }
 
     pub fn kill(&self, id: u64) -> bool {
-        let entry = self.inner.lock().unwrap().remove(&id);
+        let entry = self.shards[shard_of(id)].lock().unwrap().remove(&id);
         match entry {
             Some(e) => {
                 for h in e.aborts {
@@ -96,33 +113,40 @@ impl ConnTable {
     }
 
     pub fn close_all(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        let n = inner.len();
-        for (_, e) in inner.drain() {
-            for h in e.aborts {
-                h.abort();
+        let mut n = 0;
+        for shard in &self.shards {
+            let mut inner = shard.lock().unwrap();
+            n += inner.len();
+            for (_, e) in inner.drain() {
+                for h in e.aborts {
+                    h.abort();
+                }
             }
         }
         n
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
+        self.shards.iter().all(|s| s.lock().unwrap().is_empty())
     }
 
     pub fn list(&self) -> Vec<ConnSnapshot> {
-        let inner = self.inner.lock().unwrap();
-        let mut v = Vec::with_capacity(inner.len());
-        for e in inner.values() {
-            v.push(ConnSnapshot {
-                meta: e.meta.clone(),
-                upload: e.up.load(Ordering::Relaxed),
-                download: e.down.load(Ordering::Relaxed),
-            });
+        // 逐片加锁收集，不同时持有两把锁
+        let mut v = Vec::new();
+        for shard in &self.shards {
+            let inner = shard.lock().unwrap();
+            v.reserve(inner.len());
+            for e in inner.values() {
+                v.push(ConnSnapshot {
+                    meta: e.meta.clone(),
+                    upload: e.up.load(Ordering::Relaxed),
+                    download: e.down.load(Ordering::Relaxed),
+                });
+            }
         }
         v.sort_by_key(|s| s.meta.id);
         v

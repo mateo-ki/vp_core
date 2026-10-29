@@ -45,12 +45,25 @@ RustCrypto 的 SIMD 内联循环，加密吞吐掉 4-5 倍）。
   ~125ms、CPU 全程睡眠，疑似工具侧问题而非内核——内核基准同机可达
   GB/s）。修复前其绝对数值不可用；待任务 8 二阶段重写。
 
+## 3.5 RouterHandle 热替换读路径（报告任务5）
+
+- 位置：`crates/vp-common/examples/swap_bench.rs`
+- 运行：`cargo run --release -p vp-common --example swap_bench`
+- 方法：8 读线程高频 clone 快照 + 1 写线程每 10ms 替换（模拟热更新）。
+
+参考值（2026-10）：RwLock<Arc> 9.69M ops/s（单次最差 266µs，写方在锁内
+构建载荷所致，真实代码在锁外构建）；ArcSwap 14.5M ops/s。
+**结论：同数量级，路由 pick 每连接仅 1 次，保留 RwLock 不换库**。
+注：基准的写方在锁内做 1000 次字符串分配，对 RwLock 略有不公平。
+
 ## 4. 回归守护
 
 - 泵链读防死锁回归：`cargo test -p vp-core --lib tunnel::`
   （`readahead_never_holds_data_hostage_on_exact_multiple` 等 6 测）
 - 健康检查任务生命周期：`cargo test -p vp-router --lib group::tests::health_task_lifecycle_on_swap`
 - 缓冲池/连接预算指标：`cargo test -p vp-common`
+- 连接表分片语义：`cargo test -p vp-core --lib conn_table`
+- 测速有界并发/健康检查：`cargo test -p vp-router --lib`
 
 ## 5. 二阶段规划（按审计报告 §13）
 

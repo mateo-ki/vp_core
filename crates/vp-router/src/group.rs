@@ -254,25 +254,50 @@ impl Group {
         if n == 0 {
             return;
         }
-        // 全局共享限流信号量（全进程限额 32，消除海量组并发导致的套接字耗尽与内存尖峰）
+        // 有界并发（报告 9.2）：固定 worker 池按索引取活，同时存在的任务数
+        // = min(n, PROBE_WORKERS)，而非先为全部成员建任务再排队等信号量。
+        // 全局信号量仍保留，跨组总量依旧受限。
+        const PROBE_WORKERS: usize = 32;
         let semaphore = global_probe_semaphore().clone();
-        let mut tasks = Vec::with_capacity(n);
-        for m in &self.members {
-            let m = m.clone();
-            let sem = semaphore.clone();
-            let url = self.test_url.clone();
-            tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.ok();
-                let started = std::time::Instant::now();
-                let ok = probe(&m, &url).await.is_ok();
-                let ms = started.elapsed().as_millis() as u32;
-                if ok { Some(ms) } else { None }
+        let members = Arc::new(self.members.clone());
+        let url = Arc::new(self.test_url.clone());
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = Arc::new(std::sync::Mutex::new(vec![None; n]));
+        let workers = n.min(PROBE_WORKERS);
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let (members, url, next, sem, results) = (
+                members.clone(),
+                url.clone(),
+                next.clone(),
+                semaphore.clone(),
+                results.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= members.len() {
+                        break;
+                    }
+                    let m = members[i].clone();
+                    let _permit = sem.acquire().await.ok();
+                    let started = std::time::Instant::now();
+                    let ok = probe(&m, &url).await.is_ok();
+                    let ms = if ok {
+                        Some(started.elapsed().as_millis() as u32)
+                    } else {
+                        None
+                    };
+                    results.lock().unwrap()[i] = ms;
+                }
             }));
         }
-        let mut results = Vec::with_capacity(n);
-        for t in tasks {
-            results.push(t.await.unwrap_or(None));
+        for h in handles {
+            let _ = h.await;
         }
+        let results = Arc::try_unwrap(results)
+            .map(|m| m.into_inner().unwrap())
+            .unwrap_or_default();
         self.apply_probe_results(&results);
     }
 

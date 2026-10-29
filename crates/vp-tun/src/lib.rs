@@ -275,6 +275,20 @@ async fn dispatch_tcp(
     }
 
     let res = ctx.router.pick(&sess).await;
+    let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+    let chain_tag = if res.outbound.name() != res.via.as_ref() {
+        format!("{}[{}]", res.via, res.outbound.name())
+    } else {
+        res.outbound.name().to_string()
+    };
+    let src_str = sess.src.map(|s| s.to_string()).unwrap_or_else(|| "tun".into());
+    tracing::info!(
+        "[TCP] {} --> {} match {} using {}",
+        src_str,
+        sess.dst,
+        rule_tag,
+        chain_tag
+    );
     let meta = vp_core::ConnMeta {
         id: sess.id,
         inbound: sess.inbound.clone(),
@@ -300,7 +314,7 @@ async fn dispatch_tcp(
             let _ = vp_core::relay(client, remote, hook).await;
         }
         Err(e) => {
-            debug!("tun tcp 出站失败: {e}");
+            tracing::warn!("[TCP] {} 出站 {} 失败: {e}", sess.dst, res.outbound.name());
         }
     }
 }
@@ -314,6 +328,20 @@ async fn dispatch_udp(
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
     let res = ctx.router.pick(&sess).await;
+    let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+    let chain_tag = if res.outbound.name() != res.via.as_ref() {
+        format!("{}[{}]", res.via, res.outbound.name())
+    } else {
+        res.outbound.name().to_string()
+    };
+    let src_str = sess.src.map(|s| s.to_string()).unwrap_or_else(|| "tun".into());
+    tracing::info!(
+        "[UDP] {} --> {} match {} using {}",
+        src_str,
+        sess.dst,
+        rule_tag,
+        chain_tag
+    );
     if !res.outbound.support_udp() {
         return Err(Error::Unsupported(format!(
             "出站 {} 无 UDP",

@@ -23,6 +23,7 @@ serde_yaml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

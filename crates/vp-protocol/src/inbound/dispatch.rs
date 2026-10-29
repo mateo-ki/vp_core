@@ -86,12 +86,19 @@ pub async fn dispatch_stream(
         start: now_millis(),
     };
 
-    debug!(
-        "{} -> {} via {} ({})",
+    let rule_tag = res.rule.as_ref().map(|r| r.rule.as_str()).unwrap_or("Match()");
+    let chain_tag = if outbound.name() != res.via.as_ref() {
+        format!("{}[{}]", res.via, outbound.name())
+    } else {
+        outbound.name().to_string()
+    };
+    let src_str = sess.src.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
+    tracing::info!(
+        "[TCP] {} --> {} match {} using {}",
+        src_str,
         sess.dst,
-        outbound.name(),
-        res.via,
-        sess.inbound
+        rule_tag,
+        chain_tag
     );
 
     match outbound.connect_stream(&sess, &sess.dst).await {
@@ -119,9 +126,9 @@ pub async fn dispatch_stream(
         }
         Err(e) => {
             if outbound.name() == "REJECT" {
-                tracing::debug!("出站 REJECT 阻断目标: {}", sess.dst);
+                tracing::info!("[TCP] {} 出站 REJECT 阻断", sess.dst);
             } else {
-                warn!("出站 {} 失败: {}", outbound.name(), e);
+                warn!("[TCP] {} 出站 {} 失败: {}", sess.dst, outbound.name(), e);
             }
             match reply {
                 ClientReply::Socks5(_) => {

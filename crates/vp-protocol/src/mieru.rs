@@ -659,6 +659,8 @@ pub struct MieruStream<S> {
     closed: bool,
 }
 
+impl<S: ProxyStream> vp_core::ProxyStream for MieruStream<S> {}
+
 impl<S> MieruStream<S> {
     fn new(
         io: S,

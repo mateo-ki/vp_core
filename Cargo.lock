@@ -2735,10 +2735,12 @@ version = "1.0.4"
 dependencies = [
  "async-trait",
  "bytes",
+ "libc",
  "serde",
  "tokio",
  "tracing",
  "vp-common",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -334,6 +334,11 @@ pub struct ShadowTlsStream<S> {
     err: Option<std::io::Error>,
 }
 
+impl<S> vp_core::ProxyStream for ShadowTlsStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> ShadowTlsStream<S> {
     #[cfg(test)]
     fn inner_mut(&mut self) -> &mut S {

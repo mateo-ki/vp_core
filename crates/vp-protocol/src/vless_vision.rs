@@ -62,6 +62,11 @@ pub struct VisionStream<S> {
     scratch: [u8; 2048],
 }
 
+impl<S> vp_core::ProxyStream for VisionStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> VisionStream<S> {
     pub fn new(io: S) -> Self {
         Self {

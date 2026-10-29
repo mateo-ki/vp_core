@@ -1181,6 +1181,11 @@ pub struct UtlsStream<S> {
     tx_closed: bool,
 }
 
+impl<S> vp_core::ProxyStream for UtlsStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S: tokio::io::AsyncRead + Unpin> UtlsStream<S> {
     /// 处理一条完整记录的解密与分发；Ok(false) = 无应用数据（continue 循环）
     fn handle_record(&mut self) -> Result<bool> {

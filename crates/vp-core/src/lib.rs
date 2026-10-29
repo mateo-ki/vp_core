@@ -6,8 +6,11 @@
 pub mod conn_table;
 pub mod inbound;
 pub mod outbound;
+pub mod process;
 pub mod router;
 pub mod session;
+#[cfg(target_os = "linux")]
+pub mod splice;
 pub mod sniff;
 pub mod stream;
 pub mod tunnel;

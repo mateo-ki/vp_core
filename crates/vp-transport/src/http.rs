@@ -74,6 +74,11 @@ pub struct HttpStream<S> {
     out: BytesMut,
 }
 
+impl<S> vp_core::ProxyStream for HttpStream<S> where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S: AsyncWrite + Unpin> AsyncWrite for HttpStream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,

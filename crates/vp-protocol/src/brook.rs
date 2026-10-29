@@ -309,6 +309,8 @@ pub struct BrookStream<S> {
     shutdown: bool,
 }
 
+impl<S: ProxyStream> vp_core::ProxyStream for BrookStream<S> {}
+
 impl<S> BrookStream<S> {
     fn new(io: S, tx: BrookCipher, rx: BrookCipher, datagram: bool) -> Self {
         BrookStream {

@@ -83,36 +83,50 @@ impl vp_core::Inbound for TunInbound {
     }
 
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
-        let tag = self.tag.clone();
-        let cfg = self.cfg.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run(cfg, tag, ctx).await {
-                warn!("TUN 数据面退出: {e}");
-            }
-        });
+        self.start_with_handle(ctx).await?;
         // TUN 无监听端口
         Ok(0)
     }
 }
 
-async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
-    let pool = Arc::new(
-        FakeIpPool::new(&cfg.fake_ip_range)
-            .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", cfg.fake_ip_range)))?,
-    );
-    let resolver = Arc::new(Resolver::system());
+impl TunInbound {
+    /// 启动 TUN 数据面并返回任务句柄。
+    /// 与 trait `start` 的区别：设备创建失败会同步返回 Err（热重载路径据此
+    /// 向控制端上报失败），且任务句柄可被 abort —— TUN 热停用就靠它。
+    pub async fn start_with_handle(
+        self: Arc<Self>,
+        ctx: InboundCtx,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let tag = self.tag.clone();
+        let cfg = self.cfg.clone();
+        let dev = create_tun_device(&cfg).await?;
+        let pool = Arc::new(
+            FakeIpPool::new(&cfg.fake_ip_range)
+                .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", cfg.fake_ip_range)))?,
+        );
+        let resolver = Arc::new(Resolver::system());
+        info!(
+            "TUN 已启动: {} mtu={} fakeip={}",
+            cfg.address, cfg.mtu, cfg.fake_ip_range
+        );
+        Ok(tokio::spawn(async move {
+            if let Err(e) = run_with_device(cfg, tag, ctx, pool, resolver, dev).await {
+                warn!("TUN 数据面退出: {e}");
+            }
+        }))
+    }
+}
 
+/// 创建 TUN 设备（fd 注入 / Wintun / tun crate 三路），失败即报错不吞。
+async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStream>> {
     if let Some(fd) = cfg.fd {
         #[cfg(unix)]
         {
             use std::os::fd::FromRawFd;
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let tokio_file = tokio::fs::File::from_std(file);
-            info!(
-                "TUN 移动端模式已启动（外部 FD={fd}）: fakeip={}",
-                cfg.fake_ip_range
-            );
-            return run_with_device(cfg, tag, ctx, pool, resolver, tokio_file).await;
+            info!("TUN 移动端模式（外部 FD={fd}）: fakeip={}", cfg.fake_ip_range);
+            return Ok(Box::new(tokio_file));
         }
         #[cfg(not(unix))]
         {
@@ -161,12 +175,7 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
 
     let dev = tun::create_as_async(&tcfg)
         .map_err(|e| Error::Other(format!("创建 TUN 设备失败（需要管理员权限）: {e}")))?;
-
-    info!(
-        "TUN 已启动: {} mtu={} fakeip={}",
-        cfg.address, cfg.mtu, cfg.fake_ip_range
-    );
-    run_with_device(cfg, tag, ctx, pool, resolver, dev).await
+    Ok(Box::new(vp_core::stream::Opaque(dev)))
 }
 
 async fn run_with_device<D>(
@@ -214,7 +223,7 @@ where
                     debug!("tun tcp {:?} -> {dst}", tcp.local_addr());
                     let src = Some(tcp.local_addr());
                     let sess = Session::new_tcp(tag.clone(), src, dst.clone());
-                    dispatch_tcp(&ctx, sess, Box::new(tcp)).await;
+                    dispatch_tcp(&ctx, sess, Box::new(vp_core::stream::Opaque(tcp))).await;
                 }
                 IpStackStream::Udp(udp) => {
                     let dst_ip = udp.peer_addr().ip();

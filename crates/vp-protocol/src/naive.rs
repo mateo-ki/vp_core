@@ -77,6 +77,8 @@ pub struct NaiveStream {
     closed: bool,
 }
 
+impl vp_core::ProxyStream for NaiveStream {}
+
 impl NaiveStream {
     pub fn new(recv: h2::RecvStream, send: h2::SendStream<Bytes>, padding: bool) -> Self {
         let paddings = if padding { NUM_FIRST_PADDINGS } else { 0 };

@@ -133,15 +133,15 @@ windows-sys = { version = "0.59", features = [
 rcgen = "0.13"
 
 [profile.release]
-# 极致小 + 快（实测与 opt-3 吞吐无差异，体积 -27%）：
-#   lto=fat + codegen-units=1 跨 crate 全局优化
-#   opt-level=z 体积优先；strip 去符号
+# 快优先：opt-level 必须是 3 —— "z" 会废掉 RustCrypto 的 SIMD 内联循环，
+# AEAD 吞吐掉 4-5 倍（aes-128-gcm 实测 1329 -> 323 MB/s，chacha20 1339 -> 265）。
+#   lto=fat + codegen-units=1 跨 crate 全局优化；strip 去符号
 # 注意：不用 panic="abort" —— 单个连接的 panic 只终止该 tokio 任务，
 # 内核进程必须存活（稳定性优先）
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-opt-level = "z"
+opt-level = 3
 
 [profile.bench]
 debug = false

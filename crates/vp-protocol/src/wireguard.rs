@@ -717,6 +717,8 @@ pub struct WgTcpStream {
     err: Option<std::io::Error>,
 }
 
+impl vp_core::ProxyStream for WgTcpStream {}
+
 impl WgTcpStream {
     fn new(up_rx: mpsc::Receiver<UpMsg>, down_tx: mpsc::Sender<DownMsg>) -> Self {
         WgTcpStream {

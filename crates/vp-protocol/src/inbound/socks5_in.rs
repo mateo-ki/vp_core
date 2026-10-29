@@ -75,7 +75,7 @@ pub async fn serve_socks5<S>(
     ctx: &InboundCtx,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static + vp_core::ProxyStream,
 {
     // 方法协商
     let mut head = [0u8; 2];

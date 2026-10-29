@@ -74,7 +74,7 @@ impl TrojanOutbound {
         initial: Option<&[u8]>,
     ) -> Result<Box<dyn ProxyStream>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static + ProxyStream,
     {
         let mut req = Vec::with_capacity(96);
         // hex(sha224) 56 字符

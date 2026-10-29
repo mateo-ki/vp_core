@@ -103,6 +103,11 @@ pub struct PrefixedStream<S> {
     consumed: bool,
 }
 
+impl<S> vp_core::ProxyStream for PrefixedStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> PrefixedStream<S> {
     #[allow(dead_code)]
     pub fn new(inner: S, prefix: u8) -> Self {

@@ -28,6 +28,28 @@ pub async fn dispatch_stream(
     mut client: Box<dyn ProxyStream>,
     reply: ClientReply<'_>,
 ) {
+    // 连接资源预算（审计报告任务2）：超限快速拒绝，额度由 RAII 贯穿连接生命周期
+    let _conn_permit = match ctx.stats.conn_budget.try_acquire(&sess.inbound) {
+        Some(p) => p,
+        None => {
+            warn!("[TCP] {} 入站 {} 连接数超限，拒绝", sess.dst, sess.inbound);
+            match reply {
+                ClientReply::Socks5(_) => {
+                    let _ = client
+                        .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await;
+                }
+                ClientReply::Http(_) => {
+                    let _ = client
+                        .write_all(b"HTTP/1.1 503 Too Many Connections\r\n\r\n")
+                        .await;
+                }
+                ClientReply::None => {}
+            }
+            return;
+        }
+    };
+
     // UDP over TCP（UoT）：魔法地址目标交由 UoT 中继处理
     if crate::uot::is_magic(&sess.dst) {
         let _ = crate::uot::serve_client(ctx, sess, client).await;

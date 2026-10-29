@@ -449,6 +449,8 @@ pub struct QuicBiStream {
     pub recv: quinn::RecvStream,
 }
 
+impl vp_core::ProxyStream for QuicBiStream {}
+
 impl AsyncRead for QuicBiStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,

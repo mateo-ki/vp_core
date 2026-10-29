@@ -40,6 +40,11 @@ pub struct SsCryptoStream<S> {
     closed: bool,
 }
 
+impl<S> vp_core::ProxyStream for SsCryptoStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> SsCryptoStream<S> {
     /// 客户端：立即发送自身 salt + 首块（目标地址），接收方向等待对端 salt
     pub fn new_client(

@@ -270,7 +270,7 @@ pub async fn wrap_transport(
                 },
             )
             .await?;
-            Box::new(s)
+            Box::new(vp_core::stream::Opaque(s))
         } else {
             let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = tls::tls_connect(
@@ -284,7 +284,7 @@ pub async fn wrap_transport(
                 },
             )
             .await?;
-            Box::new(s)
+            Box::new(vp_core::stream::Opaque(s))
         };
         if let Some(ws) = &cfg.ws {
             let ws_stream = ws::ws_handshake_client(tls, server_host, ws).await?;

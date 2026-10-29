@@ -70,7 +70,7 @@ pub async fn serve_http<S>(
     ctx: &InboundCtx,
 ) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static + vp_core::ProxyStream,
 {
     // 读请求头
     let mut buf: Vec<u8> = Vec::with_capacity(2048);

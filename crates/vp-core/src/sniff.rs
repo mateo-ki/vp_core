@@ -17,6 +17,11 @@ pub struct PeekedStream<S> {
     offset: usize,
 }
 
+impl<S> ProxyStream for PeekedStream<S> where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> PeekedStream<S> {
     pub fn new(inner: S, buffer: Vec<u8>) -> Self {
         Self {

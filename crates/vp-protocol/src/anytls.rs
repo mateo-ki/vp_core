@@ -397,6 +397,8 @@ struct AnytlsStream<S> {
     fin_sent: bool,
 }
 
+impl<S: ProxyStream> vp_core::ProxyStream for AnytlsStream<S> {}
+
 impl<S> AnytlsStream<S> {
     // （pump_read / drive_out 要求 S: Unpin，见下方 poll impl 约束）
     fn new(io: S, sid: u32, padder: Padder) -> Self {

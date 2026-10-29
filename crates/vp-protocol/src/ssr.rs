@@ -686,6 +686,11 @@ pub struct SsrStream<S> {
     tls: Option<TlsTicket>,
 }
 
+impl<S> vp_core::ProxyStream for SsrStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> SsrStream<S> {
     fn flush_out(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>
     where

@@ -377,7 +377,7 @@ pub async fn connect_tls<
         ech_config: None,
     };
     let s = tls_connect(stream, host, &cfg).await?;
-    Ok(Box::new(s))
+    Ok(Box::new(vp_core::stream::Opaque(s)))
 }
 
 #[cfg(test)]

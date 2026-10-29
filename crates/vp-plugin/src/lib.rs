@@ -108,6 +108,11 @@ pub struct TransformStream<S> {
     closed: bool,
 }
 
+impl<S> vp_core::ProxyStream for TransformStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> TransformStream<S> {
     pub fn new(inner: S, plugin: Arc<TransformPlugin>) -> Self {
         TransformStream {

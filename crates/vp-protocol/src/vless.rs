@@ -273,6 +273,11 @@ pub struct VlessStream<S> {
     decoded: BytesMut,
 }
 
+impl<S> vp_core::ProxyStream for VlessStream<S> where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+}
+
 impl<S> VlessStream<S> {
     /// 若请求仍未发出（消费方先读后写），以独立帧发出（标准 vless 语义；
     /// 写前读的协议极少见，正常代理流量总是先发载荷）

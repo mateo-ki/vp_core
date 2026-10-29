@@ -47,6 +47,8 @@ pub struct SmuxStream {
     active_counter: Arc<AtomicUsize>,
 }
 
+impl vp_core::ProxyStream for SmuxStream {}
+
 impl AsyncRead for SmuxStream {
     fn poll_read(
         mut self: Pin<&mut Self>,

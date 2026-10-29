@@ -795,6 +795,8 @@ struct SshStream<S> {
     closed: bool,
 }
 
+impl<S: ProxyStream> vp_core::ProxyStream for SshStream<S> {}
+
 impl<S> SshStream<S> {
     fn new(io: S, rx: SshCipher, tx: SshCipher, their_ch: u32, remote_window: u32) -> Self {
         SshStream {

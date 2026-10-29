@@ -885,6 +885,13 @@ pub struct AnytlsCfg {
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
+    #[serde(
+        alias = "reality-opts",
+        alias = "reality_opts",
+        alias = "realityOpts",
+        default
+    )]
+    pub reality_opts: Option<RealityOpts>,
     #[serde(default)]
     pub udp: bool,
 }

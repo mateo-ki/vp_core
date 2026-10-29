@@ -21,6 +21,9 @@ struct Cli {
 enum Cmd {
     /// 启动内核
     Run {
+        /// GUI 托管模式：stdin 收到 stop 或管道关闭时正常退出
+        #[arg(long)]
+        managed_stdin: bool,
         /// 配置文件（.yaml / .yml / .json）
         #[arg(short, long)]
         config: PathBuf,
@@ -40,6 +43,13 @@ enum Cmd {
         /// 工作目录 / 规则库目录（支持 -d / -D / --directory）
         #[arg(short = 'd', short_alias = 'D', long, alias = "dir")]
         directory: Option<PathBuf>,
+    },
+    /// 将本地分享链接列表转换为 proxies YAML（不发起网络请求）
+    ImportLinks {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
     },
     /// 全组测速
     Test {
@@ -107,9 +117,14 @@ fn fetch(url: String, proxy: Option<String>, user_agent: Option<String>) -> Resu
 }
 
 fn init_logging(level: &str) {
+    use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi)
+        .init();
     // panic 不退出（任务级隔离），但记录到日志
     std::panic::set_hook(Box::new(|info| {
         tracing::error!("panic（已隔离）: {info}");
@@ -132,6 +147,36 @@ fn trim_working_set() {}
 async fn main() {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::ImportLinks { input, output } => {
+            let result = (|| -> Result<(), String> {
+                let text = std::fs::read_to_string(&input).map_err(|e| e.to_string())?;
+                if text.len() > 4 * 1024 * 1024 {
+                    return Err("导入内容超过 4 MB".into());
+                }
+                let mut yaml = String::from("proxies:\n");
+                let mut count = 0;
+                for (i, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let node = vp_protocol::sub::parse_uri(line)
+                        .map_err(|_| format!("第 {} 行链接无效或格式不支持", i + 1))?;
+                    yaml.push_str(&node.to_yaml());
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err("没有可导入的链接".into());
+                }
+                std::fs::write(&output, yaml).map_err(|e| e.to_string())?;
+                println!("已解析 {count} 个节点");
+                Ok(())
+            })();
+            if let Err(e) = result {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        }
         Cmd::Validate {
             config,
             directory: _,
@@ -293,6 +338,7 @@ async fn main() {
             }
         }
         Cmd::Run {
+            managed_stdin,
             config,
             directory,
             log_level,
@@ -338,6 +384,22 @@ async fn main() {
             // 启动初始化完成后立即修剪工作集，归还解析配置产生的临时内存页
             trim_working_set();
 
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            if managed_stdin {
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::stdin().lock().lines() {
+                        match line {
+                            Ok(line) if line.trim() != "stop" => continue,
+                            _ => break,
+                        }
+                    }
+                    let _ = stop_tx.send(());
+                });
+            } else {
+                std::mem::forget(stop_tx);
+            }
+
             // 跨平台文件变动检测（每秒检查一次 mtime）+ Unix SIGHUP / SIGINT·SIGTERM
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             ticker.tick().await; // 消耗初始即刻 tick
@@ -356,6 +418,7 @@ async fn main() {
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
+                        _ = &mut stop_rx => break,
                         _ = term.recv() => break,
                         Some(_) = hup.recv() => {
                             match app.reload().await {
@@ -396,6 +459,7 @@ async fn main() {
                 loop {
                     tokio::select! {
                         _ = tokio::signal::ctrl_c() => break,
+                        _ = &mut stop_rx => break,
                         _ = ticker.tick() => {
                             trim_ticks += 1;
                             if trim_ticks >= 300 {

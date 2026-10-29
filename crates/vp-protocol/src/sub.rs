@@ -106,7 +106,7 @@ impl SubNode {
 }
 
 fn q(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', ""))
+    serde_json::to_string(s).expect("string serialization is infallible")
 }
 
 /// 解析任意分享链接
@@ -410,8 +410,11 @@ fn parse_ssh(rest: &str) -> Result<SubNode> {
 }
 
 fn parse_anytls(rest: &str) -> Result<SubNode> {
-    // anytls://password@host:port?sni=x&insecure=1&udp=1&fp=chrome#name
+    // anytls://password@host:port?sni=x&insecure=1&udp=1&fp=chrome&security=reality&pbk=...#name
     let (password, host, port, p, name) = split_main(rest)?;
+    let is_reality = p.get("security").map(|s| s == "reality").unwrap_or(false)
+        || p.contains_key("pbk")
+        || p.contains_key("publicKey");
     let mut f = vec![
         ("name".into(), q(&name)),
         ("type".into(), "anytls".into()),
@@ -436,7 +439,23 @@ fn parse_anytls(rest: &str) -> Result<SubNode> {
     {
         f.push(("udp".into(), "true".into()));
     }
-    if let Some(fp) = p.get("fp").or_else(|| p.get("client-fingerprint")) {
+    if is_reality {
+        if let Some(pbk) = p.get("pbk").or_else(|| p.get("publicKey")) {
+            f.push(("__reality_pbk".into(), q(pbk)));
+        }
+        if let Some(sid) = p.get("sid").or_else(|| p.get("shortId")) {
+            f.push(("__reality_sid".into(), q(sid)));
+        }
+        if let Some(spx) = p.get("spx").or_else(|| p.get("spiderX")) {
+            f.push(("__reality_spx".into(), q(spx)));
+        }
+        let fp = p
+            .get("fp")
+            .or_else(|| p.get("fingerprint"))
+            .cloned()
+            .unwrap_or_else(|| "chrome".into());
+        f.push(("client-fingerprint".into(), fp));
+    } else if let Some(fp) = p.get("fp").or_else(|| p.get("client-fingerprint")) {
         f.push(("client-fingerprint".into(), q(fp)));
     }
     Ok(SubNode { fields: f })
@@ -521,8 +540,8 @@ fn parse_mieru(rest: &str) -> Result<SubNode> {
             ("type".into(), "mieru".into()),
             ("server".into(), host),
             ("port".into(), port),
-            ("username".into(), q(username)),
-            ("password".into(), q(password)),
+            ("username".into(), q(&urldecode(username))),
+            ("password".into(), q(&urldecode(password))),
         ],
     })
 }
@@ -1334,6 +1353,43 @@ mod tests {
             }
             _ => panic!("Expected Trojan kind"),
         }
+    }
+
+    #[test]
+    fn anytls_reality_uri() {
+        let uri = "anytls://password123@1.2.3.4:443?security=reality&sni=www.apple.com&fp=chrome&pbk=aabbccdd11223344&sid=1234&udp=1#at-reality";
+        let n = parse_uri(uri).unwrap();
+        assert_eq!(n.name(), "at-reality");
+        let y = n.to_yaml();
+        assert!(y.contains("type: anytls"), "{y}");
+        assert!(y.contains("reality-opts:"), "{y}");
+        assert!(y.contains("public-key: \"aabbccdd11223344\""), "{y}");
+        assert!(y.contains("short-id: \"1234\""), "{y}");
+        assert!(y.contains("udp: true"), "{y}");
+
+        let doc = format!("proxies:\n{y}");
+        let mut map: std::collections::HashMap<String, Vec<vp_config::ProxyCfg>> =
+            serde_yaml::from_str(&doc).unwrap();
+        let cfg = map.remove("proxies").unwrap().pop().unwrap();
+        match cfg.kind {
+            vp_config::ProxyKind::Anytls(a) => {
+                let ro = a.reality_opts.unwrap();
+                assert_eq!(ro.public_key, "aabbccdd11223344");
+                assert_eq!(ro.short_id.as_deref(), Some("1234"));
+            }
+            _ => panic!("Expected Anytls kind"),
+        }
+    }
+
+    #[test]
+    fn mieru_encoded_credentials() {
+        let n = parse_uri("mieru://alice:p%40ss%3A%22word@m.com:8964#encoded").unwrap();
+        let yaml = format!("proxies:\n{}", n.to_yaml());
+        let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            value["proxies"][0]["password"].as_str(),
+            Some("p@ss:\"word")
+        );
     }
 
     #[test]

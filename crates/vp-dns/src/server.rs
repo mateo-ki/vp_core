@@ -46,13 +46,13 @@ impl DnsServer {
         }
     }
 
-    /// 启动 UDP 监听，返回实际绑定地址
-    pub async fn spawn(self) -> Result<SocketAddr> {
+    /// 启动 UDP 监听，返回实际绑定地址与接收循环任务句柄（热停用 TUN 时 abort 用）
+    pub async fn spawn_handle(self) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
         let sock = Arc::new(UdpSocket::bind(self.listen).await?);
         let bound = sock.local_addr()?;
         let this = Arc::new(self);
         let resolver = this.resolver.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 1500];
             loop {
                 match sock.recv_from(&mut buf).await {
@@ -74,7 +74,12 @@ impl DnsServer {
                 }
             }
         });
-        Ok(bound)
+        Ok((bound, handle))
+    }
+
+    /// 启动 UDP 监听（不保留任务句柄）
+    pub async fn spawn(self) -> Result<SocketAddr> {
+        self.spawn_handle().await.map(|(addr, _)| addr)
     }
 
     async fn handle(

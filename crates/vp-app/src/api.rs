@@ -17,6 +17,10 @@ pub struct ApiState {
     pub conns: Arc<ConnTable>,
     pub secret: Option<String>,
     pub config_meta: Arc<RwLock<Option<crate::ConfigMeta>>>,
+    /// TUN 运行时：PUT /configs 热重载按配置差量动态启停 TUN（免重启热切换）
+    pub tun_runtime: Arc<RwLock<Option<crate::TunRuntime>>>,
+    /// 全局 DNS 解析器：热开启 TUN 时复用它建 fake-ip 劫持服务器
+    pub dns: Arc<vp_dns::Resolver>,
 }
 
 /// 监听已建立的 controller：启动 accept 循环（同步返回，切断类型环）
@@ -103,7 +107,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
     })
 }
 
-/// 热重载：重建 Router 并替换（失败保留旧配置）
+/// 热重载：重建 Router 并替换（失败保留旧配置）；配置 tun 段有开关差量时
+/// 同步动态启停 TUN 入站（免重启热切换）。
 async fn reload_into(
     st: &ApiState,
     path: Option<std::path::PathBuf>,
@@ -116,6 +121,21 @@ async fn reload_into(
         Ok(a) => a,
         Err(e) => return Err(e.to_string()),
     };
+
+    // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
+    let new_cfg: vp_config::Config =
+        vp_config::parse(text, fmt).map_err(|e| format!("{e}"))?;
+    crate::sync_tun_state(
+        &st.tun_runtime,
+        &st.router,
+        &st.stats,
+        &st.conns,
+        &st.dns,
+        &new_cfg,
+    )
+    .await
+    .map_err(|e| format!("TUN 热切换失败: {e}"))?;
+
     st.router.swap(app.router.current());
     *st.config_meta.write().unwrap() = Some(crate::ConfigMeta {
         path,

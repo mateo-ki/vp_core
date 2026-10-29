@@ -293,6 +293,14 @@ impl AnytlsOutbound {
     }
 
     fn internal_new(name: Option<&str>, cfg: &AnytlsCfg) -> Result<Self> {
+        let reality = match &cfg.reality_opts {
+            Some(r) => Some(vp_transport::parse_reality_config(
+                &r.public_key,
+                r.short_id.as_deref(),
+                r.spider_x.clone(),
+            )?),
+            None => None,
+        };
         Ok(AnytlsOutbound {
             name: name.unwrap_or("anytls").into(),
             server: cfg.server.clone(),
@@ -308,7 +316,7 @@ impl AnytlsOutbound {
                 ws: None,
                 http: None,
                 grpc: None,
-                reality: None,
+                reality,
                 ech: None,
             },
         })
@@ -972,11 +980,35 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            reality_opts: None,
             udp: false,
         };
         let mut o = AnytlsOutbound::new(&cfg).unwrap();
         o.transport.tls = false; // 自环走明文（TLS 拨号已由 utls e2e 覆盖）
         o
+    }
+
+    #[test]
+    fn anytls_outbound_with_reality_config() {
+        let cfg = AnytlsCfg {
+            server: "1.2.3.4".into(),
+            port: 443,
+            password: "password123".into(),
+            server_name: Some("www.apple.com".into()),
+            skip_cert_verify: false,
+            client_fingerprint: Some("chrome".into()),
+            reality_opts: Some(vp_config::RealityOpts {
+                public_key: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio".into(),
+                short_id: Some("1234".into()),
+                spider_x: Some("/".into()),
+            }),
+            udp: true,
+        };
+        let o = AnytlsOutbound::new(&cfg).expect("AnytlsOutbound with REALITY should build");
+        assert!(o.transport.tls);
+        assert!(o.transport.reality.is_some());
+        let r = o.transport.reality.unwrap();
+        assert_eq!(r.short_id[..2], [0x12, 0x34]);
     }
 
     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {

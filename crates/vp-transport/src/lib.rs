@@ -354,17 +354,17 @@ pub fn get_bind_interface_index() -> Option<u32> {
 }
 
 /// 创建 UDP 套接字，若配置了物理网卡索引则绑定 IP_UNICAST_IF / IPV6_UNICAST_IF 防止路由环路
-pub fn create_udp_socket(bind_addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+pub fn create_udp_socket(
+    bind_addr: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::UdpSocket> {
     vp_dns::create_udp_socket(bind_addr)
 }
 
 /// 自动探测系统的物理出站网卡索引（用于 Windows TUN 模式防环路）
 #[cfg(windows)]
 pub fn detect_default_physical_interface() -> Option<u32> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetIpForwardTable, MIB_IPFORWARDTABLE,
-    };
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpForwardTable, MIB_IPFORWARDTABLE};
 
     let mut size: u32 = 0;
     unsafe {
@@ -386,7 +386,8 @@ pub fn detect_default_physical_interface() -> Option<u32> {
                 if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardNextHop != 0 {
                     // 排除 Fake-IP / TUN 保留网段 (198.18.0.0/15)
                     let hop_bytes = row.dwForwardNextHop.to_ne_bytes();
-                    let is_tun_fake = hop_bytes[0] == 198 && (hop_bytes[1] == 18 || hop_bytes[1] == 19);
+                    let is_tun_fake =
+                        hop_bytes[0] == 198 && (hop_bytes[1] == 18 || hop_bytes[1] == 19);
                     if !is_tun_fake && row.dwForwardMetric1 < best_metric {
                         best_metric = row.dwForwardMetric1;
                         best_if = row.dwForwardIfIndex;
@@ -394,7 +395,9 @@ pub fn detect_default_physical_interface() -> Option<u32> {
                 }
             }
             if best_if > 0 {
-                tracing::info!("自动从默认网关路由探测到物理出站网卡 IfIndex={best_if} (metric={best_metric})");
+                tracing::info!(
+                    "自动从默认网关路由探测到物理出站网卡 IfIndex={best_if} (metric={best_metric})"
+                );
                 return Some(best_if);
             }
         }
@@ -420,8 +423,11 @@ pub async fn connect_tcp_stream(
                     std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
                     std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
                 };
-                let socket =
-                    socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                let socket = socket2::Socket::new(
+                    domain,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )?;
                 socket.set_nonblocking(true)?;
 
                 bind_socket_to_interface(&socket, addr, if_idx)?;

@@ -750,7 +750,9 @@ impl SnellInbound {
                 stream.write_all(&ok_chunk).await?;
                 // 原生 Snell UDP 代理转发协程
                 let mut client_stream = SnellStream::new(stream, enc, dec, Vec::new(), raw);
-                let udp_sock = Arc::new(vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?);
+                let udp_sock = Arc::new(vp_transport::create_udp_socket(
+                    "0.0.0.0:0".parse().unwrap(),
+                )?);
                 let sock_r = udp_sock.clone();
 
                 tokio::spawn(async move {

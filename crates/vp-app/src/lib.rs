@@ -173,10 +173,12 @@ async fn start_tun_runtime(
         fd: tun_cfg.fd,
         ring_capacity: tun_cfg.ring_capacity,
     };
-    let tun_in = Arc::new(
-        vp_tun::TunInbound::new(t, "tun")
-            .with_dns(pool_arc, dns, cfg.dns.fake_ip_filter.clone(), cfg.ipv6),
-    );
+    let tun_in = Arc::new(vp_tun::TunInbound::new(t, "tun").with_dns(
+        pool_arc,
+        dns,
+        cfg.dns.fake_ip_filter.clone(),
+        cfg.ipv6,
+    ));
     #[cfg(windows)]
     if tun_cfg.auto_route {
         if let Some(if_idx) = vp_transport::detect_default_physical_interface() {

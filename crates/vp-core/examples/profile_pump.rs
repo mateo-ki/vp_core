@@ -42,7 +42,8 @@ fn process_cpu_secs() -> f64 {
     }
 }
 
-#[cfg(not(windows))]
+// getrusage 经 libc —— 该依赖仅接入 Linux 目标（供 splice 使用）
+#[cfg(target_os = "linux")]
 fn process_cpu_secs() -> f64 {
     unsafe {
         let mut ru: libc::rusage = std::mem::zeroed();

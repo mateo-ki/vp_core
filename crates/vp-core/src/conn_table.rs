@@ -44,8 +44,9 @@ struct ConnEntry {
 const SHARDS: usize = 16;
 
 fn shard_of(id: u64) -> usize {
-    // 乘法哈希取高位：连续 id 也能均匀落片
-    ((id as usize).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> (usize::BITS - 4) & (SHARDS - 1)
+    // 乘法哈希取高位：连续 id 也能均匀落片。
+    // 全程 u64 运算 —— 常数与中间值都会在 32 位目标（armv7 等）上溢出 usize。
+    (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 60) as usize & (SHARDS - 1)
 }
 
 pub struct ConnTable {

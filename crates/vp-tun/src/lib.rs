@@ -129,7 +129,7 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
                 "TUN 移动端模式（外部 FD={fd}）: fakeip={}",
                 cfg.fake_ip_range
             );
-            return Ok(Box::new(tokio_file));
+            return Ok(Box::new(vp_core::stream::Opaque(tokio_file)));
         }
         #[cfg(not(unix))]
         {

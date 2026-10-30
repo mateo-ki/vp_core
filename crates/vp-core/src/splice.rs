@@ -61,8 +61,11 @@ impl SockEnd {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // 安全性：fd 由下方 FdGuard 独占持有，且字段声明顺序保证
+        // AsyncFd（解注册）先于 FdGuard（关 fd）析构。
+        let afd = unsafe { AsyncFd::register(FdView(fd)) }.map_err(register_err)?;
         Ok(SockEnd {
-            _afd: AsyncFd::new(FdView(fd))?,
+            _afd: afd,
             fd: FdGuard(fd),
         })
     }
@@ -76,11 +79,20 @@ struct PipeEnd {
 
 impl PipeEnd {
     fn new(fd: RawFd) -> io::Result<Self> {
+        // 安全性：同 SockEnd —— fd 由 FdGuard 独占，析构顺序先解注册后关闭。
+        let afd = unsafe { AsyncFd::register(FdView(fd)) }.map_err(register_err)?;
         Ok(PipeEnd {
-            _afd: AsyncFd::new(FdView(fd))?,
+            _afd: afd,
             fd: FdGuard(fd),
         })
     }
+}
+
+/// `AsyncFd::register` 失败转 io::Error；取回原始 fd 关闭，避免泄漏
+fn register_err(e: tokio::io::unix::AsyncFdRegisterError<FdView>) -> io::Error {
+    let (view, cause) = e.into_parts();
+    drop(FdGuard(view.0));
+    cause
 }
 
 struct Pipe {

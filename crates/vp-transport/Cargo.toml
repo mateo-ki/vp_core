@@ -37,6 +37,9 @@ aes-gcm.workspace = true
 default = ["tls"]
 tls = []
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 tracing-subscriber.workspace = true
 rcgen.workspace = true

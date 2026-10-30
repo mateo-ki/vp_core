@@ -82,7 +82,7 @@ impl Outbound for DirectOutbound {
         } else {
             "0.0.0.0:0".parse().unwrap()
         };
-        let sock = tokio::net::UdpSocket::bind(bind).await?;
+        let sock = vp_transport::create_udp_socket(bind)?;
         let target = match &dst.host {
             Host::Ip(ip) => std::net::SocketAddr::new(*ip, dst.port),
             Host::Domain(d) => {

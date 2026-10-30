@@ -58,8 +58,7 @@ impl<S> SsCryptoStream<S> {
         let sub = cipher.subkey(&key, &salt)?;
         let mut enc = AeadChunkCodec::new(&cipher, &sub)?;
         let mut out = BytesMut::from(&salt[..]);
-        let chunk = enc.seal_chunk(&first_payload);
-        out.extend_from_slice(&chunk);
+        enc.seal_chunk_into_bytes(&first_payload, &mut out);
         Ok(SsCryptoStream {
             inner,
             cipher,
@@ -206,12 +205,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsCryptoStream<S> {
         }
         std::task::ready!(this.flush_out(cx))?;
         if let Some(enc) = this.enc.as_mut() {
-            let chunk = enc.seal_chunk(buf);
-            this.out.extend_from_slice(&chunk);
+            // SIP008 / RFC 规范：单块载荷上限 0x3FFF（16383 字节），高两位恒 0
+            for chunk in buf.chunks(0x3FFF) {
+                enc.seal_chunk_into_bytes(chunk, &mut this.out);
+            }
         } else {
             this.out.extend_from_slice(buf);
         }
-        std::task::ready!(this.flush_out(cx))?;
+        let _ = this.flush_out(cx);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -226,8 +227,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsCryptoStream<S> {
         if !this.closed {
             if let Some(enc) = this.enc.as_mut() {
                 // 0 长度块作为结束信号
-                let chunk = enc.seal_chunk(&[]);
-                this.out.extend_from_slice(&chunk);
+                enc.seal_chunk_into_bytes(&[], &mut this.out);
             }
             this.closed = true;
         }
@@ -501,9 +501,8 @@ impl SsInbound {
                         let Ok(mut codec) = AeadChunkCodec::new(&cipher, &sub) else {
                             continue;
                         };
-                        let chunk = codec.seal_chunk(&plain);
                         let mut dgram = salt;
-                        dgram.extend_from_slice(&chunk);
+                        codec.seal_chunk_into(&plain, &mut dgram);
                         let _ = sock2.send_to(&dgram, client).await;
                     }
                     nat2.lock().unwrap().remove(&client);

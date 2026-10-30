@@ -69,10 +69,14 @@ pub async fn dispatch_stream(
         }
     }
 
-    // 协议嗅探：若目标为 IP 且客户端先发言（无协议前置回写需求），窥探 SNI / HTTP Host
-    if matches!(sess.dst.host, vp_common::Host::Ip(_)) && matches!(reply, ClientReply::None) {
+    // 协议嗅探优化：若目标为 IP 且客户端先发言，仅对常见 Web 端口窥探 SNI / HTTP Host
+    // 非 Web 端口跳过嗅探，消除 100ms 无谓等待延迟
+    if matches!(sess.dst.host, vp_common::Host::Ip(_))
+        && matches!(reply, ClientReply::None)
+        && matches!(sess.dst.port, 80 | 443 | 8080 | 8443 | 8444 | 9443)
+    {
         let (sniffed, peeked) =
-            crate::sniff::sniff_stream(client, std::time::Duration::from_millis(100)).await;
+            crate::sniff::sniff_stream(client, std::time::Duration::from_millis(30)).await;
         client = peeked;
         if let Some(domain) = sniffed {
             debug!("sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);

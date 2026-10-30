@@ -61,6 +61,7 @@ pub fn enable(address: &str, netmask: &str) -> Result<AutoRouteGuard> {
 
     #[cfg(windows)]
     {
+        // 1. 基础 TUN 网段路由
         let out = Command::new("route")
             .args([
                 "add",
@@ -75,11 +76,36 @@ pub fn enable(address: &str, netmask: &str) -> Result<AutoRouteGuard> {
             .map_err(|e| Error::Other(format!("route 命令执行失败: {e}")))?;
         if !out.status.success() {
             return Err(Error::Other(format!(
-                "route add 失败: {}",
+                "route add 基础网段失败: {}",
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
-        info!("Windows auto-route 启用: {net}/{mask} -> {address}");
+
+        // 2. 接管全网双 /1 拆分路由（0.0.0.0/1 和 128.0.0.0/1，比系统 /0 更精确且不破坏原默认网关）
+        let _ = Command::new("route")
+            .args([
+                "add",
+                "0.0.0.0",
+                "mask",
+                "128.0.0.0",
+                address,
+                "metric",
+                "1",
+            ])
+            .output();
+        let _ = Command::new("route")
+            .args([
+                "add",
+                "128.0.0.0",
+                "mask",
+                "128.0.0.0",
+                address,
+                "metric",
+                "1",
+            ])
+            .output();
+
+        info!("Windows auto-route 启用: {net}/{mask} + 0.0.0.0/1 + 128.0.0.0/1 -> {address}");
     }
 
     #[cfg(target_os = "linux")]
@@ -131,6 +157,12 @@ pub fn disable(address: &str, netmask: &str) -> Result<()> {
     {
         let _ = Command::new("route")
             .args(["delete", &net, "mask", &mask.to_string(), address])
+            .output();
+        let _ = Command::new("route")
+            .args(["delete", "0.0.0.0", "mask", "128.0.0.0"])
+            .output();
+        let _ = Command::new("route")
+            .args(["delete", "128.0.0.0", "mask", "128.0.0.0"])
             .output();
     }
 

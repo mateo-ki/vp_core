@@ -5,14 +5,97 @@ pub mod server;
 pub mod wire;
 
 pub use fakeip::FakeIpPool;
-pub use server::DnsServer;
+pub use server::{DnsServer, is_fake_ip_filtered};
+
+static BIND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 设置出站套接字强制绑定的物理网卡索引（TUN 模式防环路）
+pub fn set_bind_interface_index(if_idx: u32) {
+    BIND_INTERFACE_INDEX.store(if_idx, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 获取当前设置的物理网卡索引
+pub fn get_bind_interface_index() -> Option<u32> {
+    let idx = BIND_INTERFACE_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    if idx > 0 { Some(idx) } else { None }
+}
+
+/// 创建 UDP 套接字，若配置了物理网卡索引则绑定 IP_UNICAST_IF / IPV6_UNICAST_IF 防止路由环路
+pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    #[cfg(windows)]
+    {
+        if !bind_addr.ip().is_loopback() {
+            if let Some(if_idx) = get_bind_interface_index() {
+                let domain = match bind_addr {
+                    SocketAddr::V4(_) => socket2::Domain::IPV4,
+                    SocketAddr::V6(_) => socket2::Domain::IPV6,
+                };
+                let socket = socket2::Socket::new(
+                    domain,
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )?;
+                socket.set_nonblocking(true)?;
+
+                bind_socket_to_interface(&socket, bind_addr, if_idx)?;
+                socket.bind(&bind_addr.into())?;
+
+                let std_sock: std::net::UdpSocket = socket.into();
+                return tokio::net::UdpSocket::from_std(std_sock);
+            }
+        }
+    }
+    let std_sock = std::net::UdpSocket::bind(bind_addr)?;
+    std_sock.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(std_sock)
+}
+
+#[cfg(windows)]
+fn bind_socket_to_interface(
+    socket: &socket2::Socket,
+    addr: SocketAddr,
+    if_idx: u32,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, setsockopt,
+    };
+
+    let raw = socket.as_raw_socket() as SOCKET;
+    let (level, opt, opt_val) = match addr {
+        SocketAddr::V4(_) => (
+            IPPROTO_IP,
+            IP_UNICAST_IF,
+            if_idx.to_be(), // big-endian
+        ),
+        SocketAddr::V6(_) => (
+            IPPROTO_IPV6,
+            IPV6_UNICAST_IF,
+            if_idx, // host byte order
+        ),
+    };
+    unsafe {
+        let ret = setsockopt(
+            raw,
+            level,
+            opt,
+            &opt_val as *const _ as *const _,
+            std::mem::size_of::<u32>() as i32,
+        );
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!("vp-dns 绑定物理网卡 if_idx={if_idx} 失败: {err}");
+        }
+    }
+    Ok(())
+}
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 use vp_common::{Error, Host, Result};
 
@@ -623,7 +706,7 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
     } else {
         "[::]:0".parse().unwrap()
     };
-    let sock = UdpSocket::bind(bind).await?;
+    let sock = create_udp_socket(bind)?;
     sock.connect(addr).await?;
     let id = query_id();
     let q = wire::build_query(id, domain, qtype);
@@ -635,6 +718,42 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
 
 async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(windows)]
+    let mut stream = if let Some(if_idx) = get_bind_interface_index() {
+        let domain_socket = match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = socket2::Socket::new(
+            domain_socket,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        socket.set_nonblocking(true)?;
+        bind_socket_to_interface(&socket, addr, if_idx)?;
+        match socket.connect(&addr.into()) {
+            Ok(()) => {
+                let std_stream: std::net::TcpStream = socket.into();
+                tokio::net::TcpStream::from_std(std_stream)?
+            }
+            Err(e)
+                if e.raw_os_error()
+                    == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
+            {
+                let std_stream: std::net::TcpStream = socket.into();
+                let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+                tokio_stream.writable().await?;
+                if let Some(err) = tokio_stream.take_error()? {
+                    return Err(err.into());
+                }
+                tokio_stream
+            }
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        with_timeout(TcpStream::connect(addr)).await?
+    };
+    #[cfg(not(windows))]
     let mut stream = with_timeout(TcpStream::connect(addr)).await?;
     let id = query_id();
     let q = wire::build_query(id, domain, qtype);
@@ -931,6 +1050,7 @@ async fn read_http_body<S: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::UdpSocket;
 
     #[test]
     fn server_parsing() {

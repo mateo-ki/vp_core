@@ -237,12 +237,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnellStream<S> {
             )));
         }
         std::task::ready!(this.flush_out(cx))?;
-        // 分块写入：每块最大 16KB
-        let chunk_size = buf.len().min(16384);
-        let chunk = this.enc.seal_chunk(&buf[..chunk_size]);
-        this.out.extend_from_slice(&chunk);
-        std::task::ready!(this.flush_out(cx))?;
-        Poll::Ready(Ok(chunk_size))
+        for chunk in buf.chunks(0x3FFF) {
+            this.enc.seal_chunk_into_bytes(chunk, &mut this.out);
+        }
+        let _ = this.flush_out(cx);
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -254,8 +253,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnellStream<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
         if !this.closed {
-            let chunk = this.enc.seal_chunk(&[]);
-            this.out.extend_from_slice(&chunk);
+            this.enc.seal_chunk_into_bytes(&[], &mut this.out);
             this.closed = true;
         }
         let _ = this.flush_out(cx);
@@ -407,10 +405,8 @@ impl SnellOutbound {
         // 3. 构建首个请求 payload：[CMD][DST_ADDR]
         let mut req_payload = vec![cmd];
         encode_socks_addr(dst, &mut req_payload);
-        let sealed_req = enc.seal_chunk(&req_payload);
-
         let mut init_bytes = prefix;
-        init_bytes.extend_from_slice(&sealed_req);
+        enc.seal_chunk_into(&req_payload, &mut init_bytes);
         tcp.write_all(&init_bytes).await?;
 
         // 4. 等待服务端首块响应：[RESP_SUCCESS]
@@ -754,7 +750,7 @@ impl SnellInbound {
                 stream.write_all(&ok_chunk).await?;
                 // 原生 Snell UDP 代理转发协程
                 let mut client_stream = SnellStream::new(stream, enc, dec, Vec::new(), raw);
-                let udp_sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+                let udp_sock = Arc::new(vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?);
                 let sock_r = udp_sock.clone();
 
                 tokio::spawn(async move {

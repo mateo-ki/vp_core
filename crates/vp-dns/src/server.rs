@@ -28,6 +28,8 @@ pub struct DnsServer {
 const QTYPE_A: u16 = 1;
 const QTYPE_PTR: u16 = 12;
 const QTYPE_AAAA: u16 = 28;
+const QTYPE_SVCB: u16 = 64;
+const QTYPE_HTTPS: u16 = 65;
 
 impl DnsServer {
     pub fn new(
@@ -126,31 +128,20 @@ impl DnsServer {
             return Ok(());
         }
 
+        // HTTPS/SVCB 查询优化：Fake-IP 模式下立即应答空记录（NOERROR 且 0 应答），
+        // 彻底根除现代浏览器并发查询 Type 65 导致的 1~3 秒白屏/转圈卡顿，并防止真 IP 泄露绕过代理
+        if (qtype == QTYPE_HTTPS || qtype == QTYPE_SVCB) && fake_mode {
+            let resp = wire::build_empty_response(pkt);
+            let _ = sock.send_to(&resp, from).await;
+            return Ok(());
+        }
+
         // 其余原样转发上游
         self.forward(sock, pkt, from, resolver).await
     }
 
-    /// fake-ip 过滤名单匹配（mihomo 语法）：
-    /// - `+.x` → x 及任意层级子域；`*.x` → x 的单层子域（`*` 恰好匹配一段）
-    /// - 裸域名 → 该域名及其任意层级子域（本内核语义，保留向后兼容）
-    /// - `rule:` 前缀（mihomo 扩展语法）暂不支持，忽略该条
     fn filtered(&self, domain: &str) -> bool {
-        let d = domain.to_ascii_lowercase();
-        self.fake_ip_filter.iter().any(|f| {
-            let f = f.trim().to_ascii_lowercase();
-            if f.is_empty() || f.starts_with("rule:") {
-                return false;
-            }
-            if let Some(rest) = f.strip_prefix("+.") {
-                return d == rest || d.ends_with(&format!(".{rest}"));
-            }
-            if !f.contains('*') {
-                return d == f || d.ends_with(&format!(".{f}"));
-            }
-            let pl: Vec<&str> = f.split('.').collect();
-            let dl: Vec<&str> = d.split('.').collect();
-            pl.len() == dl.len() && pl.iter().zip(dl.iter()).all(|(p, x)| *p == "*" || p == x)
-        })
+        is_fake_ip_filtered(domain, &self.fake_ip_filter)
     }
 
     async fn forward(
@@ -166,11 +157,12 @@ impl DnsServer {
             let _ = sock.send_to(&resp, from).await;
             return Ok(());
         };
-        let fwd = UdpSocket::bind("0.0.0.0:0").await?;
+        // 使用防路由环路 UDP 套接字（绑定物理网卡出站），避免 TUN 模式下双 /1 路由导致查询自循环
+        let fwd = crate::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
         fwd.connect(upstream).await?;
         fwd.send(pkt).await?;
         let mut buf = vec![0u8; 1500];
-        let n = tokio::time::timeout(Duration::from_secs(3), fwd.recv(&mut buf))
+        let n = tokio::time::timeout(Duration::from_millis(1500), fwd.recv(&mut buf))
             .await
             .map_err(|_| Error::Dns("上游超时".into()))??;
         // 保证 id 与查询一致
@@ -181,6 +173,29 @@ impl DnsServer {
         let _ = sock.send_to(&buf[..n], from).await;
         Ok(())
     }
+}
+
+/// fake-ip 过滤名单匹配（mihomo 语法）：
+/// - `+.x` → x 及任意层级子域；`*.x` → x 的单层子域（`*` 恰好匹配一段）
+/// - 裸域名 → 该域名及其任意层级子域（本内核语义，保留向后兼容）
+/// - `rule:` 前缀（mihomo 扩展语法）暂不支持，忽略该条
+pub fn is_fake_ip_filtered(domain: &str, filter: &[String]) -> bool {
+    let d = domain.to_ascii_lowercase();
+    filter.iter().any(|f| {
+        let f = f.trim().to_ascii_lowercase();
+        if f.is_empty() || f.starts_with("rule:") {
+            return false;
+        }
+        if let Some(rest) = f.strip_prefix("+.") {
+            return d == rest || d.ends_with(&format!(".{rest}"));
+        }
+        if !f.contains('*') {
+            return d == f || d.ends_with(&format!(".{f}"));
+        }
+        let pl: Vec<&str> = f.split('.').collect();
+        let dl: Vec<&str> = d.split('.').collect();
+        pl.len() == dl.len() && pl.iter().zip(dl.iter()).all(|(p, x)| *p == "*" || p == x)
+    })
 }
 
 /// "x.y.z.w.in-addr.arpa" → Ipv4Addr

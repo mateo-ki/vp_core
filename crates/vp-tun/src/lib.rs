@@ -44,7 +44,7 @@ impl Default for TunConfig {
         TunConfig {
             address: "198.18.0.1".parse().unwrap(),
             netmask: "255.255.0.0".parse().unwrap(),
-            mtu: 1500,
+            mtu: 9000,
             fake_ip_range: "198.18.0.0/16".into(),
             dns_hijack: true,
             fd: None,
@@ -56,6 +56,10 @@ impl Default for TunConfig {
 pub struct TunInbound {
     cfg: TunConfig,
     tag: Arc<str>,
+    pool: Option<Arc<FakeIpPool>>,
+    resolver: Option<Arc<Resolver>>,
+    fake_ip_filter: Vec<String>,
+    ipv6: bool,
 }
 
 impl TunInbound {
@@ -63,7 +67,25 @@ impl TunInbound {
         TunInbound {
             cfg,
             tag: tag.into(),
+            pool: None,
+            resolver: None,
+            fake_ip_filter: Vec::new(),
+            ipv6: false,
         }
+    }
+
+    pub fn with_dns(
+        mut self,
+        pool: Arc<FakeIpPool>,
+        resolver: Arc<Resolver>,
+        fake_ip_filter: Vec<String>,
+        ipv6: bool,
+    ) -> Self {
+        self.pool = Some(pool);
+        self.resolver = Some(resolver);
+        self.fake_ip_filter = fake_ip_filter;
+        self.ipv6 = ipv6;
+        self
     }
 
     pub fn new_with_fd(cfg: TunConfig, tag: &str, fd: i32) -> Self {
@@ -72,6 +94,10 @@ impl TunInbound {
         TunInbound {
             cfg,
             tag: tag.into(),
+            pool: None,
+            resolver: None,
+            fake_ip_filter: Vec::new(),
+            ipv6: false,
         }
     }
 }
@@ -100,17 +126,24 @@ impl TunInbound {
         let tag = self.tag.clone();
         let cfg = self.cfg.clone();
         let dev = create_tun_device(&cfg).await?;
-        let pool =
-            Arc::new(FakeIpPool::new(&cfg.fake_ip_range).ok_or_else(|| {
+        let pool = match &self.pool {
+            Some(p) => p.clone(),
+            None => Arc::new(FakeIpPool::new(&cfg.fake_ip_range).ok_or_else(|| {
                 Error::Config(format!("fake-ip 网段非法: {}", cfg.fake_ip_range))
-            })?);
-        let resolver = Arc::new(Resolver::system());
+            })?),
+        };
+        let resolver = match &self.resolver {
+            Some(r) => r.clone(),
+            None => Arc::new(Resolver::system()),
+        };
+        let filter = Arc::new(self.fake_ip_filter.clone());
+        let ipv6 = self.ipv6;
         info!(
             "TUN 已启动: {} mtu={} fakeip={}",
             cfg.address, cfg.mtu, cfg.fake_ip_range
         );
         Ok(tokio::spawn(async move {
-            if let Err(e) = run_with_device(cfg, tag, ctx, pool, resolver, dev).await {
+            if let Err(e) = run_with_device(cfg, tag, ctx, pool, resolver, filter, ipv6, dev).await {
                 warn!("TUN 数据面退出: {e}");
             }
         }))
@@ -158,6 +191,7 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
 
     #[cfg(windows)]
     {
+        let dns_server = cfg.address;
         match wintun_installer::windows::ensure_wintun_dll() {
             Ok(dll_path) => {
                 info!("Windows TUN 加载 Wintun 驱动: {}", dll_path.display());
@@ -166,12 +200,16 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
                     // 关键修复：给 vpcore-tun 指定一个固定的确定性 GUID（避免 Windows 每次生成随机 GUID 导致序号递增）
                     // 例如固定为 "vpcoretun0000001" 对应的静态 u128：
                     p.device_guid(0x7670636f_7265_7475_6e30_303030303031_u128);
+                    // 关键修复：向 Wintun 注入 TUN 接口自身地址作为主 DNS 服务器
+                    p.dns_servers(&[dns_server]);
                 });
             }
             Err(e) => {
                 warn!("Wintun 驱动准备提示: {e}");
             }
         }
+        // 关键修复：赋予最低跃点数（Metric: 0），让操作系统优选该虚拟网卡处理流量与 DNS
+        tcfg.metric(0);
         // 关键内存优化：Wintun 驱动默认分配 64MB (MAX_RING_CAPACITY) 发送环与接收环，
         // 映射后直接占用 128MB+ 物理工作集。
         // 将其调整为 4MB (0x400000) 即可支撑万兆吞吐，同时直接降低约 120MB 常驻内存！
@@ -190,6 +228,8 @@ async fn run_with_device<D>(
     ctx: InboundCtx,
     pool: Arc<FakeIpPool>,
     resolver: Arc<Resolver>,
+    filter: Arc<Vec<String>>,
+    ipv6: bool,
     dev: D,
 ) -> Result<()>
 where
@@ -215,6 +255,7 @@ where
         let tag = tag.clone();
         let pool = pool.clone();
         let resolver = resolver.clone();
+        let filter = filter.clone();
         let dns_hijack = cfg.dns_hijack;
         tokio::spawn(async move {
             match stream {
@@ -235,7 +276,7 @@ where
                     let dst_ip = udp.peer_addr().ip();
                     let dst_port = udp.peer_addr().port();
                     if dns_hijack && dst_port == 53 {
-                        handle_dns(udp, pool, resolver).await;
+                        handle_dns(udp, pool, resolver, filter, ipv6).await;
                         return;
                     }
                     let fake_domain = pool.reverse(dst_ip);
@@ -278,10 +319,13 @@ async fn dispatch_tcp(
     mut sess: Session,
     mut client: Box<dyn vp_core::ProxyStream>,
 ) {
-    // 协议嗅探：若目标为纯 IP，窥探首包 SNI / HTTP Host 还原真实域名
-    if matches!(sess.dst.host, vp_common::Host::Ip(_)) {
+    // 协议嗅探优化：仅对常见 Web 端口（80, 443, 8080, 8443 等）纯 IP 目标窥探首包 SNI / HTTP Host
+    // 非 Web 端口（如 22 SSH、3306 MySQL 等服务端先发包协议）跳过嗅探，彻底消除 100ms 无谓等待延迟
+    if matches!(sess.dst.host, vp_common::Host::Ip(_))
+        && matches!(sess.dst.port, 80 | 443 | 8080 | 8443 | 8444 | 9443)
+    {
         let (sniffed, peeked) =
-            vp_core::sniff_stream(client, std::time::Duration::from_millis(100)).await;
+            vp_core::sniff_stream(client, std::time::Duration::from_millis(30)).await;
         client = peeked;
         if let Some(domain) = sniffed {
             debug!("tun sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
@@ -417,56 +461,91 @@ async fn dispatch_udp(
     Ok(())
 }
 
-/// DNS 劫持：就地应答（fake-ip / PTR / 上游转发）
+/// DNS 劫持：就地并发应答（fake-ip / PTR / Type 65 极速空应答 / 防环路物理出站上游转发）
 async fn handle_dns(
-    mut udp: ipstack::IpStackUdpStream,
+    udp: ipstack::IpStackUdpStream,
     pool: Arc<FakeIpPool>,
     resolver: Arc<Resolver>,
+    filter: Arc<Vec<String>>,
+    ipv6: bool,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut reader, mut writer) = tokio::io::split(udp);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(resp) = rx.recv().await {
+            if writer.write_all(&resp).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut buf = vec![0u8; 1500];
     loop {
-        let n = match udp.read(&mut buf).await {
+        let n = match reader.read(&mut buf).await {
             Ok(n) if n > 0 => n,
             _ => break,
         };
-        let resp = build_dns_reply(&buf[..n], &pool, &resolver).await;
-        if udp.write_all(&resp).await.is_err() {
-            break;
-        }
+        let query = buf[..n].to_vec();
+        let pool = pool.clone();
+        let resolver = resolver.clone();
+        let filter = filter.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let resp = build_dns_reply(&query, &pool, &resolver, &filter, ipv6).await;
+            let _ = tx.send(resp).await;
+        });
     }
+
+    drop(tx);
+    let _ = writer_task.await;
 }
 
-async fn build_dns_reply(
+pub async fn build_dns_reply(
     query: &[u8],
     pool: &Arc<FakeIpPool>,
     resolver: &Arc<Resolver>,
+    filter: &[String],
+    ipv6: bool,
 ) -> Vec<u8> {
     let Some((_id, name, qtype)) = vp_dns::wire::parse_query(query) else {
         return vp_dns::wire::build_empty_response(query);
     };
     const A: u16 = 1;
-    const AAAA: u16 = 28;
     const PTR: u16 = 12;
-    if qtype == A {
-        if let Some(ip) = pool.allocate(&name) {
-            return vp_dns::wire::build_a_response(query, ip);
-        }
-    } else if qtype == AAAA {
-        return vp_dns::wire::build_empty_response(query);
-    } else if qtype == PTR {
+    const AAAA: u16 = 28;
+    const SVCB: u16 = 64;
+    const HTTPS: u16 = 65;
+
+    let fake_mode = !vp_dns::is_fake_ip_filtered(&name, filter);
+
+    if qtype == PTR {
         if let Some(ip) = parse_ptr_name(&name) {
             if let Some(domain) = pool.reverse(IpAddr::V4(ip)) {
                 return vp_dns::wire::build_ptr_response(query, &domain);
             }
         }
+    } else if qtype == A && fake_mode {
+        if let Some(ip) = pool.allocate(&name) {
+            return vp_dns::wire::build_a_response(query, ip);
+        }
+    } else if qtype == AAAA && fake_mode && !ipv6 {
+        return vp_dns::wire::build_empty_response(query);
+    } else if (qtype == HTTPS || qtype == SVCB) && fake_mode {
+        // 关键性能优化：对 fake-ip 域名直接应答空记录（NOERROR 且 0 应答），
+        // 彻底根除现代浏览器并发查询 Type 65 导致的 1~3 秒白屏/转圈卡顿，
+        // 同时避免通过 IPv4Hint / IPv6Hint 拿到真 IP 绕过虚拟网卡分流
+        return vp_dns::wire::build_empty_response(query);
     }
+
+    // 过滤名单域名或其它记录类型：通过物理网卡防环路 UDP 套接字转发上游
     if let Some(up) = resolver.first_udp_server() {
-        if let Ok(fwd) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        if let Ok(fwd) = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap()) {
             if fwd.connect(up).await.is_ok() && fwd.send(query).await.is_ok() {
                 let mut buf = vec![0u8; 1500];
                 if let Ok(Ok(n)) =
-                    tokio::time::timeout(std::time::Duration::from_secs(3), fwd.recv(&mut buf))
+                    tokio::time::timeout(std::time::Duration::from_millis(1500), fwd.recv(&mut buf))
                         .await
                 {
                     let mut out = buf[..n].to_vec();
@@ -507,22 +586,30 @@ mod tests {
     async fn dns_hijack_fake_ip_flow() {
         let pool = Arc::new(FakeIpPool::new("198.18.0.0/16").unwrap());
         let resolver = Arc::new(Resolver::system());
+        let filter: Vec<String> = Vec::new();
         let q = wire::build_query(0xabcd, "www.google.com", wire::QType::A);
-        let reply = build_dns_reply(&q, &pool, &resolver).await;
+        let reply = build_dns_reply(&q, &pool, &resolver, &filter, false).await;
         let msg = wire::parse_response(&reply).unwrap();
         assert_eq!(msg.id, 0xabcd);
         let ips = wire::extract_ips(&msg, wire::TYPE_A);
         assert_eq!(ips.len(), 1);
         assert!(pool.contains(ips[0].0), "应返回 fake-ip");
         // 稳定性
-        let reply2 = build_dns_reply(&q, &pool, &resolver).await;
+        let reply2 = build_dns_reply(&q, &pool, &resolver, &filter, false).await;
         let ip2 = wire::extract_ips(&wire::parse_response(&reply2).unwrap(), wire::TYPE_A)[0].0;
         assert_eq!(ips[0].0, ip2);
 
         // AAAA → 空应答
         let q6 = wire::build_query(0x0002, "www.google.com", wire::QType::Aaaa);
-        let r6 = build_dns_reply(&q6, &pool, &resolver).await;
+        let r6 = build_dns_reply(&q6, &pool, &resolver, &filter, false).await;
         assert!(wire::extract_ips(&wire::parse_response(&r6).unwrap(), wire::TYPE_AAAA).is_empty());
+
+        // HTTPS (Type 65) → 极速空应答（根除浏览器 3 秒卡顿）
+        let q_https = wire::build_query(0x0065, "www.google.com", wire::QType::Https);
+        let r_https = build_dns_reply(&q_https, &pool, &resolver, &filter, false).await;
+        let msg_https = wire::parse_response(&r_https).unwrap();
+        assert_eq!(msg_https.id, 0x0065);
+        assert!(msg_https.answers.is_empty(), "Fake-IP 域名 Type 65 应立即返回空应答");
     }
 
     #[tokio::test]
@@ -530,6 +617,7 @@ mod tests {
         let pool = Arc::new(FakeIpPool::new("198.18.0.0/16").unwrap());
         let ip = pool.allocate("ptr.test").unwrap();
         let resolver = Arc::new(Resolver::system());
+        let filter: Vec<String> = Vec::new();
         let o = ip.octets();
         let name = format!("{}.{}.{}.{}.in-addr.arpa", o[3], o[2], o[1], o[0]);
         let q = wire::build_query(0x33, &name, wire::QType::A);
@@ -538,7 +626,7 @@ mod tests {
         let len = q.len();
         q[len - 4] = 0;
         q[len - 3] = 12;
-        let reply = build_dns_reply(&q, &pool, &resolver).await;
+        let reply = build_dns_reply(&q, &pool, &resolver, &filter, false).await;
         // rdata 末段: [len hi][len lo][labels...]
         let msg = wire::parse_response(&reply).unwrap();
         assert_eq!(msg.answers.len(), 1);

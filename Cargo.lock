@@ -2785,6 +2785,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "serde_yaml",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -2792,6 +2793,7 @@ dependencies = [
  "vp-config",
  "vp-rule",
  "webpki-roots 0.26.11",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2941,6 +2943,7 @@ dependencies = [
  "vp-core",
  "vp-dns",
  "webpki-roots 0.26.11",
+ "windows-sys 0.59.0",
  "x25519-dalek",
 ]
 
@@ -2959,6 +2962,7 @@ dependencies = [
  "vp-core",
  "vp-dns",
  "vp-rule",
+ "vp-transport",
 ]
 
 [[package]]

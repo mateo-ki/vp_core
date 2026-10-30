@@ -41,9 +41,8 @@ pub fn stats() -> BufpoolStats {
     }
 }
 
-/// 32KB：裸转发单核吞吐的关键参数 —— 两次 syscall（读+写）搬 32KB，
-/// 相比 16KB 直接把 syscall 数砍半；交互式小包流量读不满整块，走不到预读，无额外延迟。
-pub const BUF_SIZE: usize = 32 * 1024;
+/// 128KB：大吞吐与高性能传输
+pub const BUF_SIZE: usize = 128 * 1024;
 /// 缓冲池上限：256 块 * 32KB = 8MB 常驻上限，兼顾高并发零分配与低内存嵌入式/路由器设备不 OOM
 const POOL_CAP: usize = 256;
 

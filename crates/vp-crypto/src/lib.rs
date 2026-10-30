@@ -116,6 +116,52 @@ impl AnyAead {
         };
         r.map_err(|_| Error::Proto("AEAD 解密失败"))
     }
+
+    /// 原地加密（零堆分配）：直接就地加密 `buffer`，返回 16 字节 tag。
+    pub fn seal_in_place_detached(
+        &self,
+        nonce: &[u8; 12],
+        buffer: &mut [u8],
+        aad: &[u8],
+    ) -> [u8; 16] {
+        use aes_gcm::aead::AeadInPlace;
+        let n = Nonce::from(*nonce);
+        let tag = match self {
+            AnyAead::A128(a) => a.encrypt_in_place_detached(&n, aad, buffer).unwrap(),
+            AnyAead::A256(a) => a.encrypt_in_place_detached(&n, aad, buffer).unwrap(),
+            AnyAead::Chacha(a) => a.encrypt_in_place_detached(&n, aad, buffer).unwrap(),
+        };
+        let mut out_tag = [0u8; 16];
+        out_tag.copy_from_slice(tag.as_slice());
+        out_tag
+    }
+
+    /// 原地解密（零堆分配）：就地解密 `buffer` 并校验 tag。
+    pub fn open_in_place_detached(
+        &self,
+        nonce: &[u8; 12],
+        buffer: &mut [u8],
+        tag: &[u8; 16],
+        aad: &[u8],
+    ) -> Result<()> {
+        use aes_gcm::aead::{AeadInPlace, Tag};
+        let n = Nonce::from(*nonce);
+        let r = match self {
+            AnyAead::A128(a) => {
+                let t = Tag::<Aes128Gcm>::from_slice(tag);
+                a.decrypt_in_place_detached(&n, aad, buffer, t)
+            }
+            AnyAead::A256(a) => {
+                let t = Tag::<Aes256Gcm>::from_slice(tag);
+                a.decrypt_in_place_detached(&n, aad, buffer, t)
+            }
+            AnyAead::Chacha(a) => {
+                let t = Tag::<ChaCha20Poly1305>::from_slice(tag);
+                a.decrypt_in_place_detached(&n, aad, buffer, t)
+            }
+        };
+        r.map_err(|_| Error::Proto("AEAD 解密失败"))
+    }
 }
 
 /// 12 字节 nonce：counter 大端
@@ -148,6 +194,22 @@ mod tests {
             assert!(a.open(3, &ct, b"bad").is_err());
             // 错误 nonce
             assert!(a.open(1, &ct, b"aad").is_err());
+
+            // in-place 往返与 cross 互认
+            let nonce = [42u8; 12];
+            let mut data = b"hello in-place zero copy".to_vec();
+            let tag = a.seal_in_place_detached(&nonce, &mut data, b"aad");
+            assert_ne!(&data[..], b"hello in-place zero copy");
+            // 组装成标准 ct+tag 校验 open_nonce 是否互通
+            let mut full_ct = data.clone();
+            full_ct.extend_from_slice(&tag);
+            let opened = a.open_nonce(&nonce, &full_ct, b"aad").unwrap();
+            assert_eq!(&opened[..], b"hello in-place zero copy");
+
+            // 就地解密
+            a.open_in_place_detached(&nonce, &mut data, &tag, b"aad")
+                .unwrap();
+            assert_eq!(&data[..], b"hello in-place zero copy");
         }
     }
 

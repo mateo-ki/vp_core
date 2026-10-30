@@ -18,6 +18,10 @@ tokio.workspace = true
 bytes.workspace = true
 rand.workspace = true
 tracing.workspace = true
+socket2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

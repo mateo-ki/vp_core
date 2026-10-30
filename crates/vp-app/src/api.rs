@@ -449,9 +449,58 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 &mut stream,
                 200,
                 "OK",
-                &json!({"mode": format!("{:?}", router.mode())}),
+                &json!({"mode": format!("{:?}", router.mode()).to_lowercase()}),
             )
             .await;
+        }
+        ("PATCH", ["configs"]) => {
+            // 免停热切分流模式：PATCH /configs {"mode": "rule"|"global"|"direct"}
+            let mut patched = false;
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&req.body) {
+                if let Some(mode_str) = val.get("mode").and_then(|v| v.as_str()) {
+                    let target_mode = match mode_str.to_ascii_lowercase().as_str() {
+                        "rule" => Some(vp_config::Mode::Rule),
+                        "global" => Some(vp_config::Mode::Global),
+                        "direct" => Some(vp_config::Mode::Direct),
+                        _ => None,
+                    };
+                    if let Some(new_mode) = target_mode {
+                        let cur_router = st.router.current();
+                        let new_router = cur_router.clone_with_mode(new_mode);
+                        st.router.swap(new_router);
+
+                        // 同步持久化至内存与磁盘 YAML 配置
+                        let cur_meta = st.config_meta.read().unwrap().clone();
+                        if let Some(mut meta) = cur_meta {
+                            if let Some(ref path) = meta.path {
+                                if let Ok(content) = tokio::fs::read_to_string(path).await {
+                                    if let Ok(re) = regex::Regex::new(r"(?m)^(\s*mode\s*:\s*).*$") {
+                                        let new_content = re
+                                            .replace(&content, format!("${{1}}{mode_str}"))
+                                            .to_string();
+                                        let _ = tokio::fs::write(path, &new_content).await;
+                                        meta.text = new_content;
+                                        *st.config_meta.write().unwrap() = Some(meta);
+                                    }
+                                }
+                            }
+                        }
+                        patched = true;
+                    }
+                }
+            }
+
+            if patched {
+                reply(&mut stream, 204, "No Content", &json!({})).await;
+            } else {
+                reply(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &json!({"message": "无效的配置 PATCH 请求体或不支持的模式"}),
+                )
+                .await;
+            }
         }
         ("PUT", ["configs"]) => {
             // 热重载：PUT /configs?path=... 或 JSON body {"path": "..."} 或重新读取当前配置
@@ -811,6 +860,41 @@ rules: ['MATCH,PROXY']
         .await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("PROXY"));
+
+        // GET /configs 初始模式应为 rule
+        let resp = http_get("127.0.0.1:19091", "/configs", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("\"mode\":\"rule\"") || resp.1.contains("\"mode\": \"rule\""));
+
+        // PATCH /configs 免停热切至 global
+        let resp = http_patch(
+            "127.0.0.1:19091",
+            "/configs",
+            Some("s3cret"),
+            r#"{"mode":"global"}"#,
+        )
+        .await;
+        assert_eq!(resp.0, 204, "PATCH 模式热切应返回 204: {resp:?}");
+
+        // 验证热切后模式变更为 global
+        let resp = http_get("127.0.0.1:19091", "/configs", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("\"mode\":\"global\"") || resp.1.contains("\"mode\": \"global\""));
+
+        // PATCH /configs 免停热切至 direct
+        let resp = http_patch(
+            "127.0.0.1:19091",
+            "/configs",
+            Some("s3cret"),
+            r#"{"mode":"direct"}"#,
+        )
+        .await;
+        assert_eq!(resp.0, 204);
+
+        let resp = http_get("127.0.0.1:19091", "/configs", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("\"mode\":\"direct\"") || resp.1.contains("\"mode\": \"direct\""));
+
         let _ = app;
     }
 
@@ -822,6 +906,26 @@ rules: ['MATCH,PROXY']
         );
         assert_eq!(url_decode("%E6%B5%8B%E8%AF%95+name"), "测试 name");
         assert_eq!(url_decode("PROXY"), "PROXY");
+    }
+
+    async fn http_patch(
+        addr: &str,
+        path: &str,
+        secret: Option<&str>,
+        body: &str,
+    ) -> (u16, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = secret
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "PATCH {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        parse_http(&buf)
     }
 
     async fn http_put_raw(

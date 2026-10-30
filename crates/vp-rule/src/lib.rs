@@ -229,7 +229,7 @@ pub struct MatchResult<'a> {
     pub rule: &'a str,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RuleEngine {
     rules: Vec<CompiledRule>,
     needs_ip: bool,

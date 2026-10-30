@@ -205,6 +205,27 @@ impl Router {
         })
     }
 
+    /// 仅替换分流模式（规则 / 全局 / 直连）。
+    /// 复用现有 groups、outbounds 与 rules，保持延迟历史与手工节点选择。
+    pub fn clone_with_mode(&self, mode: Mode) -> Arc<Router> {
+        let mut background_tasks = Vec::new();
+        for (idx, g) in self.groups.values().enumerate() {
+            if let Some(h) = g.start_health_checks(idx) {
+                background_tasks.push(h);
+            }
+        }
+        Arc::new(Router {
+            outbounds: self.outbounds.clone(),
+            groups: self.groups.clone(),
+            rules: self.rules.clone(),
+            mode,
+            dns: self.dns.clone(),
+            ipv6: self.ipv6,
+            global_outbound: self.global_outbound.clone(),
+            background_tasks,
+        })
+    }
+
     /// 穿透组得到叶子节点名（API 展示 via）
     fn resolve_via(&self, outbound: &Arc<dyn Outbound>, sess: &Session) -> Arc<str> {
         let mut name: Arc<str> = outbound.name().into();

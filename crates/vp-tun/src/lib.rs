@@ -163,6 +163,9 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
                 info!("Windows TUN 加载 Wintun 驱动: {}", dll_path.display());
                 tcfg.platform_config(move |p| {
                     p.wintun_file(dll_path);
+                    // 关键修复：给 vpcore-tun 指定一个固定的确定性 GUID（避免 Windows 每次生成随机 GUID 导致序号递增）
+                    // 例如固定为 "vpcoretun0000001" 对应的静态 u128：
+                    p.device_guid(0x7670636f_7265_7475_6e30_303030303031_u128);
                 });
             }
             Err(e) => {

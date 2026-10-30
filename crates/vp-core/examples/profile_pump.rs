@@ -42,7 +42,13 @@ fn process_cpu_secs() -> f64 {
     }
 }
 
-// getrusage 经 libc —— 该依赖仅接入 Linux 目标（供 splice 使用）
+// getrusage 经 libc —— 该依赖仅接入 Linux 目标（供 splice 使用）；
+// 其余平台（macOS 等）该示例不用于精度测量，CPU 记账置 0 以保证可编译
+#[cfg(not(any(windows, target_os = "linux")))]
+fn process_cpu_secs() -> f64 {
+    0.0
+}
+
 #[cfg(target_os = "linux")]
 fn process_cpu_secs() -> f64 {
     unsafe {

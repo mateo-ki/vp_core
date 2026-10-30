@@ -191,6 +191,7 @@ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
     i += 1;
     let option = body[i];
     i += 1;
+    let padding_len = (body[i] >> 4) as usize;
     let security = match body[i] & 0x0f {
         SEC_AES128_GCM => Security::Aes128Gcm,
         SEC_CHACHA20 => Security::ChaCha20,
@@ -203,6 +204,7 @@ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
     i += 1;
     let (dst, used) = decode_v2ray_addr(&body[i..])?;
     i += used;
+    i += padding_len;
     if i != body.len() {
         return Err(Error::Proto("vmess 请求头长度异常"));
     }
@@ -423,19 +425,30 @@ impl VmessBodyCodec {
         n
     }
 
-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+    /// 零中间分配加密：直接就地加密并追加到 `out`（BytesMut）
+    fn seal_chunk_into_bytes(&mut self, payload: &[u8], out: &mut BytesMut) {
         let idx = self.idx;
         self.idx = self.idx.wrapping_add(1);
-        let ct = self.aead.seal_nonce(&self.nonce(idx), payload, b"");
-        // 线上 chunk = [2B 长度^掩码][ct]，长度值 = ct 长度（payload+tag）
-        let mut len_field = ct.len() as u16;
+        let ct_len = payload.len() + 16;
+        let mut len_field = ct_len as u16;
         if let Some(m) = self.mask.as_mut() {
             len_field ^= m.next_u16();
         }
-        let mut out = Vec::with_capacity(ct.len() + 2);
+        out.reserve(2 + ct_len);
         out.extend_from_slice(&len_field.to_be_bytes());
-        out.extend_from_slice(&ct);
-        out
+        let start = out.len();
+        out.extend_from_slice(payload);
+        let tag = self
+            .aead
+            .seal_in_place_detached(&self.nonce(idx), &mut out[start..], b"");
+        out.extend_from_slice(&tag);
+    }
+
+    #[allow(dead_code)]
+    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        self.seal_chunk_into_bytes(payload, &mut out);
+        out.to_vec()
     }
 
     /// 尝试从 buf 解出一条 payload；数据不足返回 None。
@@ -464,11 +477,17 @@ impl VmessBodyCodec {
         if ct_len < 16 {
             return Some(Err(Error::Proto("vmess 分块长度小于 AEAD 标签")));
         }
+        let plen = ct_len - 16;
+        let mut data = buf[2..2 + plen].to_vec();
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&buf[2 + plen..total]);
         let idx = self.idx;
-        let data = match self.aead.open_nonce(&self.nonce(idx), &buf[2..total], b"") {
-            Ok(p) => p,
-            Err(e) => return Some(Err(e)),
-        };
+        if let Err(e) = self
+            .aead
+            .open_in_place_detached(&self.nonce(idx), &mut data, &tag, b"")
+        {
+            return Some(Err(e));
+        }
         self.idx = self.idx.wrapping_add(1);
         Some(Ok((data, total)))
     }
@@ -489,6 +508,14 @@ impl BodyCodec {
         })
     }
 
+    fn seal_chunk_into_bytes(&mut self, payload: &[u8], out: &mut BytesMut) {
+        match self {
+            BodyCodec::Aead(c) => c.seal_chunk_into_bytes(payload, out),
+            BodyCodec::Plain(c) => c.seal_chunk_into_bytes(payload, out),
+        }
+    }
+
+    #[allow(dead_code)]
     fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
         match self {
             BodyCodec::Aead(c) => c.seal_chunk(payload),
@@ -518,16 +545,22 @@ impl PlainCodec {
         }
     }
 
-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+    fn seal_chunk_into_bytes(&mut self, payload: &[u8], out: &mut BytesMut) {
         let mut len_field = payload.len() as u16;
         if let Some(m) = self.mask.as_mut() {
             len_field ^= m.next_u16();
         }
-        let mut out = Vec::with_capacity(6 + payload.len());
+        out.reserve(6 + payload.len());
         out.extend_from_slice(&len_field.to_be_bytes());
         out.extend_from_slice(&kdf::fnv1a32(payload).to_be_bytes());
         out.extend_from_slice(payload);
-        out
+    }
+
+    #[allow(dead_code)]
+    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        self.seal_chunk_into_bytes(payload, &mut out);
+        out.to_vec()
     }
 
     fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
@@ -850,9 +883,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
             )));
         }
         std::task::ready!(this.flush_out(cx))?;
-        let chunk = this.enc.seal_chunk(buf);
-        this.out.extend_from_slice(&chunk);
-        std::task::ready!(this.flush_out(cx))?;
+        for chunk in buf.chunks(0x3FFF) {
+            this.enc.seal_chunk_into_bytes(chunk, &mut this.out);
+        }
+        let _ = this.flush_out(cx);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -865,8 +899,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
         if !this.closed {
-            let chunk = this.enc.seal_chunk(&[]);
-            this.out.extend_from_slice(&chunk);
+            this.enc.seal_chunk_into_bytes(&[], &mut this.out);
             this.closed = true;
         }
         let _ = this.flush_out(cx);

@@ -31,7 +31,7 @@ impl Format {
 
 /// 解析配置文本。格式由参数指定。
 pub fn parse(text: &str, fmt: Format) -> Result<Config> {
-    let json_value: serde_json::Value = match fmt {
+    let mut json_value: serde_json::Value = match fmt {
         Format::Yaml => {
             let v: serde_yaml::Value = serde_yaml::from_str(text)
                 .map_err(|e| Error::Config(format!("YAML 解析失败: {e}")))?;
@@ -41,11 +41,56 @@ pub fn parse(text: &str, fmt: Format) -> Result<Config> {
             json5::from_str(text).map_err(|e| Error::Config(format!("JSON 解析失败: {e}")))?
         }
     };
+    sanitize_proxy_aliases(&mut json_value);
     use serde::de::IntoDeserializer;
     let deserializer = json_value.into_deserializer();
     let cfg: Config = serde_path_to_error::deserialize(deserializer)
         .map_err(|e| Error::Config(format!("配置结构错误: {}", e)))?;
     Ok(cfg)
+}
+
+/// 归一化代理节点中的同义别名字段（如 servername 与 sni、skip-cert-verify 与 allowInsecure 等），
+/// 杜绝因同时存在多个别名键导致 serde 反序列化时报 duplicate field 错误。
+fn sanitize_proxy_aliases(val: &mut serde_json::Value) {
+    if let Some(proxies) = val.get_mut("proxies").and_then(|p| p.as_array_mut()) {
+        for p in proxies {
+            if let Some(obj) = p.as_object_mut() {
+                // 1. server_name / servername / sni / server-name 全部移除，取首个有效值
+                let s1 = obj.remove("server_name");
+                let s2 = obj.remove("servername");
+                let s3 = obj.remove("server-name");
+                let s4 = obj.remove("sni");
+                if let Some(s) = s1.or(s2).or(s3).or(s4) {
+                    obj.insert("server_name".into(), s);
+                }
+
+                // 2. skip-cert-verify / skip_cert_verify / allowInsecure / allow_insecure / insecure
+                let k1 = obj.remove("skip_cert_verify");
+                let k2 = obj.remove("skip-cert-verify");
+                let k3 = obj.remove("allowInsecure");
+                let k4 = obj.remove("allow_insecure");
+                let k5 = obj.remove("insecure");
+                if let Some(s) = k1.or(k2).or(k3).or(k4).or(k5) {
+                    obj.insert("skip_cert_verify".into(), s);
+                }
+
+                // 3. client-fingerprint / client_fingerprint / fp
+                let f1 = obj.remove("client_fingerprint");
+                let f2 = obj.remove("client-fingerprint");
+                let f3 = obj.remove("fp");
+                if let Some(f) = f1.or(f2).or(f3) {
+                    obj.insert("client_fingerprint".into(), f);
+                }
+
+                // 4. alter_id / alterId
+                let a1 = obj.remove("alter_id");
+                let a2 = obj.remove("alterId");
+                if let Some(a) = a1.or(a2) {
+                    obj.insert("alter_id".into(), a);
+                }
+            }
+        }
+    }
 }
 
 /// 从文件加载（扩展名决定格式）
@@ -327,6 +372,34 @@ sub-rules:
             "proxies:\n  - name: a\n    type: ss\n    server: x\n    port: 1\n    cipher: aes\n";
         let err = parse(y, Format::Yaml).unwrap_err();
         assert!(err.to_string().contains("password"), "{err}");
+    }
+
+    #[test]
+    fn test_duplicate_alias_keys_in_proxy_handled_gracefully() {
+        let yaml = r#"
+mixed-port: 7890
+proxies:
+  - name: "dup_vless"
+    type: vless
+    server: 1.1.1.1
+    port: 443
+    uuid: "d9d939c9-1a6b-47d1-80d0-4bf008fee7ff"
+    tls: true
+    server_name: "test.com"
+    servername: "test.com"
+    sni: "test.com"
+    skip-cert-verify: true
+    skip_cert_verify: true
+"#;
+        let cfg = parse(yaml, Format::Yaml).expect("同义别名字段并存时应当优雅去重，不能报 duplicate field");
+        assert_eq!(cfg.proxies.len(), 1);
+        match &cfg.proxies[0].kind {
+            ProxyKind::Vless(v) => {
+                assert_eq!(v.server_name.as_deref(), Some("test.com"));
+                assert!(v.skip_cert_verify);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

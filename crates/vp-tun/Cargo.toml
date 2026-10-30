@@ -10,6 +10,7 @@ license.workspace = true
 vp-common.workspace = true
 vp-core.workspace = true
 vp-dns.workspace = true
+vp-transport.workspace = true
 vp-rule.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

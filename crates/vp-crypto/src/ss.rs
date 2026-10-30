@@ -146,17 +146,48 @@ impl AeadChunkCodec {
         n
     }
 
+    /// 零中间分配加密：直接就地加密并追加到 `out`（BytesMut），消除所有中间 Vec
+    pub fn seal_chunk_into_bytes(&mut self, payload: &[u8], out: &mut bytes::BytesMut) {
+        let needed = 2 + self.tag_len + payload.len() + self.tag_len;
+        out.reserve(needed);
+        let n1 = Self::ss_nonce(self.next_nonce());
+        let mut len_buf = (payload.len() as u16).to_be_bytes();
+        let len_tag = self.aead.seal_in_place_detached(&n1, &mut len_buf, b"");
+        out.extend_from_slice(&len_buf);
+        out.extend_from_slice(&len_tag);
+
+        let n2 = Self::ss_nonce(self.next_nonce());
+        let start = out.len();
+        out.extend_from_slice(payload);
+        let data_tag = self
+            .aead
+            .seal_in_place_detached(&n2, &mut out[start..], b"");
+        out.extend_from_slice(&data_tag);
+    }
+
+    /// 零中间分配加密：直接就地加密并追加到 `out`（Vec<u8>）
+    pub fn seal_chunk_into(&mut self, payload: &[u8], out: &mut Vec<u8>) {
+        let needed = 2 + self.tag_len + payload.len() + self.tag_len;
+        out.reserve(needed);
+        let n1 = Self::ss_nonce(self.next_nonce());
+        let mut len_buf = (payload.len() as u16).to_be_bytes();
+        let len_tag = self.aead.seal_in_place_detached(&n1, &mut len_buf, b"");
+        out.extend_from_slice(&len_buf);
+        out.extend_from_slice(&len_tag);
+
+        let n2 = Self::ss_nonce(self.next_nonce());
+        let start = out.len();
+        out.extend_from_slice(payload);
+        let data_tag = self
+            .aead
+            .seal_in_place_detached(&n2, &mut out[start..], b"");
+        out.extend_from_slice(&data_tag);
+    }
+
     /// 加密为一个分块（[2B len ct][len tag][payload ct][payload tag]）
     pub fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(payload.len() + 2 + 2 * self.tag_len);
-        let n1 = Self::ss_nonce(self.next_nonce());
-        let len_ct = self
-            .aead
-            .seal_nonce(&n1, &(payload.len() as u16).to_be_bytes(), b"");
-        out.extend_from_slice(&len_ct);
-        let n2 = Self::ss_nonce(self.next_nonce());
-        let data_ct = self.aead.seal_nonce(&n2, payload, b"");
-        out.extend_from_slice(&data_ct);
+        self.seal_chunk_into(payload, &mut out);
         out
     }
 
@@ -168,23 +199,27 @@ impl AeadChunkCodec {
             return None;
         }
         let n1 = Self::ss_nonce(self.counter);
-        let len_pt = match self.aead.open_nonce(&n1, &buf[..len_ct_len], b"") {
-            Ok(p) => p,
-            Err(e) => return Some(Err(e)),
-        };
-        if len_pt.len() != 2 {
-            return Some(Err(Error::Proto("长度块非法")));
+        let mut len_buf = [buf[0], buf[1]];
+        let mut tag1 = [0u8; 16];
+        tag1.copy_from_slice(&buf[2..len_ct_len]);
+        if let Err(e) = self
+            .aead
+            .open_in_place_detached(&n1, &mut len_buf, &tag1, b"")
+        {
+            return Some(Err(e));
         }
-        let plen = u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize;
+        let plen = u16::from_be_bytes(len_buf) as usize;
         let total = len_ct_len + plen + self.tag_len;
         if buf.len() < total {
             return None;
         }
         let n2 = Self::ss_nonce(self.counter + 1);
-        let data = match self.aead.open_nonce(&n2, &buf[len_ct_len..total], b"") {
-            Ok(p) => p,
-            Err(e) => return Some(Err(e)),
-        };
+        let mut data = buf[len_ct_len..len_ct_len + plen].to_vec();
+        let mut tag2 = [0u8; 16];
+        tag2.copy_from_slice(&buf[len_ct_len + plen..total]);
+        if let Err(e) = self.aead.open_in_place_detached(&n2, &mut data, &tag2, b"") {
+            return Some(Err(e));
+        }
         self.counter += 2;
         Some(Ok((data, total)))
     }

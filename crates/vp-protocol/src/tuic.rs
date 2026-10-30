@@ -533,7 +533,7 @@ impl TuicInbound {
         }
         let target = *guard;
         drop(guard);
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
         sock.connect(target).await?;
         let _ = sock.send(&pkt.payload).await;
         let conn2 = conn.clone();

@@ -68,12 +68,21 @@ pub struct TunRuntime {
 
 impl TunRuntime {
     /// 热停用 TUN：先 drop 路由守卫（Drop 内自动恢复路由表），再停 DNS 劫持与数据面。
-    pub fn shutdown(self) {
-        drop(self.route_guard);
-        if let Some(h) = self.dns_server {
+    pub fn shutdown(mut self) {
+        #[cfg(windows)]
+        vp_transport::set_bind_interface_index(0);
+        let _ = self.route_guard.take();
+        if let Some(h) = self.dns_server.take() {
             h.abort();
         }
         self.data_plane.abort();
+    }
+}
+
+impl Drop for TunRuntime {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        vp_transport::set_bind_interface_index(0);
     }
 }
 
@@ -126,13 +135,14 @@ async fn start_tun_runtime(
     }
     let pool = vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range)
         .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range)))?;
+    let pool_arc = Arc::new(pool);
     let dns_listen: std::net::SocketAddr = "0.0.0.0:53"
         .parse()
         .map_err(|e| Error::Config(format!("DNS 监听非法: {e}")))?;
     let dns_srv = vp_dns::DnsServer::new(
         dns_listen,
-        dns,
-        Some(Arc::new(pool.clone())),
+        dns.clone(),
+        Some(pool_arc.clone()),
         cfg.dns.fake_ip_filter.clone(),
         cfg.ipv6,
     );
@@ -142,7 +152,9 @@ async fn start_tun_runtime(
             Some(handle)
         }
         Err(e) => {
-            warn!("dns 服务器启动失败: {e}");
+            tracing::debug!(
+                "宿主机 53 端口外部监听未启用 (TUN 模式下由用户态虚拟网卡无损劫持接管): {e}"
+            );
             None
         }
     };
@@ -161,7 +173,17 @@ async fn start_tun_runtime(
         fd: tun_cfg.fd,
         ring_capacity: tun_cfg.ring_capacity,
     };
-    let tun_in = Arc::new(vp_tun::TunInbound::new(t, "tun"));
+    let tun_in = Arc::new(
+        vp_tun::TunInbound::new(t, "tun")
+            .with_dns(pool_arc, dns, cfg.dns.fake_ip_filter.clone(), cfg.ipv6),
+    );
+    #[cfg(windows)]
+    if tun_cfg.auto_route {
+        if let Some(if_idx) = vp_transport::detect_default_physical_interface() {
+            vp_transport::set_bind_interface_index(if_idx);
+        }
+    }
+
     let data_plane = tun_in
         .clone()
         .start_with_handle(ctx)

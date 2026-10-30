@@ -224,7 +224,7 @@ impl WgCore {
         let tunn = Arc::new(std::sync::Mutex::new(tunn));
         tokio::spawn(async move {
             match async {
-                let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                let udp = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
                 udp.connect((server_owned.as_str(), port)).await?;
                 Ok::<tokio::net::UdpSocket, std::io::Error>(udp)
             }

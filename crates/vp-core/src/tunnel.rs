@@ -124,6 +124,7 @@ pub async fn relay(
 /// 把若干段内存按顺序写尽。优先一次 vectored 写（Windows = WSASend 多缓冲，一次
 /// syscall 落全部块）；`write_vectored` 允许部分写，循环推进剩余部分直到写完。
 /// 只剩一段时退回 `write_all`（单块场景 vector 无收益）。
+#[allow(dead_code)]
 async fn write_chain_vectored<'a, W: AsyncWrite + Unpin>(
     w: &mut W,
     bufs: &'a [vp_common::bufpool::PooledBuf],
@@ -251,10 +252,15 @@ async fn pump<R, W>(
             }
         }
         let total: usize = lens[..count].iter().sum();
-        let write_ok = if count == 1 {
-            w.write_all(bufs[0].as_slice()).await.is_ok()
-        } else {
-            write_chain_vectored(&mut w, &bufs[..count]).await
+        let write_ok = {
+            let mut ok = true;
+            for b in &bufs[..count] {
+                if w.write_all(b.as_slice()).await.is_err() {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
         };
         if !write_ok {
             break;

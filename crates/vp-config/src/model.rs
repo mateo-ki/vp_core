@@ -352,7 +352,7 @@ fn default_tun_mask() -> String {
 }
 
 fn default_tun_mtu() -> u16 {
-    1500
+    9000
 }
 
 fn default_fake_range() -> String {

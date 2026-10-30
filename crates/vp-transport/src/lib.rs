@@ -339,6 +339,158 @@ fn global_node_resolver() -> Option<(std::sync::Arc<vp_dns::Resolver>, bool)> {
     NODE_RESOLVER.read().ok().and_then(|slot| slot.clone())
 }
 
+static BIND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 设置出站套接字强制绑定的物理网卡索引（TUN 模式防环路）
+pub fn set_bind_interface_index(if_idx: u32) {
+    BIND_INTERFACE_INDEX.store(if_idx, std::sync::atomic::Ordering::Relaxed);
+    vp_dns::set_bind_interface_index(if_idx);
+}
+
+/// 获取当前设置的物理网卡索引
+pub fn get_bind_interface_index() -> Option<u32> {
+    let idx = BIND_INTERFACE_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    if idx > 0 { Some(idx) } else { None }
+}
+
+/// 创建 UDP 套接字，若配置了物理网卡索引则绑定 IP_UNICAST_IF / IPV6_UNICAST_IF 防止路由环路
+pub fn create_udp_socket(bind_addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    vp_dns::create_udp_socket(bind_addr)
+}
+
+/// 自动探测系统的物理出站网卡索引（用于 Windows TUN 模式防环路）
+#[cfg(windows)]
+pub fn detect_default_physical_interface() -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetIpForwardTable, MIB_IPFORWARDTABLE,
+    };
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+
+    let mut size: u32 = 0;
+    unsafe {
+        let ret = GetIpForwardTable(std::ptr::null_mut(), &mut size, 1);
+        if ret != ERROR_INSUFFICIENT_BUFFER && ret != 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let table_ptr = buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE;
+        if GetIpForwardTable(table_ptr, &mut size, 1) == 0 {
+            let num_entries = (*table_ptr).dwNumEntries as usize;
+            let rows_ptr = (*table_ptr).table.as_ptr();
+            let mut best_if = 0;
+            let mut best_metric = u32::MAX;
+
+            for i in 0..num_entries {
+                let row = *rows_ptr.add(i);
+                // 默认路由：Destination 0.0.0.0 且 Mask 0.0.0.0
+                if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardNextHop != 0 {
+                    // 排除 Fake-IP / TUN 保留网段 (198.18.0.0/15)
+                    let hop_bytes = row.dwForwardNextHop.to_ne_bytes();
+                    let is_tun_fake = hop_bytes[0] == 198 && (hop_bytes[1] == 18 || hop_bytes[1] == 19);
+                    if !is_tun_fake && row.dwForwardMetric1 < best_metric {
+                        best_metric = row.dwForwardMetric1;
+                        best_if = row.dwForwardIfIndex;
+                    }
+                }
+            }
+            if best_if > 0 {
+                tracing::info!("自动从默认网关路由探测到物理出站网卡 IfIndex={best_if} (metric={best_metric})");
+                return Some(best_if);
+            }
+        }
+    }
+    tracing::warn!("未能自动探测物理出站网卡");
+    None
+}
+
+#[cfg(not(windows))]
+pub fn detect_default_physical_interface() -> Option<u32> {
+    None
+}
+
+/// 建立 TCP 连接，若配置了物理网卡索引则绑定 IP_UNICAST_IF 防止路由环路
+pub async fn connect_tcp_stream(
+    addr: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    #[cfg(windows)]
+    {
+        if !addr.ip().is_loopback() {
+            if let Some(if_idx) = get_bind_interface_index() {
+                let domain = match addr {
+                    std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+                    std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+                };
+                let socket =
+                    socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                socket.set_nonblocking(true)?;
+
+                bind_socket_to_interface(&socket, addr, if_idx)?;
+
+                match socket.connect(&addr.into()) {
+                    Ok(()) => {
+                        let std_stream: std::net::TcpStream = socket.into();
+                        return tokio::net::TcpStream::from_std(std_stream);
+                    }
+                    Err(e)
+                        if e.raw_os_error()
+                            == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
+                    {
+                        let std_stream: std::net::TcpStream = socket.into();
+                        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+                        tokio_stream.writable().await?;
+                        if let Some(err) = tokio_stream.take_error()? {
+                            return Err(err);
+                        }
+                        return Ok(tokio_stream);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    tokio::net::TcpStream::connect(addr).await
+}
+
+#[cfg(windows)]
+fn bind_socket_to_interface(
+    socket: &socket2::Socket,
+    addr: std::net::SocketAddr,
+    if_idx: u32,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, setsockopt,
+    };
+
+    let raw = socket.as_raw_socket() as SOCKET;
+    let (level, opt, opt_val) = match addr {
+        std::net::SocketAddr::V4(_) => (
+            IPPROTO_IP,
+            IP_UNICAST_IF,
+            if_idx.to_be(), // IP_UNICAST_IF requires network byte order (big-endian)
+        ),
+        std::net::SocketAddr::V6(_) => (
+            IPPROTO_IPV6,
+            IPV6_UNICAST_IF,
+            if_idx, // IPV6_UNICAST_IF requires host byte order
+        ),
+    };
+    unsafe {
+        let ret = setsockopt(
+            raw,
+            level,
+            opt,
+            &opt_val as *const _ as *const _,
+            std::mem::size_of::<u32>() as i32,
+        );
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!("绑定物理网卡 if_idx={if_idx} 失败: {err}");
+        }
+    }
+    Ok(())
+}
+
 /// 多地址竞速 TCP 拨号。
 ///
 /// 节点域名常返回多条 A 记录，且解析结果可能混入被污染/已失效的地址（GFW 的"邻居 IP"
@@ -350,7 +502,20 @@ pub async fn dial_tcp_multi(
     port: u16,
     budget: Duration,
 ) -> Result<tokio::net::TcpStream> {
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let addr = SocketAddr::new(ip, port);
+        let tcp = tokio::time::timeout(budget, connect_tcp_stream(addr))
+            .await
+            .map_err(|_| {
+                vp_common::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("连接 {host}:{port} 超时"),
+                ))
+            })??;
+        tune(&tcp);
+        return Ok(tcp);
+    }
     let mut addrs: Vec<SocketAddr> = Vec::new();
     // 1) 内置 DNS（多上游并发 + 缓存 + 污染过滤）：节点域名优先走它
     if let Some((resolver, ipv6)) = global_node_resolver() {
@@ -376,7 +541,7 @@ pub async fn dial_tcp_multi(
         return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
     }
     if addrs.len() == 1 {
-        let tcp = tokio::time::timeout(budget, tokio::net::TcpStream::connect(addrs[0]))
+        let tcp = tokio::time::timeout(budget, connect_tcp_stream(addrs[0]))
             .await
             .map_err(|_| {
                 vp_common::Error::Io(std::io::Error::new(
@@ -410,7 +575,7 @@ pub async fn dial_addrs_multi(
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            let res = tokio::net::TcpStream::connect(addr).await;
+            let res = connect_tcp_stream(addr).await;
             (addr, res)
         });
     }
@@ -549,6 +714,18 @@ mod tests {
         let dead: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
         let res = dial_addrs_multi(&[dead], "dead.test", 9, Duration::from_millis(700)).await;
         assert!(res.is_err(), "全黑洞地址应当失败: {res:?}");
+    }
+
+    #[test]
+    fn test_detect_default_physical_interface() {
+        #[cfg(windows)]
+        {
+            let if_idx = detect_default_physical_interface();
+            assert!(if_idx.is_some(), "应当能检测到默认物理网卡");
+            let idx = if_idx.unwrap();
+            assert!(idx > 0);
+            assert_ne!(idx, 82, "绝不能匹配到 vpcore-tun 自身");
+        }
     }
 
     #[test]

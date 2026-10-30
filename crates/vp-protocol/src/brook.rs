@@ -722,12 +722,12 @@ impl BrookInbound {
                 SocketAddr::new(ips[0], dst.port)
             }
         };
-        let sock = tokio::net::UdpSocket::bind(if target.is_ipv6() {
-            "[::]:0"
+        let bind_addr: SocketAddr = if target.is_ipv6() {
+            "[::]:0".parse().unwrap()
         } else {
-            "0.0.0.0:0"
-        })
-        .await?;
+            "0.0.0.0:0".parse().unwrap()
+        };
+        let sock = vp_transport::create_udp_socket(bind_addr)?;
         sock.connect(target).await?;
         let sock = std::sync::Arc::new(sock);
         let writer = {

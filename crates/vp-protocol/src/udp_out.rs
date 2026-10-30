@@ -97,7 +97,7 @@ pub async fn socks5_udp_connect(
             }
         }
     };
-    let relay = UdpSocket::bind("0.0.0.0:0").await?;
+    let relay = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
     relay.connect(bind).await?;
     Ok(Socks5PacketConn {
         _ctrl: ctrl,
@@ -174,7 +174,7 @@ impl SsUdpConn {
             .map_err(|e| Error::Addr(format!("解析 {server_host} 失败: {e}")))?
             .next()
             .ok_or(Error::Addr("无地址".into()))?;
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+        let sock = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
         Ok(SsUdpConn {
             sock: Arc::new(sock),
             cipher,
@@ -203,10 +203,8 @@ impl PacketConn for SsUdpConn {
         vp_common::rand_bytes(&mut salt);
         let sub = self.cipher.subkey(&self.key, &salt)?;
         let mut codec = vp_crypto::ss::AeadChunkCodec::new(&self.cipher, &sub)?;
-        let chunk = codec.seal_chunk(&plain);
-
         let mut dgram = salt;
-        dgram.extend_from_slice(&chunk);
+        codec.seal_chunk_into(&plain, &mut dgram);
         self.sock.send_to(&dgram, self.server).await?;
         Ok(())
     }

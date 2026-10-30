@@ -212,7 +212,7 @@ impl Hysteria1Outbound {
                 } else {
                     "[::]:0"
                 };
-                let sock = tokio::net::UdpSocket::bind(bind).await?;
+                let sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
                 let wrapped = Arc::new(ObfsUdpSocket::new(sock, ob.clone()));
                 quinn::Endpoint::new_with_abstract_socket(
                     quinn::EndpointConfig::default(),

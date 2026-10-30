@@ -5,3 +5,5 @@ Cargo.lock.orig
 .idea/
 .zcode/
 .agents/
+/vendor
+/.wsl-setup

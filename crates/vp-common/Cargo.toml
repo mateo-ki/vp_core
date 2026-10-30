@@ -7,10 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-arc-swap.workspace = true
 bytes.workspace = true
 serde = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+
+[dev-dependencies]
+arc-swap.workspace = true
 
 [features]
 default = ["rand", "serde"]

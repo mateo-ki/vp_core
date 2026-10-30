@@ -1,3 +1,15 @@
+# 🚀 VP_Core v1.2.0 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.2.0**！本版正式打通外部控制器 REST API 模式热切能力，实现「规则 / 全局 / 直连」运行中免停秒级无感热切换：
+
+### ⚡ 外部控制器与出站模式免停热调
+- **PATCH /configs 动态热调模式**：实现 Clash 兼容规范 REST API `PATCH /configs {"mode": "rule" | "global" | "direct"}`，支持大小写不敏感解析与标准响应；
+- **RouterHandle 原子路由热换**：新增 `clone_with_mode` 机制，在保持所有既有代理组连接池、节点健康检查与活跃长连接不中断的前提下，原子替换内存分流决策引擎；
+- **配置持久化落盘同步**：热调模式时自动异步将生效模式写回持久化 `config.yaml`（`mode:` 字段），保证重启后状态一致；
+- **GET /configs 模式小写规范对齐**：返回结果与 Clash / Mihomo 规范严格对齐为小写（`rule`/`global`/`direct`）。
+
+---
+
 # 🚀 VP_Core v1.1.0 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.1.0**！本版是数据面性能与运行时资源治理的里程碑：转发引擎引入预读合并与 Linux splice 零拷贝，编译优化释放加密 SIMD 算力，并建立起"可限制、可追踪、可取消、可回收"的连接运行时：

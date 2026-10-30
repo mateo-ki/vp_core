@@ -908,12 +908,7 @@ rules: ['MATCH,PROXY']
         assert_eq!(url_decode("PROXY"), "PROXY");
     }
 
-    async fn http_patch(
-        addr: &str,
-        path: &str,
-        secret: Option<&str>,
-        body: &str,
-    ) -> (u16, String) {
+    async fn http_patch(addr: &str, path: &str, secret: Option<&str>, body: &str) -> (u16, String) {
         let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
         let auth = secret
             .map(|t| format!("Authorization: Bearer {t}\r\n"))

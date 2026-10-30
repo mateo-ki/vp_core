@@ -143,7 +143,8 @@ impl TunInbound {
             cfg.address, cfg.mtu, cfg.fake_ip_range
         );
         Ok(tokio::spawn(async move {
-            if let Err(e) = run_with_device(cfg, tag, ctx, pool, resolver, filter, ipv6, dev).await {
+            if let Err(e) = run_with_device(cfg, tag, ctx, pool, resolver, filter, ipv6, dev).await
+            {
                 warn!("TUN 数据面退出: {e}");
             }
         }))
@@ -222,6 +223,7 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
     Ok(Box::new(vp_core::stream::Opaque(dev)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_device<D>(
     cfg: TunConfig,
     tag: Arc<str>,
@@ -609,7 +611,10 @@ mod tests {
         let r_https = build_dns_reply(&q_https, &pool, &resolver, &filter, false).await;
         let msg_https = wire::parse_response(&r_https).unwrap();
         assert_eq!(msg_https.id, 0x0065);
-        assert!(msg_https.answers.is_empty(), "Fake-IP 域名 Type 65 应立即返回空应答");
+        assert!(
+            msg_https.answers.is_empty(),
+            "Fake-IP 域名 Type 65 应立即返回空应答"
+        );
     }
 
     #[tokio::test]

@@ -391,7 +391,8 @@ proxies:
     skip-cert-verify: true
     skip_cert_verify: true
 "#;
-        let cfg = parse(yaml, Format::Yaml).expect("同义别名字段并存时应当优雅去重，不能报 duplicate field");
+        let cfg = parse(yaml, Format::Yaml)
+            .expect("同义别名字段并存时应当优雅去重，不能报 duplicate field");
         assert_eq!(cfg.proxies.len(), 1);
         match &cfg.proxies[0].kind {
             ProxyKind::Vless(v) => {

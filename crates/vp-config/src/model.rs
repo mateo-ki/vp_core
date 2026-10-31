@@ -216,8 +216,8 @@ pub struct Config {
     pub asn_url: Option<String>,
     #[serde(default)]
     pub tun: Option<TunCfg>,
-    /// 协议服务端入站（自建服务器场景）
-    #[serde(default)]
+    /// 协议服务端入站（自建服务器/透明网关/多入站场景）
+    #[serde(alias = "inbounds", default)]
     pub listeners: Vec<ListenerCfg>,
     /// 性能与套接字缓冲区调优
     #[serde(default)]
@@ -262,16 +262,24 @@ pub struct TuningConfig {
     pub tcp_keepalive_secs: Option<u64>,
 }
 
-/// 服务端入站定义（M1：trojan/vmess/vless/ss，TLS 证书项随 M3 补）
+/// 服务端入站定义（支持 tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss）
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListenerCfg {
     pub name: String,
-    /// trojan / vmess / vless / ss
+    /// trojan / vmess / vless / ss / anytls / mieru / tproxy / redir / mixed / socks5 / http
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
     #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
+    /// 监听绑定 IP（默认 "0.0.0.0"）
+    #[serde(
+        alias = "bind-address",
+        alias = "bind_address",
+        alias = "listen",
+        default
+    )]
+    pub listen: Option<String>,
     /// trojan: 密码列表；vmess/vless: uuid 列表；ss: 单密码
     #[serde(default)]
     pub users: Vec<String>,
@@ -466,6 +474,7 @@ pub enum ProxyKind {
     Http(HttpCfg),
     Https(HttpCfg),
     Wireguard(WgCfg),
+    Tailscale(TailscaleCfg),
     Direct,
     Reject,
 }
@@ -492,6 +501,7 @@ impl ProxyKind {
             ProxyKind::Http(_) => "http",
             ProxyKind::Https(_) => "https",
             ProxyKind::Wireguard(_) => "wireguard",
+            ProxyKind::Tailscale(_) => "tailscale",
             ProxyKind::Direct => "direct",
             ProxyKind::Reject => "reject",
         }
@@ -517,6 +527,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Http(h) | ProxyKind::Https(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Wireguard(w) => Some((w.server.clone(), w.port)),
+            ProxyKind::Tailscale(t) => Some((t.server.clone(), t.port)),
             ProxyKind::Direct | ProxyKind::Reject => None,
         }
     }
@@ -541,6 +552,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(_) => true,
             ProxyKind::Http(_) | ProxyKind::Https(_) => false,
             ProxyKind::Wireguard(_) => true,
+            ProxyKind::Tailscale(t) => t.udp,
             ProxyKind::Direct => true,
             ProxyKind::Reject => false,
         }
@@ -1110,6 +1122,38 @@ impl WgCfg {
     pub fn local_v6(&self) -> Option<std::net::Ipv6Addr> {
         self.ipv6.as_deref().and_then(|s| s.parse().ok())
     }
+}
+
+/// Tailscale 节点配置（支持通过本地或远程 Tailscale Connector/Socks5 接入或出口节点路由）
+#[derive(Debug, Clone, Deserialize)]
+pub struct TailscaleCfg {
+    #[serde(default = "default_tailscale_server")]
+    pub server: String,
+    #[serde(
+        default = "default_tailscale_port",
+        deserialize_with = "de_u16_lenient"
+    )]
+    pub port: u16,
+    #[serde(alias = "auth-key", alias = "auth_key", default)]
+    pub auth_key: Option<String>,
+    #[serde(alias = "control-url", alias = "control_url", default)]
+    pub control_url: Option<String>,
+    #[serde(alias = "exit-node", alias = "exit_node", default)]
+    pub exit_node: Option<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(alias = "state-dir", alias = "state_dir", default)]
+    pub state_dir: Option<String>,
+    #[serde(default = "default_true")]
+    pub udp: bool,
+}
+
+fn default_tailscale_server() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_tailscale_port() -> u16 {
+    1055
 }
 
 #[derive(Debug, Clone, Deserialize)]

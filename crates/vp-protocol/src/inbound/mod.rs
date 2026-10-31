@@ -21,6 +21,8 @@ pub enum InboundKind {
     Mixed,
     Socks5,
     Http,
+    Redir,
+    Tproxy,
 }
 
 /// 构建入站监听器
@@ -29,6 +31,8 @@ pub fn build_inbound(kind: InboundKind, bind: String, port: u16, tag: &str) -> A
         InboundKind::Mixed => Arc::new(MixedInbound::new(bind, port, tag)),
         InboundKind::Socks5 => Arc::new(Socks5Inbound::new(bind, port, tag)),
         InboundKind::Http => Arc::new(HttpInbound::new(bind, port, tag)),
+        InboundKind::Redir => Arc::new(crate::redir::RedirInbound::new(&bind, port, tag)),
+        InboundKind::Tproxy => Arc::new(crate::tproxy::TproxyInbound::new(&bind, port, tag)),
     }
 }
 

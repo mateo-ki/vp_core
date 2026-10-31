@@ -7,3 +7,5 @@ Cargo.lock.orig
 .agents/
 /vendor
 /.wsl-setup
+__pycache__/
+*.pyc

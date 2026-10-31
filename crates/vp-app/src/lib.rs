@@ -118,6 +118,31 @@ pub async fn sync_tun_state(
     Ok(())
 }
 
+fn parse_dns_listen(s: &str, default_bind: &str) -> Result<std::net::SocketAddr> {
+    let s = s.trim();
+    if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    let default_ip = if default_bind == "*" || default_bind.is_empty() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        default_bind
+            .parse::<std::net::IpAddr>()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+    };
+
+    if let Some(port_str) = s.strip_prefix(':') {
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| Error::Config(format!("dns.listen 端口非法 {s}: {e}")))?;
+        return Ok(std::net::SocketAddr::new(default_ip, port));
+    }
+    if let Ok(port) = s.parse::<u16>() {
+        return Ok(std::net::SocketAddr::new(default_ip, port));
+    }
+    Err(Error::Config(format!("dns.listen 地址格式非法: {s}")))
+}
+
 /// 启动 TUN 三件套（fake-ip DNS 服务器、TUN 数据面、auto-route 路由守卫）。
 /// 启动与热重载共用：设备创建失败返回 Err；DNS 监听 / auto-route 失败仅告警
 /// （与既有启动语义一致：TUN 建不起来不该拦住整个内核）。
@@ -136,9 +161,12 @@ async fn start_tun_runtime(
     let pool = vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range)
         .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range)))?;
     let pool_arc = Arc::new(pool);
-    let dns_listen: std::net::SocketAddr = "0.0.0.0:53"
-        .parse()
-        .map_err(|e| Error::Config(format!("DNS 监听非法: {e}")))?;
+    let dns_listen: std::net::SocketAddr = cfg
+        .dns
+        .listen
+        .as_deref()
+        .and_then(|s| parse_dns_listen(s, "0.0.0.0").ok())
+        .unwrap_or_else(|| "0.0.0.0:53".parse().unwrap());
     let dns_srv = vp_dns::DnsServer::new(
         dns_listen,
         dns.clone(),
@@ -723,19 +751,32 @@ impl App {
                 }
             }
 
-            // redir/tproxy（仅 Linux；非 Linux 明确报错但不阻断启动）
-            for (port, tag) in [(cfg.redir_port, "redir"), (cfg.tproxy_port, "tproxy")] {
-                if let Some(p) = port {
-                    let inb: Arc<dyn vp_core::Inbound> =
-                        Arc::new(vp_protocol::redir::RedirInbound::new(&bind, p, tag));
-                    match inb.clone().start(inb_ctx.clone()).await {
-                        Ok(bound) => {
-                            info!("{tag} 监听 {bind}:{bound}");
-                            listen_ports.push((tag.to_string(), bound));
-                        }
-                        Err(e) => {
-                            warn!("{tag} 未启用: {e}");
-                        }
+            // redir 透明代理（仅 Linux；非 Linux 明确报错但不阻断启动）
+            if let Some(p) = cfg.redir_port {
+                let inb: Arc<dyn vp_core::Inbound> =
+                    Arc::new(vp_protocol::redir::RedirInbound::new(&bind, p, "redir"));
+                match inb.clone().start(inb_ctx.clone()).await {
+                    Ok(bound) => {
+                        info!("redir 监听 {bind}:{bound}");
+                        listen_ports.push(("redir".to_string(), bound));
+                    }
+                    Err(e) => {
+                        warn!("redir 未启用: {e}");
+                    }
+                }
+            }
+
+            // tproxy 透明代理（仅 Linux 支持 TCP+UDP 透明代理与 IP_TRANSPARENT 辅助控制报文）
+            if let Some(p) = cfg.tproxy_port {
+                let inb: Arc<dyn vp_core::Inbound> =
+                    Arc::new(vp_protocol::tproxy::TproxyInbound::new(&bind, p, "tproxy"));
+                match inb.clone().start(inb_ctx.clone()).await {
+                    Ok(bound) => {
+                        info!("tproxy 监听 {bind}:{bound}");
+                        listen_ports.push(("tproxy".to_string(), bound));
+                    }
+                    Err(e) => {
+                        warn!("tproxy 未启用: {e}");
                     }
                 }
             }
@@ -755,6 +796,52 @@ impl App {
                         listen_ports.push((l.name.clone(), bound));
                     }
                     Err(e) => warn!("listener {:?} 启动失败: {e}", l.name),
+                }
+            }
+
+            // 独立 DNS 服务端：只要配置了 dns.listen（例如 "0.0.0.0:53" 或 ":53"），
+            // 无论是否启用 TUN，均作为独立 DNS 服务对外监听并提供智能分流/解析
+            if let Some(listen_str) = &cfg.dns.listen {
+                match parse_dns_listen(listen_str, &bind) {
+                    Ok(listen_addr) => {
+                        let pool_arc = if cfg.dns.enhanced_mode.as_deref() == Some("fake-ip")
+                            || cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false)
+                        {
+                            let range = cfg
+                                .dns
+                                .fake_ip_range
+                                .as_deref()
+                                .or_else(|| cfg.tun.as_ref().map(|t| t.fake_ip_range.as_str()))
+                                .unwrap_or("198.18.0.0/16");
+                            vp_dns::FakeIpPool::new(range).map(Arc::new)
+                        } else {
+                            None
+                        };
+
+                        let dns_srv = vp_dns::DnsServer::new(
+                            listen_addr,
+                            dns.clone(),
+                            pool_arc,
+                            cfg.dns.fake_ip_filter.clone(),
+                            cfg.ipv6,
+                        );
+
+                        match dns_srv.spawn_handle().await {
+                            Ok((bound, _handle)) => {
+                                info!(
+                                    "dns 独立服务端监听 {bound} (enhanced-mode: {:?})",
+                                    cfg.dns.enhanced_mode
+                                );
+                                listen_ports.push(("dns".to_string(), bound.port()));
+                            }
+                            Err(e) => {
+                                warn!("dns.listen 监听 {listen_addr} 失败: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("dns.listen 解析失败: {e}");
+                    }
                 }
             }
 
@@ -914,16 +1001,38 @@ impl App {
     }
 }
 
-/// 构建 listeners 段的服务端入站（trojan/vmess/vless/ss）
+/// 构建 listeners / inbounds 段的服务端入站（tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss...）
 fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound>> {
     let tag = l.name.as_str();
+    let bind = l.listen.as_deref().unwrap_or("0.0.0.0");
     match l.kind.as_str() {
+        "tproxy" => Ok(Arc::new(vp_protocol::tproxy::TproxyInbound::new(
+            bind, l.port, tag,
+        ))),
+        "redir" => Ok(Arc::new(vp_protocol::redir::RedirInbound::new(
+            bind, l.port, tag,
+        ))),
+        "mixed" => Ok(Arc::new(vp_protocol::inbound::MixedInbound::new(
+            bind.to_string(),
+            l.port,
+            tag,
+        ))),
+        "socks" | "socks5" => Ok(Arc::new(vp_protocol::inbound::Socks5Inbound::new(
+            bind.to_string(),
+            l.port,
+            tag,
+        ))),
+        "http" => Ok(Arc::new(vp_protocol::inbound::HttpInbound::new(
+            bind.to_string(),
+            l.port,
+            tag,
+        ))),
         "trojan" => {
             if l.users.is_empty() {
                 return Err(Error::Config("trojan listener 需要 users（密码）".into()));
             }
             Ok(Arc::new(vp_protocol::trojan::TrojanInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "vmess" => {
@@ -931,7 +1040,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 return Err(Error::Config("vmess listener 需要 users（uuid）".into()));
             }
             Ok(Arc::new(vp_protocol::vmess::VmessInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "vless" => {
@@ -939,7 +1048,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 return Err(Error::Config("vless listener 需要 users（uuid）".into()));
             }
             Ok(Arc::new(vp_protocol::vless::VlessInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "anytls" => {
@@ -947,7 +1056,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 return Err(Error::Config("anytls listener 需要 users（密码）".into()));
             }
             Ok(Arc::new(vp_protocol::anytls::AnytlsInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "mieru" => {
@@ -957,7 +1066,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 ));
             }
             Ok(Arc::new(vp_protocol::mieru::MieruInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "brook" => {
@@ -965,7 +1074,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 return Err(Error::Config("brook listener 需要 users（密码）".into()));
             }
             Ok(Arc::new(vp_protocol::brook::BrookInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "snell" => {
@@ -975,7 +1084,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 ));
             }
             Ok(Arc::new(vp_protocol::snell::SnellInbound::new(
-                "0.0.0.0",
+                bind,
                 l.port,
                 tag,
                 &l.users,
@@ -989,7 +1098,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 ));
             }
             Ok(Arc::new(vp_protocol::naive::NaiveInbound::new(
-                "0.0.0.0", l.port, tag, &l.users,
+                bind, l.port, tag, &l.users,
             )?))
         }
         "ss" => {
@@ -1016,11 +1125,11 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 None => None,
             };
             Ok(Arc::new(vp_protocol::ss::SsInbound::new_with_shadow_tls(
-                "0.0.0.0", l.port, tag, cipher, password, stls,
+                bind, l.port, tag, cipher, password, stls,
             )?))
         }
         other => Err(Error::Unsupported(format!(
-            "listener 类型 {other:?}（M1 支持 trojan/vmess/vless/ss）"
+            "listener 类型 {other:?}（支持 tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss 等）"
         ))),
     }
 }
@@ -2111,6 +2220,113 @@ rules:
         assert_eq!(res.rule.as_ref().unwrap().target, "PROXY");
         assert_eq!(res.rule.as_ref().unwrap().rule, "MATCH,PROXY");
         assert_eq!(&*res.via, "DIRECT");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn standalone_dns_listen_without_tun() {
+        let temp_dir = std::env::temp_dir().join(format!("vp_dns_listen_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let cfg = r#"
+mode: rule
+dns:
+  enable: true
+  listen: 127.0.0.1:0
+  enhanced-mode: fake-ip
+  nameserver:
+    - 223.5.5.5
+proxies: []
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [DIRECT]
+rules: ['MATCH,PROXY']
+"#;
+        let app = App::start(cfg, Format::Yaml, &temp_dir, true)
+            .await
+            .expect("无 TUN 独立 dns.listen 服务应当启动成功");
+
+        let dns_port = app
+            .listen_ports
+            .iter()
+            .find(|(tag, _)| tag == "dns")
+            .map(|(_, port)| *port)
+            .expect("应当在 listen_ports 中注册独立 dns 端口");
+        assert!(dns_port > 0);
+
+        // 发送 UDP DNS 查询 (query for example.com A record)
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // 构造简易 DNS A 记录查询: Transaction ID 0x1234, Flags 0x0100 (standard query), 1 question
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        // 7example3com0
+        query.extend_from_slice(&[
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+        // Type A (1), Class IN (1)
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        sock.send_to(&query, ("127.0.0.1", dns_port)).await.unwrap();
+
+        let mut resp_buf = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(3), sock.recv(&mut resp_buf))
+            .await
+            .expect("DNS 应答超时")
+            .unwrap();
+
+        assert!(n >= 12, "DNS 响应报文应至少包含 12 字节报头");
+        assert_eq!(&resp_buf[..2], &[0x12, 0x34], "Transaction ID 必须一致");
+        // Flags: QR bit should be 1 (response)
+        assert_ne!(resp_buf[2] & 0x80, 0, "QR bit 应标记为应答");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_tailscale_and_tproxy_inbounds_config() {
+        let temp_dir = std::env::temp_dir().join("vp_test_ts_tproxy");
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        let cfg = r#"
+inbounds:
+  - name: my-tproxy
+    type: tproxy
+    port: 0
+    listen: 127.0.0.1
+  - name: my-mixed
+    type: mixed
+    port: 0
+    listen: 127.0.0.1
+proxies:
+  - name: ts-node
+    type: tailscale
+    server: 127.0.0.1
+    port: 1055
+    exit-node: "100.64.0.1"
+    udp: true
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [ts-node, DIRECT]
+rules:
+  - DOMAIN-SUFFIX,ts.net,ts-node
+  - IP-CIDR,100.64.0.0/10,ts-node
+  - MATCH,PROXY
+"#;
+        let app = App::start(cfg, Format::Yaml, &temp_dir, true)
+            .await
+            .expect("配置应成功解析并启动");
+
+        // 验证 tailscale 节点注册在 router 中
+        let ts = app.router.current().outbound("ts-node");
+        assert!(ts.is_some(), "tailscale 节点应注册到路由表");
+        assert_eq!(ts.unwrap().name(), "ts-node");
+
+        // mixed 入站必然启动成功
+        assert!(app.listen_ports.iter().any(|(tag, _)| tag == "my-mixed"));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

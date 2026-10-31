@@ -24,6 +24,8 @@ pub mod ss;
 pub mod ssh;
 pub mod ssr;
 pub mod sub;
+pub mod tailscale;
+pub mod tproxy;
 #[cfg(feature = "trojan")]
 pub mod trojan;
 pub mod tuic;
@@ -401,6 +403,10 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
         ProxyKind::Brook(b) => Arc::new(brook::BrookOutbound::new_named(cfg.name.as_str(), b)?),
         ProxyKind::Mieru(m) => Arc::new(mieru::MieruOutbound::new_named(cfg.name.as_str(), m)?),
         ProxyKind::Naive(n) => build_naive(cfg, n)?,
+        ProxyKind::Tailscale(ts) => Arc::new(tailscale::TailscaleOutbound::new_named(
+            cfg.name.as_str(),
+            ts,
+        )?),
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     let o = match cfg.kind {

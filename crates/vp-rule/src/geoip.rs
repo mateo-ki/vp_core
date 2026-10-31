@@ -15,14 +15,153 @@ pub enum GeoIpDb {
     Dat(Arc<HashMap<String, Arc<IpIntervalSet>>>),
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug, Clone)]
 struct CountryNode {
     iso_code: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct CountryLookup {
-    country: Option<CountryNode>,
+#[derive(serde::Deserialize, Debug, Clone)]
+struct ContinentNode {
+    code: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum CountryField {
+    Object(CountryNode),
+    String(String),
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum ContinentField {
+    Object(ContinentNode),
+    String(String),
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum TagsField {
+    List(Vec<String>),
+    Single(String),
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum MmdbRecord {
+    /// 字典格式（兼顾 MaxMind 标准结构、自定义 code/country 扁平字段以及 tags 标签）
+    Map {
+        #[serde(default)]
+        country: Option<CountryField>,
+        #[serde(default)]
+        registered_country: Option<CountryField>,
+        #[serde(default)]
+        continent: Option<ContinentField>,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        iso_code: Option<String>,
+        #[serde(default)]
+        tags: Option<TagsField>,
+    },
+    /// MetaCubeX / meta-rules-dat `geoip.metadb` (DatabaseType: "Meta-geoip0")：
+    /// 存储为字符串数组，如 ["cn", "google"]
+    StringList(Vec<String>),
+    /// 存储为单个字符串，如 "cn"
+    Single(String),
+}
+
+impl MmdbRecord {
+    pub fn matches_code(&self, target: &str) -> bool {
+        match self {
+            MmdbRecord::Map {
+                country,
+                registered_country,
+                continent,
+                code,
+                iso_code,
+                tags,
+            } => {
+                if let Some(c) = country {
+                    match c {
+                        CountryField::Object(node) => {
+                            if let Some(iso) = node.iso_code.as_deref() {
+                                if iso.eq_ignore_ascii_case(target) {
+                                    return true;
+                                }
+                            }
+                        }
+                        CountryField::String(s) => {
+                            if s.eq_ignore_ascii_case(target) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = registered_country {
+                    match c {
+                        CountryField::Object(node) => {
+                            if let Some(iso) = node.iso_code.as_deref() {
+                                if iso.eq_ignore_ascii_case(target) {
+                                    return true;
+                                }
+                            }
+                        }
+                        CountryField::String(s) => {
+                            if s.eq_ignore_ascii_case(target) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = continent {
+                    match c {
+                        ContinentField::Object(node) => {
+                            if let Some(code) = node.code.as_deref() {
+                                if code.eq_ignore_ascii_case(target) {
+                                    return true;
+                                }
+                            }
+                        }
+                        ContinentField::String(s) => {
+                            if s.eq_ignore_ascii_case(target) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if let Some(c) = code.as_deref() {
+                    if c.eq_ignore_ascii_case(target) {
+                        return true;
+                    }
+                }
+                if let Some(c) = iso_code.as_deref() {
+                    if c.eq_ignore_ascii_case(target) {
+                        return true;
+                    }
+                }
+                if let Some(t) = tags {
+                    match t {
+                        TagsField::List(list) => {
+                            if list.iter().any(|item| item.eq_ignore_ascii_case(target)) {
+                                return true;
+                            }
+                        }
+                        TagsField::Single(s) => {
+                            if s.eq_ignore_ascii_case(target) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            MmdbRecord::StringList(list) => {
+                list.iter().any(|item| item.eq_ignore_ascii_case(target))
+            }
+            MmdbRecord::Single(s) => s.eq_ignore_ascii_case(target),
+        }
+    }
 }
 
 impl GeoIpDb {
@@ -123,16 +262,12 @@ impl GeoIpMatcher {
                     }
             }
             GeoIpMatcher::MmdbMmap { code, reader } => {
-                let hit: Option<CountryLookup> = reader.lookup(ip).ok().flatten();
-                hit.and_then(|c| c.country)
-                    .and_then(|c| c.iso_code)
-                    .is_some_and(|iso| iso.eq_ignore_ascii_case(code))
+                let hit: Option<MmdbRecord> = reader.lookup(ip).ok().flatten();
+                hit.is_some_and(|r| r.matches_code(code))
             }
             GeoIpMatcher::MmdbMem { code, reader } => {
-                let hit: Option<CountryLookup> = reader.lookup(ip).ok().flatten();
-                hit.and_then(|c| c.country)
-                    .and_then(|c| c.iso_code)
-                    .is_some_and(|iso| iso.eq_ignore_ascii_case(code))
+                let hit: Option<MmdbRecord> = reader.lookup(ip).ok().flatten();
+                hit.is_some_and(|r| r.matches_code(code))
             }
             GeoIpMatcher::Dat { set } => set.contains(ip),
         }
@@ -255,5 +390,39 @@ mod tests {
         assert!(lan_matcher.matches("192.168.1.1".parse().unwrap()));
         assert!(lan_matcher.matches("127.0.0.1".parse().unwrap()));
         assert!(!lan_matcher.matches("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_mmdb_record_polymorphic_deserialization() {
+        // 1. MaxMind 标准嵌套对象
+        let standard_json = r#"{"country": {"iso_code": "CN"}}"#;
+        let rec: MmdbRecord = serde_yaml::from_str(standard_json).unwrap();
+        assert!(rec.matches_code("cn"));
+        assert!(rec.matches_code("CN"));
+        assert!(!rec.matches_code("US"));
+
+        // 2. 大洲代码
+        let continent_json = r#"{"continent": {"code": "AS"}}"#;
+        let rec: MmdbRecord = serde_yaml::from_str(continent_json).unwrap();
+        assert!(rec.matches_code("AS"));
+
+        // 3. MetaCubeX meta-rules-dat `geoip.metadb` 字符串数组
+        let list_json = r#"["cn", "google"]"#;
+        let rec: MmdbRecord = serde_yaml::from_str(list_json).unwrap();
+        assert!(rec.matches_code("CN"));
+        assert!(rec.matches_code("google"));
+        assert!(rec.matches_code("GOOGLE"));
+        assert!(!rec.matches_code("telegram"));
+
+        // 4. sing-geoip 单个字符串
+        let single_json = r#""cn""#;
+        let rec: MmdbRecord = serde_yaml::from_str(single_json).unwrap();
+        assert!(rec.matches_code("CN"));
+        assert!(!rec.matches_code("HK"));
+
+        // 5. 扁平 Map 格式
+        let map_json = r#"{"code": "HK"}"#;
+        let rec: MmdbRecord = serde_yaml::from_str(map_json).unwrap();
+        assert!(rec.matches_code("hk"));
     }
 }

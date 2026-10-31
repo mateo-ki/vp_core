@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::task::JoinHandle;
-use vp_common::bufpool::BUF_SIZE;
 use vp_common::{Stats, get_buf};
 
 use crate::conn_table::{ConnMeta, ConnTable};
@@ -33,8 +32,8 @@ enum Dir {
 
 /// 双向转发。返回 (up, down) 字节数。任何一侧结束都会向对端传播关闭。
 pub async fn relay(
-    left: Box<dyn ProxyStream>,
-    right: Box<dyn ProxyStream>,
+    #[allow(unused_mut)] mut left: Box<dyn ProxyStream>,
+    #[allow(unused_mut)] mut right: Box<dyn ProxyStream>,
     hook: RelayHook,
 ) -> (u64, u64) {
     // Linux 裸 socket 直连：splice 零拷贝快速路径（数据不过用户态）。
@@ -42,38 +41,76 @@ pub async fn relay(
     // 建管道失败发生在任何数据移动之前，撤销注册后落回通用泵。
     #[cfg(target_os = "linux")]
     {
-        if let (Some(a), Some(b)) = (left.raw_socket(), right.raw_socket()) {
-            let registered = match (&hook.table, &hook.meta) {
-                (Some(t), Some(m)) => {
-                    if let Some(s) = &hook.stats {
-                        s.conn_open();
+        if left.raw_socket().is_some() && right.raw_socket().is_some() {
+            // 若某侧持有嗅探/预读未消费的首包字节，在切入内核态 splice 前先写出至对端，防首包丢失
+            let mut pre_up = 0u64;
+            let mut pre_down = 0u64;
+            let mut drain_ok = true;
+            if let Some(peek) = left.unconsumed_peek() {
+                if !peek.is_empty() {
+                    let len = peek.len();
+                    if right.write_all(peek).await.is_err() {
+                        drain_ok = false;
+                    } else {
+                        pre_up += len as u64;
+                        left.consume_peek(len);
                     }
-                    Some(t.register(m.clone()))
                 }
-                _ => None,
-            };
-            match splice::relay_pair(a, b, hook.stats.clone()).await {
-                Ok((up, down)) => {
-                    if let (Some(t), Some(rc)) = (&hook.table, &registered) {
-                        t.remove(rc.id);
-                    }
-                    if registered.is_some() {
-                        if let Some(s) = &hook.stats {
-                            s.conn_close();
+            }
+            if drain_ok {
+                if let Some(peek) = right.unconsumed_peek() {
+                    if !peek.is_empty() {
+                        let len = peek.len();
+                        if left.write_all(peek).await.is_err() {
+                            drain_ok = false;
+                        } else {
+                            pre_down += len as u64;
+                            right.consume_peek(len);
                         }
                     }
-                    return (up, down);
                 }
-                Err(_) => {
-                    if let (Some(t), Some(rc)) = (&hook.table, &registered) {
-                        t.remove(rc.id);
-                    }
-                    if registered.is_some() {
-                        if let Some(s) = &hook.stats {
-                            s.conn_close();
+            }
+            if drain_ok {
+                if let (Some(a), Some(b)) = (left.raw_socket(), right.raw_socket()) {
+                    let registered = match (&hook.table, &hook.meta) {
+                        (Some(t), Some(m)) => {
+                            if let Some(s) = &hook.stats {
+                                s.conn_open();
+                                if pre_up > 0 {
+                                    s.add_up(pre_up);
+                                }
+                                if pre_down > 0 {
+                                    s.add_down(pre_down);
+                                }
+                            }
+                            Some(t.register(m.clone()))
+                        }
+                        _ => None,
+                    };
+                    match splice::relay_pair(a, b, hook.stats.clone()).await {
+                        Ok((up, down)) => {
+                            if let (Some(t), Some(rc)) = (&hook.table, &registered) {
+                                t.remove(rc.id);
+                            }
+                            if registered.is_some() {
+                                if let Some(s) = &hook.stats {
+                                    s.conn_close();
+                                }
+                            }
+                            return (up + pre_up, down + pre_down);
+                        }
+                        Err(_) => {
+                            if let (Some(t), Some(rc)) = (&hook.table, &registered) {
+                                t.remove(rc.id);
+                            }
+                            if registered.is_some() {
+                                if let Some(s) = &hook.stats {
+                                    s.conn_close();
+                                }
+                            }
+                            // 落回下方通用泵
                         }
                     }
-                    // 落回下方通用泵
                 }
             }
         }
@@ -232,9 +269,9 @@ async fn pump<R, W>(
             }
             Err(_) => break,
         }
-        // 只有"读满整块"才继续链读；链读一律"探一眼"：
-        // 有数据就追加，没有（或 EOF/错误）就带着已攒数据收手，立刻送达
-        while count < MAX_CHAIN && lens[count - 1] == BUF_SIZE {
+        // 持续灌数据时链读；链读一律"探一眼"（非阻塞）：
+        // 有已就绪数据就追加，没有（Pending / EOF / 错误）带着已攒数据立即写出，绝不持数据阻塞
+        while count < MAX_CHAIN && lens[count - 1] >= 2048 {
             if count == bufs.len() {
                 bufs.push(get_buf());
             }
@@ -260,6 +297,9 @@ async fn pump<R, W>(
                     break;
                 }
             }
+            if ok {
+                let _ = w.flush().await;
+            }
             ok
         };
         if !write_ok {
@@ -284,6 +324,7 @@ async fn pump<R, W>(
 mod tests {
     use super::*;
     use tokio::io::duplex;
+    use vp_common::bufpool::BUF_SIZE;
 
     #[tokio::test]
     async fn relay_transfers_both_ways() {

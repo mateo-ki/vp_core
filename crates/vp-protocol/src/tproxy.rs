@@ -315,15 +315,16 @@ mod linux_impl {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        let mut msg = libc::msghdr {
-            msg_name: &mut src_storage as *mut _ as *mut libc::c_void,
-            msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-            msg_iov: &mut iov,
-            msg_iovlen: 1,
-            msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
-            msg_controllen: cmsg_buf.len(),
-            msg_flags: 0,
-        };
+        // musl 的 msghdr 含私有填充字段（__pad1/__pad2），禁止结构体字面量构造，
+        // 且 msg_controllen 在 musl 为 u32（glibc 为 usize）——统一 zeroed + 逐字段赋值
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = &mut src_storage as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_buf.len() as _;
+        msg.msg_flags = 0;
 
         let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
         if n < 0 {

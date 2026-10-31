@@ -167,6 +167,21 @@ impl Group {
         }
     }
 
+    /// 取消策略组固定选中 / 重置选择
+    pub fn unfix_selected(&self) -> bool {
+        match self.ty {
+            GroupType::Select => {
+                *self.select_now.write().unwrap() = 0;
+                true
+            }
+            GroupType::UrlTest | GroupType::Fallback => {
+                self.selected.store(0, Ordering::Relaxed);
+                true
+            }
+            _ => true,
+        }
+    }
+
     pub fn selected_name(&self) -> Arc<str> {
         match self.ty {
             GroupType::Select => {
@@ -220,6 +235,16 @@ impl Group {
                 std::io::ErrorKind::TimedOut,
                 "测速失败",
             )))
+        }
+    }
+
+    /// 外部单节点测速完成后，将结果回填至包含该成员的策略组状态表
+    pub fn record_member_probe_result(&self, member: &str, result_ms: Option<u32>) {
+        if let Some(i) = self.member_names.iter().position(|n| &**n == member) {
+            let mut alive = self.alive.lock().unwrap();
+            let mut delay = self.delay_ms.lock().unwrap();
+            alive[i] = result_ms.is_some();
+            delay[i] = result_ms;
         }
     }
 
@@ -391,6 +416,14 @@ fn fnv_index(bytes: &[u8], n: usize) -> usize {
         hash = hash.wrapping_mul(0x01000193);
     }
     (hash as usize) % n.max(1)
+}
+
+/// 对任意独立出站节点执行 URL 延迟探测（返回毫秒）
+pub async fn url_test_outbound(o: &Arc<dyn Outbound>, url: &str) -> Result<u32> {
+    let sem = global_probe_semaphore().clone();
+    let _permit = sem.acquire().await.ok();
+    let d = probe(o, url).await?;
+    Ok((d.as_millis() as u32).max(1))
 }
 
 /// 通过指定出站探测测试 URL，返回耗时

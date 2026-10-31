@@ -124,7 +124,34 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<(DstAddr, Byt
 fn dst_to_socket(dst: &DstAddr) -> Result<SocketAddr> {
     match &dst.host {
         Host::Ip(ip) => Ok(SocketAddr::new(*ip, dst.port)),
-        Host::Domain(d) => Err(Error::Addr(format!("uot: 帧内域名目标 {d} 暂不支持"))),
+        Host::Domain(_) => Ok(SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            dst.port,
+        )),
+    }
+}
+
+async fn resolve_dst_socket(dst: &DstAddr) -> Result<SocketAddr> {
+    match &dst.host {
+        Host::Ip(ip) => Ok(SocketAddr::new(*ip, dst.port)),
+        Host::Domain(d) => {
+            if let Some((resolver, ipv6)) = vp_transport::global_node_resolver() {
+                if let Ok(ips) = resolver.resolve_domain(d, ipv6).await {
+                    if let Some(ip) = ips.first() {
+                        return Ok(SocketAddr::new(*ip, dst.port));
+                    }
+                }
+            }
+            if let Ok(mut it) = tokio::net::lookup_host((d.as_str(), dst.port)).await {
+                if let Some(addr) = it.next() {
+                    return Ok(addr);
+                }
+            }
+            Ok(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                dst.port,
+            ))
+        }
     }
 }
 
@@ -255,10 +282,11 @@ pub async fn serve_client(
                 tx
             }
         };
+        let dst_sock = resolve_dst_socket(&dst).await?;
         let _ = tx
             .send(UdpPacket {
                 src: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
-                dst: dst_to_socket(&dst)?,
+                dst: dst_sock,
                 data,
             })
             .await;

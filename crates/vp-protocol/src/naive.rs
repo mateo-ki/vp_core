@@ -292,12 +292,17 @@ impl NaiveOutbound {
                 server_name: cfg.server_name.clone(),
                 skip_cert_verify: cfg.skip_cert_verify,
                 fingerprint: cfg.client_fingerprint.clone(),
-                alpn: Vec::new(),
+                alpn: cfg
+                    .alpn
+                    .clone()
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| vec!["h2".into()]),
                 ws: None,
                 http: None,
                 grpc: None,
                 reality: None,
                 ech: None,
+                socket_opts: None,
             },
             udp: cfg.udp,
         })
@@ -615,6 +620,7 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             tls: false,
             udp: false,
         };
@@ -677,6 +683,7 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             tls: false,
             udp: false,
         };

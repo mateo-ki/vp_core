@@ -164,8 +164,14 @@ mod linux_impl {
                             }
 
                             // 首包/旧流已亡：路由解析与出站建连（可能慢）在锁外执行，不阻塞其他流
-                            match spawn_tproxy_udp_flow(flow_key, &ctx, tag.clone(), flows.clone())
-                                .await
+                            match spawn_tproxy_udp_flow(
+                                flow_key,
+                                &payload,
+                                &ctx,
+                                tag.clone(),
+                                flows.clone(),
+                            )
+                            .await
                             {
                                 Ok(tx) => {
                                     let _ = tx.send(payload).await;
@@ -442,11 +448,23 @@ mod linux_impl {
 
     async fn spawn_tproxy_udp_flow(
         (src, orig_dst): (SocketAddr, SocketAddr),
+        first_pkt: &[u8],
         ctx: &InboundCtx,
         tag: Arc<str>,
         flows: UdpFlowMap,
     ) -> Result<tokio::sync::mpsc::Sender<Bytes>> {
-        let dst_addr = DstAddr::ip(orig_dst.ip(), orig_dst.port());
+        // 1. Fake-IP 自动反查还原；2. 若为纯 IP 且是 QUIC 端口，窥探 QUIC Initial SNI
+        let domain_opt = vp_dns::reverse_fake_ip(orig_dst.ip()).or_else(|| {
+            if matches!(orig_dst.port(), 443 | 8443 | 2053 | 2083 | 2087 | 2096) {
+                vp_core::sniff::sniff_quic_sni(first_pkt)
+            } else {
+                None
+            }
+        });
+        let dst_addr = match domain_opt {
+            Some(domain) => DstAddr::new(domain, orig_dst.port()),
+            None => DstAddr::ip(orig_dst.ip(), orig_dst.port()),
+        };
         let mut sess = Session::new_udp(tag, Some(src), dst_addr.clone());
         sess.network = Network::Udp;
 

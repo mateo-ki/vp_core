@@ -25,6 +25,33 @@ pub struct RelayHook {
     pub stats: Option<Arc<Stats>>,
 }
 
+/// RAII 连接清理守卫：确保无论任务是正常结束、遇到 panic 还是被上层取消 (cancelled/aborted)，
+/// 均自动清理连接表、关闭统计并终止泵任务，杜绝幽灵连接残留与内存泄漏。
+struct RelayGuard {
+    table: Option<Arc<ConnTable>>,
+    id: Option<u64>,
+    stats: Option<Arc<Stats>>,
+    t1: Option<tokio::task::AbortHandle>,
+    t2: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for RelayGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.t1.take() {
+            h.abort();
+        }
+        if let Some(h) = self.t2.take() {
+            h.abort();
+        }
+        if let (Some(t), Some(id)) = (&self.table, self.id.take()) {
+            t.remove(id);
+        }
+        if let Some(s) = self.stats.take() {
+            s.conn_close();
+        }
+    }
+}
+
 enum Dir {
     Up,
     Down,
@@ -87,27 +114,24 @@ pub async fn relay(
                         }
                         _ => None,
                     };
+                    let splice_guard = RelayGuard {
+                        table: hook.table.clone(),
+                        id: registered.as_ref().map(|rc| rc.id),
+                        stats: if registered.is_some() {
+                            hook.stats.clone()
+                        } else {
+                            None
+                        },
+                        t1: None,
+                        t2: None,
+                    };
                     match splice::relay_pair(a, b, hook.stats.clone()).await {
                         Ok((up, down)) => {
-                            if let (Some(t), Some(rc)) = (&hook.table, &registered) {
-                                t.remove(rc.id);
-                            }
-                            if registered.is_some() {
-                                if let Some(s) = &hook.stats {
-                                    s.conn_close();
-                                }
-                            }
+                            drop(splice_guard);
                             return (up + pre_up, down + pre_down);
                         }
                         Err(_) => {
-                            if let (Some(t), Some(rc)) = (&hook.table, &registered) {
-                                t.remove(rc.id);
-                            }
-                            if registered.is_some() {
-                                if let Some(s) = &hook.stats {
-                                    s.conn_close();
-                                }
-                            }
+                            drop(splice_guard);
                             // 落回下方通用泵
                         }
                     }
@@ -145,16 +169,20 @@ pub async fn relay(
         t.attach_aborts(id, vec![t1.abort_handle(), t2.abort_handle()]);
     }
 
-    let _ = tokio::join!(t1, t2);
+    let guard = RelayGuard {
+        table: hook.table.clone(),
+        id,
+        stats: if registered.is_some() {
+            hook.stats.clone()
+        } else {
+            None
+        },
+        t1: Some(t1.abort_handle()),
+        t2: Some(t2.abort_handle()),
+    };
 
-    if let (Some(t), Some(id)) = (&hook.table, id) {
-        t.remove(id);
-    }
-    if registered.is_some() {
-        if let Some(s) = &hook.stats {
-            s.conn_close();
-        }
-    }
+    let _ = tokio::join!(t1, t2);
+    drop(guard);
     (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed))
 }
 

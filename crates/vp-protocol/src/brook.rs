@@ -719,7 +719,11 @@ impl BrookInbound {
             vp_common::Host::Ip(ip) => SocketAddr::new(*ip, dst.port),
             vp_common::Host::Domain(d) => {
                 let ips = Resolver::system().resolve_domain(d, false).await?;
-                SocketAddr::new(ips[0], dst.port)
+                let ip = ips
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Error::Dns(format!("未解析到域名 {d} 的 IP 地址")))?;
+                SocketAddr::new(ip, dst.port)
             }
         };
         let bind_addr: SocketAddr = if target.is_ipv6() {

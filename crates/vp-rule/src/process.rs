@@ -159,11 +159,18 @@ fn find_socket_inode_linux(src: SocketAddr) -> Option<u64> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let (file_path, target_hex) = match src {
+    let candidates: Vec<(&str, String)> = match src {
         SocketAddr::V4(v4) => {
             let ip = u32::from_ne_bytes(v4.ip().octets());
             let port = v4.port();
-            ("/proc/net/tcp", format!("{ip:08X}:{port:04X}"))
+            let v4_hex = format!("{ip:08X}:{port:04X}");
+            let mapped_v6 = format!("0000000000000000FFFF0000{ip:08X}:{port:04X}");
+            vec![
+                ("/proc/net/tcp", v4_hex.clone()),
+                ("/proc/net/udp", v4_hex),
+                ("/proc/net/tcp6", mapped_v6.clone()),
+                ("/proc/net/udp6", mapped_v6),
+            ]
         }
         SocketAddr::V6(v6) => {
             let o = v6.ip().octets();
@@ -172,20 +179,28 @@ fn find_socket_inode_linux(src: SocketAddr) -> Option<u64> {
             let p3 = u32::from_ne_bytes([o[8], o[9], o[10], o[11]]);
             let p4 = u32::from_ne_bytes([o[12], o[13], o[14], o[15]]);
             let port = v6.port();
-            (
-                "/proc/net/tcp6",
-                format!("{p1:08X}{p2:08X}{p3:08X}{p4:08X}:{port:04X}"),
-            )
+            let v6_hex = format!("{p1:08X}{p2:08X}{p3:08X}{p4:08X}:{port:04X}");
+            vec![
+                ("/proc/net/tcp6", v6_hex.clone()),
+                ("/proc/net/udp6", v6_hex),
+            ]
         }
     };
 
-    let f = File::open(file_path).ok()?;
-    let reader = BufReader::new(f);
-    for line in reader.lines().skip(1) {
-        let line = line.ok()?;
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 9 && parts[1].eq_ignore_ascii_case(&target_hex) {
-            return parts[9].parse::<u64>().ok();
+    for (file_path, target_hex) in candidates {
+        let Ok(f) = File::open(file_path) else {
+            continue;
+        };
+        let reader = BufReader::new(f);
+        for line in reader.lines().skip(1).flatten() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 9 && parts[1].eq_ignore_ascii_case(&target_hex) {
+                if let Ok(ino) = parts[9].parse::<u64>() {
+                    if ino > 0 {
+                        return Some(ino);
+                    }
+                }
+            }
         }
     }
     None
@@ -209,17 +224,17 @@ fn find_process_by_inode_linux(inode: u64) -> Option<String> {
             for fd in fds.flatten() {
                 if let Ok(link) = fs::read_link(fd.path()) {
                     if link.to_string_lossy() == target {
+                        let exe_path = entry.path().join("exe");
+                        if let Ok(exe) = fs::read_link(exe_path) {
+                            if let Some(file_name) = exe.file_name() {
+                                return Some(file_name.to_string_lossy().to_string());
+                            }
+                        }
                         let comm_path = entry.path().join("comm");
                         if let Ok(comm) = fs::read_to_string(comm_path) {
                             let trimmed = comm.trim().to_string();
                             if !trimmed.is_empty() {
                                 return Some(trimmed);
-                            }
-                        }
-                        let exe_path = entry.path().join("exe");
-                        if let Ok(exe) = fs::read_link(exe_path) {
-                            if let Some(file_name) = exe.file_name() {
-                                return Some(file_name.to_string_lossy().to_string());
                             }
                         }
                     }
@@ -230,7 +245,25 @@ fn find_process_by_inode_linux(inode: u64) -> Option<String> {
     None
 }
 
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn find_process_name_uncached(src: SocketAddr) -> Option<String> {
+    let out = std::process::Command::new("lsof")
+        .args(["-n", "-P", "-F", "c", "-i", &format!("@{src}")])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(cmd) = line.strip_prefix('c') {
+            let trimmed = cmd.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 fn find_process_name_uncached(_src: SocketAddr) -> Option<String> {
     None
 }

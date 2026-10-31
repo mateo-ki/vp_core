@@ -5,9 +5,10 @@
 //! 并支持配置 Exit Node 作为互联网出口。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, info};
 use vp_common::{DstAddr, Result};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 
@@ -18,14 +19,13 @@ pub struct TailscaleOutbound {
     server: String,
     port: u16,
     exit_node: Option<String>,
-    #[allow(dead_code)]
     auth_key: Option<String>,
-    #[allow(dead_code)]
     control_url: Option<String>,
-    #[allow(dead_code)]
     hostname: Option<String>,
+    state_dir: Option<String>,
     udp: bool,
     socks5: Socks5Outbound,
+    bootstrapped: AtomicBool,
 }
 
 impl TailscaleOutbound {
@@ -47,13 +47,87 @@ impl TailscaleOutbound {
             auth_key: cfg.auth_key.clone(),
             control_url: cfg.control_url.clone(),
             hostname: cfg.hostname.clone(),
+            state_dir: cfg.state_dir.clone(),
             udp: cfg.udp,
             socks5,
+            bootstrapped: AtomicBool::new(false),
         })
     }
 
     pub fn exit_node(&self) -> Option<&str> {
         self.exit_node.as_deref()
+    }
+
+    /// 当本地 tailscaled SOCKS5 端口尚未就绪时，尝试按配置自动拉起 userspace tailscaled 并下发认证/ExitNode 参数
+    async fn try_bootstrap_daemon(&self) {
+        if self.bootstrapped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.server != "127.0.0.1" && !self.server.eq_ignore_ascii_case("localhost") {
+            return;
+        }
+        let port = self.port;
+        let state_dir = self.state_dir.clone();
+        let auth_key = self.auth_key.clone();
+        let control_url = self.control_url.clone();
+        let hostname = self.hostname.clone();
+        let exit_node = self.exit_node.clone();
+        let tag = self.name.clone();
+
+        let _ = tokio::task::spawn_blocking(move || {
+            use std::process::{Command, Stdio};
+
+            let mut daemon_cmd = Command::new("tailscaled");
+            daemon_cmd
+                .arg("--tun=userspace-networking")
+                .arg(format!("--socks5-server=127.0.0.1:{port}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+
+            let sock_path = state_dir.as_ref().map(|dir| {
+                let _ = std::fs::create_dir_all(dir);
+                daemon_cmd.arg(format!("--statedir={dir}"));
+                let s = format!("{dir}/tailscaled.sock");
+                daemon_cmd.arg(format!("--socket={s}"));
+                s
+            });
+
+            if daemon_cmd.spawn().is_ok() {
+                info!("tailscale [{tag}]: 已拉起后台 userspace tailscaled (127.0.0.1:{port})");
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+
+            if auth_key.is_some()
+                || control_url.is_some()
+                || hostname.is_some()
+                || exit_node.is_some()
+            {
+                let mut up_cmd = Command::new("tailscale");
+                if let Some(ref s) = sock_path {
+                    up_cmd.arg(format!("--socket={s}"));
+                }
+                up_cmd.arg("up").arg("--accept-routes");
+                if let Some(ref key) = auth_key {
+                    up_cmd.arg(format!("--auth-key={key}"));
+                }
+                if let Some(ref url) = control_url {
+                    up_cmd.arg(format!("--login-server={url}"));
+                }
+                if let Some(ref host) = hostname {
+                    up_cmd.arg(format!("--hostname={host}"));
+                }
+                if let Some(ref exit) = exit_node {
+                    up_cmd.arg(format!("--exit-node={exit}"));
+                }
+                up_cmd
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let _ = up_cmd.status();
+            }
+        })
+        .await;
     }
 }
 
@@ -68,7 +142,14 @@ impl Outbound for TailscaleOutbound {
             "tailscale [{}]: 路由 {} -> {}:{} (exit-node: {:?})",
             self.name, dst, self.server, self.port, self.exit_node
         );
-        self.socks5.connect_stream(sess, dst).await
+        match self.socks5.connect_stream(sess, dst).await {
+            Ok(s) => Ok(s),
+            Err(_first_err) if !self.bootstrapped.load(Ordering::Relaxed) => {
+                self.try_bootstrap_daemon().await;
+                self.socks5.connect_stream(sess, dst).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn connect_over(

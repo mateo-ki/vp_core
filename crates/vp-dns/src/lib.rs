@@ -5,9 +5,39 @@ pub mod server;
 pub mod wire;
 
 pub use fakeip::FakeIpPool;
-pub use server::{DnsServer, is_fake_ip_filtered};
+pub use server::{DnsServer, is_fake_ip_filtered, set_global_geosite_db};
 
 static BIND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ROUTING_MARK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static BIND_INTERFACE_NAME: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+static GLOBAL_FAKE_IP_POOL: std::sync::RwLock<Option<std::sync::Arc<FakeIpPool>>> =
+    std::sync::RwLock::new(None);
+
+/// 设置全局共享的 Fake-IP 池（供 TUN、独立 DNS、redir/tproxy/mixed/socks5/udp 全入站统一分配与反查）
+pub fn set_global_fake_ip_pool(pool: Option<std::sync::Arc<FakeIpPool>>) {
+    *GLOBAL_FAKE_IP_POOL.write().unwrap() = pool;
+}
+
+/// 获取全局共享的 Fake-IP 池
+pub fn get_global_fake_ip_pool() -> Option<std::sync::Arc<FakeIpPool>> {
+    GLOBAL_FAKE_IP_POOL.read().unwrap().clone()
+}
+
+/// 快速反查 Fake-IP 对应的真实域名（若未开启或非 Fake-IP 则返回 None）
+pub fn reverse_fake_ip(ip: std::net::IpAddr) -> Option<String> {
+    GLOBAL_FAKE_IP_POOL
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|p| p.reverse(ip))
+}
+
+/// 清空全局 Fake-IP 池所有已分配映射
+pub fn flush_global_fake_ip_pool() {
+    if let Some(pool) = GLOBAL_FAKE_IP_POOL.read().unwrap().as_ref() {
+        pool.clear();
+    }
+}
 
 /// 设置出站套接字强制绑定的物理网卡索引（TUN 模式防环路）
 pub fn set_bind_interface_index(if_idx: u32) {
@@ -20,12 +50,131 @@ pub fn get_bind_interface_index() -> Option<u32> {
     if idx > 0 { Some(idx) } else { None }
 }
 
-/// 创建 UDP 套接字，若配置了物理网卡索引则绑定 IP_UNICAST_IF / IPV6_UNICAST_IF 防止路由环路
+/// 设置 Linux 出站路由标记（SO_MARK / fwmark，用于 TPROXY / TUN 策略路由防环路）
+pub fn set_routing_mark(mark: u32) {
+    ROUTING_MARK.store(mark, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 获取当前设置的出站路由标记
+pub fn get_routing_mark() -> Option<u32> {
+    let m = ROUTING_MARK.load(std::sync::atomic::Ordering::Relaxed);
+    if m > 0 { Some(m) } else { None }
+}
+
+/// 设置出站强制绑定的物理网卡名称（如 eth0 / en0）
+pub fn set_bind_interface_name(name: Option<String>) {
+    *BIND_INTERFACE_NAME.write().unwrap() = name.filter(|s| !s.trim().is_empty());
+}
+
+/// 获取当前设置的物理网卡名称
+pub fn get_bind_interface_name() -> Option<String> {
+    BIND_INTERFACE_NAME.read().unwrap().clone()
+}
+
+#[cfg(windows)]
+pub fn resolve_windows_interface_index(name: &str) -> Option<u32> {
+    if let Ok(idx) = name.parse::<u32>() {
+        return Some(idx);
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().collect();
+    wide.push(0);
+    let mut idx = 0u32;
+    unsafe {
+        if windows_sys::Win32::NetworkManagement::IpHelper::GetAdapterIndex(wide.as_ptr(), &mut idx)
+            == 0
+            && idx > 0
+        {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn apply_unix_outbound_opts(
+    socket: &socket2::Socket,
+    _is_ipv6: bool,
+    if_name_opt: Option<&str>,
+    routing_mark_opt: Option<u32>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let mark = routing_mark_opt.or_else(get_routing_mark);
+        if let Some(m) = mark {
+            let _ = socket.set_mark(m);
+        }
+        let fallback_name = if if_name_opt.is_none() {
+            get_bind_interface_name()
+        } else {
+            None
+        };
+        let dev = if_name_opt.or(fallback_name.as_deref());
+        if let Some(d) = dev {
+            let _ = socket.bind_device(Some(d.as_bytes()));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let idx = if let Some(n) = if_name_opt {
+            let cstr = std::ffi::CString::new(n).ok();
+            cstr.and_then(|c| {
+                let i = unsafe { libc::if_nametoindex(c.as_ptr()) };
+                if i > 0 { Some(i) } else { None }
+            })
+        } else {
+            get_bind_interface_index().or_else(|| {
+                get_bind_interface_name().and_then(|name| {
+                    let cstr = std::ffi::CString::new(name).ok()?;
+                    let i = unsafe { libc::if_nametoindex(cstr.as_ptr()) };
+                    if i > 0 { Some(i) } else { None }
+                })
+            })
+        };
+        if let Some(if_idx) = idx {
+            unsafe {
+                if _is_ipv6 {
+                    let _ = libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_BOUND_IF,
+                        &if_idx as *const _ as *const libc::c_void,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    );
+                } else {
+                    let _ = libc::setsockopt(
+                        socket.as_raw_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_BOUND_IF,
+                        &if_idx as *const _ as *const libc::c_void,
+                        std::mem::size_of::<u32>() as libc::socklen_t,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 创建 UDP 套接字，若配置了物理网卡索引/名称或 routing-mark 则自动绑定防止路由环路
 pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    create_udp_socket_with_opts(bind_addr, None, None)
+}
+
+/// 创建带有节点级网卡或路由标记覆盖的 UDP 套接字
+pub fn create_udp_socket_with_opts(
+    bind_addr: SocketAddr,
+    if_name_opt: Option<&str>,
+    routing_mark_opt: Option<u32>,
+) -> std::io::Result<tokio::net::UdpSocket> {
     #[cfg(windows)]
     {
+        let _ = routing_mark_opt;
         if !bind_addr.ip().is_loopback() {
-            if let Some(if_idx) = get_bind_interface_index() {
+            let if_idx = if_name_opt
+                .and_then(resolve_windows_interface_index)
+                .or_else(get_bind_interface_index);
+            if let Some(if_idx) = if_idx {
                 let domain = match bind_addr {
                     SocketAddr::V4(_) => socket2::Domain::IPV4,
                     SocketAddr::V6(_) => socket2::Domain::IPV6,
@@ -38,9 +187,6 @@ pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::U
                 socket.set_nonblocking(true)?;
 
                 bind_socket_to_interface(&socket, bind_addr, if_idx)?;
-                // 源地址必须显式绑到物理网卡自己的 IP：只设 UNICAST_IF 时 Windows 的
-                // 源地址/路由选择仍可能按路由表走 —— auto-route 下即 TUN 自身
-                // （198.18.0.1），DNS 上游流量就此流回自己形成回环。
                 let effective = match (interface_ipv4(if_idx), bind_addr) {
                     (Some(ip), SocketAddr::V4(_)) => SocketAddr::new(std::net::IpAddr::V4(ip), 0),
                     _ => bind_addr,
@@ -50,6 +196,28 @@ pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::U
                 let std_sock: std::net::UdpSocket = socket.into();
                 return tokio::net::UdpSocket::from_std(std_sock);
             }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let has_override = if_name_opt.is_some() || routing_mark_opt.is_some();
+        if !bind_addr.ip().is_loopback()
+            && (has_override
+                || get_routing_mark().is_some()
+                || get_bind_interface_name().is_some()
+                || get_bind_interface_index().is_some())
+        {
+            let domain = match bind_addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            socket.set_nonblocking(true)?;
+            apply_unix_outbound_opts(&socket, bind_addr.is_ipv6(), if_name_opt, routing_mark_opt);
+            socket.bind(&bind_addr.into())?;
+            let std_sock: std::net::UdpSocket = socket.into();
+            return tokio::net::UdpSocket::from_std(std_sock);
         }
     }
     let std_sock = std::net::UdpSocket::bind(bind_addr)?;
@@ -107,10 +275,66 @@ pub fn bind_tcp_socket_to_interface(
 }
 
 /// 绑定物理网卡的 TCP 拨号（TUN 防回环）。未配置绑定索引时退化为普通拨号。
-#[cfg(windows)]
 pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
-    if !addr.ip().is_loopback() {
-        if let Some(if_idx) = get_bind_interface_index() {
+    connect_tcp_bound_with_opts(addr, None, None).await
+}
+
+/// 带有特定网卡或路由标记覆盖的 TCP 拨号
+pub async fn connect_tcp_bound_with_opts(
+    addr: SocketAddr,
+    if_name_opt: Option<&str>,
+    routing_mark_opt: Option<u32>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    #[cfg(windows)]
+    {
+        let _ = routing_mark_opt;
+        if !addr.ip().is_loopback() {
+            let if_idx = if_name_opt
+                .and_then(resolve_windows_interface_index)
+                .or_else(get_bind_interface_index);
+            if let Some(if_idx) = if_idx {
+                let domain = match addr {
+                    SocketAddr::V4(_) => socket2::Domain::IPV4,
+                    SocketAddr::V6(_) => socket2::Domain::IPV6,
+                };
+                let socket = socket2::Socket::new(
+                    domain,
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )?;
+                socket.set_nonblocking(true)?;
+                bind_tcp_socket_to_interface(&socket, addr, if_idx)?;
+                match socket.connect(&addr.into()) {
+                    Ok(()) => {
+                        let std_stream: std::net::TcpStream = socket.into();
+                        return tokio::net::TcpStream::from_std(std_stream);
+                    }
+                    Err(e)
+                        if e.raw_os_error()
+                            == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
+                    {
+                        let std_stream: std::net::TcpStream = socket.into();
+                        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+                        tokio_stream.writable().await?;
+                        if let Some(err) = tokio_stream.take_error()? {
+                            return Err(err);
+                        }
+                        return Ok(tokio_stream);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let has_override = if_name_opt.is_some() || routing_mark_opt.is_some();
+        if !addr.ip().is_loopback()
+            && (has_override
+                || get_routing_mark().is_some()
+                || get_bind_interface_name().is_some()
+                || get_bind_interface_index().is_some())
+        {
             let domain = match addr {
                 SocketAddr::V4(_) => socket2::Domain::IPV4,
                 SocketAddr::V6(_) => socket2::Domain::IPV6,
@@ -118,15 +342,15 @@ pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::
             let socket =
                 socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
             socket.set_nonblocking(true)?;
-            bind_tcp_socket_to_interface(&socket, addr, if_idx)?;
+            apply_unix_outbound_opts(&socket, addr.is_ipv6(), if_name_opt, routing_mark_opt);
             match socket.connect(&addr.into()) {
                 Ok(()) => {
                     let std_stream: std::net::TcpStream = socket.into();
                     return tokio::net::TcpStream::from_std(std_stream);
                 }
                 Err(e)
-                    if e.raw_os_error()
-                        == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
+                    if e.raw_os_error() == Some(libc::EINPROGRESS)
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
                 {
                     let std_stream: std::net::TcpStream = socket.into();
                     let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
@@ -140,13 +364,6 @@ pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::
             }
         }
     }
-    tokio::net::TcpStream::connect(addr).await
-}
-
-/// 非 Windows：Linux/macOS 的 TUN 防回环走策略路由 / BSD 路由栈，无需套接字级绑定，
-/// 保持普通拨号（与本次改动前行为一致）。
-#[cfg(not(windows))]
-pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
     tokio::net::TcpStream::connect(addr).await
 }
 
@@ -195,8 +412,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 use vp_common::{Error, Host, Result};
 
@@ -236,14 +451,19 @@ pub struct CompiledFallbackFilter {
 }
 
 /// DNS 解析器：多上游，UDP 优先 TCP 兜底；进程内共享缓存；支持 nameserver-policy 分流与 fallback-filter 污染过滤。
+type EchCacheEntry = (Option<Arc<Vec<u8>>>, Instant);
+
 pub struct Resolver {
     servers: Vec<ServerAddr>,
     fallbacks: Vec<ServerAddr>,
     policies: Vec<PolicyRule>,
     fallback_filter: Option<CompiledFallbackFilter>,
+    hosts: HashMap<String, Vec<IpAddr>>,
+    fake_ip: Option<Arc<FakeIpPool>>,
+    bootstrap_servers: Vec<SocketAddr>,
     cache: Mutex<CacheInner>,
-    /// ECH 配置缓存（域名 → HTTPS 记录 ech SvcParam 字节；None=确认无/查询失败）
-    ech_cache: Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>,
+    /// ECH 配置缓存（域名 → (HTTPS 记录 ech SvcParam 字节, 记录时间)；None=确认无/查询失败）
+    ech_cache: Mutex<HashMap<String, EchCacheEntry>>,
     /// 无 nameserver 配置时走系统解析
     pub use_system: bool,
 }
@@ -279,6 +499,9 @@ impl Resolver {
             fallbacks: Vec::new(),
             policies: Vec::new(),
             fallback_filter: None,
+            hosts: HashMap::new(),
+            fake_ip: None,
+            bootstrap_servers: default_bootstrap_servers(),
             cache: Mutex::new(CacheInner::default()),
             ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system,
@@ -302,6 +525,9 @@ impl Resolver {
             fallbacks: parsed_fallbacks,
             policies,
             fallback_filter,
+            hosts: HashMap::new(),
+            fake_ip: None,
+            bootstrap_servers: default_bootstrap_servers(),
             cache: Mutex::new(CacheInner::default()),
             ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system,
@@ -314,10 +540,26 @@ impl Resolver {
             fallbacks: Vec::new(),
             policies: Vec::new(),
             fallback_filter: None,
+            hosts: HashMap::new(),
+            fake_ip: None,
+            bootstrap_servers: default_bootstrap_servers(),
             cache: Mutex::new(CacheInner::default()),
             ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system: true,
         }
+    }
+
+    pub fn with_default_nameservers(mut self, servers: Vec<String>) -> Self {
+        let mut list = Vec::new();
+        for s in servers {
+            if let Some(sa) = parse_bootstrap_server(&s) {
+                list.push(sa);
+            }
+        }
+        if !list.is_empty() {
+            self.bootstrap_servers = list;
+        }
+        self
     }
 
     pub fn with_fallbacks(mut self, fallbacks: Vec<String>) -> Self {
@@ -335,6 +577,64 @@ impl Resolver {
         self
     }
 
+    pub fn with_hosts(mut self, hosts: HashMap<String, Vec<IpAddr>>) -> Self {
+        self.hosts = hosts
+            .into_iter()
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v))
+            .collect();
+        self
+    }
+
+    pub fn with_fake_ip(mut self, fake_ip: Option<Arc<FakeIpPool>>) -> Self {
+        self.fake_ip = fake_ip;
+        self
+    }
+
+    pub fn fake_ip(&self) -> Option<&Arc<FakeIpPool>> {
+        self.fake_ip.as_ref()
+    }
+
+    /// 清空全部 DNS 与 ECH 缓存（含 nameserver-policy 子解析器缓存）
+    pub fn flush_cache(&self) {
+        self.cache.lock().unwrap().map.clear();
+        self.ech_cache.lock().unwrap().clear();
+        for p in &self.policies {
+            p.resolver.flush_cache();
+        }
+    }
+
+    /// 查询静态 hosts 表（支持精确匹配与 `+.` / `*.` 通配）
+    pub fn lookup_hosts(&self, domain: &str, ipv6: bool) -> Option<Arc<Vec<IpAddr>>> {
+        if self.hosts.is_empty() {
+            return None;
+        }
+        let d = domain.trim().to_ascii_lowercase();
+        let matched = self.hosts.get(&d).or_else(|| {
+            self.hosts.iter().find_map(|(pat, ips)| {
+                if let Some(rest) = pat.strip_prefix("+.") {
+                    if d == rest || d.ends_with(&format!(".{rest}")) {
+                        return Some(ips);
+                    }
+                } else if let Some(rest) = pat.strip_prefix("*.") {
+                    if d.ends_with(&format!(".{rest}")) {
+                        return Some(ips);
+                    }
+                }
+                None
+            })
+        })?;
+        let filtered: Vec<IpAddr> = matched
+            .iter()
+            .copied()
+            .filter(|ip| if ipv6 { true } else { ip.is_ipv4() })
+            .collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(Arc::new(filtered))
+        }
+    }
+
     /// 第一个 UDP 上游（DNS 服务器原样转发用）
     pub fn first_udp_server(&self) -> Option<SocketAddr> {
         self.servers
@@ -343,15 +643,48 @@ impl Resolver {
             .and_then(|s| s.addr)
     }
 
-    /// 解析目标。ipv6=false 时仅查 A 记录。
+    /// 检查指定域名是否命中专有 nameserver-policy 规则或 fallback-filter 规则
+    pub fn has_policy_match(&self, domain: &str) -> bool {
+        let d = domain.trim().to_ascii_lowercase();
+        let hit_policy = self
+            .policies
+            .iter()
+            .any(|rule| rule.trie.is_match(&d) || rule.geosite.iter().any(|s| s.matches(&d)));
+        if hit_policy {
+            return true;
+        }
+        if let Some(ref ff) = self.fallback_filter {
+            if (ff.domain.is_match(&d) || ff.geosite.iter().any(|s| s.matches(&d)))
+                && !self.fallbacks.is_empty()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 解析目标。若传入 IP 属于 Fake-IP 池，自动反查域名并解析真实 IP。
     pub async fn resolve(&self, host: &Host, ipv6: bool) -> Result<Arc<Vec<IpAddr>>> {
         match host {
-            Host::Ip(ip) => Ok(Arc::new(vec![*ip])),
+            Host::Ip(ip) => {
+                let rev = self
+                    .fake_ip
+                    .as_ref()
+                    .and_then(|p| p.reverse(*ip))
+                    .or_else(|| reverse_fake_ip(*ip));
+                if let Some(domain) = rev {
+                    return self.resolve_domain(&domain, ipv6).await;
+                }
+                Ok(Arc::new(vec![*ip]))
+            }
             Host::Domain(domain) => self.resolve_domain(domain, ipv6).await,
         }
     }
 
     pub async fn resolve_domain(&self, domain: &str, ipv6: bool) -> Result<Arc<Vec<IpAddr>>> {
+        if let Some(ips) = self.lookup_hosts(domain, ipv6) {
+            return Ok(ips);
+        }
         let key = (domain.to_ascii_lowercase(), ipv6);
         {
             let c = self.cache.lock().unwrap();
@@ -382,7 +715,10 @@ impl Resolver {
             if (ff.domain.is_match(domain) || ff.geosite.iter().any(|s| s.matches(domain)))
                 && !self.fallbacks.is_empty()
             {
-                if let Ok(ips) = Self::query_servers(&self.fallbacks, domain, qtype).await {
+                if let Ok(ips) =
+                    Self::query_servers(&self.fallbacks, domain, qtype, &self.bootstrap_servers)
+                        .await
+                {
                     let ips = Arc::new(ips);
                     self.cache_store(key, ips.clone());
                     return Ok(ips);
@@ -394,7 +730,7 @@ impl Resolver {
         let primary_res = if self.servers.is_empty() {
             self.system_lookup(domain).await
         } else {
-            Self::query_servers(&self.servers, domain, qtype)
+            Self::query_servers(&self.servers, domain, qtype, &self.bootstrap_servers)
                 .await
                 .map(Arc::new)
         };
@@ -426,7 +762,14 @@ impl Resolver {
                     tracing::info!(
                         "域名 {domain} 命中 fallback-filter 污染过滤，切换至 fallback 上游"
                     );
-                    match Self::query_servers(&self.fallbacks, domain, qtype).await {
+                    match Self::query_servers(
+                        &self.fallbacks,
+                        domain,
+                        qtype,
+                        &self.bootstrap_servers,
+                    )
+                    .await
+                    {
                         Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
                         _ => ips,
                     }
@@ -436,7 +779,14 @@ impl Resolver {
             }
             Err(e) => {
                 if !self.fallbacks.is_empty() {
-                    match Self::query_servers(&self.fallbacks, domain, qtype).await {
+                    match Self::query_servers(
+                        &self.fallbacks,
+                        domain,
+                        qtype,
+                        &self.bootstrap_servers,
+                    )
+                    .await
+                    {
                         Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
                         _ => return Err(e),
                     }
@@ -469,8 +819,15 @@ impl Resolver {
     /// 结果缓存（None 也缓存，避免对不支持域名反复查询）。ECH 连接前调用，低频路径。
     pub async fn query_https_ech(&self, domain: &str) -> Option<Arc<Vec<u8>>> {
         let key = domain.trim_end_matches('.').to_ascii_lowercase();
-        if let Some(hit) = self.ech_cache.lock().unwrap().get(&key) {
-            return hit.clone();
+        if let Some((hit, at)) = self.ech_cache.lock().unwrap().get(&key) {
+            let ttl = if hit.is_some() {
+                Duration::from_secs(600)
+            } else {
+                Duration::from_secs(120)
+            };
+            if at.elapsed() < ttl {
+                return hit.clone();
+            }
         }
         let servers: &[ServerAddr] = if self.servers.is_empty() {
             &self.fallbacks
@@ -481,7 +838,9 @@ impl Resolver {
         for server in servers {
             let mut current = key.clone();
             for _ in 0..4 {
-                let Ok(msg) = query_server_raw(server, &current, QType::Https).await else {
+                let Ok(msg) =
+                    query_server_raw(server, &current, QType::Https, &self.bootstrap_servers).await
+                else {
                     break;
                 };
                 if msg.rcode != 0 {
@@ -509,7 +868,7 @@ impl Resolver {
         if c.len() >= 1024 {
             c.clear();
         }
-        c.insert(key, found.clone());
+        c.insert(key, (found.clone(), Instant::now()));
         found
     }
 
@@ -517,12 +876,13 @@ impl Resolver {
         servers: &[ServerAddr],
         domain: &str,
         qtype: QType,
+        bootstrap: &[SocketAddr],
     ) -> Result<Vec<IpAddr>> {
         if servers.is_empty() {
             return Err(Error::Dns("无可用 DNS 服务器".into()));
         }
         if servers.len() == 1 {
-            return match query_server(&servers[0], domain, qtype).await {
+            return match query_server(&servers[0], domain, qtype, bootstrap).await {
                 Ok(ips) if !ips.is_empty() => Ok(ips),
                 Ok(_) => Err(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
                 Err(e) => Err(e),
@@ -530,13 +890,13 @@ impl Resolver {
         }
 
         // 并发查询全部上游，取各上游答案的并集（保持配置顺序去重）。
-        // 单一上游可能给出整轮被污染/失效的答案（如 GFW 对节点域名的"邻居 IP"污染），
-        // 多上游并集后配合拨号竞速，任一上游给出活地址即可用。
         let mut set = tokio::task::JoinSet::new();
+        let bs_arc = Arc::new(bootstrap.to_vec());
         for (idx, server) in servers.iter().enumerate() {
             let server = server.clone();
             let domain = domain.to_string();
-            set.spawn(async move { (idx, query_server(&server, &domain, qtype).await) });
+            let bs = bs_arc.clone();
+            set.spawn(async move { (idx, query_server(&server, &domain, qtype, &bs).await) });
         }
 
         let mut merged: Vec<(usize, Vec<IpAddr>)> = Vec::new();
@@ -611,12 +971,21 @@ fn parse_server(s: &str) -> Option<ServerAddr> {
         });
     }
     let (host, port) = split_host_port(rest, if proto_str == "tls" { 853 } else { 53 })?;
-    // 非 DoH 上游要求 IP 直连（域名上游请用 DoH/DoT 或系统解析）
+    if proto_str == "tls" {
+        let ip_opt: Option<IpAddr> = host.parse().ok();
+        return Some(ServerAddr {
+            host: host.clone(),
+            addr: ip_opt.map(|ip| SocketAddr::new(ip, port)),
+            port,
+            proto: Proto::Tls,
+            path: String::new(),
+            skip_verify,
+        });
+    }
     let ip: IpAddr = host.parse().ok()?;
     let proto = match proto_str {
         "tcp" => Proto::Tcp,
         "udp" => Proto::Udp,
-        "tls" => Proto::Tls,
         _ => return None,
     };
     Some(ServerAddr {
@@ -627,6 +996,57 @@ fn parse_server(s: &str) -> Option<ServerAddr> {
         path: String::new(),
         skip_verify,
     })
+}
+
+fn default_bootstrap_servers() -> Vec<SocketAddr> {
+    vec![
+        "223.5.5.5:53".parse().unwrap(),
+        "119.29.29.29:53".parse().unwrap(),
+        "1.1.1.1:53".parse().unwrap(),
+        "8.8.8.8:53".parse().unwrap(),
+    ]
+}
+
+fn parse_bootstrap_server(s: &str) -> Option<SocketAddr> {
+    let s = s.trim();
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, 53));
+    }
+    None
+}
+
+async fn resolve_bootstrap(
+    host: &str,
+    port: u16,
+    bootstrap_servers: &[SocketAddr],
+) -> Result<SocketAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    for bs in bootstrap_servers {
+        if let Ok(msg) = query_udp(*bs, host, QType::A).await {
+            let ips = wire::extract_ips(&msg, QType::A.code());
+            if let Some((ip, _)) = ips.first() {
+                return Ok(SocketAddr::new(*ip, port));
+            }
+        }
+    }
+    let h = host.to_string();
+    let mut addrs = tokio::task::spawn_blocking(move || {
+        use std::net::ToSocketAddrs;
+        (h.as_str(), port).to_socket_addrs()
+    })
+    .await
+    .map_err(|e| Error::Dns(format!("Bootstrap DNS 任务失败: {e}")))?
+    .map_err(|e| Error::Dns(format!("Bootstrap 解析 {host} 失败: {e}")))?;
+
+    if let Some(a) = addrs.next() {
+        return Ok(a);
+    }
+    Err(Error::Dns(format!("无法解析上游服务器域名: {host}")))
 }
 
 /// "host:port" → (host, port)；无端口用 default
@@ -733,11 +1153,16 @@ pub fn compile_fallback_filter(
     }
 }
 
-async fn query_server(server: &ServerAddr, domain: &str, qtype: QType) -> Result<Vec<IpAddr>> {
+async fn query_server(
+    server: &ServerAddr,
+    domain: &str,
+    qtype: QType,
+    bootstrap: &[SocketAddr],
+) -> Result<Vec<IpAddr>> {
     let mut current_domain = domain.to_string();
     let mut hops = 0;
     loop {
-        let msg = query_server_raw(server, &current_domain, qtype).await?;
+        let msg = query_server_raw(server, &current_domain, qtype, bootstrap).await?;
         if msg.rcode != 0 {
             return Err(Error::Dns(format!("DNS 错误码 {}", msg.rcode)));
         }
@@ -763,20 +1188,19 @@ async fn query_server_raw(
     server: &ServerAddr,
     current_domain: &str,
     qtype: QType,
+    bootstrap: &[SocketAddr],
 ) -> Result<wire::Message> {
     match server.proto {
         Proto::Udp => query_udp(server.addr.expect("udp 必为 IP"), current_domain, qtype).await,
         Proto::Tcp => query_tcp(server.addr.expect("tcp 必为 IP"), current_domain, qtype).await,
         Proto::Tls => {
-            query_tls(
-                server.addr.expect("tls 必为 IP"),
-                &server.host,
-                current_domain,
-                qtype,
-            )
-            .await
+            let addr = match server.addr {
+                Some(a) => a,
+                None => resolve_bootstrap(&server.host, server.port, bootstrap).await?,
+            };
+            query_tls(addr, &server.host, current_domain, qtype).await
         }
-        Proto::Doh => with_timeout(query_doh(server, current_domain, qtype)).await,
+        Proto::Doh => with_timeout(query_doh(server, current_domain, qtype, bootstrap)).await,
     }
 }
 
@@ -819,10 +1243,8 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
 
 async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(windows)]
-    let mut stream = connect_tcp_bound(addr).await?;
-    #[cfg(not(windows))]
-    let mut stream = with_timeout(TcpStream::connect(addr)).await?;
+    // 跨平台统一走出站网卡绑定拨号，杜绝 Linux/macOS 透明代理及 TUN auto-route 下发生 DNS 查询回环
+    let mut stream = with_timeout(connect_tcp_bound(addr)).await?;
     let id = query_id();
     let q = wire::build_query(id, domain, qtype);
     let mut framed = Vec::with_capacity(q.len() + 2);
@@ -967,24 +1389,18 @@ async fn stream_read_exact<S: tokio::io::AsyncRead + Unpin>(
 // DoH（RFC 8484）
 // ---------------------------------------------------------------------------
 
-async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
+async fn query_doh(
+    server: &ServerAddr,
+    domain: &str,
+    qtype: QType,
+    bootstrap: &[SocketAddr],
+) -> Result<wire::Message> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // 1) 解析 DoH 服务器自身（IP 直连 / 域名走系统解析，避免递归）
+    // 1) 解析 DoH 服务器自身（优先使用 bootstrap-nameserver，避免系统 DNS 劫持死锁）
     let addr: SocketAddr = match server.addr {
         Some(a) => a,
-        None => {
-            let d = server.host.clone();
-            let port = server.port;
-            let mut addrs = tokio::task::spawn_blocking(move || {
-                use std::net::ToSocketAddrs;
-                (d.as_str(), port).to_socket_addrs()
-            })
-            .await
-            .map_err(|e| Error::Dns(format!("DoH 服务器解析失败: {e}")))?
-            .map_err(|e| Error::Dns(format!("DoH 服务器 {} 解析失败: {e}", server.host)))?;
-            addrs.next().ok_or(Error::Dns("DoH 服务器无地址".into()))?
-        }
+        None => resolve_bootstrap(&server.host, server.port, bootstrap).await?,
     };
 
     // 2) TLS —— DoH 上游同样必须走绑卡拨号（裸 connect 在 auto-route 下回环进 TUN）

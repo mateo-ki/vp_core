@@ -69,11 +69,19 @@ pub async fn dispatch_stream(
         }
     }
 
-    // 协议嗅探优化：若目标为 IP 且客户端先发言，仅对常见 Web 端口窥探 SNI / HTTP Host
-    // 非 Web 端口跳过嗅探，消除 100ms 无谓等待延迟
+    // 1. Fake-IP 自动反查还原：若目标 IP 落在全局 Fake-IP 池（透明网关 redir/tproxy 或 socks5/http），
+    // 立即还原为真实域名，确保非 80/443 端口（SSH、游戏、自定义端口）也能拿到真实域名分流与拨号
+    if let vp_common::Host::Ip(ip) = sess.dst.host {
+        if let Some(domain) = vp_dns::reverse_fake_ip(ip) {
+            debug!("dispatch: Fake-IP 反查还原 {} -> {}", ip, domain);
+            sess.dst.host = vp_common::Host::Domain(domain);
+        }
+    }
+
+    // 2. 协议嗅探优化：若目标仍为纯 IP 且客户端先发言，对常见 Web 端口窥探 TLS SNI / HTTP Host
     if matches!(sess.dst.host, vp_common::Host::Ip(_))
         && matches!(reply, ClientReply::None)
-        && matches!(sess.dst.port, 80 | 443 | 8080 | 8443 | 8444 | 9443)
+        && crate::sniff::is_sniffable_port(sess.dst.port)
     {
         let (sniffed, peeked) =
             crate::sniff::sniff_stream(client, std::time::Duration::from_millis(30)).await;

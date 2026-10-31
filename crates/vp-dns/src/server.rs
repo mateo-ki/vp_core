@@ -64,7 +64,8 @@ impl DnsServer {
             let resolver_udp = resolver.clone();
 
             let udp_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 1500];
+                // RFC 6891: EDNS0 允许最大 4096 字节的 UDP 报文，避免 1500 MTU 截断
+                let mut buf = vec![0u8; 4096];
                 loop {
                     match sock_udp.recv_from(&mut buf).await {
                         Ok((n, from)) => {
@@ -97,24 +98,37 @@ impl DnsServer {
                                 let resolver = resolver_tcp.clone();
                                 tokio::spawn(async move {
                                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                                    let mut len_buf = [0u8; 2];
-                                    if stream.read_exact(&mut len_buf).await.is_err() {
-                                        return;
-                                    }
-                                    let len = u16::from_be_bytes(len_buf) as usize;
-                                    if len == 0 || len > 4096 {
-                                        return;
-                                    }
-                                    let mut pkt = vec![0u8; len];
-                                    if stream.read_exact(&mut pkt).await.is_err() {
-                                        return;
-                                    }
-                                    if let Ok(Some(resp)) =
-                                        this.process_query(&pkt, &resolver).await
-                                    {
-                                        let resp_len = (resp.len() as u16).to_be_bytes();
-                                        let _ = stream.write_all(&resp_len).await;
-                                        let _ = stream.write_all(&resp).await;
+                                    // RFC 7766: TCP 连接上允许连续或流水线发送多个 DNS 查询，维护 10s 空闲保持
+                                    let idle_timeout = Duration::from_secs(10);
+                                    loop {
+                                        let mut len_buf = [0u8; 2];
+                                        let read_len = tokio::time::timeout(
+                                            idle_timeout,
+                                            stream.read_exact(&mut len_buf),
+                                        )
+                                        .await;
+                                        let Ok(Ok(_)) = read_len else {
+                                            break;
+                                        };
+                                        let len = u16::from_be_bytes(len_buf) as usize;
+                                        if len == 0 || len > 4096 {
+                                            break;
+                                        }
+                                        let mut pkt = vec![0u8; len];
+                                        if stream.read_exact(&mut pkt).await.is_err() {
+                                            break;
+                                        }
+                                        if let Ok(Some(resp)) =
+                                            this.process_query(&pkt, &resolver).await
+                                        {
+                                            let resp_len = (resp.len() as u16).to_be_bytes();
+                                            if stream.write_all(&resp_len).await.is_err() {
+                                                break;
+                                            }
+                                            if stream.write_all(&resp).await.is_err() {
+                                                break;
+                                            }
+                                        }
                                     }
                                 });
                             }
@@ -159,6 +173,22 @@ impl DnsServer {
             return Ok(None);
         };
 
+        // 0. 静态 hosts 优先命中
+        if qtype == QTYPE_A {
+            if let Some(ips) = resolver.lookup_hosts(&name, false) {
+                if let Some(std::net::IpAddr::V4(v4)) = ips.first() {
+                    return Ok(Some(wire::build_a_response(pkt, *v4)));
+                }
+            }
+        }
+        if qtype == QTYPE_AAAA && self.ipv6 {
+            if let Some(ips) = resolver.lookup_hosts(&name, true) {
+                if let Some(std::net::IpAddr::V6(v6)) = ips.iter().find(|ip| ip.is_ipv6()) {
+                    return Ok(Some(wire::build_aaaa_response(pkt, *v6)));
+                }
+            }
+        }
+
         // PTR 反查
         if qtype == QTYPE_PTR {
             if let Some(ipv4) = parse_ptr(&name) {
@@ -192,7 +222,26 @@ impl DnsServer {
             return Ok(Some(wire::build_empty_response(pkt)));
         }
 
-        // 其余原样转发上游
+        // 其余真实 A / AAAA 记录查询：当匹配 Policy 规则、Fallback 规则、或无普通 UDP 上游时，
+        // 优先通过 Resolver（支持 nameserver-policy / DoH / DoT / 缓存 / 污染过滤）
+        let needs_resolver = resolver.has_policy_match(&name)
+            || (resolver.first_udp_server().is_none() && !resolver.use_system);
+        if qtype == QTYPE_A && needs_resolver {
+            if let Ok(ips) = resolver.resolve_domain(&name, false).await {
+                if let Some(std::net::IpAddr::V4(v4)) = ips.iter().find(|ip| ip.is_ipv4()) {
+                    return Ok(Some(wire::build_a_response(pkt, *v4)));
+                }
+            }
+        }
+        if qtype == QTYPE_AAAA && self.ipv6 && needs_resolver {
+            if let Ok(ips) = resolver.resolve_domain(&name, true).await {
+                if let Some(std::net::IpAddr::V6(v6)) = ips.iter().find(|ip| ip.is_ipv6()) {
+                    return Ok(Some(wire::build_aaaa_response(pkt, *v6)));
+                }
+            }
+        }
+
+        // 原样转发上游
         self.forward_query(pkt, resolver).await.map(Some)
     }
 
@@ -201,32 +250,59 @@ impl DnsServer {
     }
 
     async fn forward_query(&self, pkt: &[u8], resolver: &Arc<Resolver>) -> Result<Vec<u8>> {
-        // 无上游服务器 → NXDOMAIN 兜底
-        let Some(upstream) = resolver.first_udp_server() else {
-            return Ok(wire::build_empty_response(pkt));
-        };
-        // 使用防路由环路 UDP 套接字（绑定物理网卡出站），避免 TUN 模式下双 /1 路由导致查询自循环
-        let fwd = crate::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
-        fwd.connect(upstream).await?;
-        fwd.send(pkt).await?;
-        let mut buf = vec![0u8; 1500];
-        let n = tokio::time::timeout(Duration::from_millis(1500), fwd.recv(&mut buf))
-            .await
-            .map_err(|_| Error::Dns("上游超时".into()))??;
-        // 保证 id 与查询一致
-        if n >= 2 && pkt.len() >= 2 {
-            buf[0] = pkt[0];
-            buf[1] = pkt[1];
+        // 如果有 UDP 上游，使用防路由环路 UDP 套接字（绑定物理网卡出站）直接转送原始报文
+        if let Some(upstream) = resolver.first_udp_server() {
+            let fwd = crate::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
+            fwd.connect(upstream).await?;
+            fwd.send(pkt).await?;
+            // RFC 6891: EDNS0 允许上游应答载荷至多达 4096 字节
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_millis(1500), fwd.recv(&mut buf))
+                .await
+                .map_err(|_| Error::Dns("上游超时".into()))??;
+            // 保证 id 与查询一致
+            if n >= 2 && pkt.len() >= 2 {
+                buf[0] = pkt[0];
+                buf[1] = pkt[1];
+            }
+            buf.truncate(n);
+            return Ok(buf);
         }
-        buf.truncate(n);
-        Ok(buf)
+
+        // 无普通 UDP 上游时（如纯 DoH / DoT 配置），尝试使用 resolver 进行解析
+        if let Some((_id, name, qtype)) = wire::parse_query(pkt) {
+            if qtype == QTYPE_A {
+                if let Ok(ips) = resolver.resolve_domain(&name, false).await {
+                    if let Some(std::net::IpAddr::V4(v4)) = ips.iter().find(|ip| ip.is_ipv4()) {
+                        return Ok(wire::build_a_response(pkt, *v4));
+                    }
+                }
+            } else if qtype == QTYPE_AAAA && self.ipv6 {
+                if let Ok(ips) = resolver.resolve_domain(&name, true).await {
+                    if let Some(std::net::IpAddr::V6(v6)) = ips.iter().find(|ip| ip.is_ipv6()) {
+                        return Ok(wire::build_aaaa_response(pkt, *v6));
+                    }
+                }
+            }
+        }
+
+        // 无法解析时返回空应答
+        Ok(wire::build_empty_response(pkt))
     }
+}
+
+static GLOBAL_GEOSITE_DB: std::sync::RwLock<Option<Arc<vp_rule::geosite::GeoSiteDb>>> =
+    std::sync::RwLock::new(None);
+
+/// 注册全局 GeoSite 数据库（用于 fake-ip-filter 中的 geosite:xx / rule:geosite:xx 规则匹配）
+pub fn set_global_geosite_db(db: Option<Arc<vp_rule::geosite::GeoSiteDb>>) {
+    *GLOBAL_GEOSITE_DB.write().unwrap() = db;
 }
 
 /// fake-ip 过滤名单匹配（mihomo 语法）：
 /// - `+.x` → x 及任意层级子域；`*.x` → x 的单层子域（`*` 恰好匹配一段）
 /// - 裸域名 → 该域名及其任意层级子域（本内核语义，保留向后兼容）
-/// - `rule:` 前缀（mihomo 扩展语法）暂不支持，忽略该条
+/// - `geosite:xxx` / `rule:geosite:xxx` → 若已加载 GeoSite 数据库则按类别匹配
 pub fn is_fake_ip_filtered(domain: &str, filter: &[String]) -> bool {
     let d = domain.to_ascii_lowercase();
     // 内置保留：Tailscale MagicDNS 域名永不使用 Fake-IP（防止点对点 100.64/10 通信被劫持中断）
@@ -235,7 +311,21 @@ pub fn is_fake_ip_filtered(domain: &str, filter: &[String]) -> bool {
     }
     filter.iter().any(|f| {
         let f = f.trim().to_ascii_lowercase();
-        if f.is_empty() || f.starts_with("rule:") {
+        if f.is_empty() {
+            return false;
+        }
+        if let Some(cat) = f
+            .strip_prefix("rule:geosite:")
+            .or_else(|| f.strip_prefix("geosite:"))
+        {
+            if let Some(db) = GLOBAL_GEOSITE_DB.read().unwrap().as_ref() {
+                if let Some(site) = db.compile(cat) {
+                    return site.matches(&d);
+                }
+            }
+            return false;
+        }
+        if f.starts_with("rule:") {
             return false;
         }
         if let Some(rest) = f.strip_prefix("+.") {
@@ -362,5 +452,36 @@ mod tests {
         assert!(srv.filtered("ts.net"));
         // 未列出的域名不命中
         assert!(!srv.filtered("www.example.org"));
+    }
+
+    #[tokio::test]
+    async fn test_server_static_hosts_and_aaaa() {
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert(
+            "myhost.local".to_string(),
+            vec!["1.2.3.4".parse().unwrap(), "2001:db8::1".parse().unwrap()],
+        );
+        let resolver = Arc::new(Resolver::new(vec![]).with_hosts(hosts));
+        let srv = DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            resolver,
+            None,
+            vec![],
+            true, // 开启 ipv6
+        );
+        let addr = srv.spawn().await.unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let r_a = query(&sock, addr, "myhost.local", QTYPE_A).await;
+        let m_a = wire::parse_response(&r_a).unwrap();
+        let ips_a = wire::extract_ips(&m_a, wire::TYPE_A);
+        assert_eq!(ips_a.len(), 1);
+        assert_eq!(ips_a[0].0.to_string(), "1.2.3.4");
+
+        let r_aaaa = query(&sock, addr, "myhost.local", QTYPE_AAAA).await;
+        let m_aaaa = wire::parse_response(&r_aaaa).unwrap();
+        let ips_aaaa = wire::extract_ips(&m_aaaa, wire::TYPE_AAAA);
+        assert_eq!(ips_aaaa.len(), 1);
+        assert_eq!(ips_aaaa[0].0.to_string(), "2001:db8::1");
     }
 }

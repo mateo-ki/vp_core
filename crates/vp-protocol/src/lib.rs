@@ -113,6 +113,7 @@ fn ws_config(opts: &Option<WsOpts>) -> Option<WsConfig> {
             .clone()
             .map(|h| h.into_iter().collect::<Vec<_>>())
             .unwrap_or_default(),
+        v2ray_http_upgrade: w.v2ray_http_upgrade,
     })
 }
 
@@ -155,14 +156,19 @@ pub fn transport_of_full(
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
         Some("ws") => Some(ws_config(ws_opts).unwrap_or_default()),
+        Some("httpupgrade") | Some("v2ray-http-upgrade") => {
+            let mut cfg = ws_config(ws_opts).unwrap_or_default();
+            cfg.v2ray_http_upgrade = true;
+            Some(cfg)
+        }
         Some("grpc") => None,
-        Some("http") => None,
+        Some("http") | Some("h2") => None,
         Some(other) => {
             return Err(Error::Unsupported(format!("传输 {other:?} 暂不支持")));
         }
     };
     let http = match network.as_deref() {
-        Some("http") => {
+        Some("http") | Some("h2") => {
             let o = http_opts.clone().unwrap_or_default();
             Some(vp_transport::http::HttpConfig {
                 method: o.method.unwrap_or_else(|| "GET".into()),
@@ -228,6 +234,7 @@ pub fn transport_of_full(
         grpc,
         reality,
         ech,
+        socket_opts: None,
     })
 }
 
@@ -440,7 +447,70 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
             }
         }
     };
+    // 节点独立网络绑定包装（仅在节点显式配置了 interface-name 或 routing-mark 时生效）
+    let o = if cfg.interface_name.is_some() || cfg.routing_mark.is_some() {
+        let opts = vp_transport::SocketOpts {
+            interface_name: cfg.interface_name.clone(),
+            routing_mark: cfg.routing_mark,
+        };
+        Arc::new(BoundOutbound::new(o, opts))
+    } else {
+        o
+    };
     Ok(o)
+}
+
+/// 节点专属出站网络绑定装饰器（为节点注入独立的 interface-name 与 routing-mark）
+pub struct BoundOutbound {
+    inner: Arc<dyn Outbound>,
+    opts: vp_transport::SocketOpts,
+}
+
+impl BoundOutbound {
+    pub fn new(inner: Arc<dyn Outbound>, opts: vp_transport::SocketOpts) -> Self {
+        Self { inner, opts }
+    }
+}
+
+#[async_trait::async_trait]
+impl Outbound for BoundOutbound {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
+        let opts = Some(self.opts.clone());
+        vp_transport::CURRENT_SOCKET_OPTS
+            .scope(opts, self.inner.connect_stream(sess, dst))
+            .await
+    }
+
+    async fn connect_over(
+        &self,
+        sess: &Session,
+        dst: &DstAddr,
+        underlying: Box<dyn ProxyStream>,
+    ) -> Result<Box<dyn ProxyStream>> {
+        let opts = Some(self.opts.clone());
+        vp_transport::CURRENT_SOCKET_OPTS
+            .scope(opts, self.inner.connect_over(sess, dst, underlying))
+            .await
+    }
+
+    fn support_udp(&self) -> bool {
+        self.inner.support_udp()
+    }
+
+    async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        let opts = Some(self.opts.clone());
+        vp_transport::CURRENT_SOCKET_OPTS
+            .scope(opts, self.inner.connect_packet(sess, dst))
+            .await
+    }
+
+    fn remote_addr(&self) -> Option<(String, u16)> {
+        self.inner.remote_addr()
+    }
 }
 
 /// 组定义转换

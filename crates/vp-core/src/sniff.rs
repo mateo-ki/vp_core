@@ -17,7 +17,33 @@ pub struct PeekedStream<S> {
     offset: usize,
 }
 
-impl<S> ProxyStream for PeekedStream<S> where S: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
+impl<S: ProxyStream> ProxyStream for PeekedStream<S> {
+    fn raw_socket(&self) -> Option<&tokio::net::TcpStream> {
+        self.inner.raw_socket()
+    }
+
+    fn unconsumed_peek(&self) -> Option<&[u8]> {
+        if self.offset < self.buffer.len() {
+            Some(&self.buffer[self.offset..])
+        } else {
+            self.inner.unconsumed_peek()
+        }
+    }
+
+    fn consume_peek(&mut self, len: usize) {
+        if self.offset < self.buffer.len() {
+            let avail = self.buffer.len() - self.offset;
+            let take = avail.min(len);
+            self.offset += take;
+            let rem = len - take;
+            if rem > 0 {
+                self.inner.consume_peek(rem);
+            }
+        } else {
+            self.inner.consume_peek(len);
+        }
+    }
+}
 
 impl<S> PeekedStream<S> {
     pub fn new(inner: S, buffer: Vec<u8>) -> Self {
@@ -254,6 +280,28 @@ mod tests {
             &read_all,
             b"GET / HTTP/1.1\r\nHost: example.org\r\n\r\nrest-data"
         );
+    }
+
+    #[tokio::test]
+    async fn test_peeked_stream_unconsumed_peek() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let write_task = tokio::spawn(async move {
+            client
+                .write_all(b"GET / HTTP/1.1\r\nHost: test.com\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let (_, mut peeked) = sniff_stream(Box::new(server), Duration::from_secs(1)).await;
+        write_task.await.unwrap();
+
+        assert!(peeked.unconsumed_peek().is_some());
+        let peek_len = peeked.unconsumed_peek().unwrap().len();
+        assert!(peek_len > 0);
+
+        // 消费全部未读首包
+        peeked.consume_peek(peek_len);
+        assert!(peeked.unconsumed_peek().is_none());
     }
 
     #[test]

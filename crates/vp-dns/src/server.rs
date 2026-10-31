@@ -48,38 +48,91 @@ impl DnsServer {
         }
     }
 
-    /// 启动 UDP 监听，返回实际绑定地址与接收循环任务句柄（热停用 TUN 时 abort 用）
+    /// 启动 UDP 与 TCP（同端口）监听，返回实际绑定地址与接收循环任务句柄
     pub async fn spawn_handle(self) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
         let sock = Arc::new(UdpSocket::bind(self.listen).await?);
         let bound = sock.local_addr()?;
         let this = Arc::new(self);
         let resolver = this.resolver.clone();
+
+        // 尝试同端口绑定 TCP DNS 监听器（兼容 dig +tcp / RFC 7766 标准 DNS 查询）
+        let tcp_listener = tokio::net::TcpListener::bind(bound).await.ok();
+
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 1500];
-            loop {
-                match sock.recv_from(&mut buf).await {
-                    Ok((n, from)) => {
-                        let pkt = buf[..n].to_vec();
-                        let this = this.clone();
-                        let sock = sock.clone();
-                        let resolver = resolver.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = this.handle(&sock, &pkt, from, &resolver).await {
-                                warn!("dns 查询处理失败: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!("dns 服务器 recv 失败: {e}");
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+            let this_udp = this.clone();
+            let sock_udp = sock.clone();
+            let resolver_udp = resolver.clone();
+
+            let udp_task = tokio::spawn(async move {
+                let mut buf = vec![0u8; 1500];
+                loop {
+                    match sock_udp.recv_from(&mut buf).await {
+                        Ok((n, from)) => {
+                            let pkt = buf[..n].to_vec();
+                            let this = this_udp.clone();
+                            let sock = sock_udp.clone();
+                            let resolver = resolver_udp.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = this.handle(&sock, &pkt, from, &resolver).await {
+                                    warn!("dns 查询处理失败: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!("dns 服务器 recv 失败: {e}");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
                     }
                 }
+            });
+
+            if let Some(listener) = tcp_listener {
+                let this_tcp = this.clone();
+                let resolver_tcp = resolver.clone();
+                let tcp_task = tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((mut stream, _)) => {
+                                let this = this_tcp.clone();
+                                let resolver = resolver_tcp.clone();
+                                tokio::spawn(async move {
+                                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                                    let mut len_buf = [0u8; 2];
+                                    if stream.read_exact(&mut len_buf).await.is_err() {
+                                        return;
+                                    }
+                                    let len = u16::from_be_bytes(len_buf) as usize;
+                                    if len == 0 || len > 4096 {
+                                        return;
+                                    }
+                                    let mut pkt = vec![0u8; len];
+                                    if stream.read_exact(&mut pkt).await.is_err() {
+                                        return;
+                                    }
+                                    if let Ok(Some(resp)) =
+                                        this.process_query(&pkt, &resolver).await
+                                    {
+                                        let resp_len = (resp.len() as u16).to_be_bytes();
+                                        let _ = stream.write_all(&resp_len).await;
+                                        let _ = stream.write_all(&resp).await;
+                                    }
+                                });
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                });
+                let _ = tokio::join!(udp_task, tcp_task);
+            } else {
+                let _ = udp_task.await;
             }
         });
         Ok((bound, handle))
     }
 
-    /// 启动 UDP 监听（不保留任务句柄）
+    /// 启动 UDP 与 TCP 监听（不保留任务句柄）
     pub async fn spawn(self) -> Result<SocketAddr> {
         self.spawn_handle().await.map(|(addr, _)| addr)
     }
@@ -91,8 +144,19 @@ impl DnsServer {
         from: SocketAddr,
         resolver: &Arc<Resolver>,
     ) -> Result<()> {
+        if let Some(resp) = self.process_query(pkt, resolver).await? {
+            let _ = sock.send_to(&resp, from).await;
+        }
+        Ok(())
+    }
+
+    pub async fn process_query(
+        &self,
+        pkt: &[u8],
+        resolver: &Arc<Resolver>,
+    ) -> Result<Option<Vec<u8>>> {
         let Some((_id, name, qtype)) = wire::parse_query(pkt) else {
-            return Ok(());
+            return Ok(None);
         };
 
         // PTR 反查
@@ -100,14 +164,12 @@ impl DnsServer {
             if let Some(ipv4) = parse_ptr(&name) {
                 if let Some(pool) = &self.fake_ip {
                     if let Some(domain) = pool.reverse(std::net::IpAddr::V4(ipv4)) {
-                        let resp = wire::build_ptr_response(pkt, &domain);
-                        let _ = sock.send_to(&resp, from).await;
-                        return Ok(());
+                        return Ok(Some(wire::build_ptr_response(pkt, &domain)));
                     }
                 }
             }
             // 交由上游
-            return self.forward(sock, pkt, from, resolver).await;
+            return self.forward_query(pkt, resolver).await.map(Some);
         }
 
         let fake_mode = self.fake_ip.is_some() && !self.filtered(&name);
@@ -115,47 +177,33 @@ impl DnsServer {
         if qtype == QTYPE_A && fake_mode {
             let pool = self.fake_ip.as_ref().unwrap();
             if let Some(ip) = pool.allocate(&name) {
-                let resp = wire::build_a_response(pkt, ip);
-                let _ = sock.send_to(&resp, from).await;
-                return Ok(());
+                return Ok(Some(wire::build_a_response(pkt, ip)));
             }
-            return self.forward(sock, pkt, from, resolver).await;
+            return self.forward_query(pkt, resolver).await.map(Some);
         }
 
         if qtype == QTYPE_AAAA && fake_mode && !self.ipv6 {
-            let resp = wire::build_empty_response(pkt);
-            let _ = sock.send_to(&resp, from).await;
-            return Ok(());
+            return Ok(Some(wire::build_empty_response(pkt)));
         }
 
         // HTTPS/SVCB 查询优化：Fake-IP 模式下立即应答空记录（NOERROR 且 0 应答），
         // 彻底根除现代浏览器并发查询 Type 65 导致的 1~3 秒白屏/转圈卡顿，并防止真 IP 泄露绕过代理
         if (qtype == QTYPE_HTTPS || qtype == QTYPE_SVCB) && fake_mode {
-            let resp = wire::build_empty_response(pkt);
-            let _ = sock.send_to(&resp, from).await;
-            return Ok(());
+            return Ok(Some(wire::build_empty_response(pkt)));
         }
 
         // 其余原样转发上游
-        self.forward(sock, pkt, from, resolver).await
+        self.forward_query(pkt, resolver).await.map(Some)
     }
 
     fn filtered(&self, domain: &str) -> bool {
         is_fake_ip_filtered(domain, &self.fake_ip_filter)
     }
 
-    async fn forward(
-        &self,
-        sock: &UdpSocket,
-        pkt: &[u8],
-        from: SocketAddr,
-        resolver: &Arc<Resolver>,
-    ) -> Result<()> {
+    async fn forward_query(&self, pkt: &[u8], resolver: &Arc<Resolver>) -> Result<Vec<u8>> {
         // 无上游服务器 → NXDOMAIN 兜底
         let Some(upstream) = resolver.first_udp_server() else {
-            let resp = wire::build_empty_response(pkt);
-            let _ = sock.send_to(&resp, from).await;
-            return Ok(());
+            return Ok(wire::build_empty_response(pkt));
         };
         // 使用防路由环路 UDP 套接字（绑定物理网卡出站），避免 TUN 模式下双 /1 路由导致查询自循环
         let fwd = crate::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
@@ -170,8 +218,8 @@ impl DnsServer {
             buf[0] = pkt[0];
             buf[1] = pkt[1];
         }
-        let _ = sock.send_to(&buf[..n], from).await;
-        Ok(())
+        buf.truncate(n);
+        Ok(buf)
     }
 }
 
@@ -181,6 +229,10 @@ impl DnsServer {
 /// - `rule:` 前缀（mihomo 扩展语法）暂不支持，忽略该条
 pub fn is_fake_ip_filtered(domain: &str, filter: &[String]) -> bool {
     let d = domain.to_ascii_lowercase();
+    // 内置保留：Tailscale MagicDNS 域名永不使用 Fake-IP（防止点对点 100.64/10 通信被劫持中断）
+    if d == "ts.net" || d.ends_with(".ts.net") {
+        return true;
+    }
     filter.iter().any(|f| {
         let f = f.trim().to_ascii_lowercase();
         if f.is_empty() || f.starts_with("rule:") {
@@ -305,6 +357,9 @@ mod tests {
         assert!(srv.filtered("a.mydevice.example"));
         // rule: 前缀暂不支持，不命中
         assert!(!srv.filtered("baidu.com"));
+        // Tailscale 域名过滤
+        assert!(srv.filtered("node.ts.net"));
+        assert!(srv.filtered("ts.net"));
         // 未列出的域名不命中
         assert!(!srv.filtered("www.example.org"));
     }

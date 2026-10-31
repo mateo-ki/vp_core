@@ -18,6 +18,14 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     fn raw_socket(&self) -> Option<&tokio::net::TcpStream> {
         None
     }
+
+    /// 预读/嗅探层中未消费的字节（若存在）
+    fn unconsumed_peek(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// 标记已消费预读字节（与 unconsumed_peek 配合，在切入 splice 前排空）
+    fn consume_peek(&mut self, _len: usize) {}
 }
 
 /// 裸 socket：ProxyStream + raw_socket_fd 全开。
@@ -41,6 +49,14 @@ impl_proxy_stream![tokio::io::DuplexStream, tokio::io::SimplexStream];
 impl ProxyStream for Box<dyn ProxyStream> {
     fn raw_socket(&self) -> Option<&tokio::net::TcpStream> {
         (**self).raw_socket()
+    }
+
+    fn unconsumed_peek(&self) -> Option<&[u8]> {
+        (**self).unconsumed_peek()
+    }
+
+    fn consume_peek(&mut self, len: usize) {
+        (**self).consume_peek(len);
     }
 }
 

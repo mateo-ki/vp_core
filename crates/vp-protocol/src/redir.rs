@@ -63,6 +63,7 @@ impl Inbound for RedirInbound {
                 loop {
                     match listener.accept().await {
                         Ok((stream, src)) => {
+                            vp_transport::tune(&stream);
                             let ctx = ctx.clone();
                             let tag = tag.clone();
                             tokio::spawn(async move {
@@ -96,7 +97,7 @@ impl Inbound for RedirInbound {
 }
 
 #[cfg(target_os = "linux")]
-fn original_dst(stream: &tokio::net::TcpStream) -> Result<DstAddr> {
+pub fn original_dst(stream: &tokio::net::TcpStream) -> Result<DstAddr> {
     use std::os::fd::AsRawFd;
     unsafe {
         let fd = stream.as_raw_fd();

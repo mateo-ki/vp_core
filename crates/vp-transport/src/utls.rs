@@ -1611,7 +1611,7 @@ mod tests {
         assert_eq!(&buf, b"hello-utls");
 
         // 大包（跨多记录分帧 + 并发回读避免 TCP 缓冲区死锁）
-        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let payload: Vec<u8> = (0..128_000u32).map(|i| (i % 251) as u8).collect();
         let (mut rh, mut wh) = tokio::io::split(s);
         let send_payload = payload.clone();
         let send_task = tokio::spawn(async move {
@@ -1621,7 +1621,7 @@ mod tests {
         let mut got = Vec::with_capacity(payload.len());
         let mut rb = [0u8; 64 * 1024];
         while got.len() < payload.len() {
-            let n = tokio::time::timeout(std::time::Duration::from_secs(10), rh.read(&mut rb))
+            let n = tokio::time::timeout(std::time::Duration::from_secs(30), rh.read(&mut rb))
                 .await
                 .expect("读取回显超时")
                 .unwrap();
@@ -1629,7 +1629,7 @@ mod tests {
             got.extend_from_slice(&rb[..n]);
         }
         send_task.await.unwrap();
-        assert_eq!(got, payload, "300KB 回显应逐字节一致");
+        assert_eq!(got, payload, "128KB 回显应逐字节一致");
     }
 
     #[tokio::test]

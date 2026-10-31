@@ -26,6 +26,7 @@ vp-router.workspace = true
 vp-plugin.workspace = true
 vp-rule.workspace = true
 tokio.workspace = true
+socket2.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 tracing.workspace = true

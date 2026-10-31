@@ -5,6 +5,7 @@ use std::time::Instant;
 const SIZE: usize = 64 * 1024 * 1024; // 64MB 明文，跑 3 轮取最好
 
 #[test]
+#[ignore = "基准压测：手动执行 cargo test -p vp-crypto --test aead_bench -- --ignored --nocapture"]
 fn aead_throughput_report() {
     use aes_gcm::aead::Aead;
     use aes_gcm::{AesGcm, KeyInit, Nonce};

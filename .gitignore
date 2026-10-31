@@ -9,3 +9,6 @@ Cargo.lock.orig
 /.wsl-setup
 __pycache__/
 *.pyc
+sync_to_wsl.sh
+scripts/wsl_baseline_test.sh
+scripts/wsl_diag_one.sh

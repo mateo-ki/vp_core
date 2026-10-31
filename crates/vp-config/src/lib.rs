@@ -88,6 +88,37 @@ fn sanitize_proxy_aliases(val: &mut serde_json::Value) {
                 if let Some(a) = a1.or(a2) {
                     obj.insert("alter_id".into(), a);
                 }
+
+                // 5. ports / mport (如 Hysteria2 端口跳跃范围)
+                let p1 = obj.remove("ports");
+                let p2 = obj.remove("mport");
+                if let Some(p) = p1.or(p2) {
+                    obj.insert("ports".into(), p);
+                }
+
+                // 6. up / up-mbps / up_mbps
+                let u1 = obj.remove("up");
+                let u2 = obj.remove("up-mbps");
+                let u3 = obj.remove("up_mbps");
+                if let Some(u) = u1.or(u2).or(u3) {
+                    obj.insert("up".into(), u);
+                }
+
+                // 7. down / down-mbps / down_mbps
+                let d1 = obj.remove("down");
+                let d2 = obj.remove("down-mbps");
+                let d3 = obj.remove("down_mbps");
+                if let Some(d) = d1.or(d2).or(d3) {
+                    obj.insert("down".into(), d);
+                }
+
+                // 8. obfs / obfs-type / obfs_type
+                let o1 = obj.remove("obfs");
+                let o2 = obj.remove("obfs-type");
+                let o3 = obj.remove("obfs_type");
+                if let Some(o) = o1.or(o2).or(o3) {
+                    obj.insert("obfs".into(), o);
+                }
             }
         }
     }
@@ -398,6 +429,83 @@ proxies:
             ProxyKind::Vless(v) => {
                 assert_eq!(v.server_name.as_deref(), Some("test.com"));
                 assert!(v.skip_cert_verify);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hysteria2_and_tuic_sni_alias_retained() {
+        let yaml = r#"
+mixed-port: 7890
+proxies:
+  - name: "hy2-node"
+    type: hysteria2
+    server: 52.1.2.3
+    port: 443
+    password: "secretpassword"
+    sni: "www.bing.com"
+  - name: "tuic-node"
+    type: tuic
+    server: 52.1.2.4
+    port: 443
+    uuid: "d9d939c9-1a6b-47d1-80d0-4bf008fee7ff"
+    password: "tuicpassword"
+    servername: "www.microsoft.com"
+"#;
+        let cfg = parse(yaml, Format::Yaml).expect("hy2 与 tuic 别名解析应当成功");
+        assert_eq!(cfg.proxies.len(), 2);
+        match &cfg.proxies[0].kind {
+            ProxyKind::Hysteria2(h) => {
+                assert_eq!(
+                    h.sni.as_deref(),
+                    Some("www.bing.com"),
+                    "Hysteria2 sni 字段必须正确保留，不可被别名清洗阶段清除"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &cfg.proxies[1].kind {
+            ProxyKind::Tuic(t) => {
+                assert_eq!(
+                    t.sni.as_deref(),
+                    Some("www.microsoft.com"),
+                    "Tuic servername 字段必须正确解析为 sni"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hysteria2_ports_and_mport_duplicate_alias() {
+        let json = r#"
+{
+  "mixed-port": 7890,
+  "proxies": [
+    {
+      "name": "hy2-ports",
+      "type": "hysteria2",
+      "server": "203.0.113.10",
+      "port": 20000,
+      "password": "pwd",
+      "mport": "20000-50000",
+      "ports": "20000-50000",
+      "up": "100 Mbps",
+      "up-mbps": 100,
+      "down": "200 Mbps",
+      "down-mbps": 200
+    }
+  ]
+}
+"#;
+        let cfg = parse(json, Format::Json).expect("mport 与 ports 共存应被正确去重");
+        assert_eq!(cfg.proxies.len(), 1);
+        match &cfg.proxies[0].kind {
+            ProxyKind::Hysteria2(h) => {
+                assert_eq!(h.ports.as_deref(), Some("20000-50000"));
+                assert_eq!(h.up, Some(100));
+                assert_eq!(h.down, Some(200));
             }
             other => panic!("unexpected {other:?}"),
         }

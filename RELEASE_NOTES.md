@@ -1,3 +1,18 @@
+# 🚀 VP_Core v1.3.2 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.3.2**！本版聚焦 **Windows TUN 模式 DNS 劫持拦截与 Fake-IP 冲突修复**，彻底解决 TUN 模式下 YouTube 访问失败与 DNS 超时问题：
+
+### 🌐 Windows Wintun DNS 劫持分离与 Fake-IP 冲突根治（P0）
+- **DNS 拦截分离**：Wintun 适配器 DNS 地址指向同网段未占用 IP（`198.18.0.2`），避免 Windows 将发往虚拟网卡自身 IP（`198.18.0.1`）的 DNS 查询直接经系统内核回环处理导致 TUN 无法拦截的问题；
+- **Fake-IP 地址池保留池加固**：保留 `base+1`（网卡地址）与 `base+2`（DNS 劫持地址），Fake-IP 严格从 `base+3` 起按需分配，杜绝地址冲突。
+
+### ⚡ Hysteria 2 / QUIC Datagram 与物理网卡防环路优化
+- **QUIC Datagram 目标保留**：修复 TUN 模式下目标地址回环反查引起的格式化异常，UDP 流量正确携带原始目标域名/地址，解决 YouTube 等 QUIC 站点握手黑洞；
+- **底层 UDP 套接字物理绑定**：出站 QUIC / UDP 套接字显式通过物理网卡拨号，防止 TUN 下发的默认路由造成自循环死锁；
+- **TUN MTU 调优**：MTU 标准化为 1500，杜绝超大包分片导致上游光猫/路由器丢包。
+
+---
+
 # 🚀 VP_Core v1.3.1 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.3.1**！本版是 **Windows TUN 防回环专项 + ECH 回退修复**，根治"开启 TUN 后整机断网"与"节点 ECH 被拒后连接判死"两大故障：

@@ -312,12 +312,13 @@ impl AnytlsOutbound {
                 server_name: cfg.server_name.clone(),
                 skip_cert_verify: cfg.skip_cert_verify,
                 fingerprint: cfg.client_fingerprint.clone(),
-                alpn: Vec::new(),
+                alpn: cfg.alpn.clone().unwrap_or_default(),
                 ws: None,
                 http: None,
                 grpc: None,
                 reality,
                 ech: None,
+                socket_opts: None,
             },
         })
     }
@@ -982,6 +983,7 @@ mod tests {
             server_name: None,
             skip_cert_verify: false,
             client_fingerprint: None,
+            alpn: None,
             reality_opts: None,
             udp: false,
         };
@@ -999,6 +1001,7 @@ mod tests {
             server_name: Some("www.apple.com".into()),
             skip_cert_verify: false,
             client_fingerprint: Some("chrome".into()),
+            alpn: None,
             reality_opts: Some(vp_config::RealityOpts {
                 public_key: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio".into(),
                 short_id: Some("1234".into()),

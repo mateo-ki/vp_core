@@ -19,6 +19,10 @@ pub struct ApiState {
     pub config_meta: Arc<RwLock<Option<crate::ConfigMeta>>>,
     /// TUN 运行时：PUT /configs 热重载按配置差量动态启停 TUN（免重启热切换）
     pub tun_runtime: Arc<RwLock<Option<crate::TunRuntime>>>,
+    /// TUN 实时运行状态
+    pub tun_status: Arc<RwLock<crate::TunStatus>>,
+    /// 独立 DNS 服务端实时运行状态
+    pub dns_status: Arc<RwLock<crate::DnsStatus>>,
     /// 全局 DNS 解析器：热开启 TUN 时复用它建 fake-ip 劫持服务器
     pub dns: Arc<vp_dns::Resolver>,
 }
@@ -53,6 +57,8 @@ struct Req {
     query: String,
     body: Vec<u8>,
     auth: Option<String>,
+    ws_key: Option<String>,
+    is_ws: bool,
 }
 
 async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
@@ -78,6 +84,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
     let mut auth = None;
+    let mut ws_key = None;
+    let mut is_ws = false;
     let mut content_length = 0usize;
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
@@ -87,6 +95,10 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
                 auth = Some(v.to_string());
             } else if k == "content-length" {
                 content_length = v.parse().unwrap_or(0);
+            } else if k == "sec-websocket-key" {
+                ws_key = Some(v.to_string());
+            } else if k == "upgrade" && v.eq_ignore_ascii_case("websocket") {
+                is_ws = true;
             }
         }
     }
@@ -104,6 +116,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
         query,
         body,
         auth,
+        ws_key,
+        is_ws,
     })
 }
 
@@ -146,26 +160,61 @@ async fn reload_into(
     Ok(())
 }
 
-/// GET /traffic：WebSocket 升级后每秒推送流量 JSON
-async fn serve_traffic_ws(mut stream: tokio::net::TcpStream, st: &ApiState) {
+async fn upgrade_to_ws(
+    mut stream: tokio::net::TcpStream,
+    ws_key: Option<&str>,
+) -> Option<vp_transport::WsStream<tokio::net::TcpStream>> {
     use tokio::io::AsyncWriteExt;
-    // serve() 已消费请求头；回 101（Accept 值为标记，客户端为内核 GUI/测试）
-    let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: vpcore\r\n\r\n";
+    let accept = ws_key
+        .map(vp_transport::ws::compute_ws_accept)
+        .unwrap_or_else(|| "vpcore".to_string());
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+    );
     if stream.write_all(resp.as_bytes()).await.is_err() {
-        return;
+        return None;
     }
-    // 升级完成后流上走 WS 帧
-    let mut ws = match vp_transport::ws::ws_handshake_after_101(stream).await {
-        Ok(w) => w,
-        Err(_) => return,
+    let mut ws = vp_transport::ws::ws_handshake_after_101(stream)
+        .await
+        .ok()?;
+    // RFC 6455: 0x1 为文本帧，保证浏览器前端（YACD / Metacubexd）JSON.parse 正确解析而非收到 Blob
+    ws.set_write_opcode(0x1);
+    Some(ws)
+}
+
+/// 获取当前进程常驻内存或活跃池化缓冲近似内存（字节）
+fn current_memory_inuse(st: &ApiState) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages) = s.split_whitespace().nth(1) {
+                if let Ok(pages) = rss_pages.parse::<u64>() {
+                    return pages * 4096;
+                }
+            }
+        }
+    }
+    let active_conns = st.conns.list().len() as u64;
+    let bstats = vp_common::bufpool::stats();
+    // 基准常驻 + 活跃/闲置池化缓冲块 + 活跃连接开销
+    (8 * 1024 * 1024)
+        + ((bstats.active + bstats.idle) as u64) * (vp_common::bufpool::BUF_SIZE as u64)
+        + active_conns * 8192
+}
+
+/// GET /traffic：WebSocket 升级后每秒推送流量 JSON
+async fn serve_traffic_ws(stream: tokio::net::TcpStream, ws_key: Option<&str>, st: &ApiState) {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut ws) = upgrade_to_ws(stream, ws_key).await else {
+        return;
     };
     let mut last_up = 0u64;
     let mut last_down = 0u64;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let s = st.stats.snapshot();
-        let up = s.upload - last_up;
-        let down = s.download - last_down;
+        let up = s.upload.saturating_sub(last_up);
+        let down = s.download.saturating_sub(last_down);
         last_up = s.upload;
         last_down = s.download;
         let payload = format!("{{\"up\":{up},\"down\":{down}}}");
@@ -175,18 +224,75 @@ async fn serve_traffic_ws(mut stream: tokio::net::TcpStream, st: &ApiState) {
     }
 }
 
+/// GET /memory：WebSocket 升级后每秒推送内存占用 JSON
+async fn serve_memory_ws(stream: tokio::net::TcpStream, ws_key: Option<&str>, st: &ApiState) {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut ws) = upgrade_to_ws(stream, ws_key).await else {
+        return;
+    };
+    loop {
+        let inuse = current_memory_inuse(st);
+        let payload = format!("{{\"inuse\":{inuse},\"oslimit\":0}}");
+        if ws.write_all(payload.as_bytes()).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// GET /logs：WebSocket 升级后实时推送内核连接/状态事件日志
+async fn serve_logs_ws(stream: tokio::net::TcpStream, ws_key: Option<&str>, st: &ApiState) {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut ws) = upgrade_to_ws(stream, ws_key).await else {
+        return;
+    };
+    let mut seen_ids = std::collections::HashSet::new();
+    let init_msg = json!({
+        "type": "info",
+        "payload": format!("VP_Core v{} log stream connected (mode: {:?})", env!("CARGO_PKG_VERSION"), st.router.current().mode())
+    });
+    if ws.write_all(init_msg.to_string().as_bytes()).await.is_err() {
+        return;
+    }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        for c in st.conns.list() {
+            if seen_ids.insert(c.meta.id) {
+                let chain = c.meta.chain.as_deref().unwrap_or("DIRECT");
+                let rule = c.meta.rule.as_deref().unwrap_or("MATCH");
+                let msg = json!({
+                    "type": "info",
+                    "payload": format!("[{}] {}:{} ({}) match {} using {}", c.meta.network.to_ascii_uppercase(), c.meta.host, c.meta.dst_port, c.meta.inbound, rule, chain)
+                });
+                if ws.write_all(msg.to_string().as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if seen_ids.len() > 4096 {
+            seen_ids.clear();
+        }
+    }
+}
+
 async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
     let Some(req) = read_request(&mut stream).await else {
         return Ok(());
     };
-    // 鉴权
+    // CORS 预检请求直接放行（浏览器 OPTIONS 预检不携带 Authorization）
+    if req.method.eq_ignore_ascii_case("OPTIONS") {
+        reply(&mut stream, 204, "No Content", &json!({})).await;
+        return Ok(());
+    }
+    // 鉴权（兼容 Header `Authorization: Bearer <secret>` 与 WebSocket URL `?token=<secret>`）
     if let Some(secret) = &st.secret {
-        let ok = req
+        let header_ok = req
             .auth
             .as_deref()
-            .and_then(|a| a.strip_prefix("Bearer "))
-            .is_some_and(|t| t == secret);
-        if !ok {
+            .and_then(|a| a.strip_prefix("Bearer ").or(Some(a)))
+            .is_some_and(|t| t.trim() == secret);
+        let token_ok = query_param(&req.query, "token").is_some_and(|t| t == *secret);
+        if !header_ok && !token_ok {
             reply(
                 &mut stream,
                 401,
@@ -270,6 +376,30 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                     }
                 }
                 reply(&mut stream, 200, "OK", &item).await;
+            } else if let Some(ob) = router.outbound(name) {
+                let mut item = json!({
+                    "name": name,
+                    "type": "Static",
+                    "udp": ob.support_udp(),
+                    "all": [],
+                    "history": [],
+                });
+                for g in router.groups().values() {
+                    if let Some((_, delay, alive)) = g
+                        .member_states()
+                        .into_iter()
+                        .find(|(n, _, _)| &**n == *name)
+                    {
+                        if let Some(obj) = item.as_object_mut() {
+                            obj.insert("alive".into(), json!(alive));
+                            if let Some(ms) = delay {
+                                obj.insert("history".into(), json!([{"time": "now", "delay": ms}]));
+                            }
+                        }
+                        break;
+                    }
+                }
+                reply(&mut stream, 200, "OK", &item).await;
             } else {
                 reply(
                     &mut stream,
@@ -310,36 +440,110 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 }
             }
         }
-        ("GET", ["proxies", name, "delay"]) => {
-            let group = router.get_group(name);
-            match group {
-                Some(g) => {
-                    let url = query_param(&req.query, "url")
-                        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
-                    let member = query_param(&req.query, "member");
-                    let ms = match member {
-                        Some(m) => g.url_test_member(&m).await,
-                        None => g.url_test_member(&g.selected_name()).await,
-                    };
-                    match ms {
-                        Ok(ms) => {
-                            reply(&mut stream, 200, "OK", &json!({"delay": ms, "url": url})).await
-                        }
-                        Err(_) => {
-                            reply(&mut stream, 408, "Timeout", &json!({"message": "测速失败"}))
-                                .await
-                        }
+        ("DELETE", ["proxies", name]) => {
+            if let Some(g) = router.get_group(name) {
+                g.unfix_selected();
+                reply(&mut stream, 204, "No Content", &json!({})).await;
+            } else {
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": "not found"}),
+                )
+                .await;
+            }
+        }
+        ("GET", ["group", name, "delay"]) => {
+            let timeout_ms: u64 = query_param(&req.query, "timeout")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5000);
+            if let Some(g) = router.get_group(name) {
+                let members = g.member_names().to_vec();
+                let mut set = tokio::task::JoinSet::new();
+                for member_arc in members {
+                    let g_clone = g.clone();
+                    let member = member_arc.to_string();
+                    set.spawn(async move {
+                        let res = tokio::time::timeout(
+                            std::time::Duration::from_millis(timeout_ms),
+                            g_clone.url_test_member(&member),
+                        )
+                        .await;
+                        let delay = match res {
+                            Ok(Ok(ms)) => ms,
+                            _ => 0,
+                        };
+                        (member, delay)
+                    });
+                }
+                let mut results = serde_json::Map::new();
+                while let Some(res) = set.join_next().await {
+                    if let Ok((m, delay)) = res {
+                        results.insert(m, json!(delay));
                     }
                 }
-                None => {
-                    reply(
-                        &mut stream,
-                        404,
-                        "Not Found",
-                        &json!({"message": "not found"}),
-                    )
-                    .await
+                reply(&mut stream, 200, "OK", &serde_json::Value::Object(results)).await;
+            } else {
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": "not found"}),
+                )
+                .await;
+            }
+        }
+        ("GET", ["ui"]) => {
+            reply(
+                &mut stream,
+                200,
+                "OK",
+                &json!({
+                    "message": "VP_Core External Controller API",
+                    "dashboards": [
+                        "https://metacubex.github.io/metacubexd/",
+                        "https://yacd.haishan.me/",
+                        "https://board.zash.run.place/"
+                    ]
+                }),
+            )
+            .await;
+        }
+        ("GET", ["proxies", name, "delay"]) => {
+            let url = query_param(&req.query, "url")
+                .unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
+            if let Some(g) = router.get_group(name) {
+                let member = query_param(&req.query, "member");
+                let ms = match member {
+                    Some(m) => g.url_test_member(&m).await,
+                    None => g.url_test_member(&g.selected_name()).await,
+                };
+                match ms {
+                    Ok(ms) => {
+                        reply(&mut stream, 200, "OK", &json!({"delay": ms, "url": url})).await
+                    }
+                    Err(_) => {
+                        reply(&mut stream, 408, "Timeout", &json!({"message": "测速失败"})).await
+                    }
                 }
+            } else if router.outbound(name).is_some() {
+                match router.url_test_node(name, &url).await {
+                    Ok(ms) => {
+                        reply(&mut stream, 200, "OK", &json!({"delay": ms, "url": url})).await
+                    }
+                    Err(_) => {
+                        reply(&mut stream, 408, "Timeout", &json!({"message": "测速失败"})).await
+                    }
+                }
+            } else {
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": "not found"}),
+                )
+                .await
             }
         }
         ("GET", ["rules"]) => {
@@ -445,11 +649,17 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             }
         }
         ("GET", ["configs"]) => {
+            let tun_st = st.tun_status.read().unwrap().clone();
+            let dns_st = st.dns_status.read().unwrap().clone();
             reply(
                 &mut stream,
                 200,
                 "OK",
-                &json!({"mode": format!("{:?}", router.mode()).to_lowercase()}),
+                &json!({
+                    "mode": format!("{:?}", router.mode()).to_lowercase(),
+                    "tun": tun_st,
+                    "dns": dns_st,
+                }),
             )
             .await;
         }
@@ -677,6 +887,31 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             let cur = st.config_meta.read().unwrap().clone();
             match cur {
                 Some(meta) => {
+                    // 若该 proxy-provider 配置了远端 URL，先主动拉取最新订阅并更新本地缓存文件
+                    if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
+                        if let Some(p) = cfg.proxy_providers.get(*name) {
+                            if let Some(ref url) = p.url {
+                                let url = url.clone();
+                                let cache_path = p
+                                    .path
+                                    .as_ref()
+                                    .map(|path| meta.base_dir.join(path))
+                                    .unwrap_or_else(|| {
+                                        meta.base_dir.join(".cache").join(format!("{name}.yaml"))
+                                    });
+                                if let Ok(Ok(body)) = tokio::task::spawn_blocking(move || {
+                                    crate::fetch_remote_provider(&url, "clash.meta/v1.18.0")
+                                })
+                                .await
+                                {
+                                    if let Some(parent) = cache_path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    let _ = std::fs::write(&cache_path, &body);
+                                }
+                            }
+                        }
+                    }
                     let reloaded = reload_into(st, meta.path, &meta.text, meta.fmt, meta.base_dir)
                         .await
                         .is_ok();
@@ -703,7 +938,154 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 }
             }
         }
+        ("GET", ["providers", "rules"]) => {
+            let meta = st.config_meta.read().unwrap().clone();
+            let mut providers_map = serde_json::Map::new();
+            if let Some(meta) = meta {
+                if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
+                    for (name, r) in cfg.rule_providers {
+                        let cache_path = r
+                            .path
+                            .as_ref()
+                            .map(|p| meta.base_dir.join(p))
+                            .unwrap_or_else(|| {
+                                meta.base_dir
+                                    .join(".cache")
+                                    .join("rules")
+                                    .join(format!("{name}.yaml"))
+                            });
+                        let rule_count = std::fs::read_to_string(&cache_path)
+                            .map(|t| {
+                                t.lines()
+                                    .filter(|l| {
+                                        let s = l.trim();
+                                        !s.is_empty() && !s.starts_with('#') && s != "payload:"
+                                    })
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        providers_map.insert(
+                            name.clone(),
+                            json!({
+                                "name": name,
+                                "type": "Rule",
+                                "behavior": r.behavior,
+                                "format": r.format.unwrap_or_else(|| "yaml".into()),
+                                "vehicleType": r.kind.unwrap_or_else(|| "HTTP".into()),
+                                "ruleCount": rule_count,
+                                "updatedAt": vp_core::conn_table::iso8601(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64,
+                                ),
+                            }),
+                        );
+                    }
+                }
+            }
+            reply(
+                &mut stream,
+                200,
+                "OK",
+                &json!({ "providers": providers_map }),
+            )
+            .await;
+        }
+        ("GET", ["providers", "rules", name]) => {
+            let meta = st.config_meta.read().unwrap().clone();
+            let mut found = None;
+            if let Some(meta) = meta {
+                if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
+                    if let Some(r) = cfg.rule_providers.get(*name) {
+                        found = Some(json!({
+                            "name": name,
+                            "type": "Rule",
+                            "behavior": r.behavior,
+                            "format": r.format.as_deref().unwrap_or("yaml"),
+                            "vehicleType": r.kind.as_deref().unwrap_or("HTTP"),
+                            "updatedAt": vp_core::conn_table::iso8601(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                            ),
+                        }));
+                    }
+                }
+            }
+            match found {
+                Some(val) => reply(&mut stream, 200, "OK", &val).await,
+                None => {
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "rule provider not found"}),
+                    )
+                    .await
+                }
+            }
+        }
+        ("PUT", ["providers", "rules", name]) => {
+            let cur = st.config_meta.read().unwrap().clone();
+            match cur {
+                Some(meta) => {
+                    if let Ok(cfg) = vp_config::parse(&meta.text, meta.fmt) {
+                        if let Some(r) = cfg.rule_providers.get(*name) {
+                            if let Some(ref url) = r.url {
+                                let url = url.clone();
+                                let cache_path = r
+                                    .path
+                                    .as_ref()
+                                    .map(|path| meta.base_dir.join(path))
+                                    .unwrap_or_else(|| {
+                                        meta.base_dir
+                                            .join(".cache")
+                                            .join("rules")
+                                            .join(format!("{name}.yaml"))
+                                    });
+                                if let Ok(Ok(body)) = tokio::task::spawn_blocking(move || {
+                                    crate::fetch_remote_provider(&url, "vpcore/0.1")
+                                })
+                                .await
+                                {
+                                    if let Some(parent) = cache_path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    let _ = std::fs::write(&cache_path, &body);
+                                }
+                            }
+                        }
+                    }
+                    let reloaded = reload_into(st, meta.path, &meta.text, meta.fmt, meta.base_dir)
+                        .await
+                        .is_ok();
+                    if reloaded {
+                        reply(&mut stream, 204, "No Content", &json!({})).await;
+                    } else {
+                        reply(
+                            &mut stream,
+                            500,
+                            "Internal Server Error",
+                            &json!({"message": format!("刷新规则集 {name} 失败")}),
+                        )
+                        .await;
+                    }
+                }
+                None => {
+                    reply(
+                        &mut stream,
+                        404,
+                        "Not Found",
+                        &json!({"message": "no config loaded"}),
+                    )
+                    .await
+                }
+            }
+        }
         ("POST", ["dns", "flush"]) | ("PUT", ["dns", "flush"]) => {
+            st.dns.flush_cache();
             reply(
                 &mut stream,
                 200,
@@ -712,9 +1094,35 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
             )
             .await;
         }
+        ("POST", ["cache", "fakeip", "flush"]) => {
+            vp_dns::flush_global_fake_ip_pool();
+            st.dns.flush_cache();
+            reply(&mut stream, 204, "No Content", &json!({})).await;
+        }
         ("GET", ["traffic"]) => {
             // WebSocket /traffic：每秒推送 {"up":..,"down":..}
-            serve_traffic_ws(stream, st).await;
+            serve_traffic_ws(stream, req.ws_key.as_deref(), st).await;
+        }
+        ("GET", ["memory"]) => {
+            if req.is_ws {
+                serve_memory_ws(stream, req.ws_key.as_deref(), st).await;
+            } else {
+                let inuse = current_memory_inuse(st);
+                reply(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &json!({"inuse": inuse, "oslimit": 0}),
+                )
+                .await;
+            }
+        }
+        ("GET", ["logs"]) => {
+            if req.is_ws {
+                serve_logs_ws(stream, req.ws_key.as_deref(), st).await;
+            } else {
+                reply(&mut stream, 200, "OK", &json!({"logs": []})).await;
+            }
         }
         _ => {
             reply(
@@ -773,7 +1181,7 @@ async fn reply(
 ) {
     let payload = serde_json::to_vec(body).unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nContent-Length: {}\r\n\r\n",
         payload.len()
     );
     let _ = stream.write_all(head.as_bytes()).await;
@@ -788,9 +1196,18 @@ mod tests {
 
     #[tokio::test]
     async fn controller_api_works() {
-        let cfg = r#"
-mixed-port: 17891
-external-controller: 127.0.0.1:19091
+        async fn free_port() -> u16 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        }
+        let mixed_port = free_port().await;
+        let ctl_port = free_port().await;
+        let ctl_addr = format!("127.0.0.1:{ctl_port}");
+
+        let cfg = format!(
+            r#"
+mixed-port: {mixed_port}
+external-controller: {ctl_addr}
 secret: "s3cret"
 proxies: []
 proxy-groups:
@@ -798,52 +1215,70 @@ proxy-groups:
     type: select
     proxies: [DIRECT]
 rules: ['MATCH,PROXY']
-"#;
-        let app = App::start(cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+"#
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
             .await
             .unwrap();
 
         // 无鉴权 → 401
-        let resp = http_get("127.0.0.1:19091", "/version", None).await;
+        let resp = http_get(&ctl_addr, "/version", None).await;
         assert_eq!(resp.0, 401);
 
         // 带鉴权
-        let resp = http_get("127.0.0.1:19091", "/version", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/version", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("version"));
 
         // proxies
-        let resp = http_get("127.0.0.1:19091", "/proxies", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/proxies", Some("s3cret")).await;
         assert!(resp.1.contains("PROXY"));
 
-        // providers/proxies
-        let resp = http_get("127.0.0.1:19091", "/providers/proxies", Some("s3cret")).await;
+        // providers/proxies 与 providers/rules
+        let resp = http_get(&ctl_addr, "/providers/proxies", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("providers"));
 
+        let resp = http_get(&ctl_addr, "/providers/rules", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("providers"));
+
+        // 单节点详情查询 /proxies/DIRECT 与 ?token= 鉴权
+        let resp = http_get(&ctl_addr, "/proxies/DIRECT?token=s3cret", None).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("DIRECT"));
+
+        // /memory 与 /logs
+        let resp = http_get(&ctl_addr, "/memory", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("inuse"));
+
+        let resp = http_get(&ctl_addr, "/logs", Some("s3cret")).await;
+        assert_eq!(resp.0, 200);
+
         // dns/flush
-        let resp = http_put_raw("127.0.0.1:19091", "/dns/flush", Some("s3cret"), "").await;
+        let resp = http_put_raw(&ctl_addr, "/dns/flush", Some("s3cret"), "").await;
         assert_eq!(resp.0, 200);
 
         // rules
-        let resp = http_get("127.0.0.1:19091", "/rules", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/rules", Some("s3cret")).await;
         assert!(resp.1.contains("MATCH"));
 
         // connections
-        let resp = http_get("127.0.0.1:19091", "/connections", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/connections", Some("s3cret")).await;
         assert!(resp.1.contains("connections"));
 
         // 热重载（PUT /configs）
-        let resp = http_put_raw("127.0.0.1:19091", "/configs?force=true", Some("s3cret"), "").await;
+        let resp = http_put_raw(&ctl_addr, "/configs?force=true", Some("s3cret"), "").await;
         assert_eq!(resp.0, 204, "热重载应 204: {resp:?}");
 
         // 批量断连（DELETE /connections，无连接也返回 204）
-        let resp = http_del("127.0.0.1:19091", "/connections", Some("s3cret")).await;
+        let resp = http_del(&ctl_addr, "/connections", Some("s3cret")).await;
         assert_eq!(resp.0, 204);
 
         // 切换 selector（DIRECT→DIRECT 幂等）
         let resp = http_put(
-            "127.0.0.1:19091",
+            &ctl_addr,
             "/proxies/PROXY",
             Some("s3cret"),
             r#"{"name":"DIRECT"}"#,
@@ -852,23 +1287,18 @@ rules: ['MATCH,PROXY']
         assert!(resp.0 == 204, "{resp:?}");
 
         // 验证 URL 编码策略组名访问（例如 %50%52%4F%58%59 即 PROXY）
-        let resp = http_get(
-            "127.0.0.1:19091",
-            "/proxies/%50%52%4F%58%59",
-            Some("s3cret"),
-        )
-        .await;
+        let resp = http_get(&ctl_addr, "/proxies/%50%52%4F%58%59", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("PROXY"));
 
         // GET /configs 初始模式应为 rule
-        let resp = http_get("127.0.0.1:19091", "/configs", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/configs", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("\"mode\":\"rule\"") || resp.1.contains("\"mode\": \"rule\""));
 
         // PATCH /configs 免停热切至 global
         let resp = http_patch(
-            "127.0.0.1:19091",
+            &ctl_addr,
             "/configs",
             Some("s3cret"),
             r#"{"mode":"global"}"#,
@@ -877,13 +1307,13 @@ rules: ['MATCH,PROXY']
         assert_eq!(resp.0, 204, "PATCH 模式热切应返回 204: {resp:?}");
 
         // 验证热切后模式变更为 global
-        let resp = http_get("127.0.0.1:19091", "/configs", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/configs", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("\"mode\":\"global\"") || resp.1.contains("\"mode\": \"global\""));
 
         // PATCH /configs 免停热切至 direct
         let resp = http_patch(
-            "127.0.0.1:19091",
+            &ctl_addr,
             "/configs",
             Some("s3cret"),
             r#"{"mode":"direct"}"#,
@@ -891,7 +1321,7 @@ rules: ['MATCH,PROXY']
         .await;
         assert_eq!(resp.0, 204);
 
-        let resp = http_get("127.0.0.1:19091", "/configs", Some("s3cret")).await;
+        let resp = http_get(&ctl_addr, "/configs", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("\"mode\":\"direct\"") || resp.1.contains("\"mode\": \"direct\""));
 

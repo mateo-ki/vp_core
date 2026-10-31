@@ -198,6 +198,8 @@ pub struct TransportConfig {
     pub reality: Option<RealityConfig>,
     /// ECH（Encrypted Client Hello）
     pub ech: Option<EchRequest>,
+    /// 节点专属出站网络选项（独立网卡绑定 interface-name / 路由标记 routing-mark）
+    pub socket_opts: Option<SocketOpts>,
 }
 
 /// ALPN 取值：节点显式声明的优先，否则按传输类型推导（grpc→h2，ws→http/1.1）
@@ -335,11 +337,32 @@ pub fn set_global_node_resolver(resolver: std::sync::Arc<vp_dns::Resolver>, ipv6
     }
 }
 
-fn global_node_resolver() -> Option<(std::sync::Arc<vp_dns::Resolver>, bool)> {
+pub fn global_node_resolver() -> Option<(std::sync::Arc<vp_dns::Resolver>, bool)> {
     NODE_RESOLVER.read().ok().and_then(|slot| slot.clone())
 }
 
 static BIND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub use vp_dns::{
+    connect_tcp_bound_with_opts, create_udp_socket_with_opts, get_bind_interface_name,
+    get_routing_mark, set_bind_interface_name, set_routing_mark,
+};
+
+/// 节点专属网络出站选项（优先于全局默认配置）
+#[derive(Debug, Clone, Default)]
+pub struct SocketOpts {
+    pub interface_name: Option<String>,
+    pub routing_mark: Option<u32>,
+}
+
+tokio::task_local! {
+    pub static CURRENT_SOCKET_OPTS: Option<SocketOpts>;
+}
+
+/// 获取当前 task-local 作用域内注入的节点网络出站选项
+pub fn current_socket_opts() -> Option<SocketOpts> {
+    CURRENT_SOCKET_OPTS.try_with(|o| o.clone()).ok().flatten()
+}
 
 /// 设置出站套接字强制绑定的物理网卡索引（TUN 模式防环路）
 pub fn set_bind_interface_index(if_idx: u32) {
@@ -353,11 +376,69 @@ pub fn get_bind_interface_index() -> Option<u32> {
     if idx > 0 { Some(idx) } else { None }
 }
 
-/// 创建 UDP 套接字，若配置了物理网卡索引则绑定 IP_UNICAST_IF / IPV6_UNICAST_IF 防止路由环路
+/// 创建 UDP 套接字，若配置了物理网卡索引/名称或 routing-mark 则绑定防止路由环路
 pub fn create_udp_socket(
     bind_addr: std::net::SocketAddr,
 ) -> std::io::Result<tokio::net::UdpSocket> {
-    vp_dns::create_udp_socket(bind_addr)
+    let scoped = CURRENT_SOCKET_OPTS.try_with(|o| o.clone()).ok().flatten();
+    let if_name = scoped.as_ref().and_then(|o| o.interface_name.as_deref());
+    let mark = scoped.as_ref().and_then(|o| o.routing_mark);
+    vp_dns::create_udp_socket_with_opts(bind_addr, if_name, mark)
+}
+
+/// 自动探测 Linux / macOS 的默认物理出站网卡名称（如 eth0 / en0，排除 vpcore-tun 与 lo）
+pub fn detect_default_physical_interface_name() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/net/route") {
+            let mut best_if: Option<String> = None;
+            let mut best_metric = u32::MAX;
+            for line in content.lines().skip(1) {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.len() >= 8 {
+                    let iface = cols[0];
+                    let dest = cols[1];
+                    let flags = u32::from_str_radix(cols[3], 16).unwrap_or(0);
+                    let metric = cols[6].parse::<u32>().unwrap_or(u32::MAX);
+                    let mask = cols[7];
+                    if dest == "00000000"
+                        && mask == "00000000"
+                        && (flags & 0x1) != 0
+                        && iface != "vpcore-tun"
+                        && iface != "lo"
+                        && metric < best_metric
+                    {
+                        best_metric = metric;
+                        best_if = Some(iface.to_string());
+                    }
+                }
+            }
+            if let Some(ref name) = best_if {
+                tracing::info!("Linux 自动探测到默认物理出站网卡: {name} (metric={best_metric})");
+            }
+            return best_if;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("interface:") {
+                    let iface = rest.trim();
+                    if !iface.is_empty() && iface != "vpcore-tun" && !iface.starts_with("utun") {
+                        tracing::info!("macOS 自动探测到默认物理出站网卡: {iface}");
+                        return Some(iface.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 自动探测系统的物理出站网卡索引（用于 Windows TUN 模式防环路）
@@ -411,73 +492,48 @@ pub fn detect_default_physical_interface() -> Option<u32> {
     None
 }
 
-/// 建立 TCP 连接，若配置了物理网卡索引则绑定 IP_UNICAST_IF 防止路由环路
+/// 建立 TCP 连接，若配置了物理网卡索引/名称或 routing-mark 则绑定防环路参数
 pub async fn connect_tcp_stream(
     addr: std::net::SocketAddr,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    #[cfg(windows)]
-    {
-        if !addr.ip().is_loopback() {
-            if let Some(if_idx) = get_bind_interface_index() {
-                let domain = match addr {
-                    std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
-                    std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
-                };
-                let socket = socket2::Socket::new(
-                    domain,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                )?;
-                socket.set_nonblocking(true)?;
+    connect_tcp_stream_with_opts(addr, None).await
+}
 
-                // UNICAST_IF + 显式源 IP 绑定（实现在 vp-dns，与 DNS 上游共用同一套）：
-                // 只设 UNICAST_IF 不绑源 IP 时，Windows 的源地址/路由选择仍可能按路由
-                // 表走 —— auto-route 下即 TUN 自身，节点拨号全部流回自己形成回环。
-                vp_dns::bind_tcp_socket_to_interface(&socket, addr, if_idx)?;
-
-                match socket.connect(&addr.into()) {
-                    Ok(()) => {
-                        let std_stream: std::net::TcpStream = socket.into();
-                        return tokio::net::TcpStream::from_std(std_stream);
-                    }
-                    Err(e)
-                        if e.raw_os_error()
-                            == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
-                    {
-                        let std_stream: std::net::TcpStream = socket.into();
-                        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
-                        tokio_stream.writable().await?;
-                        if let Some(err) = tokio_stream.take_error()? {
-                            return Err(err);
-                        }
-                        return Ok(tokio_stream);
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-    }
-    tokio::net::TcpStream::connect(addr).await
+/// 建立带有节点专属网卡或路由标记覆盖的 TCP 连接
+pub async fn connect_tcp_stream_with_opts(
+    addr: std::net::SocketAddr,
+    opts: Option<&SocketOpts>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let scoped = CURRENT_SOCKET_OPTS.try_with(|o| o.clone()).ok().flatten();
+    let effective = opts.or(scoped.as_ref());
+    let if_name = effective.and_then(|o| o.interface_name.as_deref());
+    let mark = effective.and_then(|o| o.routing_mark);
+    vp_dns::connect_tcp_bound_with_opts(addr, if_name, mark).await
 }
 
 // bind_socket_to_interface 已上移到 vp_dns（bind_tcp_socket_to_interface / connect_tcp_bound），
 // DNS 上游与节点拨号共用同一套"UNICAST_IF + 源 IP 绑定"实现，避免两份实现漂移。
 
 /// 多地址竞速 TCP 拨号。
-///
-/// 节点域名常返回多条 A 记录，且解析结果可能混入被污染/已失效的地址（GFW 的"邻居 IP"
-/// 污染会返回与真实记录同网段的假地址）。顺序拨号时排在前面的一条假地址就能吃光整体
-/// 超时预算，表现成节点"时通时不通"。这里把内置 DNS 与系统解析的并集地址并发竞速：
-/// 后续地址错峰启动（保留解析器给出的优先序偏好），任一地址建立连接即胜出并取消其余。
 pub async fn dial_tcp_multi(
     host: &str,
     port: u16,
     budget: Duration,
 ) -> Result<tokio::net::TcpStream> {
+    dial_tcp_multi_with_opts(host, port, budget, None).await
+}
+
+/// 带有节点专属出站网卡/路由标记的多地址竞速 TCP 拨号
+pub async fn dial_tcp_multi_with_opts(
+    host: &str,
+    port: u16,
+    budget: Duration,
+    opts: Option<&SocketOpts>,
+) -> Result<tokio::net::TcpStream> {
     use std::net::{IpAddr, SocketAddr};
     if let Ok(ip) = host.parse::<IpAddr>() {
         let addr = SocketAddr::new(ip, port);
-        let tcp = tokio::time::timeout(budget, connect_tcp_stream(addr))
+        let tcp = tokio::time::timeout(budget, connect_tcp_stream_with_opts(addr, opts))
             .await
             .map_err(|_| {
                 vp_common::Error::Io(std::io::Error::new(
@@ -513,7 +569,7 @@ pub async fn dial_tcp_multi(
         return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
     }
     if addrs.len() == 1 {
-        let tcp = tokio::time::timeout(budget, connect_tcp_stream(addrs[0]))
+        let tcp = tokio::time::timeout(budget, connect_tcp_stream_with_opts(addrs[0], opts))
             .await
             .map_err(|_| {
                 vp_common::Error::Io(std::io::Error::new(
@@ -524,7 +580,7 @@ pub async fn dial_tcp_multi(
         tune(&tcp);
         return Ok(tcp);
     }
-    dial_addrs_multi(&addrs, host, port, budget).await
+    dial_addrs_multi_with_opts(&addrs, host, port, budget, opts).await
 }
 
 /// 对既定地址列表竞速拨号（[`dial_tcp_multi`] 的核心，独立出来便于测试）。
@@ -534,20 +590,33 @@ pub async fn dial_addrs_multi(
     port: u16,
     budget: Duration,
 ) -> Result<tokio::net::TcpStream> {
+    dial_addrs_multi_with_opts(addrs, host, port, budget, None).await
+}
+
+/// 带有节点专属出站网卡/路由标记的地址列表竞速拨号
+pub async fn dial_addrs_multi_with_opts(
+    addrs: &[std::net::SocketAddr],
+    host: &str,
+    port: u16,
+    budget: Duration,
+    opts: Option<&SocketOpts>,
+) -> Result<tokio::net::TcpStream> {
     const STAGGER: Duration = Duration::from_millis(150);
     let total = addrs.len();
     let mut tasks: tokio::task::JoinSet<(
         std::net::SocketAddr,
         std::io::Result<tokio::net::TcpStream>,
     )> = tokio::task::JoinSet::new();
+    let opts_owned = opts.cloned();
     for (idx, addr) in addrs.iter().enumerate() {
         let addr = *addr;
         let delay = STAGGER * (idx as u32).min(4);
+        let opts_task = opts_owned.clone();
         tasks.spawn(async move {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
-            let res = connect_tcp_stream(addr).await;
+            let res = connect_tcp_stream_with_opts(addr, opts_task.as_ref()).await;
             (addr, res)
         });
     }
@@ -607,7 +676,13 @@ pub async fn dial(
     server_port: u16,
     cfg: &TransportConfig,
 ) -> Result<Box<dyn ProxyStream>> {
-    let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
+    let tcp = dial_tcp_multi_with_opts(
+        server_host,
+        server_port,
+        Duration::from_secs(8),
+        cfg.socket_opts.as_ref(),
+    )
+    .await?;
     match wrap_transport(Box::new(tcp), server_host, cfg).await {
         // ECH 被服务端拒绝：底层流已废弃，只能换新连接重拨。tls 层状态机决定重拨走什么：
         // 服务端给了新的 retry config → 再试一次 ECH；否则直接普通 TLS。
@@ -615,7 +690,13 @@ pub async fn dial(
         // 之后该主机被记住拒绝状态，后续连接首轮就直走普通 TLS，不再浪费握手。
         Err(e) if e.to_string().contains("ECH_REJECTED_FALLBACK") => {
             for _ in 0..2 {
-                let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
+                let tcp = dial_tcp_multi_with_opts(
+                    server_host,
+                    server_port,
+                    Duration::from_secs(8),
+                    cfg.socket_opts.as_ref(),
+                )
+                .await?;
                 match wrap_transport(Box::new(tcp), server_host, cfg).await {
                     Err(e2) if e2.to_string().contains("ECH_REJECTED_FALLBACK") => continue,
                     other => return other,
@@ -669,11 +750,14 @@ mod tests {
 
     #[tokio::test]
     async fn dial_tcp_multi_races_around_dead_address() {
-        // 首位放一个不可路由的黑洞地址（模拟被污染/失效的 A 记录），
-        // 竞速应绕过它从活地址建立连接，而不是被它吃光预算。
+        // 首位放一个已关闭的失效地址（模拟被污染/失效的 A 记录），
+        // 竞速应绕过它从活地址建立连接，而不是被它阻断。
+        let dead_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = dead_lis.local_addr().unwrap();
+        drop(dead_lis);
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live = listener.local_addr().unwrap();
-        let dead: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
         let server = tokio::spawn(async move {
             let (_s, _) = listener.accept().await.unwrap();
         });
@@ -691,9 +775,17 @@ mod tests {
 
     #[tokio::test]
     async fn dial_tcp_multi_reports_failure_when_all_dead() {
-        let dead: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
-        let res = dial_addrs_multi(&[dead], "dead.test", 9, Duration::from_millis(700)).await;
-        assert!(res.is_err(), "全黑洞地址应当失败: {res:?}");
+        let dead_lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = dead_lis.local_addr().unwrap();
+        drop(dead_lis);
+        let res = dial_addrs_multi(
+            &[dead],
+            "dead.test",
+            dead.port(),
+            Duration::from_millis(700),
+        )
+        .await;
+        assert!(res.is_err(), "全失效地址应当失败: {res:?}");
     }
 
     #[test]

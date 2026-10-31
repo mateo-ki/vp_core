@@ -222,6 +222,49 @@ pub struct Config {
     /// 性能与套接字缓冲区调优
     #[serde(default)]
     pub tuning: Option<TuningConfig>,
+    /// Linux 出站数据包路由标记（SO_MARK / fwmark，用于 iptables/nftables TPROXY 防环路）
+    #[serde(alias = "routing-mark", alias = "fwmark", default)]
+    pub routing_mark: Option<u32>,
+    /// 出站强制绑定的物理网卡名称（如 eth0 / en0，用于透明网关或 TUN 模式防环路）
+    #[serde(
+        alias = "interface-name",
+        alias = "bind-interface",
+        alias = "bind_interface",
+        default
+    )]
+    pub interface_name: Option<String>,
+    /// 静态域名解析映射表（hosts 节，值可为单个 IP 字符串或 IP 列表）
+    #[serde(default, deserialize_with = "de_hosts_map")]
+    pub hosts: HashMap<String, Vec<String>>,
+}
+
+fn de_hosts_map<'de, D>(deserializer: D) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<HashMap<String, serde_yaml::Value>>::deserialize(deserializer)?;
+    let Some(raw) = opt else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (k, v) in raw {
+        let mut list = Vec::new();
+        match v {
+            serde_yaml::Value::String(s) => list.push(s),
+            serde_yaml::Value::Sequence(seq) => {
+                for item in seq {
+                    if let Some(s) = item.as_str() {
+                        list.push(s.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !list.is_empty() {
+            out.insert(k, list);
+        }
+    }
+    Ok(out)
 }
 
 /// 连接资源预算配置（resource-limits 节）
@@ -321,6 +364,25 @@ pub struct TunCfg {
     pub fake_ip_range: String,
     #[serde(alias = "auto-route", alias = "auto_route", default = "default_true")]
     pub auto_route: bool,
+    /// 自动路由模式：full（默认，接管 0.0.0.0/1 与 128.0.0.0/1 全流量）或 fake-ip-only（仅接管 fake-ip 网段）
+    #[serde(alias = "auto-route-mode", alias = "auto_route_mode", default)]
+    pub auto_route_mode: Option<String>,
+    /// 自定义 TUN 接管的目标 CIDR 地址列表（若指定则额外下发）
+    #[serde(
+        alias = "route-address",
+        alias = "route_address",
+        default,
+        deserialize_with = "null_to_default"
+    )]
+    pub route_address: Vec<String>,
+    /// 排除的 CIDR 路由列表
+    #[serde(
+        alias = "route-exclude-address",
+        alias = "route_exclude_address",
+        default,
+        deserialize_with = "null_to_default"
+    )]
+    pub route_exclude_address: Vec<String>,
     #[serde(default)]
     pub auto_redirect: Option<bool>,
     /// 移动端 (Android / iOS) 外部注入的文件描述符
@@ -329,6 +391,9 @@ pub struct TunCfg {
     /// Windows Wintun 环形缓冲区容量（字节，必须为 2 的幂，范围 128KB ~ 64MB，默认 4MB: 0x400000）
     #[serde(alias = "ring-capacity", alias = "ring_capacity", default)]
     pub ring_capacity: Option<u32>,
+    /// 严格模式：TUN / DNS 启动失败时不静默降级，直接报错返回
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 impl Default for TunCfg {
@@ -339,10 +404,14 @@ impl Default for TunCfg {
             netmask: default_tun_mask(),
             mtu: default_tun_mtu(),
             fake_ip_range: default_fake_range(),
-            auto_route: false,
+            auto_route: true,
+            auto_route_mode: None,
+            route_address: Vec::new(),
+            route_exclude_address: Vec::new(),
             auto_redirect: None,
             fd: None,
             ring_capacity: None,
+            strict: None,
         }
     }
 }
@@ -360,7 +429,7 @@ fn default_tun_mask() -> String {
 }
 
 fn default_tun_mtu() -> u16 {
-    9000
+    1500
 }
 
 fn default_fake_range() -> String {
@@ -382,7 +451,7 @@ pub struct DnsConfig {
     #[serde(default)]
     pub listen: Option<String>,
     #[serde(default)]
-    pub ipv6: bool,
+    pub ipv6: Option<bool>,
     #[serde(alias = "enhanced-mode", alias = "enhanced_mode", default)]
     pub enhanced_mode: Option<String>,
     #[serde(default, deserialize_with = "null_to_default")]
@@ -400,6 +469,13 @@ pub struct DnsConfig {
     pub nameserver_policy: HashMap<String, serde_yaml::Value>,
     #[serde(alias = "fallback-filter", alias = "fallback_filter", default)]
     pub fallback_filter: Option<FallbackFilterConfig>,
+}
+
+impl DnsConfig {
+    /// 获取实际生效的 IPv6 解析开关（优先采用 dns.ipv6；未配置时继承顶层全局 ipv6）
+    pub fn is_ipv6(&self, global_ipv6: bool) -> bool {
+        self.ipv6.unwrap_or(global_ipv6)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -449,6 +525,12 @@ pub struct ProxyCfg {
     /// 多路复用（smux）
     #[serde(default)]
     pub smux: Option<SmuxConfig>,
+    /// 节点专属出站绑卡（优先于全局 bind-interface / interface-name）
+    #[serde(alias = "interface-name", alias = "bind-interface", default)]
+    pub interface_name: Option<String>,
+    /// 节点专属路由标记（优先于全局 routing-mark / fwmark）
+    #[serde(alias = "routing-mark", alias = "fwmark", default)]
+    pub routing_mark: Option<u32>,
     #[serde(flatten)]
     pub kind: ProxyKind,
 }
@@ -592,6 +674,13 @@ pub struct WsOpts {
     pub headers: Option<HashMap<String, String>>,
     #[serde(alias = "max-early-data", alias = "max_early_data", default)]
     pub max_early_data: Option<u64>,
+    #[serde(
+        alias = "v2ray-http-upgrade",
+        alias = "v2ray_http_upgrade",
+        alias = "http-upgrade",
+        default
+    )]
+    pub v2ray_http_upgrade: bool,
 }
 
 /// HTTP 伪装传输选项（Clash `http-opts`，network: "http"）。
@@ -925,6 +1014,8 @@ pub struct AnytlsCfg {
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
     #[serde(
         alias = "reality-opts",
         alias = "reality_opts",
@@ -965,6 +1056,8 @@ pub struct NaiveCfg {
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
     #[serde(default = "default_true")]
     pub tls: bool,
     #[serde(default)]
@@ -977,7 +1070,13 @@ pub struct Hysteria2Cfg {
     #[serde(deserialize_with = "de_u16_lenient")]
     pub port: u16,
     pub password: String,
-    #[serde(default)]
+    #[serde(
+        alias = "server_name",
+        alias = "server-name",
+        alias = "servername",
+        alias = "sni",
+        default
+    )]
     pub sni: Option<String>,
     #[serde(
         alias = "skip-cert-verify",
@@ -1006,6 +1105,12 @@ pub struct Hysteria2Cfg {
     pub obfs: Option<String>,
     #[serde(alias = "obfs-password", alias = "obfs_password", default)]
     pub obfs_password: Option<String>,
+    /// 端口跳跃范围（如 "20000-50000" 或 "20000-30000,40000-50000"）
+    #[serde(alias = "mport", default)]
+    pub ports: Option<String>,
+    /// 端口跳跃周期（秒，默认 30）
+    #[serde(alias = "hop-interval", alias = "hop_interval", default)]
+    pub hop_interval: Option<u64>,
 }
 
 /// Hysteria v1 出站配置（Clash/mihomo 语法）。
@@ -1064,7 +1169,13 @@ pub struct TuicCfg {
     pub port: u16,
     pub uuid: String,
     pub password: String,
-    #[serde(default)]
+    #[serde(
+        alias = "server_name",
+        alias = "server-name",
+        alias = "servername",
+        alias = "sni",
+        default
+    )]
     pub sni: Option<String>,
     #[serde(
         alias = "skip-cert-verify",
@@ -1184,7 +1295,13 @@ pub struct HttpCfg {
     pub tls: bool,
     #[serde(alias = "skip-cert-verify", default)]
     pub skip_cert_verify: bool,
-    #[serde(alias = "sni", alias = "servername", default)]
+    #[serde(
+        alias = "server_name",
+        alias = "server-name",
+        alias = "servername",
+        alias = "sni",
+        default
+    )]
     pub sni: Option<String>,
 }
 

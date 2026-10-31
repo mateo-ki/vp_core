@@ -87,7 +87,11 @@ impl Outbound for DirectOutbound {
             Host::Ip(ip) => std::net::SocketAddr::new(*ip, dst.port),
             Host::Domain(d) => {
                 let ips = self.dns.resolve_domain(d, self.ipv6).await?;
-                std::net::SocketAddr::new(ips[0], dst.port)
+                let ip = ips
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Error::Dns(format!("未解析到域名 {d} 的 IP 地址")))?;
+                std::net::SocketAddr::new(ip, dst.port)
             }
         };
         sock.connect(target).await?;

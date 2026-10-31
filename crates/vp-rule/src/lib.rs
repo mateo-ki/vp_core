@@ -127,8 +127,24 @@ impl Matcher {
                 let p = if *src { ctx.src_port } else { ctx.dst_port };
                 ranges.iter().any(|&(lo, hi)| p >= lo && p <= hi)
             }
-            Matcher::ProcessName(n) => ctx.process.is_some_and(|p| p.eq_ignore_ascii_case(n)),
-            Matcher::ProcessPath(p) => ctx.process.is_some_and(|x| x.eq_ignore_ascii_case(p)),
+            Matcher::ProcessName(n) => ctx.process.is_some_and(|p| {
+                if p.eq_ignore_ascii_case(n) {
+                    return true;
+                }
+                let base = p.rsplit(['/', '\\']).next().unwrap_or(p);
+                base.eq_ignore_ascii_case(n)
+                    || base
+                        .strip_suffix(".exe")
+                        .is_some_and(|s| s.eq_ignore_ascii_case(n))
+            }),
+            Matcher::ProcessPath(pat) => ctx.process.is_some_and(|p| {
+                if p.eq_ignore_ascii_case(pat) {
+                    return true;
+                }
+                let pat_base = pat.rsplit(['/', '\\']).next().unwrap_or(pat);
+                let p_base = p.rsplit(['/', '\\']).next().unwrap_or(p);
+                !pat_base.is_empty() && p_base.eq_ignore_ascii_case(pat_base)
+            }),
             Matcher::Inbound(n) => ctx.inbound == &**n,
             Matcher::InPort(ranges) => ctx
                 .inbound_port

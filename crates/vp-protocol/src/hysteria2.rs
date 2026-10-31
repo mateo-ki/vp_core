@@ -170,6 +170,7 @@ pub struct Hysteria2Session {
     pub endpoint: quinn::Endpoint,
     pub _critical_streams: crate::h3_min::H3CriticalStreams,
     pub udp_demux: Arc<Hysteria2UdpDemuxer>,
+    pub created_at: std::time::Instant,
 }
 
 impl Hysteria2Session {
@@ -236,10 +237,34 @@ impl Hysteria2UdpDemuxer {
     }
 }
 
+pub fn parse_port_ranges(spec: &str) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for seg in spec.split(',') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = seg.split_once('-') {
+            if let (Ok(start), Ok(end)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
+                if start > 0 && end >= start {
+                    out.push((start, end));
+                }
+            }
+        } else if let Ok(p) = seg.parse::<u16>() {
+            if p > 0 {
+                out.push((p, p));
+            }
+        }
+    }
+    out
+}
+
 pub struct Hysteria2Outbound {
     name: Arc<str>,
     server: String,
     port: u16,
+    port_ranges: Vec<(u16, u16)>,
+    hop_interval_secs: u64,
     password: String,
     sni: Option<String>,
     skip_verify: bool,
@@ -266,12 +291,27 @@ impl Hysteria2Outbound {
             cfg.obfs_password.as_deref().map(SalamanderObfs::new)
         };
 
+        let port_ranges = cfg
+            .ports
+            .as_deref()
+            .map(parse_port_ranges)
+            .unwrap_or_default();
+        let hop_interval_secs = cfg.hop_interval.unwrap_or(30).max(5);
+
         Ok(Hysteria2Outbound {
             name: "hysteria2".into(),
             server: cfg.server.clone(),
             port: cfg.port,
+            port_ranges,
+            hop_interval_secs,
             password: cfg.password.clone(),
-            sni: cfg.sni.clone().or(Some(cfg.server.clone())),
+            sni: cfg
+                .sni
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| Some(cfg.server.clone())),
             skip_verify: cfg.skip_cert_verify,
             _up_mbps: cfg.up.unwrap_or(0),
             down_mbps: cfg.down.unwrap_or(0),
@@ -281,13 +321,52 @@ impl Hysteria2Outbound {
         })
     }
 
+    fn pick_port(&self) -> u16 {
+        if self.port_ranges.is_empty() {
+            return self.port;
+        }
+        let total: u32 = self
+            .port_ranges
+            .iter()
+            .map(|(s, e)| (*e as u32) - (*s as u32) + 1)
+            .sum();
+        if total == 0 {
+            return self.port;
+        }
+        let mut rnd = [0u8; 4];
+        vp_common::rand_bytes(&mut rnd);
+        let mut offset = u32::from_le_bytes(rnd) % total;
+        for &(s, e) in &self.port_ranges {
+            let span = (e as u32) - (s as u32) + 1;
+            if offset < span {
+                return s + (offset as u16);
+            }
+            offset -= span;
+        }
+        self.port
+    }
+
     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
-        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
+        let target_port = self.pick_port();
+        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), target_port))
             .await
             .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
             .next()
             .ok_or(Error::Addr("无地址".into()))?;
-        let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+        let bind: &'static str = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let tokio_sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
+        let std_sock = tokio_sock.into_std().map_err(Error::Io)?;
+        let mut ep = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 endpoint: {e}"))))?;
         ep.set_default_client_config(hysteria_client_config(
             self.skip_verify,
             self.sni.as_deref(),
@@ -331,7 +410,9 @@ impl Hysteria2Outbound {
     async fn get_or_connect_session(&self) -> Result<Arc<Hysteria2Session>> {
         let mut guard = self.session.lock().await;
         if let Some(ref s) = *guard {
-            if s.is_alive() {
+            let need_hop = !self.port_ranges.is_empty()
+                && s.created_at.elapsed() >= std::time::Duration::from_secs(self.hop_interval_secs);
+            if s.is_alive() && !need_hop {
                 return Ok(s.clone());
             }
         }
@@ -343,6 +424,7 @@ impl Hysteria2Outbound {
             endpoint: ep,
             _critical_streams: critical,
             udp_demux,
+            created_at: std::time::Instant::now(),
         });
         *guard = Some(s.clone());
         Ok(s)
@@ -424,7 +506,7 @@ impl Outbound for Hysteria2Outbound {
         true
     }
 
-    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+    async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         let sess = self.get_or_connect_session().await?;
         let session_id = self.udp_session.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(256);
@@ -435,6 +517,7 @@ impl Outbound for Hysteria2Outbound {
             rx,
             session: session_id,
             pkt_id: AtomicU16::new(1),
+            target: dst.clone(),
         }))
     }
 
@@ -490,6 +573,7 @@ struct Hy2UdpConn {
     rx: mpsc::Receiver<UdpPacket>,
     session: u32,
     pkt_id: AtomicU16,
+    target: DstAddr,
 }
 
 impl Drop for Hy2UdpConn {
@@ -506,7 +590,13 @@ impl Drop for Hy2UdpConn {
 impl PacketConn for Hy2UdpConn {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
         let pkt_id = self.pkt_id.fetch_add(1, Ordering::Relaxed);
-        let addr = format!("{}:{}", pkt.dst.ip(), pkt.dst.port());
+        let addr = if pkt.dst.ip().is_loopback()
+            || matches!(self.target.host, vp_common::Host::Domain(_))
+        {
+            self.target.to_string()
+        } else {
+            format!("{}:{}", pkt.dst.ip(), pkt.dst.port())
+        };
         let mut msg = Vec::with_capacity(pkt.data.len() + addr.len() + 16);
         msg.extend_from_slice(&self.session.to_be_bytes());
         msg.extend_from_slice(&pkt_id.to_be_bytes());
@@ -1115,6 +1205,8 @@ mod tests {
             down: None,
             obfs: None,
             obfs_password: None,
+            ports: None,
+            hop_interval: None,
         })
         .unwrap();
 
@@ -1183,6 +1275,8 @@ mod tests {
             down: None,
             obfs: None,
             obfs_password: None,
+            ports: None,
+            hop_interval: None,
         })
         .unwrap();
         let sess = Session::new_tcp("t".into(), None, dst.clone());
@@ -1243,6 +1337,8 @@ mod real_node_probe {
             down: None,
             obfs: None,
             obfs_password: None,
+            ports: None,
+            hop_interval: None,
         };
         let out = Hysteria2Outbound::new(&cfg).expect("build");
         let t0 = std::time::Instant::now();
@@ -1300,6 +1396,8 @@ mod real_node_probe {
             down: None,
             obfs: None,
             obfs_password: None,
+            ports: None,
+            hop_interval: None,
         };
         let out = Hysteria2Outbound::new(&cfg).expect("build");
         let dst = vp_common::DstAddr::new("www.gstatic.com", 80);
@@ -1337,6 +1435,55 @@ mod real_node_probe {
                 String::from_utf8_lossy(&buf[..n])
             ),
             Ok(Err(e)) => println!("read error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "真实节点调试：需要外网"]
+    async fn hy2_real_udp_probe() {
+        let server = std::env::var("HY2_TEST_SERVER").unwrap_or_else(|_| "localhost".into());
+        let port = std::env::var("HY2_TEST_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443);
+        let password = std::env::var("HY2_TEST_PASSWORD").unwrap_or_default();
+        let sni = std::env::var("HY2_TEST_SNI").ok();
+        let cfg = vp_config::Hysteria2Cfg {
+            server,
+            port,
+            password,
+            sni,
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            hop_interval: None,
+        };
+        let out = Hysteria2Outbound::new(&cfg).expect("build");
+        let dst = vp_common::DstAddr::new("1.1.1.1", 53);
+        let sess = Session::new_udp("probe".into(), None, dst.clone());
+        let mut conn = out
+            .connect_packet(&sess, &dst)
+            .await
+            .expect("connect_packet");
+        let query = [
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
+            b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
+            0x01,
+        ];
+        let pkt = UdpPacket {
+            src: "127.0.0.1:12345".parse().unwrap(),
+            dst: "1.1.1.1:53".parse().unwrap(),
+            data: query.to_vec().into(),
+        };
+        conn.send(&pkt).await.expect("send");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv()).await;
+        match resp {
+            Ok(Ok(p)) => println!("UDP OK, 收到回包 {} 字节", p.data.len()),
+            Ok(Err(e)) => println!("UDP recv error: {e}"),
+            Err(_) => println!("UDP 5s 超时未收到回包！服务端不支持 UDP 或丢包！"),
         }
     }
 }

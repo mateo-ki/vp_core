@@ -62,8 +62,17 @@ impl UdpNat {
                 *c = Some(pkt.src);
             }
         }
+        let resolved_domain = fake_domain
+            .or_else(|| vp_dns::reverse_fake_ip(pkt.dst.ip()))
+            .or_else(|| {
+                if matches!(pkt.dst.port(), 443 | 8443 | 2053 | 2083 | 2087 | 2096) {
+                    vp_core::sniff::sniff_quic_sni(&pkt.data)
+                } else {
+                    None
+                }
+            });
         let dst = DstAddr {
-            host: match fake_domain {
+            host: match resolved_domain {
                 Some(domain) => Host::Domain(domain),
                 None => Host::Ip(pkt.dst.ip()),
             },

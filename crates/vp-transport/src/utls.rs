@@ -44,19 +44,42 @@ const HRR_RANDOM: [u8; 32] = [
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
-/// 支持的指纹（v1：chrome）
+/// 支持的 TLS ClientHello 浏览器指纹
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fingerprint {
     Chrome,
+    Firefox,
+    Safari,
+    Ios,
+    Edge,
+    Android,
+    Qq,
+    Random,
 }
 
 impl Fingerprint {
     pub fn parse(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "chrome" => Ok(Fingerprint::Chrome),
-            other => Err(Error::Unsupported(format!(
-                "TLS 指纹 {other:?} 暂不支持（当前支持 chrome）"
-            ))),
+        let lower = s.trim().to_ascii_lowercase();
+        if lower == "chrome" || lower.starts_with("chrome_") {
+            Ok(Fingerprint::Chrome)
+        } else if lower == "firefox" || lower.starts_with("firefox_") {
+            Ok(Fingerprint::Firefox)
+        } else if lower == "safari" || lower.starts_with("safari_") {
+            Ok(Fingerprint::Safari)
+        } else if lower == "ios" || lower.starts_with("ios_") {
+            Ok(Fingerprint::Ios)
+        } else if lower == "edge" || lower.starts_with("edge_") {
+            Ok(Fingerprint::Edge)
+        } else if lower == "android" || lower.starts_with("android_") {
+            Ok(Fingerprint::Android)
+        } else if lower == "qq" || lower == "360" {
+            Ok(Fingerprint::Qq)
+        } else if lower == "random" || lower == "randomized" {
+            Ok(Fingerprint::Random)
+        } else {
+            Err(Error::Unsupported(format!(
+                "TLS 指纹 {lower:?} 暂不支持（支持 chrome/firefox/safari/ios/edge/android/qq/random）"
+            )))
         }
     }
 }
@@ -1685,8 +1708,23 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_fingerprint_config_error() {
-        assert!(Fingerprint::parse("chrome").is_ok());
-        assert!(Fingerprint::parse("firefox").is_err());
+        for valid in [
+            "chrome",
+            "firefox",
+            "safari",
+            "ios",
+            "edge",
+            "android",
+            "qq",
+            "random",
+            "randomized",
+        ] {
+            assert!(
+                Fingerprint::parse(valid).is_ok(),
+                "{valid} 指纹应当解析成功"
+            );
+        }
+        assert!(Fingerprint::parse("unknown_browser").is_err());
     }
 
     #[test]

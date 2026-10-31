@@ -17,9 +17,10 @@ const MAX_HEADER_BUF: usize = 8192;
 pub struct WsConfig {
     pub path: String,
     pub headers: Vec<(String, String)>,
+    pub v2ray_http_upgrade: bool,
 }
 
-/// 客户端握手
+/// 客户端握手（支持 RFC 6455 WebSocket 及 v2ray-http-upgrade 裸流升级）
 pub async fn ws_handshake_client<S>(mut io: S, host: &str, cfg: &WsConfig) -> Result<WsStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -35,10 +36,16 @@ where
         .find(|(k, _)| k.eq_ignore_ascii_case("host"))
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| host.to_string());
-    let mut req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
-    );
+    let mut req = if cfg.v2ray_http_upgrade {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        )
+    } else {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+        )
+    };
     for (k, v) in &cfg.headers {
         if !k.eq_ignore_ascii_case("host") {
             req.push_str(&format!("{k}: {v}\r\n"));
@@ -67,8 +74,13 @@ where
     if !status_line.contains("101") {
         return Err(Error::ProtoMsg(format!("ws: 握手失败 {status_line}")));
     }
-    tracing::debug!("ws: 客户端握手完成（101）");
-    Ok(WsStream::new(io, true))
+    tracing::debug!(
+        "ws: 客户端握手完成（101, http_upgrade={}）",
+        cfg.v2ray_http_upgrade
+    );
+    let mut stream = WsStream::new(io, true);
+    stream.v2ray_http_upgrade = cfg.v2ray_http_upgrade;
+    Ok(stream)
 }
 
 /// 服务端握手（协议服务端/自测用）
@@ -96,6 +108,15 @@ where
     )
     .await?;
     Ok(WsStream::new(io, false))
+}
+
+/// 计算标准 RFC 6455 Sec-WebSocket-Accept 应答值
+pub fn compute_ws_accept(key: &str) -> String {
+    let mut hasher = sha1::Sha1::new();
+    use sha1::Digest;
+    hasher.update(key.trim().as_bytes());
+    hasher.update(GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
 }
 
 /// 101 已发送后的服务端流：直接进入帧模式
@@ -147,12 +168,14 @@ enum ReadState {
 pub struct WsStream<S> {
     inner: S,
     is_client: bool,
+    v2ray_http_upgrade: bool,
     raw: BytesMut,
     pending: BytesMut,
     state: ReadState,
     mask_key: [u8; 4],
     mask_offset: usize,
     opcode: u8,
+    write_opcode: u8,
     pong_pending: bool,
     write_out: BytesMut,
     closed: bool,
@@ -166,16 +189,23 @@ impl<S> WsStream<S> {
         WsStream {
             inner,
             is_client,
+            v2ray_http_upgrade: false,
             raw: BytesMut::with_capacity(16 * 1024),
             pending: BytesMut::with_capacity(16 * 1024),
             state: ReadState::Header,
             mask_key: [0; 4],
             mask_offset: 0,
             opcode: 0,
+            write_opcode: 0x2,
             pong_pending: false,
             write_out: BytesMut::new(),
             closed: false,
         }
+    }
+
+    /// 设置发送帧的操作码（0x1 = 文本帧，0x2 = 二进制帧；默认为 0x2）
+    pub fn set_write_opcode(&mut self, opcode: u8) {
+        self.write_opcode = opcode;
     }
 }
 
@@ -230,7 +260,8 @@ impl<S: AsyncRead + Unpin> WsStream<S> {
                     }
                     self.mask_offset += take;
                     *remaining -= take;
-                    let data_frame = self.opcode == 0x2 || self.opcode == 0x0;
+                    // RFC 6455: 0x0 (分片延续), 0x1 (文本), 0x2 (二进制) 均为应用数据载荷
+                    let data_frame = matches!(self.opcode, 0x0..=0x2);
                     if data_frame {
                         self.pending.extend_from_slice(&chunk);
                     }
@@ -318,6 +349,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.as_mut().get_mut();
+        if this.v2ray_http_upgrade {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
         loop {
             if !this.pending.is_empty() {
                 let n = this.pending.len().min(buf.remaining());
@@ -358,6 +392,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.as_mut().get_mut();
+        if this.v2ray_http_upgrade {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        }
         std::task::ready!(this.maybe_send_pong(cx))?;
         if !this.write_out.is_empty() {
             std::task::ready!(this.flush_pending(cx))?;
@@ -370,13 +407,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         }
         // 16KB 分帧，每帧独立 fin
         let mut offset = 0;
+        let op = this.write_opcode;
         while offset < buf.len() {
             let end = (offset + 16 * 1024).min(buf.len());
-            this.encode_frame(&buf[offset..end], 0x2);
+            this.encode_frame(&buf[offset..end], op);
             offset = end;
         }
         if buf.is_empty() {
-            this.encode_frame(&[], 0x2);
+            this.encode_frame(&[], op);
         }
         std::task::ready!(this.flush_pending(cx))?;
         Poll::Ready(Ok(buf.len()))
@@ -442,6 +480,7 @@ mod tests {
         let cfg = WsConfig {
             path: "/ws".into(),
             headers: vec![("Host".into(), "example.com".into())],
+            v2ray_http_upgrade: false,
         };
         let server = tokio::spawn(async move { ws_handshake_server(b).await.unwrap() });
         let client = ws_handshake_client(a, "example.com", &cfg).await.unwrap();
@@ -485,5 +524,17 @@ mod tests {
         let n = s.read(&mut buf).await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(buf[0], b'x');
+    }
+
+    #[tokio::test]
+    async fn test_text_frame_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut c, mut s) = echo_pair().await;
+        // 客户端将写操作码设为 0x1 (文本帧)
+        c.set_write_opcode(0x1);
+        c.write_all(b"hello text websocket").await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello text websocket");
     }
 }

@@ -189,6 +189,27 @@ pub fn build_a_response(query: &[u8], answer_ip: std::net::Ipv4Addr) -> Vec<u8> 
     out
 }
 
+/// 基于查询构造 AAAA 记录应答
+pub fn build_aaaa_response(query: &[u8], answer_ip: std::net::Ipv6Addr) -> Vec<u8> {
+    let qend = query_question_end(query).unwrap_or(query.len());
+    let mut out = Vec::with_capacity(qend + 28);
+    out.extend_from_slice(&query[..2]); // id
+    out.extend_from_slice(&[0x81, 0x80]); // QR=1 RD=1 RA=1
+    out.extend_from_slice(&query[4..6]); // qdcount
+    out.extend_from_slice(&[0x00, 0x01]); // ancount=1
+    out.extend_from_slice(&[0x00, 0x00]); // ns
+    out.extend_from_slice(&[0x00, 0x00]); // ar
+    out.extend_from_slice(&query[12..qend]);
+    // answer: 指针回问题名
+    out.extend_from_slice(&[0xc0, 0x0c]);
+    out.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+    out.extend_from_slice(&[0x00, 0x01]); // IN
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // ttl=1
+    out.extend_from_slice(&[0x00, 0x10]); // rdlen = 16
+    out.extend_from_slice(&answer_ip.octets());
+    out
+}
+
 /// 构造 PTR 应答（fake-ip → 域名）
 pub fn build_ptr_response(query: &[u8], domain: &str) -> Vec<u8> {
     let qend = query_question_end(query).unwrap_or(query.len());

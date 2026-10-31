@@ -44,7 +44,7 @@ impl Default for TunConfig {
         TunConfig {
             address: "198.18.0.1".parse().unwrap(),
             netmask: "255.255.0.0".parse().unwrap(),
-            mtu: 9000,
+            mtu: 1500,
             fake_ip_range: "198.18.0.0/16".into(),
             dns_hijack: true,
             fd: None,
@@ -192,7 +192,21 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
 
     #[cfg(windows)]
     {
-        let dns_server = cfg.address;
+        // 关键根治：向 Wintun 注入专用虚拟 DNS 地址（例如 198.18.0.2），
+        // 绝对不能设为虚拟网卡自身的本地单播 IP (198.18.0.1)！
+        // 否则 Windows 内核网络栈会判定为本机 loopback 自发自收，完全绕过 Wintun 驱动与 ipstack，
+        // 导致整机所有 DNS 请求被静默丢弃（找不到域名/断网）。
+        let dns_server = match cfg.address {
+            IpAddr::V4(v4) => {
+                let n = u32::from(v4);
+                IpAddr::V4(std::net::Ipv4Addr::from(n + 1))
+            }
+            IpAddr::V6(v6) => {
+                let mut octets = v6.octets();
+                octets[15] = octets[15].wrapping_add(1);
+                IpAddr::V6(std::net::Ipv6Addr::from(octets))
+            }
+        };
         match wintun_installer::windows::ensure_wintun_dll() {
             Ok(dll_path) => {
                 info!("Windows TUN 加载 Wintun 驱动: {}", dll_path.display());
@@ -201,7 +215,7 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
                     // 关键修复：给 vpcore-tun 指定一个固定的确定性 GUID（避免 Windows 每次生成随机 GUID 导致序号递增）
                     // 例如固定为 "vpcoretun0000001" 对应的静态 u128：
                     p.device_guid(0x7670636f_7265_7475_6e30_303030303031_u128);
-                    // 关键修复：向 Wintun 注入 TUN 接口自身地址作为主 DNS 服务器
+                    // 关键修复：向 Wintun 注入非本地单播的虚拟 DNS 服务器地址
                     p.dns_servers(&[dns_server]);
                 });
             }
@@ -321,10 +335,22 @@ async fn dispatch_tcp(
     mut sess: Session,
     mut client: Box<dyn vp_core::ProxyStream>,
 ) {
-    // 协议嗅探优化：仅对常见 Web 端口（80, 443, 8080, 8443 等）纯 IP 目标窥探首包 SNI / HTTP Host
-    // 非 Web 端口（如 22 SSH、3306 MySQL 等服务端先发包协议）跳过嗅探，彻底消除 100ms 无谓等待延迟
+    // 进程归属反查
+    if sess.process.is_none() {
+        if let Some(src) = sess.src {
+            let p = tokio::task::spawn_blocking(move || vp_rule::process::find_process_name(src))
+                .await
+                .ok()
+                .flatten();
+            if let Some(p) = p {
+                sess.process = Some(Arc::from(p));
+            }
+        }
+    }
+
+    // 协议嗅探优化：对常见 Web 端口纯 IP 目标窥探首包 SNI / HTTP Host
     if matches!(sess.dst.host, vp_common::Host::Ip(_))
-        && matches!(sess.dst.port, 80 | 443 | 8080 | 8443 | 8444 | 9443)
+        && vp_core::sniff::is_sniffable_port(sess.dst.port)
     {
         let (sniffed, peeked) =
             vp_core::sniff_stream(client, std::time::Duration::from_millis(30)).await;
@@ -391,10 +417,33 @@ async fn dispatch_tcp(
 /// 与 PacketConn（收发带地址）桥接：同任务内 select 双泵。
 async fn dispatch_udp(
     ctx: &InboundCtx,
-    sess: Session,
+    mut sess: Session,
     mut udp: ipstack::IpStackUdpStream,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
+
+    let mut up_buf = [0u8; 65535];
+    let mut first_n: Option<usize> = None;
+
+    // 若目标为纯 IP 且是常见 QUIC 端口，先读首包并尝试解密提取 QUIC Initial SNI
+    if matches!(sess.dst.host, vp_common::Host::Ip(_))
+        && matches!(sess.dst.port, 443 | 8443 | 2053 | 2083 | 2087 | 2096)
+    {
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), udp.read(&mut up_buf)).await
+        {
+            if n > 0 {
+                first_n = Some(n);
+                if let Some(domain) = vp_core::sniff::sniff_quic_sni(&up_buf[..n]) {
+                    debug!("tun quic sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+                    sess.dst.host = vp_common::Host::Domain(domain);
+                }
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
     let res = ctx.router.pick(&sess).await;
     let rule_tag = res
         .rule
@@ -426,9 +475,19 @@ async fn dispatch_udp(
     let mut conn = res.outbound.connect_packet(&sess, &sess.dst).await?;
     let dst_addr: SocketAddr = match &sess.dst.host {
         vp_common::Host::Ip(ip) => SocketAddr::new(*ip, sess.dst.port),
-        vp_common::Host::Domain(_) => SocketAddr::new([127, 0, 0, 1].into(), sess.dst.port),
+        vp_common::Host::Domain(_) => SocketAddr::new(udp.peer_addr().ip(), sess.dst.port),
     };
-    let mut up_buf = [0u8; 65535];
+    if let Some(n) = first_n {
+        let pkt = UdpPacket {
+            src: dst_addr,
+            dst: dst_addr,
+            data: up_buf[..n].to_vec().into(),
+        };
+        if conn.send(&pkt).await.is_err() {
+            return Ok(());
+        }
+    }
+    let idle_timeout = std::time::Duration::from_secs(60);
     loop {
         tokio::select! {
             biased;
@@ -457,6 +516,10 @@ async fn dispatch_udp(
                     }
                     Err(_) => break,
                 }
+            }
+            _ = tokio::time::sleep(idle_timeout) => {
+                // 超过 60 秒无双向数据报，自动退出并释放 UDP 会话
+                break;
             }
         }
     }

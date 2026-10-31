@@ -158,33 +158,44 @@ async fn start_tun_runtime(
     if !tun_cfg.enable {
         return Err(Error::Config("tun.enable = false".into()));
     }
-    let pool = vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range)
-        .ok_or_else(|| Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range)))?;
-    let pool_arc = Arc::new(pool);
-    let dns_listen: std::net::SocketAddr = cfg
-        .dns
-        .listen
-        .as_deref()
-        .and_then(|s| parse_dns_listen(s, "0.0.0.0").ok())
-        .unwrap_or_else(|| "0.0.0.0:53".parse().unwrap());
-    let dns_srv = vp_dns::DnsServer::new(
-        dns_listen,
-        dns.clone(),
-        Some(pool_arc.clone()),
-        cfg.dns.fake_ip_filter.clone(),
-        cfg.ipv6,
-    );
-    let dns_handle = match dns_srv.spawn_handle().await {
-        Ok((bound, handle)) => {
-            info!("dns 服务器（fake-ip 劫持）监听 {bound}");
-            Some(handle)
+    let pool_arc =
+        match dns
+            .fake_ip()
+            .cloned()
+            .or_else(vp_dns::get_global_fake_ip_pool)
+        {
+            Some(p) => p,
+            None => {
+                let p = Arc::new(vp_dns::FakeIpPool::new(&tun_cfg.fake_ip_range).ok_or_else(
+                    || Error::Config(format!("fake-ip 网段非法: {}", tun_cfg.fake_ip_range)),
+                )?);
+                vp_dns::set_global_fake_ip_pool(Some(p.clone()));
+                p
+            }
+        };
+    let dns_handle = if cfg.dns.listen.is_none() {
+        let dns_listen: std::net::SocketAddr = "0.0.0.0:53".parse().unwrap();
+        let dns_srv = vp_dns::DnsServer::new(
+            dns_listen,
+            dns.clone(),
+            Some(pool_arc.clone()),
+            cfg.dns.fake_ip_filter.clone(),
+            cfg.dns.is_ipv6(cfg.ipv6),
+        );
+        match dns_srv.spawn_handle().await {
+            Ok((bound, handle)) => {
+                info!("dns 服务器（fake-ip 劫持）监听 {bound}");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::info!(
+                    "宿主机 53 端口外部监听未占用 (TUN 模式下由虚拟网卡 IP 协议栈无损劫持接管 53 端口流量): {e}"
+                );
+                None
+            }
         }
-        Err(e) => {
-            tracing::debug!(
-                "宿主机 53 端口外部监听未启用 (TUN 模式下由用户态虚拟网卡无损劫持接管): {e}"
-            );
-            None
-        }
+    } else {
+        None
     };
     let t = vp_tun::TunConfig {
         address: tun_cfg
@@ -205,12 +216,18 @@ async fn start_tun_runtime(
         pool_arc,
         dns,
         cfg.dns.fake_ip_filter.clone(),
-        cfg.ipv6,
+        cfg.dns.is_ipv6(cfg.ipv6),
     ));
-    #[cfg(windows)]
     if tun_cfg.auto_route {
+        #[cfg(windows)]
         if let Some(if_idx) = vp_transport::detect_default_physical_interface() {
             vp_transport::set_bind_interface_index(if_idx);
+        }
+        #[cfg(not(windows))]
+        if cfg.interface_name.is_none() {
+            if let Some(if_name) = vp_transport::detect_default_physical_interface_name() {
+                vp_transport::set_bind_interface_name(Some(if_name));
+            }
         }
     }
 
@@ -222,12 +239,27 @@ async fn start_tun_runtime(
     info!("TUN 模式已启动（{}）", tun_cfg.address);
     let mut route_guard = None;
     if tun_cfg.auto_route {
-        match vp_tun::auto_route::enable(&tun_cfg.address, &tun_cfg.netmask) {
+        let route_opts = vp_tun::auto_route::AutoRouteOptions {
+            mode: tun_cfg.auto_route_mode.clone(),
+            route_address: tun_cfg.route_address.clone(),
+            route_exclude_address: tun_cfg.route_exclude_address.clone(),
+        };
+        match vp_tun::auto_route::enable_with_options(
+            &tun_cfg.address,
+            &tun_cfg.netmask,
+            &route_opts,
+        ) {
             Ok(guard) => {
-                info!("auto-route 已启用");
+                info!("auto-route 已启用 (mode: {:?})", tun_cfg.auto_route_mode);
                 route_guard = Some(guard);
             }
-            Err(e) => warn!("auto-route 启用失败（需管理员权限）: {e}"),
+            Err(e) => {
+                let err_msg = format!("auto-route 启用失败（需管理员权限）: {e}");
+                tracing::error!("{err_msg}");
+                if tun_cfg.strict.unwrap_or(false) {
+                    return Err(Error::Other(err_msg));
+                }
+            }
         }
     }
     Ok(TunRuntime {
@@ -235,6 +267,26 @@ async fn start_tun_runtime(
         dns_server: dns_handle,
         route_guard,
     })
+}
+
+/// TUN 运行时健康状态（供宿主、GUI 与 GET /configs 实时获知真实运行状态）
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct TunStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub device: Option<String>,
+    pub dns_hijack: bool,
+    pub auto_route: bool,
+    pub error: Option<String>,
+}
+
+/// 独立 DNS 服务端运行时健康状态
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct DnsStatus {
+    pub enabled: bool,
+    pub running: bool,
+    pub listen: Option<String>,
+    pub error: Option<String>,
 }
 
 pub struct App {
@@ -247,6 +299,10 @@ pub struct App {
     pub config_meta: Arc<RwLock<Option<ConfigMeta>>>,
     /// TUN 运行时：Some = TUN 已启用。热重载按配置差量动态增删（免重启热切换）。
     pub tun_runtime: Arc<RwLock<Option<TunRuntime>>>,
+    /// TUN 运行健康状态
+    pub tun_status: Arc<RwLock<TunStatus>>,
+    /// 独立 DNS 运行健康状态
+    pub dns_status: Arc<RwLock<DnsStatus>>,
     /// 全局 DNS 解析器：热开启 TUN 时复用它建 fake-ip 劫持服务器
     pub dns: Arc<Resolver>,
 }
@@ -469,32 +525,81 @@ impl App {
             vp_transport::set_global_tuning(rcv, snd, nodelay, ka_secs);
         }
 
+        if let Some(mark) = cfg.routing_mark {
+            vp_transport::set_routing_mark(mark);
+        } else if start_listeners {
+            vp_transport::set_routing_mark(0);
+        }
+        if cfg.interface_name.is_some() {
+            vp_transport::set_bind_interface_name(cfg.interface_name.clone());
+        } else if start_listeners {
+            vp_transport::set_bind_interface_name(None);
+        }
+
         let geosite = load_geosite(&base_dir, cfg.geosite_url.as_deref()).await;
+        if let Some(ref db) = geosite {
+            vp_dns::set_global_geosite_db(Some(Arc::new(db.clone())));
+        }
         let t_geosite = t_start.elapsed();
         let geoip = load_geoip(&base_dir, cfg.geoip_url.as_deref()).await;
         let asn = load_asn(&base_dir, cfg.asn_url.as_deref()).await;
         let t_geoip = t_start.elapsed();
 
-        let dns = Arc::new(if cfg.dns.enable {
-            let policies =
-                vp_dns::compile_nameserver_policy(&cfg.dns.nameserver_policy, geosite.as_ref());
-            let fallback_filter =
-                cfg.dns.fallback_filter.as_ref().map(|ff| {
+        // 全局统一 Fake-IP 池：供独立 dns.listen、TUN 数据面以及 redir/tproxy/mixed/socks5/udp 全入站共享反查
+        let global_fake_pool = if cfg.dns.enhanced_mode.as_deref() == Some("fake-ip")
+            || cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false)
+            || cfg.dns.fake_ip_range.is_some()
+        {
+            let range = cfg
+                .dns
+                .fake_ip_range
+                .as_deref()
+                .or_else(|| cfg.tun.as_ref().map(|t| t.fake_ip_range.as_str()))
+                .unwrap_or("198.18.0.0/16");
+            vp_dns::FakeIpPool::new(range).map(Arc::new)
+        } else {
+            None
+        };
+        if global_fake_pool.is_some() {
+            vp_dns::set_global_fake_ip_pool(global_fake_pool.clone());
+        }
+
+        // 解析静态 hosts 映射表
+        let mut hosts_map: HashMap<String, Vec<std::net::IpAddr>> = HashMap::new();
+        for (domain, ip_strs) in &cfg.hosts {
+            let ips: Vec<std::net::IpAddr> = ip_strs
+                .iter()
+                .filter_map(|s| s.trim().parse::<std::net::IpAddr>().ok())
+                .collect();
+            if !ips.is_empty() {
+                hosts_map.insert(domain.clone(), ips);
+            }
+        }
+
+        let dns = Arc::new(
+            if cfg.dns.enable {
+                let policies =
+                    vp_dns::compile_nameserver_policy(&cfg.dns.nameserver_policy, geosite.as_ref());
+                let fallback_filter = cfg.dns.fallback_filter.as_ref().map(|ff| {
                     vp_dns::compile_fallback_filter(ff, geosite.as_ref(), geoip.as_ref())
                 });
-            Resolver::build(
-                cfg.dns.nameserver.clone(),
-                cfg.dns.fallback.clone(),
-                policies,
-                fallback_filter,
-            )
-        } else {
-            Resolver::system()
-        });
+                Resolver::build(
+                    cfg.dns.nameserver.clone(),
+                    cfg.dns.fallback.clone(),
+                    policies,
+                    fallback_filter,
+                )
+                .with_default_nameservers(cfg.dns.default_nameserver.clone())
+            } else {
+                Resolver::system()
+            }
+            .with_hosts(hosts_map)
+            .with_fake_ip(global_fake_pool.clone()),
+        );
         let t_dns = t_start.elapsed();
         // 节点自身的域名拨号走全局解析器（多上游并集 + 缓存 + 竞速拨号，
         // 对抗节点域名被污染/多 A 记录中混有失效地址导致的"时通时不通"）
-        vp_transport::set_global_node_resolver(dns.clone(), cfg.ipv6);
+        vp_transport::set_global_node_resolver(dns.clone(), cfg.dns.is_ipv6(cfg.ipv6));
         // ECH（ech-opts）的 HTTPS(type65) 记录查询也走全局解析器
         vp_transport::tls::set_global_resolver(dns.clone());
         let deps = OutboundDeps {
@@ -723,6 +828,8 @@ impl App {
         // 入站
         let mut listen_ports = Vec::new();
         let mut tun_runtime_opt: Option<TunRuntime> = None;
+        let tun_status: Arc<RwLock<TunStatus>>;
+        let dns_status: Arc<RwLock<DnsStatus>>;
         if start_listeners {
             let bind = if cfg.allow_lan {
                 if cfg.bind_address == "*" {
@@ -799,31 +906,20 @@ impl App {
                 }
             }
 
+            let mut dns_st = DnsStatus::default();
             // 独立 DNS 服务端：只要配置了 dns.listen（例如 "0.0.0.0:53" 或 ":53"），
             // 无论是否启用 TUN，均作为独立 DNS 服务对外监听并提供智能分流/解析
             if let Some(listen_str) = &cfg.dns.listen {
+                dns_st.enabled = true;
+                dns_st.listen = Some(listen_str.clone());
                 match parse_dns_listen(listen_str, &bind) {
                     Ok(listen_addr) => {
-                        let pool_arc = if cfg.dns.enhanced_mode.as_deref() == Some("fake-ip")
-                            || cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false)
-                        {
-                            let range = cfg
-                                .dns
-                                .fake_ip_range
-                                .as_deref()
-                                .or_else(|| cfg.tun.as_ref().map(|t| t.fake_ip_range.as_str()))
-                                .unwrap_or("198.18.0.0/16");
-                            vp_dns::FakeIpPool::new(range).map(Arc::new)
-                        } else {
-                            None
-                        };
-
                         let dns_srv = vp_dns::DnsServer::new(
                             listen_addr,
                             dns.clone(),
-                            pool_arc,
+                            global_fake_pool.clone(),
                             cfg.dns.fake_ip_filter.clone(),
-                            cfg.ipv6,
+                            cfg.dns.is_ipv6(cfg.ipv6),
                         );
 
                         match dns_srv.spawn_handle().await {
@@ -833,20 +929,41 @@ impl App {
                                     cfg.dns.enhanced_mode
                                 );
                                 listen_ports.push(("dns".to_string(), bound.port()));
+                                dns_st.running = true;
                             }
                             Err(e) => {
-                                warn!("dns.listen 监听 {listen_addr} 失败: {e}");
+                                let err_msg = format!("dns.listen 监听 {listen_addr} 失败: {e}");
+                                tracing::error!("{err_msg}");
+                                dns_st.error = Some(err_msg.clone());
+                                if cfg.tun.as_ref().and_then(|t| t.strict).unwrap_or(false)
+                                    || std::env::var("VPCORE_STRICT")
+                                        .map(|v| v == "1" || v == "true")
+                                        .unwrap_or(false)
+                                {
+                                    return Err(Error::Other(err_msg));
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("dns.listen 解析失败: {e}");
+                        let err_msg = format!("dns.listen 解析失败: {e}");
+                        tracing::error!("{err_msg}");
+                        dns_st.error = Some(err_msg.clone());
+                        if cfg.tun.as_ref().and_then(|t| t.strict).unwrap_or(false)
+                            || std::env::var("VPCORE_STRICT")
+                                .map(|v| v == "1" || v == "true")
+                                .unwrap_or(false)
+                        {
+                            return Err(Error::Config(err_msg));
+                        }
                     }
                 }
             }
 
+            let mut tun_st = TunStatus::default();
             // TUN 模式
             if let Some(tun_cfg) = &cfg.tun {
+                tun_st.enabled = tun_cfg.enable;
                 if tun_cfg.enable {
                     let ctx = InboundCtx {
                         router: router_handle.clone(),
@@ -854,11 +971,33 @@ impl App {
                         conns: conns.clone(),
                     };
                     match start_tun_runtime(&cfg, dns.clone(), ctx).await {
-                        Ok(rt) => tun_runtime_opt = Some(rt),
-                        Err(e) => warn!("TUN 启动失败（需要管理员权限）: {e}"),
+                        Ok(rt) => {
+                            tun_st.running = true;
+                            tun_st.device = Some("vpcore-tun".into());
+                            tun_st.dns_hijack = true;
+                            tun_st.auto_route = tun_cfg.auto_route;
+                            tun_runtime_opt = Some(rt);
+                        }
+                        Err(e) => {
+                            let err_msg = format!("TUN 启动失败（需要管理员权限）: {e}");
+                            tracing::error!("{err_msg}");
+                            tun_st.error = Some(err_msg.clone());
+                            if tun_cfg.strict.unwrap_or(false)
+                                || std::env::var("VPCORE_STRICT")
+                                    .map(|v| v == "1" || v == "true")
+                                    .unwrap_or(false)
+                            {
+                                return Err(Error::Other(err_msg));
+                            }
+                        }
                     }
                 }
             }
+            tun_status = Arc::new(RwLock::new(tun_st));
+            dns_status = Arc::new(RwLock::new(dns_st));
+        } else {
+            tun_status = Arc::new(RwLock::new(TunStatus::default()));
+            dns_status = Arc::new(RwLock::new(DnsStatus::default()));
         }
 
         let config_meta = Arc::new(RwLock::new(Some(ConfigMeta {
@@ -882,6 +1021,8 @@ impl App {
                     secret: cfg.secret.clone().filter(|s| !s.is_empty()),
                     config_meta: config_meta.clone(),
                     tun_runtime: tun_runtime.clone(),
+                    tun_status: tun_status.clone(),
+                    dns_status: dns_status.clone(),
                     dns: dns.clone(),
                 };
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -898,6 +1039,8 @@ impl App {
             controller,
             config_meta,
             tun_runtime,
+            tun_status,
+            dns_status,
             dns,
         };
         Ok(Arc::new(app))
@@ -1134,7 +1277,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
     }
 }
 
-fn fetch_remote_provider(url: &str, ua: &str) -> std::result::Result<String, String> {
+pub(crate) fn fetch_remote_provider(url: &str, ua: &str) -> std::result::Result<String, String> {
     let resp = ureq::get(url)
         .timeout(std::time::Duration::from_secs(15))
         .set("User-Agent", ua)
@@ -2327,6 +2470,86 @@ rules:
 
         // mixed 入站必然启动成功
         assert!(app.listen_ports.iter().any(|(tag, _)| tag == "my-mixed"));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_fake_ip_auto_reverse_and_hosts_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let temp_dir = std::env::temp_dir().join("vp_test_fakeip_hosts");
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+        // 启动一个非 Web 端口的本地 TCP echo 服务器（模拟透明网关下访问非 80/443 服务）
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo.accept().await {
+                let mut buf = [0u8; 32];
+                if let Ok(n) = s.read(&mut buf).await {
+                    let _ = s.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let cfg = r#"
+mixed-port: 0
+mode: rule
+hosts:
+  "my-service.internal": "127.0.0.1"
+dns:
+  enable: true
+  listen: 127.0.0.1:0
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.0/16
+  nameserver:
+    - 127.0.0.1:53535
+proxies: []
+rules:
+  - DOMAIN,my-service.internal,DIRECT
+  - MATCH,REJECT
+"#;
+        let app = App::start(cfg, Format::Yaml, &temp_dir, true)
+            .await
+            .unwrap();
+        let mixed_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "mixed")
+            .unwrap()
+            .1;
+
+        // 从全局 Fake-IP 池为 "git.corp.example" 分配一个 Fake-IP (198.18.x.x)，
+        // 并在 hosts 中验证静态解析，同时验证入站拿到 Fake-IP 时自动反查出真实域名命中规则
+        let pool = vp_dns::get_global_fake_ip_pool().expect("应当初始化全局 Fake-IP 池");
+        let fake_ip = pool.allocate("my-service.internal").unwrap();
+        assert_eq!(fake_ip.octets()[0], 198);
+        assert_eq!(fake_ip.octets()[1], 18);
+
+        // 客户端通过 mixed (SOCKS5) 直接向 Fake-IP (198.18.x.x:echo_port) 发起连接：
+        // 若无入站 Fake-IP 自动反查，目标将保持为 198.18.x.x 从而落入 MATCH,REJECT 失败；
+        // 有自动反查后，198.18.x.x 还原为 my-service.internal -> 命中 DOMAIN,my-service.internal,DIRECT -> 经 hosts 解析到 127.0.0.1:echo_port！
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", mixed_port))
+            .await
+            .unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        c.read_exact(&mut greeting).await.unwrap();
+
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&fake_ip.octets());
+        req.extend_from_slice(&echo_port.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+
+        let mut rep = [0u8; 10];
+        c.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0x00, "Fake-IP 入站反查与 hosts 解析应当成功连通");
+
+        c.write_all(b"fakeip-ok").await.unwrap();
+        let mut got = [0u8; 9];
+        c.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"fakeip-ok");
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

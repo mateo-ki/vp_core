@@ -130,12 +130,15 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
     // 6. DNS nameserver 形式
     if cfg.dns.enable {
         for ns in cfg.dns.nameserver.iter().chain(cfg.dns.fallback.iter()) {
-            let ok = ns.starts_with("https://")
-                || ns.starts_with("tls://")
-                || ns.starts_with("udp://")
-                || ns.starts_with("tcp://")
-                || ns.parse::<std::net::IpAddr>().is_ok()
-                || ns.contains("://"); // 其它 scheme 留给运行时报错
+            let base_ns = ns.split('#').next().unwrap_or(ns).trim();
+            let ok = base_ns.starts_with("https://")
+                || base_ns.starts_with("tls://")
+                || base_ns.starts_with("udp://")
+                || base_ns.starts_with("tcp://")
+                || base_ns.eq_ignore_ascii_case("system")
+                || base_ns.parse::<std::net::IpAddr>().is_ok()
+                || base_ns.parse::<std::net::SocketAddr>().is_ok()
+                || base_ns.contains("://"); // 其它 scheme 留给运行时报错
             if !ok {
                 errs.push(format!("dns.nameserver 项 {ns:?} 无法识别"));
             }

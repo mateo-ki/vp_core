@@ -171,6 +171,25 @@ impl Router {
         self.outbounds.get(name).cloned()
     }
 
+    pub fn outbounds(&self) -> &HashMap<String, Arc<dyn Outbound>> {
+        &self.outbounds
+    }
+
+    /// 对指定节点（或策略组）执行延迟测试，并将结果同步回填到包含该节点的所有策略组
+    pub async fn url_test_node(&self, name: &str, url: &str) -> Result<u32> {
+        let ob = self
+            .outbounds
+            .get(name)
+            .cloned()
+            .ok_or_else(|| vp_common::Error::Other(format!("节点 {name:?} 不存在")))?;
+        let res = group::url_test_outbound(&ob, url).await;
+        let ms_opt = res.as_ref().ok().copied();
+        for g in self.groups.values() {
+            g.record_member_probe_result(name, ms_opt);
+        }
+        res
+    }
+
     pub fn dns(&self) -> &Arc<Resolver> {
         &self.dns
     }
@@ -240,6 +259,12 @@ impl Router {
             depth += 1;
         }
         name
+    }
+}
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        self.abort_background_tasks();
     }
 }
 

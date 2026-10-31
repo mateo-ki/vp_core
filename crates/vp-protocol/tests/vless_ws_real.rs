@@ -124,10 +124,12 @@ async fn ws_tls_transport_only() {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
+            v2ray_http_upgrade: false,
         }),
         http: None,
         grpc: None,
         reality: None,
+        socket_opts: None,
     };
     let mut s = match vp_transport::dial(&cfg.server, cfg.port, &transport).await {
         Ok(s) => s,
@@ -210,6 +212,7 @@ async fn vless_staged_timing() {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
+        v2ray_http_upgrade: false,
     };
     let ws = tokio::time::timeout(
         Duration::from_secs(5),

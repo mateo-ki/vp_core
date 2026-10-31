@@ -45,7 +45,12 @@ impl FakeIpPool {
         } else {
             1u32 << (32 - plen)
         };
-        let usable = size.saturating_sub(2);
+        // 若网段足够大（> 4），预留 base+0(网络号)、base+1(TUN网卡本机IP)、base+2(Wintun DNS地址) 与广播地址
+        let usable = if size <= 4 {
+            size.saturating_sub(2)
+        } else {
+            size.saturating_sub(4)
+        };
         Some(FakeIpPool {
             base,
             size,
@@ -80,7 +85,9 @@ impl FakeIpPool {
         }
         let n = inner.next;
         inner.next += 1;
-        let ip = Ipv4Addr::from(self.base + 1 + n);
+        // 网段 > 4 时避开 base+1(TUN本机IP) 与 base+2(DNS)，从 base+3 开始分配
+        let offset = if self.size <= 4 { 1 } else { 3 };
+        let ip = Ipv4Addr::from(self.base + offset + n);
         inner.by_domain.insert(key.clone(), ip);
         inner.by_ip.insert(ip, key.clone());
         inner.order.push(key);
@@ -95,6 +102,15 @@ impl FakeIpPool {
 
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().by_domain.len()
+    }
+
+    /// 清空所有已分配的 Fake-IP 映射记录
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.by_domain.clear();
+        inner.by_ip.clear();
+        inner.order.clear();
+        inner.next = 0;
     }
 
     pub fn is_empty(&self) -> bool {

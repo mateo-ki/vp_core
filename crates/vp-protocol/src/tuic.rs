@@ -12,12 +12,14 @@
 //!
 //! ALPN：`tuic`
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use vp_common::{DstAddr, Error, Host, Result};
 use vp_core::inbound::InboundCtx;
@@ -132,9 +134,71 @@ pub struct TuicOutbound {
     port: u16,
     uuid: String,
     password: String,
+    sni: Option<String>,
     skip_verify: bool,
     _congestion_controller: Option<String>,
     assoc_counter: AtomicU16,
+    session: Mutex<Option<Arc<TuicSession>>>,
+}
+
+struct TuicSession {
+    conn: quinn::Connection,
+    _ep: quinn::Endpoint,
+    udp_demux: Arc<TuicUdpDemuxer>,
+}
+
+impl TuicSession {
+    fn is_alive(&self) -> bool {
+        self.conn.close_reason().is_none()
+    }
+}
+
+pub struct TuicUdpDemuxer {
+    listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<UdpPacket>>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl TuicUdpDemuxer {
+    pub fn new(conn: quinn::Connection) -> Self {
+        let listeners: Arc<RwLock<HashMap<u16, mpsc::Sender<UdpPacket>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let listeners_cloned = listeners.clone();
+        let task = tokio::spawn(async move {
+            while let Ok(stream) = conn.read_datagram().await {
+                if stream.len() < 2 || stream[0] != VER {
+                    continue;
+                }
+                match stream[1] {
+                    T_PACKET => {
+                        let Some(pkt) = parse_packet_opt(&stream[2..]) else {
+                            continue;
+                        };
+                        let guard = listeners_cloned.read().await;
+                        if let Some(tx) = guard.get(&pkt.assoc) {
+                            let _ = tx.try_send(UdpPacket {
+                                src: pkt.src,
+                                dst: pkt.src,
+                                data: pkt.payload,
+                            });
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+        });
+        Self {
+            listeners,
+            _task: task,
+        }
+    }
+
+    pub async fn register(&self, assoc: u16, tx: mpsc::Sender<UdpPacket>) {
+        self.listeners.write().await.insert(assoc, tx);
+    }
+
+    pub async fn unregister(&self, assoc: u16) {
+        self.listeners.write().await.remove(&assoc);
+    }
 }
 
 impl TuicOutbound {
@@ -145,23 +209,63 @@ impl TuicOutbound {
             port: cfg.port,
             uuid: cfg.uuid.clone(),
             password: cfg.password.clone(),
+            sni: cfg
+                .sni
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .or_else(|| Some(cfg.server.clone())),
             skip_verify: cfg.skip_cert_verify,
             _congestion_controller: cfg.congestion_controller.clone(),
             assoc_counter: AtomicU16::new(1),
+            session: Mutex::new(None),
         })
     }
 
+    async fn get_or_connect(&self) -> Result<Arc<TuicSession>> {
+        let mut guard = self.session.lock().await;
+        if let Some(ref s) = *guard {
+            if s.is_alive() {
+                return Ok(s.clone());
+            }
+        }
+        let (conn, ep) = self.dial().await?;
+        let udp_demux = Arc::new(TuicUdpDemuxer::new(conn.clone()));
+        let s = Arc::new(TuicSession {
+            conn,
+            _ep: ep,
+            udp_demux,
+        });
+        *guard = Some(s.clone());
+        Ok(s)
+    }
+
     /// QUIC 连接 + Authenticate
-    async fn dial(&self) -> Result<quinn::Connection> {
+    async fn dial(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
         let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
             .await
             .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
             .next()
             .ok_or(Error::Addr("无地址".into()))?;
-        let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+        let bind: &'static str = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let tokio_sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
+        let std_sock = tokio_sock.into_std().map_err(Error::Io)?;
+        let mut ep = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|e| Error::Io(std::io::Error::other(format!("tuic endpoint: {e}"))))?;
         ep.set_default_client_config(tuic_client_config(self.skip_verify));
+        let server_name = self.sni.as_deref().unwrap_or(&self.server);
         let conn = ep
-            .connect(addr, &self.server)
+            .connect(addr, server_name)
             .map_err(|e| Error::Addr(format!("tuic 连接参数: {e}")))?
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic QUIC 握手: {e}"))))?;
@@ -182,7 +286,7 @@ impl TuicOutbound {
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic auth 写入: {e}"))))?;
         uni.finish()
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic auth finish: {e}"))))?;
-        Ok(conn)
+        Ok((conn, ep))
     }
 }
 
@@ -197,31 +301,53 @@ impl Outbound for TuicOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let conn = self.dial().await?;
-        let (mut send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic open_bi: {e}"))))?;
-        let mut req = vec![VER, T_CONNECT];
-        encode_addr(dst, &mut req);
-        send.write_all(&req)
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic connect 写入: {e}"))))?;
-        Ok(Box::new(crate::hysteria2::QuicBiStream { send, recv }))
+        for attempt in 0..2 {
+            let sess = self.get_or_connect().await?;
+            match sess.conn.open_bi().await {
+                Ok((mut send, recv)) => {
+                    let mut req = vec![VER, T_CONNECT];
+                    encode_addr(dst, &mut req);
+                    if let Err(e) = send.write_all(&req).await {
+                        if attempt == 0 {
+                            *self.session.lock().await = None;
+                            continue;
+                        }
+                        return Err(Error::Io(std::io::Error::other(format!(
+                            "tuic connect 写入: {e}"
+                        ))));
+                    }
+                    return Ok(Box::new(crate::hysteria2::QuicBiStream { send, recv }));
+                }
+                Err(e) => {
+                    if attempt == 0 {
+                        *self.session.lock().await = None;
+                        continue;
+                    }
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "tuic open_bi: {e}"
+                    ))));
+                }
+            }
+        }
+        Err(Error::Io(std::io::Error::other("tuic 连接重试耗尽")))
     }
 
     fn support_udp(&self) -> bool {
         true
     }
 
-    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        let conn = self.dial().await?;
+    async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        let sess = self.get_or_connect().await?;
         let assoc = self.assoc_counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(256);
+        sess.udp_demux.register(assoc, tx).await;
         Ok(Box::new(TuicPacketConn {
-            conn,
+            conn: sess.conn.clone(),
+            demux: sess.udp_demux.clone(),
             assoc,
             pkt: AtomicU16::new(1),
-            _reply_assoc: None,
+            rx,
+            target: dst.clone(),
         }))
     }
 
@@ -230,26 +356,40 @@ impl Outbound for TuicOutbound {
     }
 }
 
-/// UDP：uni 流模式 Packet 命令（回包也走服务端 uni 流，由会话任务读取转发）
+/// UDP：uni 流模式 Packet 命令（回包走 QUIC datagram，由 TuicUdpDemuxer 统一路由）
 struct TuicPacketConn {
     conn: quinn::Connection,
+    demux: Arc<TuicUdpDemuxer>,
     assoc: u16,
     pkt: AtomicU16,
-    /// 服务端回包流
-    _reply_assoc: Option<tokio::sync::Mutex<Option<quinn::RecvStream>>>,
+    rx: mpsc::Receiver<UdpPacket>,
+    target: DstAddr,
+}
+
+impl Drop for TuicPacketConn {
+    fn drop(&mut self) {
+        let demux = self.demux.clone();
+        let assoc = self.assoc;
+        tokio::spawn(async move {
+            demux.unregister(assoc).await;
+        });
+    }
 }
 
 #[async_trait]
 impl PacketConn for TuicPacketConn {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
         let mut addr = Vec::with_capacity(24);
-        encode_addr(
-            &DstAddr {
-                host: Host::Ip(pkt.dst.ip()),
-                port: pkt.dst.port(),
-            },
-            &mut addr,
-        );
+        let dst_to_encode =
+            if pkt.dst.ip().is_loopback() || matches!(self.target.host, Host::Domain(_)) {
+                &self.target
+            } else {
+                &DstAddr {
+                    host: Host::Ip(pkt.dst.ip()),
+                    port: pkt.dst.port(),
+                }
+            };
+        encode_addr(dst_to_encode, &mut addr);
         let size = addr.len() + pkt.data.len();
         let mut msg = Vec::with_capacity(2 + 8 + size);
         msg.push(VER);
@@ -275,36 +415,10 @@ impl PacketConn for TuicPacketConn {
     }
 
     async fn recv(&mut self) -> Result<UdpPacket> {
-        // 简化实现：服务端把回包写在客户端打开的 bi 流之外的 uni 流不可等——
-        // TUIC 服务端回包：对 native 模式走 datagram，对 quic 模式服务端开 uni 流。
-        // 此处读取服务端 uni 流。
-        loop {
-            let stream = self
-                .conn
-                .read_datagram()
-                .await
-                .map_err(|e| Error::Io(std::io::Error::other(format!("tuic datagram: {e}"))))?;
-            // 尝试按 Packet 命令解析
-            if stream.len() < 2 || stream[0] != VER {
-                continue;
-            }
-            match stream[1] {
-                T_PACKET => {
-                    let Some(pkt) = parse_packet_opt(&stream[2..]) else {
-                        continue;
-                    };
-                    if pkt.assoc != self.assoc {
-                        continue;
-                    }
-                    return Ok(UdpPacket {
-                        src: pkt.src,
-                        dst: pkt.src,
-                        data: pkt.payload,
-                    });
-                }
-                _ => continue, // Heartbeat 等
-            }
-        }
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::Io(std::io::Error::other("tuic udp 接收通道已关闭")))
     }
 }
 
@@ -374,6 +488,12 @@ fn build_tuic_client_config(skip_verify: bool) -> quinn::ClientConfig {
     ));
     let mut t = quinn::TransportConfig::default();
     t.datagram_receive_buffer_size(Some(1 << 20));
+    t.max_idle_timeout(Some(
+        std::time::Duration::from_secs(30)
+            .try_into()
+            .expect("idle timeout"),
+    ));
+    t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
     cfg.transport_config(Arc::new(t));
     cfg
 }
@@ -832,6 +952,22 @@ mod tests {
             .expect("udp 超时")
             .unwrap();
         assert_eq!(&resp.data[..], b"echo:tuic-udp");
+
+        // 并发第二个 UDP 连接（同 QUIC 会话复用与 TuicUdpDemuxer 路由隔离）
+        let mut conn2 = out.connect_packet(&sess, &dst).await.unwrap();
+        conn2
+            .send(&UdpPacket {
+                src: "127.0.0.1:0".parse().unwrap(),
+                dst: udp_addr,
+                data: b"tuic-udp-2".to_vec().into(),
+            })
+            .await
+            .unwrap();
+        let resp2 = tokio::time::timeout(std::time::Duration::from_secs(5), conn2.recv())
+            .await
+            .expect("udp 2 超时")
+            .unwrap();
+        assert_eq!(&resp2.data[..], b"echo:tuic-udp-2");
     }
 
     #[test]

@@ -42,9 +42,7 @@ pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::U
                 // 源地址/路由选择仍可能按路由表走 —— auto-route 下即 TUN 自身
                 // （198.18.0.1），DNS 上游流量就此流回自己形成回环。
                 let effective = match (interface_ipv4(if_idx), bind_addr) {
-                    (Some(ip), SocketAddr::V4(_)) => {
-                        SocketAddr::new(std::net::IpAddr::V4(ip), 0)
-                    }
+                    (Some(ip), SocketAddr::V4(_)) => SocketAddr::new(std::net::IpAddr::V4(ip), 0),
                     _ => bind_addr,
                 };
                 socket.bind(&effective.into())?;

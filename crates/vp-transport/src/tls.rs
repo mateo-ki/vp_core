@@ -413,7 +413,10 @@ mod tests {
         let used: Arc<Vec<u8>> = Arc::new(vec![1, 2, 3]);
         let same = used.clone();
         let fresh: Arc<Vec<u8>> = Arc::new(vec![4, 5, 6]);
-        assert!(!should_retry_ech_with(None, &used), "没给 retry config → 放弃");
+        assert!(
+            !should_retry_ech_with(None, &used),
+            "没给 retry config → 放弃"
+        );
         assert!(
             !should_retry_ech_with(Some(same), &used),
             "原样吐回刚被拒的同一份 → 放弃"

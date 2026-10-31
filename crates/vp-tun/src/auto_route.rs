@@ -93,15 +93,7 @@ pub fn enable(address: &str, netmask: &str) -> Result<AutoRouteGuard> {
         let mut installed = 0;
         for (net_route, mask_route) in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
             match Command::new("route")
-                .args([
-                    "add",
-                    net_route,
-                    "mask",
-                    mask_route,
-                    address,
-                    "metric",
-                    "1",
-                ])
+                .args(["add", net_route, "mask", mask_route, address, "metric", "1"])
                 .output()
             {
                 Ok(out) if out.status.success() => installed += 1,
@@ -123,9 +115,7 @@ pub fn enable(address: &str, netmask: &str) -> Result<AutoRouteGuard> {
             }
         }
         if installed == 2 {
-            info!(
-                "Windows auto-route 启用: {net}/{mask} + 0.0.0.0/1 + 128.0.0.0/1 -> {address}"
-            );
+            info!("Windows auto-route 启用: {net}/{mask} + 0.0.0.0/1 + 128.0.0.0/1 -> {address}");
         } else {
             warn!(
                 "Windows auto-route 不完整：双 /1 路由仅成功 {installed}/2，\

@@ -727,7 +727,9 @@ mod tests {
 
             let prev = get_bind_interface_index();
             set_bind_interface_index(if_idx);
-            let stream = vp_dns::connect_tcp_bound(addr).await.expect("绑卡拨号应成功");
+            let stream = vp_dns::connect_tcp_bound(addr)
+                .await
+                .expect("绑卡拨号应成功");
             let local = stream.local_addr().unwrap();
             // 还原全局绑定状态，避免污染并行测试
             set_bind_interface_index(prev.unwrap_or(0));

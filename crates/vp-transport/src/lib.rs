@@ -430,7 +430,10 @@ pub async fn connect_tcp_stream(
                 )?;
                 socket.set_nonblocking(true)?;
 
-                bind_socket_to_interface(&socket, addr, if_idx)?;
+                // UNICAST_IF + 显式源 IP 绑定（实现在 vp-dns，与 DNS 上游共用同一套）：
+                // 只设 UNICAST_IF 不绑源 IP 时，Windows 的源地址/路由选择仍可能按路由
+                // 表走 —— auto-route 下即 TUN 自身，节点拨号全部流回自己形成回环。
+                vp_dns::bind_tcp_socket_to_interface(&socket, addr, if_idx)?;
 
                 match socket.connect(&addr.into()) {
                     Ok(()) => {
@@ -457,45 +460,8 @@ pub async fn connect_tcp_stream(
     tokio::net::TcpStream::connect(addr).await
 }
 
-#[cfg(windows)]
-fn bind_socket_to_interface(
-    socket: &socket2::Socket,
-    addr: std::net::SocketAddr,
-    if_idx: u32,
-) -> std::io::Result<()> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{
-        IP_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6, IPV6_UNICAST_IF, SOCKET, setsockopt,
-    };
-
-    let raw = socket.as_raw_socket() as SOCKET;
-    let (level, opt, opt_val) = match addr {
-        std::net::SocketAddr::V4(_) => (
-            IPPROTO_IP,
-            IP_UNICAST_IF,
-            if_idx.to_be(), // IP_UNICAST_IF requires network byte order (big-endian)
-        ),
-        std::net::SocketAddr::V6(_) => (
-            IPPROTO_IPV6,
-            IPV6_UNICAST_IF,
-            if_idx, // IPV6_UNICAST_IF requires host byte order
-        ),
-    };
-    unsafe {
-        let ret = setsockopt(
-            raw,
-            level,
-            opt,
-            &opt_val as *const _ as *const _,
-            std::mem::size_of::<u32>() as i32,
-        );
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::warn!("绑定物理网卡 if_idx={if_idx} 失败: {err}");
-        }
-    }
-    Ok(())
-}
+// bind_socket_to_interface 已上移到 vp_dns（bind_tcp_socket_to_interface / connect_tcp_bound），
+// DNS 上游与节点拨号共用同一套"UNICAST_IF + 源 IP 绑定"实现，避免两份实现漂移。
 
 /// 多地址竞速 TCP 拨号。
 ///
@@ -643,11 +609,19 @@ pub async fn dial(
 ) -> Result<Box<dyn ProxyStream>> {
     let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
     match wrap_transport(Box::new(tcp), server_host, cfg).await {
-        // ECH 被服务端拒绝：底层流已废弃，重拨一次（tls 层已把该主机记入回退名单，
-        // 本次重拨自动走普通 TLS）
+        // ECH 被服务端拒绝：底层流已废弃，只能换新连接重拨。tls 层状态机决定重拨走什么：
+        // 服务端给了新的 retry config → 再试一次 ECH；否则直接普通 TLS。
+        // 至多重拨两轮即可收敛：ECH(DNS 配置) → ECH(retry config) → 普通 TLS，
+        // 之后该主机被记住拒绝状态，后续连接首轮就直走普通 TLS，不再浪费握手。
         Err(e) if e.to_string().contains("ECH_REJECTED_FALLBACK") => {
-            let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
-            wrap_transport(Box::new(tcp), server_host, cfg).await
+            for _ in 0..2 {
+                let tcp = dial_tcp_multi(server_host, server_port, Duration::from_secs(8)).await?;
+                match wrap_transport(Box::new(tcp), server_host, cfg).await {
+                    Err(e2) if e2.to_string().contains("ECH_REJECTED_FALLBACK") => continue,
+                    other => return other,
+                }
+            }
+            Err(e)
         }
         other => other,
     }
@@ -731,6 +705,37 @@ mod tests {
             let idx = if_idx.unwrap();
             assert!(idx > 0);
             assert_ne!(idx, 82, "绝不能匹配到 vpcore-tun 自身");
+        }
+    }
+
+    /// 回归测试（TUN 防回环）：绑卡拨号的源地址必须是物理网卡自己的 IP。
+    /// 回归背景：TUN auto-route 下，"只设 IP_UNICAST_IF 不显式 bind 源 IP"的套接字，
+    /// Windows 的源地址/路由选择仍按路由表走（即 TUN 自身 198.18.0.1），DNS 上游与
+    /// 节点拨号全部流回自己形成回环 —— 表现为 TUN 开启后整机断网。修复 = UNICAST_IF
+    /// + 源 IP 显式绑定（vp_dns::bind_tcp_socket_to_interface）。
+    #[tokio::test]
+    async fn bound_dial_source_must_be_physical_ip() {
+        #[cfg(windows)]
+        {
+            let Some(if_idx) = detect_default_physical_interface() else {
+                return; // 无多网卡环境跳过
+            };
+            let Some(expect_ip) = vp_dns::interface_ipv4(if_idx) else {
+                return;
+            };
+            let addr: std::net::SocketAddr = "223.5.5.5:443".parse().unwrap();
+
+            let prev = get_bind_interface_index();
+            set_bind_interface_index(if_idx);
+            let stream = vp_dns::connect_tcp_bound(addr).await.expect("绑卡拨号应成功");
+            let local = stream.local_addr().unwrap();
+            // 还原全局绑定状态，避免污染并行测试
+            set_bind_interface_index(prev.unwrap_or(0));
+            assert_eq!(
+                local.ip(),
+                std::net::IpAddr::V4(expect_ip),
+                "绑卡拨号的源地址必须是物理网卡 {if_idx} 的 IP {expect_ip}"
+            );
         }
     }
 

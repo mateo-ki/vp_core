@@ -38,7 +38,16 @@ pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::U
                 socket.set_nonblocking(true)?;
 
                 bind_socket_to_interface(&socket, bind_addr, if_idx)?;
-                socket.bind(&bind_addr.into())?;
+                // 源地址必须显式绑到物理网卡自己的 IP：只设 UNICAST_IF 时 Windows 的
+                // 源地址/路由选择仍可能按路由表走 —— auto-route 下即 TUN 自身
+                // （198.18.0.1），DNS 上游流量就此流回自己形成回环。
+                let effective = match (interface_ipv4(if_idx), bind_addr) {
+                    (Some(ip), SocketAddr::V4(_)) => {
+                        SocketAddr::new(std::net::IpAddr::V4(ip), 0)
+                    }
+                    _ => bind_addr,
+                };
+                socket.bind(&effective.into())?;
 
                 let std_sock: std::net::UdpSocket = socket.into();
                 return tokio::net::UdpSocket::from_std(std_sock);
@@ -48,6 +57,92 @@ pub fn create_udp_socket(bind_addr: SocketAddr) -> std::io::Result<tokio::net::U
     let std_sock = std::net::UdpSocket::bind(bind_addr)?;
     std_sock.set_nonblocking(true)?;
     tokio::net::UdpSocket::from_std(std_sock)
+}
+
+/// 物理网卡的 IPv4 地址（出站套接字源地址绑定用）。找不到返回 None（回落通配绑定）。
+#[cfg(windows)]
+pub fn interface_ipv4(if_idx: u32) -> Option<std::net::Ipv4Addr> {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpAddrTable, MIB_IPADDRTABLE};
+
+    let mut size: u32 = 0;
+    unsafe {
+        if GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) != ERROR_INSUFFICIENT_BUFFER {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let table = buf.as_mut_ptr() as *mut MIB_IPADDRTABLE;
+        if GetIpAddrTable(table, &mut size, 0) != 0 {
+            return None;
+        }
+        let t = &*table;
+        for i in 0..t.dwNumEntries as usize {
+            let row = &*t.table.as_ptr().add(i);
+            if row.dwIndex == if_idx {
+                let b = row.dwAddr.to_ne_bytes();
+                if b == [0, 0, 0, 0] {
+                    return None;
+                }
+                return Some(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]));
+            }
+        }
+    }
+    None
+}
+
+/// TCP 套接字绑物理网卡（TUN 防回环）：UNICAST_IF + **显式源地址绑定**。
+/// 只设 UNICAST_IF 不 bind 源 IP 时，Windows 的源地址选择仍可能按路由表走
+/// （auto-route 下即 TUN 自身），节点/DNS 拨号全部流回自己形成回环。
+#[cfg(windows)]
+pub fn bind_tcp_socket_to_interface(
+    socket: &socket2::Socket,
+    addr: SocketAddr,
+    if_idx: u32,
+) -> std::io::Result<()> {
+    bind_socket_to_interface(socket, addr, if_idx)?;
+    if let SocketAddr::V4(_) = addr {
+        if let Some(ip) = interface_ipv4(if_idx) {
+            socket.bind(&SocketAddr::new(std::net::IpAddr::V4(ip), 0).into())?;
+        }
+    }
+    Ok(())
+}
+
+/// 绑定物理网卡的 TCP 拨号（TUN 防回环）。未配置绑定索引时退化为普通拨号。
+#[cfg(windows)]
+pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    if !addr.ip().is_loopback() {
+        if let Some(if_idx) = get_bind_interface_index() {
+            let domain = match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+            socket.set_nonblocking(true)?;
+            bind_tcp_socket_to_interface(&socket, addr, if_idx)?;
+            match socket.connect(&addr.into()) {
+                Ok(()) => {
+                    let std_stream: std::net::TcpStream = socket.into();
+                    return tokio::net::TcpStream::from_std(std_stream);
+                }
+                Err(e)
+                    if e.raw_os_error()
+                        == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
+                {
+                    let std_stream: std::net::TcpStream = socket.into();
+                    let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+                    tokio_stream.writable().await?;
+                    if let Some(err) = tokio_stream.take_error()? {
+                        return Err(err);
+                    }
+                    return Ok(tokio_stream);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    tokio::net::TcpStream::connect(addr).await
 }
 
 #[cfg(windows)]
@@ -95,6 +190,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use vp_common::{Error, Host, Result};
@@ -719,40 +815,7 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
 async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[cfg(windows)]
-    let mut stream = if let Some(if_idx) = get_bind_interface_index() {
-        let domain_socket = match addr {
-            SocketAddr::V4(_) => socket2::Domain::IPV4,
-            SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        let socket = socket2::Socket::new(
-            domain_socket,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        socket.set_nonblocking(true)?;
-        bind_socket_to_interface(&socket, addr, if_idx)?;
-        match socket.connect(&addr.into()) {
-            Ok(()) => {
-                let std_stream: std::net::TcpStream = socket.into();
-                tokio::net::TcpStream::from_std(std_stream)?
-            }
-            Err(e)
-                if e.raw_os_error()
-                    == Some(windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK) =>
-            {
-                let std_stream: std::net::TcpStream = socket.into();
-                let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
-                tokio_stream.writable().await?;
-                if let Some(err) = tokio_stream.take_error()? {
-                    return Err(err.into());
-                }
-                tokio_stream
-            }
-            Err(e) => return Err(e.into()),
-        }
-    } else {
-        with_timeout(TcpStream::connect(addr)).await?
-    };
+    let mut stream = connect_tcp_bound(addr).await?;
     #[cfg(not(windows))]
     let mut stream = with_timeout(TcpStream::connect(addr)).await?;
     let id = query_id();
@@ -780,7 +843,8 @@ async fn query_tls(
 
     let connector = webpki_connector(false);
     let sni = server_name(sni_host, addr.ip())?;
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    // DoT 上游必须走绑卡拨号：裸 connect 在 auto-route 下会流回 TUN 自己（回环）
+    let tcp = connect_tcp_bound(addr).await?;
     let mut tls = connector.connect(sni, tcp).await?;
 
     let id = query_id();
@@ -918,10 +982,10 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<wi
         }
     };
 
-    // 2) TLS
+    // 2) TLS —— DoH 上游同样必须走绑卡拨号（裸 connect 在 auto-route 下回环进 TUN）
     let connector = webpki_connector(server.skip_verify);
     let sni = server_name(&server.host, addr.ip())?;
-    let tcp = with_timeout(tokio::net::TcpStream::connect(addr)).await?;
+    let tcp = with_timeout(connect_tcp_bound(addr)).await?;
     let mut tls = with_timeout(connector.connect(sni, tcp)).await?;
 
     // 3) HTTP/1.1 POST（application/dns-message）

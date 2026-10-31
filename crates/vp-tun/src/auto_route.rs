@@ -8,7 +8,7 @@
 
 use std::net::IpAddr;
 use std::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 use vp_common::{Error, Result};
 
@@ -75,37 +75,61 @@ pub fn enable(address: &str, netmask: &str) -> Result<AutoRouteGuard> {
             .output()
             .map_err(|e| Error::Other(format!("route 命令执行失败: {e}")))?;
         if !out.status.success() {
+            // route.exe 把报错写在 stdout（中文系统为 GBK，lossy 后可能有乱码但可辨认）
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = String::from_utf8_lossy(&out.stdout);
             return Err(Error::Other(format!(
-                "route add 基础网段失败: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "route add 基础网段失败: {}{}",
+                detail.trim(),
+                stderr.trim()
             )));
         }
 
         // 2. 接管全网双 /1 拆分路由（0.0.0.0/1 和 128.0.0.0/1，比系统 /0 更精确且不破坏原默认网关）
-        let _ = Command::new("route")
-            .args([
-                "add",
-                "0.0.0.0",
-                "mask",
-                "128.0.0.0",
-                address,
-                "metric",
-                "1",
-            ])
-            .output();
-        let _ = Command::new("route")
-            .args([
-                "add",
-                "128.0.0.0",
-                "mask",
-                "128.0.0.0",
-                address,
-                "metric",
-                "1",
-            ])
-            .output();
-
-        info!("Windows auto-route 启用: {net}/{mask} + 0.0.0.0/1 + 128.0.0.0/1 -> {address}");
+        // route.exe 的报错打印在 stdout（且中文系统是 GBK），只看 stderr 会得到空字符串；
+        // 双 /1 缺一条 TUN 就接管不了系统流量，必须逐条校验并把详情落日志。
+        let mut installed = 0;
+        for (net_route, mask_route) in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
+            match Command::new("route")
+                .args([
+                    "add",
+                    net_route,
+                    "mask",
+                    mask_route,
+                    address,
+                    "metric",
+                    "1",
+                ])
+                .output()
+            {
+                Ok(out) if out.status.success() => installed += 1,
+                Ok(out) => {
+                    let detail = String::from_utf8_lossy(&out.stdout);
+                    let detail = detail.trim();
+                    let detail = if detail.is_empty() {
+                        String::from_utf8_lossy(&out.stderr).trim().to_string()
+                    } else {
+                        detail.to_string()
+                    };
+                    warn!(
+                        "route add {net_route} mask {mask_route} 失败（exit={}，{detail}）\
+                         —— 该半区流量不会被 TUN 接管",
+                        out.status.code().unwrap_or(-1)
+                    );
+                }
+                Err(e) => warn!("route add {net_route} mask {mask_route} 执行失败: {e}"),
+            }
+        }
+        if installed == 2 {
+            info!(
+                "Windows auto-route 启用: {net}/{mask} + 0.0.0.0/1 + 128.0.0.0/1 -> {address}"
+            );
+        } else {
+            warn!(
+                "Windows auto-route 不完整：双 /1 路由仅成功 {installed}/2，\
+                 TUN 无法接管全部系统流量（常见原因：进程无管理员权限）"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -1298,7 +1298,9 @@ impl<S: tokio::io::AsyncRead + Unpin> UtlsStream<S> {
     }
 }
 
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for UtlsStream<S> {
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncRead
+    for UtlsStream<S>
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1323,6 +1325,17 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for UtlsStream<S> {
                     this.rx_closed = true;
                     return Poll::Ready(Err(io::Error::other(e.to_string())));
                 }
+            }
+            // 如果待发缓冲区有未发出数据，在等待对端响应前主动冲刷（防止双向通信下写后未显式 flush 造成的管线死锁）
+            while !this.tx_buf.is_empty() {
+                match Pin::new(&mut this.conn).poll_write(cx, &this.tx_buf) {
+                    Poll::Ready(Ok(0)) => break,
+                    Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                    Poll::Ready(Err(_)) | Poll::Pending => break,
+                }
+            }
+            if this.tx_buf.is_empty() {
+                let _ = Pin::new(&mut this.conn).poll_flush(cx);
             }
             // 需要更多原始字节
             this.raw.reserve(16 * 1024);
@@ -1836,539 +1849,549 @@ mod tests {
 
     #[tokio::test]
     async fn e2e_reality_handshake_and_tamper_detection() {
-        let mut srv_pri_bytes = [0u8; 32];
-        vp_common::rand_bytes(&mut srv_pri_bytes);
-        let srv_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
-        let srv_pub = x25519_dalek::PublicKey::from(&srv_pri);
-        let short_id = [0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut srv_pri_bytes = [0u8; 32];
+            vp_common::rand_bytes(&mut srv_pri_bytes);
+            let srv_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
+            let srv_pub = x25519_dalek::PublicKey::from(&srv_pri);
+            let short_id = [0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
 
-        // 1. 成功通路测试
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+            // 1. 成功通路测试
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
 
-        let srv_task = tokio::spawn(async move {
-            let (mut conn, _) = listener.accept().await.unwrap();
-            let srv_static_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
+            let srv_task = tokio::spawn(async move {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let srv_static_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
 
-            // 1. 读 ClientHello
-            let (outer, _, ch_body) = read_record_raw(&mut conn).await.unwrap();
-            assert_eq!(outer, REC_HANDSHAKE);
-            let mut transcript = ch_body.clone();
+                // 1. 读 ClientHello
+                let (outer, _, ch_body) = read_record_raw(&mut conn).await.unwrap();
+                assert_eq!(outer, REC_HANDSHAKE);
+                let mut transcript = ch_body.clone();
 
-            let mut c = Cursor::new(&ch_body);
-            let _ = c.u8().unwrap();
-            c.take(3).unwrap();
-            c.take(2).unwrap();
-            let rnd = c.take(32).unwrap().to_vec();
-            let sid_len = c.u8().unwrap() as usize;
-            let sid = c.take(sid_len).unwrap().to_vec();
-            let suites_len = c.u16().unwrap() as usize;
-            c.take(suites_len).unwrap();
-            c.take(2).unwrap();
-            let ext_len = c.u16().unwrap() as usize;
-            let exts = c.take(ext_len).unwrap();
+                let mut c = Cursor::new(&ch_body);
+                let _ = c.u8().unwrap();
+                c.take(3).unwrap();
+                c.take(2).unwrap();
+                let rnd = c.take(32).unwrap().to_vec();
+                let sid_len = c.u8().unwrap() as usize;
+                let sid = c.take(sid_len).unwrap().to_vec();
+                let suites_len = c.u16().unwrap() as usize;
+                c.take(suites_len).unwrap();
+                c.take(2).unwrap();
+                let ext_len = c.u16().unwrap() as usize;
+                let exts = c.take(ext_len).unwrap();
 
-            let mut e = Cursor::new(exts);
-            let mut client_share = None;
-            while !e.done() {
-                let ty = e.u16().unwrap();
-                let l = e.u16().unwrap() as usize;
-                let val = e.take(l).unwrap();
-                if ty == 51 {
-                    let mut ks = Cursor::new(val);
-                    let _ = ks.u16().unwrap();
-                    let group = ks.u16().unwrap();
-                    let plen = ks.u16().unwrap() as usize;
-                    let key = ks.take(plen).unwrap();
-                    if group == 0x001d {
-                        client_share = Some(key.to_vec());
+                let mut e = Cursor::new(exts);
+                let mut client_share = None;
+                while !e.done() {
+                    let ty = e.u16().unwrap();
+                    let l = e.u16().unwrap() as usize;
+                    let val = e.take(l).unwrap();
+                    if ty == 51 {
+                        let mut ks = Cursor::new(val);
+                        let _ = ks.u16().unwrap();
+                        let group = ks.u16().unwrap();
+                        let plen = ks.u16().unwrap() as usize;
+                        let key = ks.take(plen).unwrap();
+                        if group == 0x001d {
+                            client_share = Some(key.to_vec());
+                        }
                     }
                 }
-            }
-            let client_share = client_share.unwrap();
-            let client_pub = x25519_dalek::PublicKey::from(
-                <[u8; 32]>::try_from(client_share.as_slice()).unwrap(),
-            );
+                let client_share = client_share.unwrap();
+                let client_pub = x25519_dalek::PublicKey::from(
+                    <[u8; 32]>::try_from(client_share.as_slice()).unwrap(),
+                );
 
-            // 认证并推导密钥
-            let auth_secret = srv_static_pri.diffie_hellman(&client_pub);
-            let prk = hkdf_extract(&rnd[0..20], auth_secret.as_bytes()).unwrap();
-            let aead_key = hkdf_expand_raw(&prk, b"REALITY", 32).unwrap();
+                // 认证并推导密钥
+                let auth_secret = srv_static_pri.diffie_hellman(&client_pub);
+                let prk = hkdf_extract(&rnd[0..20], auth_secret.as_bytes()).unwrap();
+                let aead_key = hkdf_expand_raw(&prk, b"REALITY", 32).unwrap();
 
-            // 解密 session_id 验证认证
-            let mut aad = ch_body.clone();
-            aad[39..71].copy_from_slice(&[0u8; 32]);
-            let uk = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &aead_key).unwrap();
-            let lsk = ring::aead::LessSafeKey::new(uk);
-            let nonce = ring::aead::Nonce::assume_unique_for_key(rnd[20..32].try_into().unwrap());
-            let mut in_out = sid.clone();
-            let plain = lsk
-                .open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out)
+                // 解密 session_id 验证认证
+                let mut aad = ch_body.clone();
+                aad[39..71].copy_from_slice(&[0u8; 32]);
+                let uk = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &aead_key).unwrap();
+                let lsk = ring::aead::LessSafeKey::new(uk);
+                let nonce =
+                    ring::aead::Nonce::assume_unique_for_key(rnd[20..32].try_into().unwrap());
+                let mut in_out = sid.clone();
+                let plain = lsk
+                    .open_in_place(nonce, ring::aead::Aad::from(&aad[..]), &mut in_out)
+                    .unwrap();
+                assert_eq!(&plain[8..16], &short_id);
+
+                // 2. 服务端临时 x25519
+                let mut srv_eph_bytes = [0u8; 32];
+                vp_common::rand_bytes(&mut srv_eph_bytes);
+                let srv_eph_pri = x25519_dalek::StaticSecret::from(srv_eph_bytes);
+                let srv_eph_pub = x25519_dalek::PublicKey::from(&srv_eph_pri);
+                let tls_shared = srv_eph_pri.diffie_hellman(&client_pub);
+
+                // 3. 发送 ServerHello
+                let mut sh_body = Vec::new();
+                sh_body.push(0x02);
+                sh_body.extend_from_slice(&[0, 0, 0]);
+                sh_body.extend_from_slice(&[0x03, 0x03]);
+                let mut srv_rnd = [0u8; 32];
+                vp_common::rand_bytes(&mut srv_rnd);
+                sh_body.extend_from_slice(&srv_rnd);
+                sh_body.push(sid.len() as u8);
+                sh_body.extend_from_slice(&sid);
+                sh_body.extend_from_slice(&[0x13, 0x02]); // AES256
+                // legacy_compression_methods：长度前缀 + null（RFC 8446，与真实服务端一致）
+                sh_body.extend_from_slice(&[0x01, 0x00]);
+
+                let mut sh_exts = Vec::new();
+                ext(&mut sh_exts, 43, &[0x03, 0x04]); // supported_versions 1.3
+                let mut ks_val = Vec::new();
+                ks_val.extend_from_slice(&[0x00, 0x1d]);
+                ks_val.extend_from_slice(&32u16.to_be_bytes());
+                ks_val.extend_from_slice(srv_eph_pub.as_bytes());
+                ext(&mut sh_exts, 51, &ks_val);
+
+                sh_body.extend_from_slice(&(sh_exts.len() as u16).to_be_bytes());
+                sh_body.extend_from_slice(&sh_exts);
+                let sh_len = sh_body.len() - 4;
+                sh_body[1] = (sh_len >> 16) as u8;
+                sh_body[2] = (sh_len >> 8) as u8;
+                sh_body[3] = sh_len as u8;
+
+                let mut sh_rec = Vec::new();
+                sh_rec.extend_from_slice(&[REC_HANDSHAKE, 0x03, 0x03]);
+                sh_rec.extend_from_slice(&(sh_body.len() as u16).to_be_bytes());
+                sh_rec.extend_from_slice(&sh_body);
+                conn.write_all(&sh_rec).await.unwrap();
+
+                transcript.extend_from_slice(&sh_body);
+
+                // 4. 派生握手密钥
+                let suite = suite_def(0x1302).unwrap();
+                let zeros = vec![0u8; suite.hash_len];
+                let early = suite.extract(&zeros, &zeros);
+                let empty_hash = suite.digest(&[]);
+                let d1 = suite.derive_secret(&early, "derived", &empty_hash).unwrap();
+                let hs = suite.extract(&d1, tls_shared.as_bytes());
+                let th_sh = suite.digest(&transcript);
+                let c_hs_secret = suite.derive_secret(&hs, "c hs traffic", &th_sh).unwrap();
+                let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
+                let mut s_hs_dir = traffic_direction(suite, &s_hs_secret).unwrap();
+
+                // 5. EncryptedHandshake 消息
+                let ee = vec![HS_EE, 0, 0, 2, 0, 0];
+                transcript.extend_from_slice(&ee);
+
+                // 生成 Ed25519 密钥对
+                let rcgen_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+                let pkcs8 = rcgen_kp.serialize_der();
+                let ed_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+                let params =
+                    rcgen::CertificateParams::new(vec!["www.apple.com".to_string()]).unwrap();
+                let cert = params.self_signed(&rcgen_kp).unwrap();
+                let mut cert_der = cert.der().to_vec();
+
+                // 用 HMAC-SHA512(aead_key, ed_pub) 替换证书自身签名
+                let cert_obj = CertificateDer::from(cert_der.clone());
+                let ed_pub = extract_ed25519_pubkey(&cert_obj).unwrap();
+                let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, &aead_key);
+                let expected_hmac = ring::hmac::sign(&hmac_key, &ed_pub).as_ref().to_vec();
+
+                let orig_sig = extract_cert_signature(&cert_obj).unwrap();
+                let sig_pos = cert_der
+                    .windows(64)
+                    .rposition(|w| w == orig_sig.as_slice())
+                    .unwrap();
+                cert_der[sig_pos..sig_pos + 64].copy_from_slice(&expected_hmac);
+
+                // Certificate 消息封装
+                let mut cert_msg = Vec::new();
+                cert_msg.push(HS_CERT);
+                cert_msg.extend_from_slice(&[0, 0, 0]);
+                cert_msg.push(0); // request_context 长度
+
+                let mut cert_list = Vec::new();
+                let clen = cert_der.len();
+                cert_list.extend_from_slice(&[(clen >> 16) as u8, (clen >> 8) as u8, clen as u8]);
+                cert_list.extend_from_slice(&cert_der);
+                cert_list.extend_from_slice(&[0, 0]); // extensions len = 0
+
+                let tlen = cert_list.len();
+                cert_msg.extend_from_slice(&[(tlen >> 16) as u8, (tlen >> 8) as u8, tlen as u8]);
+                cert_msg.extend_from_slice(&cert_list);
+
+                let cmsg_len = cert_msg.len() - 4;
+                cert_msg[1] = (cmsg_len >> 16) as u8;
+                cert_msg[2] = (cmsg_len >> 8) as u8;
+                cert_msg[3] = cmsg_len as u8;
+
+                transcript.extend_from_slice(&cert_msg);
+
+                // CertificateVerify 签名
+                let mut cv_msg = vec![0x20u8; 64];
+                cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+                cv_msg.push(0);
+                cv_msg.extend_from_slice(&suite.digest(&transcript));
+                let cv_sig = ed_pair.sign(&cv_msg);
+
+                let mut cv = Vec::new();
+                cv.push(HS_CERT_VERIFY);
+                cv.extend_from_slice(&[0, 0, 0]);
+                cv.extend_from_slice(&[0x08, 0x07]); // ED25519
+                cv.extend_from_slice(&(cv_sig.as_ref().len() as u16).to_be_bytes());
+                cv.extend_from_slice(cv_sig.as_ref());
+
+                let cv_len = cv.len() - 4;
+                cv[1] = (cv_len >> 16) as u8;
+                cv[2] = (cv_len >> 8) as u8;
+                cv[3] = cv_len as u8;
+
+                transcript.extend_from_slice(&cv);
+
+                // Server Finished
+                let fk = hkdf_expand_label(
+                    &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
+                    "finished",
+                    &[],
+                    suite.hash_len,
+                )
                 .unwrap();
-            assert_eq!(&plain[8..16], &short_id);
+                let srv_verify_data = ring::hmac::sign(
+                    &ring::hmac::Key::new(suite.hmac_alg, &fk),
+                    &suite.digest(&transcript),
+                )
+                .as_ref()
+                .to_vec();
 
-            // 2. 服务端临时 x25519
-            let mut srv_eph_bytes = [0u8; 32];
-            vp_common::rand_bytes(&mut srv_eph_bytes);
-            let srv_eph_pri = x25519_dalek::StaticSecret::from(srv_eph_bytes);
-            let srv_eph_pub = x25519_dalek::PublicKey::from(&srv_eph_pri);
-            let tls_shared = srv_eph_pri.diffie_hellman(&client_pub);
+                let mut fin = vec![HS_FINISHED, 0, 0, srv_verify_data.len() as u8];
+                fin.extend_from_slice(&srv_verify_data);
+                transcript.extend_from_slice(&fin);
 
-            // 3. 发送 ServerHello
-            let mut sh_body = Vec::new();
-            sh_body.push(0x02);
-            sh_body.extend_from_slice(&[0, 0, 0]);
-            sh_body.extend_from_slice(&[0x03, 0x03]);
-            let mut srv_rnd = [0u8; 32];
-            vp_common::rand_bytes(&mut srv_rnd);
-            sh_body.extend_from_slice(&srv_rnd);
-            sh_body.push(sid.len() as u8);
-            sh_body.extend_from_slice(&sid);
-            sh_body.extend_from_slice(&[0x13, 0x02]); // AES256
-            // legacy_compression_methods：长度前缀 + null（RFC 8446，与真实服务端一致）
-            sh_body.extend_from_slice(&[0x01, 0x00]);
+                // 加密发送握手消息
+                let mut hs_content = Vec::new();
+                hs_content.extend_from_slice(&ee);
+                hs_content.extend_from_slice(&cert_msg);
+                hs_content.extend_from_slice(&cv);
+                hs_content.extend_from_slice(&fin);
+                hs_content.push(REC_HANDSHAKE);
 
-            let mut sh_exts = Vec::new();
-            ext(&mut sh_exts, 43, &[0x03, 0x04]); // supported_versions 1.3
-            let mut ks_val = Vec::new();
-            ks_val.extend_from_slice(&[0x00, 0x1d]);
-            ks_val.extend_from_slice(&32u16.to_be_bytes());
-            ks_val.extend_from_slice(srv_eph_pub.as_bytes());
-            ext(&mut sh_exts, 51, &ks_val);
+                let mut enc_rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
+                let clen = hs_content.len() + 16;
+                enc_rec[3] = (clen >> 8) as u8;
+                enc_rec[4] = clen as u8;
+                let mut sealed = BytesMut::from(hs_content.as_slice());
+                s_hs_dir.seal(&enc_rec, &mut sealed).unwrap();
+                enc_rec.extend_from_slice(&sealed);
+                conn.write_all(&enc_rec).await.unwrap();
 
-            sh_body.extend_from_slice(&(sh_exts.len() as u16).to_be_bytes());
-            sh_body.extend_from_slice(&sh_exts);
-            let sh_len = sh_body.len() - 4;
-            sh_body[1] = (sh_len >> 16) as u8;
-            sh_body[2] = (sh_len >> 8) as u8;
-            sh_body[3] = sh_len as u8;
-
-            let mut sh_rec = Vec::new();
-            sh_rec.extend_from_slice(&[REC_HANDSHAKE, 0x03, 0x03]);
-            sh_rec.extend_from_slice(&(sh_body.len() as u16).to_be_bytes());
-            sh_rec.extend_from_slice(&sh_body);
-            conn.write_all(&sh_rec).await.unwrap();
-
-            transcript.extend_from_slice(&sh_body);
-
-            // 4. 派生握手密钥
-            let suite = suite_def(0x1302).unwrap();
-            let zeros = vec![0u8; suite.hash_len];
-            let early = suite.extract(&zeros, &zeros);
-            let empty_hash = suite.digest(&[]);
-            let d1 = suite.derive_secret(&early, "derived", &empty_hash).unwrap();
-            let hs = suite.extract(&d1, tls_shared.as_bytes());
-            let th_sh = suite.digest(&transcript);
-            let c_hs_secret = suite.derive_secret(&hs, "c hs traffic", &th_sh).unwrap();
-            let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
-            let mut s_hs_dir = traffic_direction(suite, &s_hs_secret).unwrap();
-
-            // 5. EncryptedHandshake 消息
-            let ee = vec![HS_EE, 0, 0, 2, 0, 0];
-            transcript.extend_from_slice(&ee);
-
-            // 生成 Ed25519 密钥对
-            let rcgen_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-            let pkcs8 = rcgen_kp.serialize_der();
-            let ed_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
-            let params = rcgen::CertificateParams::new(vec!["www.apple.com".to_string()]).unwrap();
-            let cert = params.self_signed(&rcgen_kp).unwrap();
-            let mut cert_der = cert.der().to_vec();
-
-            // 用 HMAC-SHA512(aead_key, ed_pub) 替换证书自身签名
-            let cert_obj = CertificateDer::from(cert_der.clone());
-            let ed_pub = extract_ed25519_pubkey(&cert_obj).unwrap();
-            let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, &aead_key);
-            let expected_hmac = ring::hmac::sign(&hmac_key, &ed_pub).as_ref().to_vec();
-
-            let orig_sig = extract_cert_signature(&cert_obj).unwrap();
-            let sig_pos = cert_der
-                .windows(64)
-                .rposition(|w| w == orig_sig.as_slice())
-                .unwrap();
-            cert_der[sig_pos..sig_pos + 64].copy_from_slice(&expected_hmac);
-
-            // Certificate 消息封装
-            let mut cert_msg = Vec::new();
-            cert_msg.push(HS_CERT);
-            cert_msg.extend_from_slice(&[0, 0, 0]);
-            cert_msg.push(0); // request_context 长度
-
-            let mut cert_list = Vec::new();
-            let clen = cert_der.len();
-            cert_list.extend_from_slice(&[(clen >> 16) as u8, (clen >> 8) as u8, clen as u8]);
-            cert_list.extend_from_slice(&cert_der);
-            cert_list.extend_from_slice(&[0, 0]); // extensions len = 0
-
-            let tlen = cert_list.len();
-            cert_msg.extend_from_slice(&[(tlen >> 16) as u8, (tlen >> 8) as u8, tlen as u8]);
-            cert_msg.extend_from_slice(&cert_list);
-
-            let cmsg_len = cert_msg.len() - 4;
-            cert_msg[1] = (cmsg_len >> 16) as u8;
-            cert_msg[2] = (cmsg_len >> 8) as u8;
-            cert_msg[3] = cmsg_len as u8;
-
-            transcript.extend_from_slice(&cert_msg);
-
-            // CertificateVerify 签名
-            let mut cv_msg = vec![0x20u8; 64];
-            cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-            cv_msg.push(0);
-            cv_msg.extend_from_slice(&suite.digest(&transcript));
-            let cv_sig = ed_pair.sign(&cv_msg);
-
-            let mut cv = Vec::new();
-            cv.push(HS_CERT_VERIFY);
-            cv.extend_from_slice(&[0, 0, 0]);
-            cv.extend_from_slice(&[0x08, 0x07]); // ED25519
-            cv.extend_from_slice(&(cv_sig.as_ref().len() as u16).to_be_bytes());
-            cv.extend_from_slice(cv_sig.as_ref());
-
-            let cv_len = cv.len() - 4;
-            cv[1] = (cv_len >> 16) as u8;
-            cv[2] = (cv_len >> 8) as u8;
-            cv[3] = cv_len as u8;
-
-            transcript.extend_from_slice(&cv);
-
-            // Server Finished
-            let fk = hkdf_expand_label(
-                &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
-                "finished",
-                &[],
-                suite.hash_len,
-            )
-            .unwrap();
-            let srv_verify_data = ring::hmac::sign(
-                &ring::hmac::Key::new(suite.hmac_alg, &fk),
-                &suite.digest(&transcript),
-            )
-            .as_ref()
-            .to_vec();
-
-            let mut fin = vec![HS_FINISHED, 0, 0, srv_verify_data.len() as u8];
-            fin.extend_from_slice(&srv_verify_data);
-            transcript.extend_from_slice(&fin);
-
-            // 加密发送握手消息
-            let mut hs_content = Vec::new();
-            hs_content.extend_from_slice(&ee);
-            hs_content.extend_from_slice(&cert_msg);
-            hs_content.extend_from_slice(&cv);
-            hs_content.extend_from_slice(&fin);
-            hs_content.push(REC_HANDSHAKE);
-
-            let mut enc_rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
-            let clen = hs_content.len() + 16;
-            enc_rec[3] = (clen >> 8) as u8;
-            enc_rec[4] = clen as u8;
-            let mut sealed = BytesMut::from(hs_content.as_slice());
-            s_hs_dir.seal(&enc_rec, &mut sealed).unwrap();
-            enc_rec.extend_from_slice(&sealed);
-            conn.write_all(&enc_rec).await.unwrap();
-
-            // 6. 读客户端 Finished
-            let mut c_hs_dir = traffic_direction(suite, &c_hs_secret).unwrap();
-            let c_fin_frame = read_record(&mut conn, Some(&mut c_hs_dir)).await.unwrap();
-            match c_fin_frame {
-                Frame::Data { inner, data } => {
-                    assert_eq!(inner, REC_HANDSHAKE);
-                    assert_eq!(data[0], HS_FINISHED);
+                // 6. 读客户端 Finished
+                let mut c_hs_dir = traffic_direction(suite, &c_hs_secret).unwrap();
+                let c_fin_frame = read_record(&mut conn, Some(&mut c_hs_dir)).await.unwrap();
+                match c_fin_frame {
+                    Frame::Data { inner, data } => {
+                        assert_eq!(inner, REC_HANDSHAKE);
+                        assert_eq!(data[0], HS_FINISHED);
+                    }
+                    _ => panic!("Expected client finished"),
                 }
-                _ => panic!("Expected client finished"),
-            }
 
-            // 7. 派生应用流量密钥
-            let d2 = suite.derive_secret(&hs, "derived", &empty_hash).unwrap();
-            let master = suite.extract(&d2, &zeros);
-            let th_fin = suite.digest(&transcript);
-            let s_ap_secret = suite
-                .derive_secret(&master, "s ap traffic", &th_fin)
-                .unwrap();
-            let c_ap_secret = suite
-                .derive_secret(&master, "c ap traffic", &th_fin)
-                .unwrap();
-            let mut s_ap_dir = traffic_direction(suite, &s_ap_secret).unwrap();
-            let mut c_ap_dir = traffic_direction(suite, &c_ap_secret).unwrap();
+                // 7. 派生应用流量密钥
+                let d2 = suite.derive_secret(&hs, "derived", &empty_hash).unwrap();
+                let master = suite.extract(&d2, &zeros);
+                let th_fin = suite.digest(&transcript);
+                let s_ap_secret = suite
+                    .derive_secret(&master, "s ap traffic", &th_fin)
+                    .unwrap();
+                let c_ap_secret = suite
+                    .derive_secret(&master, "c ap traffic", &th_fin)
+                    .unwrap();
+                let mut s_ap_dir = traffic_direction(suite, &s_ap_secret).unwrap();
+                let mut c_ap_dir = traffic_direction(suite, &c_ap_secret).unwrap();
 
-            // 8. 双向数据收发
-            let req_frame = read_record(&mut conn, Some(&mut c_ap_dir)).await.unwrap();
-            let Frame::Data { inner, data } = req_frame else {
-                panic!("Expected app data")
+                // 8. 双向数据收发
+                let req_frame = read_record(&mut conn, Some(&mut c_ap_dir)).await.unwrap();
+                let Frame::Data { inner, data } = req_frame else {
+                    panic!("Expected app data")
+                };
+                assert_eq!(inner, REC_APPDATA);
+                assert_eq!(&data, b"ping reality");
+
+                let mut resp_content = b"pong reality".to_vec();
+                resp_content.push(REC_APPDATA);
+                let mut resp_rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
+                let clen = resp_content.len() + 16;
+                resp_rec[3] = (clen >> 8) as u8;
+                resp_rec[4] = clen as u8;
+                let mut sealed = BytesMut::from(resp_content.as_slice());
+                s_ap_dir.seal(&resp_rec, &mut sealed).unwrap();
+                resp_rec.extend_from_slice(&sealed);
+                conn.write_all(&resp_rec).await.unwrap();
+                conn.flush().await.unwrap();
+            });
+
+            // 客户端连接并验证
+            let client_tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let reality_client_cfg = crate::RealityConfig {
+                public_key: *srv_pub.as_bytes(),
+                short_id,
+                spider_x: Some("/apple".into()),
             };
-            assert_eq!(inner, REC_APPDATA);
-            assert_eq!(&data, b"ping reality");
 
-            let mut resp_content = b"pong reality".to_vec();
-            resp_content.push(REC_APPDATA);
-            let mut resp_rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
-            let clen = resp_content.len() + 16;
-            resp_rec[3] = (clen >> 8) as u8;
-            resp_rec[4] = clen as u8;
-            let mut sealed = BytesMut::from(resp_content.as_slice());
-            s_ap_dir.seal(&resp_rec, &mut sealed).unwrap();
-            resp_rec.extend_from_slice(&sealed);
-            conn.write_all(&resp_rec).await.unwrap();
-        });
-
-        // 客户端连接并验证
-        let client_tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            // 注意：skip_cert_verify 为 false，断言系统 WebPKI 被 REALITY 机制成功绕过并完成强认证
+            let mut client_stream = utls_connect(
+                client_tcp,
+                "www.apple.com",
+                &UtlsConfig {
+                    fingerprint: Fingerprint::Chrome,
+                    server_name: Some("www.apple.com".into()),
+                    alpn: Vec::new(),
+                    skip_cert_verify: false,
+                    reality: Some(reality_client_cfg),
+                },
+            )
             .await
             .unwrap();
-        let reality_client_cfg = crate::RealityConfig {
-            public_key: *srv_pub.as_bytes(),
-            short_id,
-            spider_x: Some("/apple".into()),
-        };
 
-        // 注意：skip_cert_verify 为 false，断言系统 WebPKI 被 REALITY 机制成功绕过并完成强认证
-        let mut client_stream = utls_connect(
-            client_tcp,
-            "www.apple.com",
-            &UtlsConfig {
-                fingerprint: Fingerprint::Chrome,
-                server_name: Some("www.apple.com".into()),
-                alpn: Vec::new(),
-                skip_cert_verify: false,
-                reality: Some(reality_client_cfg),
-            },
-        )
-        .await
-        .unwrap();
+            client_stream.write_all(b"ping reality").await.unwrap();
+            client_stream.flush().await.unwrap();
+            let mut buf = [0u8; 12];
+            client_stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"pong reality");
 
-        client_stream.write_all(b"ping reality").await.unwrap();
-        let mut buf = [0u8; 12];
-        client_stream.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"pong reality");
+            srv_task.await.unwrap();
 
-        srv_task.await.unwrap();
+            // 2. 篡改证书签名测试：客户端必须立即识别并阻断连接
+            let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port2 = listener2.local_addr().unwrap().port();
 
-        // 2. 篡改证书签名测试：客户端必须立即识别并阻断连接
-        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port2 = listener2.local_addr().unwrap().port();
+            let srv_task2 = tokio::spawn(async move {
+                let (mut conn, _) = listener2.accept().await.unwrap();
+                let srv_static_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
 
-        let srv_task2 = tokio::spawn(async move {
-            let (mut conn, _) = listener2.accept().await.unwrap();
-            let srv_static_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
+                let (_, _, ch_body) = read_record_raw(&mut conn).await.unwrap();
+                let mut transcript = ch_body.clone();
+                let rnd = ch_body[6..38].to_vec();
+                let sid = ch_body[39..71].to_vec();
 
-            let (_, _, ch_body) = read_record_raw(&mut conn).await.unwrap();
-            let mut transcript = ch_body.clone();
-            let rnd = ch_body[6..38].to_vec();
-            let sid = ch_body[39..71].to_vec();
+                let mut c = Cursor::new(&ch_body[71..]);
+                let suites_len = c.u16().unwrap() as usize;
+                c.take(suites_len).unwrap();
+                c.take(2).unwrap();
+                let ext_len = c.u16().unwrap() as usize;
+                let exts = c.take(ext_len).unwrap();
 
-            let mut c = Cursor::new(&ch_body[71..]);
-            let suites_len = c.u16().unwrap() as usize;
-            c.take(suites_len).unwrap();
-            c.take(2).unwrap();
-            let ext_len = c.u16().unwrap() as usize;
-            let exts = c.take(ext_len).unwrap();
-
-            let mut e = Cursor::new(exts);
-            let mut client_share = None;
-            while !e.done() {
-                let ty = e.u16().unwrap();
-                let l = e.u16().unwrap() as usize;
-                let val = e.take(l).unwrap();
-                if ty == 51 {
-                    let mut ks = Cursor::new(val);
-                    let _ = ks.u16().unwrap();
-                    let group = ks.u16().unwrap();
-                    let plen = ks.u16().unwrap() as usize;
-                    let key = ks.take(plen).unwrap();
-                    if group == 0x001d {
-                        client_share = Some(key.to_vec());
+                let mut e = Cursor::new(exts);
+                let mut client_share = None;
+                while !e.done() {
+                    let ty = e.u16().unwrap();
+                    let l = e.u16().unwrap() as usize;
+                    let val = e.take(l).unwrap();
+                    if ty == 51 {
+                        let mut ks = Cursor::new(val);
+                        let _ = ks.u16().unwrap();
+                        let group = ks.u16().unwrap();
+                        let plen = ks.u16().unwrap() as usize;
+                        let key = ks.take(plen).unwrap();
+                        if group == 0x001d {
+                            client_share = Some(key.to_vec());
+                        }
                     }
                 }
-            }
-            let client_share = client_share.unwrap();
-            let client_pub = x25519_dalek::PublicKey::from(
-                <[u8; 32]>::try_from(client_share.as_slice()).unwrap(),
-            );
+                let client_share = client_share.unwrap();
+                let client_pub = x25519_dalek::PublicKey::from(
+                    <[u8; 32]>::try_from(client_share.as_slice()).unwrap(),
+                );
 
-            let auth_secret = srv_static_pri.diffie_hellman(&client_pub);
-            let prk = hkdf_extract(&rnd[0..20], auth_secret.as_bytes()).unwrap();
-            let aead_key = hkdf_expand_raw(&prk, b"REALITY", 32).unwrap();
+                let auth_secret = srv_static_pri.diffie_hellman(&client_pub);
+                let prk = hkdf_extract(&rnd[0..20], auth_secret.as_bytes()).unwrap();
+                let aead_key = hkdf_expand_raw(&prk, b"REALITY", 32).unwrap();
 
-            let mut srv_eph_bytes = [0u8; 32];
-            vp_common::rand_bytes(&mut srv_eph_bytes);
-            let srv_eph_pri = x25519_dalek::StaticSecret::from(srv_eph_bytes);
-            let srv_eph_pub = x25519_dalek::PublicKey::from(&srv_eph_pri);
-            let tls_shared = srv_eph_pri.diffie_hellman(&client_pub);
+                let mut srv_eph_bytes = [0u8; 32];
+                vp_common::rand_bytes(&mut srv_eph_bytes);
+                let srv_eph_pri = x25519_dalek::StaticSecret::from(srv_eph_bytes);
+                let srv_eph_pub = x25519_dalek::PublicKey::from(&srv_eph_pri);
+                let tls_shared = srv_eph_pri.diffie_hellman(&client_pub);
 
-            let mut sh_body = Vec::new();
-            sh_body.push(0x02);
-            sh_body.extend_from_slice(&[0, 0, 0]);
-            sh_body.extend_from_slice(&[0x03, 0x03]);
-            let mut srv_rnd = [0u8; 32];
-            vp_common::rand_bytes(&mut srv_rnd);
-            sh_body.extend_from_slice(&srv_rnd);
-            sh_body.push(sid.len() as u8);
-            sh_body.extend_from_slice(&sid);
-            sh_body.extend_from_slice(&[0x13, 0x02]);
-            sh_body.push(0);
+                let mut sh_body = Vec::new();
+                sh_body.push(0x02);
+                sh_body.extend_from_slice(&[0, 0, 0]);
+                sh_body.extend_from_slice(&[0x03, 0x03]);
+                let mut srv_rnd = [0u8; 32];
+                vp_common::rand_bytes(&mut srv_rnd);
+                sh_body.extend_from_slice(&srv_rnd);
+                sh_body.push(sid.len() as u8);
+                sh_body.extend_from_slice(&sid);
+                sh_body.extend_from_slice(&[0x13, 0x02]);
+                sh_body.extend_from_slice(&[0x01, 0x00]);
 
-            let mut sh_exts = Vec::new();
-            ext(&mut sh_exts, 43, &[0x03, 0x04]);
-            let mut ks_val = Vec::new();
-            ks_val.extend_from_slice(&[0x00, 0x1d]);
-            ks_val.extend_from_slice(&32u16.to_be_bytes());
-            ks_val.extend_from_slice(srv_eph_pub.as_bytes());
-            ext(&mut sh_exts, 51, &ks_val);
+                let mut sh_exts = Vec::new();
+                ext(&mut sh_exts, 43, &[0x03, 0x04]);
+                let mut ks_val = Vec::new();
+                ks_val.extend_from_slice(&[0x00, 0x1d]);
+                ks_val.extend_from_slice(&32u16.to_be_bytes());
+                ks_val.extend_from_slice(srv_eph_pub.as_bytes());
+                ext(&mut sh_exts, 51, &ks_val);
 
-            sh_body.extend_from_slice(&(sh_exts.len() as u16).to_be_bytes());
-            sh_body.extend_from_slice(&sh_exts);
-            let sh_len = sh_body.len() - 4;
-            sh_body[1] = (sh_len >> 16) as u8;
-            sh_body[2] = (sh_len >> 8) as u8;
-            sh_body[3] = sh_len as u8;
+                sh_body.extend_from_slice(&(sh_exts.len() as u16).to_be_bytes());
+                sh_body.extend_from_slice(&sh_exts);
+                let sh_len = sh_body.len() - 4;
+                sh_body[1] = (sh_len >> 16) as u8;
+                sh_body[2] = (sh_len >> 8) as u8;
+                sh_body[3] = sh_len as u8;
 
-            let mut sh_rec = Vec::new();
-            sh_rec.extend_from_slice(&[REC_HANDSHAKE, 0x03, 0x03]);
-            sh_rec.extend_from_slice(&(sh_body.len() as u16).to_be_bytes());
-            sh_rec.extend_from_slice(&sh_body);
-            conn.write_all(&sh_rec).await.unwrap();
+                let mut sh_rec = Vec::new();
+                sh_rec.extend_from_slice(&[REC_HANDSHAKE, 0x03, 0x03]);
+                sh_rec.extend_from_slice(&(sh_body.len() as u16).to_be_bytes());
+                sh_rec.extend_from_slice(&sh_body);
+                conn.write_all(&sh_rec).await.unwrap();
 
-            transcript.extend_from_slice(&sh_body);
+                transcript.extend_from_slice(&sh_body);
 
-            let suite = suite_def(0x1302).unwrap();
-            let zeros = vec![0u8; suite.hash_len];
-            let early = suite.extract(&zeros, &zeros);
-            let empty_hash = suite.digest(&[]);
-            let d1 = suite.derive_secret(&early, "derived", &empty_hash).unwrap();
-            let hs = suite.extract(&d1, tls_shared.as_bytes());
-            let th_sh = suite.digest(&transcript);
-            let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
-            let mut s_hs_dir = traffic_direction(suite, &s_hs_secret).unwrap();
+                let suite = suite_def(0x1302).unwrap();
+                let zeros = vec![0u8; suite.hash_len];
+                let early = suite.extract(&zeros, &zeros);
+                let empty_hash = suite.digest(&[]);
+                let d1 = suite.derive_secret(&early, "derived", &empty_hash).unwrap();
+                let hs = suite.extract(&d1, tls_shared.as_bytes());
+                let th_sh = suite.digest(&transcript);
+                let s_hs_secret = suite.derive_secret(&hs, "s hs traffic", &th_sh).unwrap();
+                let mut s_hs_dir = traffic_direction(suite, &s_hs_secret).unwrap();
 
-            let ee = vec![HS_EE, 0, 0, 2, 0, 0];
-            transcript.extend_from_slice(&ee);
+                let ee = vec![HS_EE, 0, 0, 2, 0, 0];
+                transcript.extend_from_slice(&ee);
 
-            let rcgen_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
-            let pkcs8 = rcgen_kp.serialize_der();
-            let ed_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
-            let params = rcgen::CertificateParams::new(vec!["www.apple.com".to_string()]).unwrap();
-            let cert = params.self_signed(&rcgen_kp).unwrap();
-            let mut cert_der = cert.der().to_vec();
+                let rcgen_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+                let pkcs8 = rcgen_kp.serialize_der();
+                let ed_pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+                let params =
+                    rcgen::CertificateParams::new(vec!["www.apple.com".to_string()]).unwrap();
+                let cert = params.self_signed(&rcgen_kp).unwrap();
+                let mut cert_der = cert.der().to_vec();
 
-            let cert_obj = CertificateDer::from(cert_der.clone());
-            let ed_pub = extract_ed25519_pubkey(&cert_obj).unwrap();
-            let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, &aead_key);
-            let mut tampered_hmac = ring::hmac::sign(&hmac_key, &ed_pub).as_ref().to_vec();
-            // 故意篡改 HMAC 签名字节
-            tampered_hmac[0] ^= 0xff;
+                let cert_obj = CertificateDer::from(cert_der.clone());
+                let ed_pub = extract_ed25519_pubkey(&cert_obj).unwrap();
+                let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, &aead_key);
+                let mut tampered_hmac = ring::hmac::sign(&hmac_key, &ed_pub).as_ref().to_vec();
+                // 故意篡改 HMAC 签名字节
+                tampered_hmac[0] ^= 0xff;
 
-            let orig_sig = extract_cert_signature(&cert_obj).unwrap();
-            let sig_pos = cert_der
-                .windows(64)
-                .rposition(|w| w == orig_sig.as_slice())
+                let orig_sig = extract_cert_signature(&cert_obj).unwrap();
+                let sig_pos = cert_der
+                    .windows(64)
+                    .rposition(|w| w == orig_sig.as_slice())
+                    .unwrap();
+                cert_der[sig_pos..sig_pos + 64].copy_from_slice(&tampered_hmac);
+
+                let mut cert_msg = Vec::new();
+                cert_msg.push(HS_CERT);
+                cert_msg.extend_from_slice(&[0, 0, 0]);
+                cert_msg.push(0);
+
+                let mut cert_list = Vec::new();
+                let clen = cert_der.len();
+                cert_list.extend_from_slice(&[(clen >> 16) as u8, (clen >> 8) as u8, clen as u8]);
+                cert_list.extend_from_slice(&cert_der);
+                cert_list.extend_from_slice(&[0, 0]);
+
+                let tlen = cert_list.len();
+                cert_msg.extend_from_slice(&[(tlen >> 16) as u8, (tlen >> 8) as u8, tlen as u8]);
+                cert_msg.extend_from_slice(&cert_list);
+
+                let cmsg_len = cert_msg.len() - 4;
+                cert_msg[1] = (cmsg_len >> 16) as u8;
+                cert_msg[2] = (cmsg_len >> 8) as u8;
+                cert_msg[3] = cmsg_len as u8;
+
+                transcript.extend_from_slice(&cert_msg);
+
+                let mut cv_msg = vec![0x20u8; 64];
+                cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+                cv_msg.push(0);
+                cv_msg.extend_from_slice(&suite.digest(&transcript));
+                let cv_sig = ed_pair.sign(&cv_msg);
+
+                let mut cv = Vec::new();
+                cv.push(HS_CERT_VERIFY);
+                cv.extend_from_slice(&[0, 0, 0]);
+                cv.extend_from_slice(&[0x08, 0x07]);
+                cv.extend_from_slice(&(cv_sig.as_ref().len() as u16).to_be_bytes());
+                cv.extend_from_slice(cv_sig.as_ref());
+
+                let cv_len = cv.len() - 4;
+                cv[1] = (cv_len >> 16) as u8;
+                cv[2] = (cv_len >> 8) as u8;
+                cv[3] = cv_len as u8;
+
+                transcript.extend_from_slice(&cv);
+
+                let fk = hkdf_expand_label(
+                    &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
+                    "finished",
+                    &[],
+                    suite.hash_len,
+                )
                 .unwrap();
-            cert_der[sig_pos..sig_pos + 64].copy_from_slice(&tampered_hmac);
+                let srv_verify_data = ring::hmac::sign(
+                    &ring::hmac::Key::new(suite.hmac_alg, &fk),
+                    &suite.digest(&transcript),
+                )
+                .as_ref()
+                .to_vec();
 
-            let mut cert_msg = Vec::new();
-            cert_msg.push(HS_CERT);
-            cert_msg.extend_from_slice(&[0, 0, 0]);
-            cert_msg.push(0);
+                let mut fin = vec![HS_FINISHED, 0, 0, srv_verify_data.len() as u8];
+                fin.extend_from_slice(&srv_verify_data);
 
-            let mut cert_list = Vec::new();
-            let clen = cert_der.len();
-            cert_list.extend_from_slice(&[(clen >> 16) as u8, (clen >> 8) as u8, clen as u8]);
-            cert_list.extend_from_slice(&cert_der);
-            cert_list.extend_from_slice(&[0, 0]);
+                let mut hs_content = Vec::new();
+                hs_content.extend_from_slice(&ee);
+                hs_content.extend_from_slice(&cert_msg);
+                hs_content.extend_from_slice(&cv);
+                hs_content.extend_from_slice(&fin);
+                hs_content.push(REC_HANDSHAKE);
 
-            let tlen = cert_list.len();
-            cert_msg.extend_from_slice(&[(tlen >> 16) as u8, (tlen >> 8) as u8, tlen as u8]);
-            cert_msg.extend_from_slice(&cert_list);
+                let mut enc_rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
+                let clen = hs_content.len() + 16;
+                enc_rec[3] = (clen >> 8) as u8;
+                enc_rec[4] = clen as u8;
+                let mut sealed = BytesMut::from(hs_content.as_slice());
+                s_hs_dir.seal(&enc_rec, &mut sealed).unwrap();
+                enc_rec.extend_from_slice(&sealed);
+                let _ = conn.write_all(&enc_rec).await;
+                let _ = conn.flush().await;
+            });
 
-            let cmsg_len = cert_msg.len() - 4;
-            cert_msg[1] = (cmsg_len >> 16) as u8;
-            cert_msg[2] = (cmsg_len >> 8) as u8;
-            cert_msg[3] = cmsg_len as u8;
+            let client_tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2))
+                .await
+                .unwrap();
+            let reality_client_cfg = crate::RealityConfig {
+                public_key: *srv_pub.as_bytes(),
+                short_id,
+                spider_x: None,
+            };
 
-            transcript.extend_from_slice(&cert_msg);
-
-            let mut cv_msg = vec![0x20u8; 64];
-            cv_msg.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-            cv_msg.push(0);
-            cv_msg.extend_from_slice(&suite.digest(&transcript));
-            let cv_sig = ed_pair.sign(&cv_msg);
-
-            let mut cv = Vec::new();
-            cv.push(HS_CERT_VERIFY);
-            cv.extend_from_slice(&[0, 0, 0]);
-            cv.extend_from_slice(&[0x08, 0x07]);
-            cv.extend_from_slice(&(cv_sig.as_ref().len() as u16).to_be_bytes());
-            cv.extend_from_slice(cv_sig.as_ref());
-
-            let cv_len = cv.len() - 4;
-            cv[1] = (cv_len >> 16) as u8;
-            cv[2] = (cv_len >> 8) as u8;
-            cv[3] = cv_len as u8;
-
-            transcript.extend_from_slice(&cv);
-
-            let fk = hkdf_expand_label(
-                &ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, &s_hs_secret),
-                "finished",
-                &[],
-                suite.hash_len,
+            let err = utls_connect(
+                client_tcp2,
+                "www.apple.com",
+                &UtlsConfig {
+                    fingerprint: Fingerprint::Chrome,
+                    server_name: Some("www.apple.com".into()),
+                    alpn: Vec::new(),
+                    skip_cert_verify: false,
+                    reality: Some(reality_client_cfg),
+                },
             )
-            .unwrap();
-            let srv_verify_data = ring::hmac::sign(
-                &ring::hmac::Key::new(suite.hmac_alg, &fk),
-                &suite.digest(&transcript),
-            )
-            .as_ref()
-            .to_vec();
-
-            let mut fin = vec![HS_FINISHED, 0, 0, srv_verify_data.len() as u8];
-            fin.extend_from_slice(&srv_verify_data);
-
-            let mut hs_content = Vec::new();
-            hs_content.extend_from_slice(&ee);
-            hs_content.extend_from_slice(&cert_msg);
-            hs_content.extend_from_slice(&cv);
-            hs_content.extend_from_slice(&fin);
-            hs_content.push(REC_HANDSHAKE);
-
-            let mut enc_rec = vec![REC_APPDATA, 0x03, 0x03, 0, 0];
-            let clen = hs_content.len() + 16;
-            enc_rec[3] = (clen >> 8) as u8;
-            enc_rec[4] = clen as u8;
-            let mut sealed = BytesMut::from(hs_content.as_slice());
-            s_hs_dir.seal(&enc_rec, &mut sealed).unwrap();
-            enc_rec.extend_from_slice(&sealed);
-            let _ = conn.write_all(&enc_rec).await;
-        });
-
-        let client_tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port2))
             .await
-            .unwrap();
-        let reality_client_cfg = crate::RealityConfig {
-            public_key: *srv_pub.as_bytes(),
-            short_id,
-            spider_x: None,
-        };
+            .err()
+            .expect("篡改证书签名必须被客户端阻断拒绝");
 
-        let err = utls_connect(
-            client_tcp2,
-            "www.apple.com",
-            &UtlsConfig {
-                fingerprint: Fingerprint::Chrome,
-                server_name: Some("www.apple.com".into()),
-                alpn: Vec::new(),
-                skip_cert_verify: false,
-                reality: Some(reality_client_cfg),
-            },
-        )
+            assert!(
+                err.to_string().contains("HMAC-SHA512"),
+                "错误信息应包含 HMAC-SHA512 失败: {err}"
+            );
+            srv_task2.await.unwrap();
+        })
         .await
-        .err()
-        .expect("篡改证书签名必须被客户端阻断拒绝");
-
-        assert!(
-            err.to_string().contains("HMAC-SHA512"),
-            "错误信息应包含 HMAC-SHA512 失败: {err}"
-        );
-        srv_task2.await.unwrap();
+        .expect("e2e_reality_handshake_and_tamper_detection 超时（15s）");
     }
 }

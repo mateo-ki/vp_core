@@ -96,11 +96,11 @@ fn apply_unix_outbound_opts(
     socket: &socket2::Socket,
     _is_ipv6: bool,
     if_name_opt: Option<&str>,
-    routing_mark_opt: Option<u32>,
+    _routing_mark_opt: Option<u32>,
 ) {
     #[cfg(target_os = "linux")]
     {
-        let mark = routing_mark_opt.or_else(get_routing_mark);
+        let mark = _routing_mark_opt.or_else(get_routing_mark);
         if let Some(m) = mark {
             let _ = socket.set_mark(m);
         }

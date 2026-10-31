@@ -127,6 +127,20 @@ fn take_ech_retry_config(host: &str) -> Option<Arc<Vec<u8>>> {
     ech_retry_configs().lock().unwrap().remove(host)
 }
 
+fn clear_ech_retry_config(host: &str) {
+    ech_retry_configs().lock().unwrap().remove(host);
+}
+
+/// ECH 被拒后的决策：服务端这次下发的 retry config 是否还值得再试一次 ECH。
+/// 只有"与刚被拒的这份配置不同"才值得（服务端轮换了密钥的标准 ECH 流程）；
+/// 原样吐回同一份（或根本没给）说明 ECH 已确认不可用，再试只是浪费两轮握手。
+fn should_retry_ech_with(received: Option<Arc<Vec<u8>>>, used: &[u8]) -> bool {
+    match received {
+        Some(r) => r.as_slice() != used,
+        None => false,
+    }
+}
+
 /// 从 tokio-rustls 握手错误中提取服务端下发的 ECHConfigList（重编码回 wire 格式）
 fn ech_retry_list_from(err: &std::io::Error) -> Option<Arc<Vec<u8>>> {
     use tokio_rustls::rustls::Error;
@@ -320,12 +334,19 @@ pub async fn tls_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
                     return Ok(s);
                 }
                 Err(e) => {
-                    // 服务端拒绝/不支持 ECH：缓存其下发的 retry config（若有），
-                    // 标记主机，由 transport::dial 重拨（有 retry config 则再试 ECH，
-                    // 否则回退普通 TLS）
-                    if let Some(retry) = ech_retry_list_from(&e) {
-                        tracing::info!("ECH 被拒，已缓存服务端 retry config 重试: {host}");
-                        note_ech_retry_config(host, retry);
+                    // 服务端拒绝 ECH 的三种结局（由 transport::dial 的重拨承接）：
+                    // - 给出与刚用过的不同的 retry config → 缓存，重拨再试一次 ECH；
+                    // - 原样吐回同一份配置（本机实测 Cloudflare 被拒时就是这种行为）
+                    //   或没给 → 清缓存，重拨直接走普通 TLS。
+                    // 注意绝不能无条件缓存 retry config：dial 只重拨一次，若重拨又带着
+                    // 同一份配置撞同一堵墙，普通 TLS 永远轮不到，连接就此判死。
+                    let retry = ech_retry_list_from(&e);
+                    if should_retry_ech_with(retry.clone(), &list) {
+                        tracing::info!("ECH 被拒，服务端给出新的 retry config，重拨重试: {host}");
+                        note_ech_retry_config(host, retry.expect("should_retry 已确认 Some"));
+                    } else {
+                        tracing::info!("ECH 被拒且无新配置可用，本次回退普通 TLS: {host}");
+                        clear_ech_retry_config(host);
                     }
                     tracing::warn!("ECH 握手失败（{e}），回退普通 TLS: {host}");
                     note_ech_rejected(host);
@@ -383,6 +404,25 @@ pub async fn connect_tls<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ECH 被拒后的决策边界：宁可回退普通 TLS，也不用同一份被拒配置反复撞墙。
+    /// （回归背景：服务端把刚拒掉的同一份 retry config 原样吐回时，旧逻辑无条件
+    /// 缓存重试，dial 单次重拨撞同一堵墙，普通 TLS 永远轮不到，节点整体判死。）
+    #[test]
+    fn ech_retry_decision_only_for_fresh_config() {
+        let used: Arc<Vec<u8>> = Arc::new(vec![1, 2, 3]);
+        let same = used.clone();
+        let fresh: Arc<Vec<u8>> = Arc::new(vec![4, 5, 6]);
+        assert!(!should_retry_ech_with(None, &used), "没给 retry config → 放弃");
+        assert!(
+            !should_retry_ech_with(Some(same), &used),
+            "原样吐回刚被拒的同一份 → 放弃"
+        );
+        assert!(
+            should_retry_ech_with(Some(fresh), &used),
+            "全新配置 → 按标准 ECH 流程再试一次"
+        );
+    }
 
     #[tokio::test]
     async fn tls_loopback_self_signed() {

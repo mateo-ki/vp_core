@@ -145,6 +145,13 @@ pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::
     tokio::net::TcpStream::connect(addr).await
 }
 
+/// 非 Windows：Linux/macOS 的 TUN 防回环走策略路由 / BSD 路由栈，无需套接字级绑定，
+/// 保持普通拨号（与本次改动前行为一致）。
+#[cfg(not(windows))]
+pub async fn connect_tcp_bound(addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+    tokio::net::TcpStream::connect(addr).await
+}
+
 #[cfg(windows)]
 fn bind_socket_to_interface(
     socket: &socket2::Socket,

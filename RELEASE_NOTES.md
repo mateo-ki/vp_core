@@ -1,3 +1,24 @@
+# 🚀 VP_Core v1.3.0 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.3.0**！本版是 **Linux 透明网关（Armbian / N1 / 软路由）生产级修复专项 + Tailscale 集成**，同时修复 4 项透明网关重大故障、全新 TPROXY 数据面与 Tailscale 出站：
+
+### 🛠 透明网关四大故障根治（P0）
+- **geoip.metadb 加载成功但查询全失效**：重写 MMDB 记录反序列化——`#[serde(untagged)]` 多态模型统一兼容 MaxMind 官方嵌套格式（`{country:{iso_code}}`）、MetaCubeX `meta-rules-dat`（纯字符串 / 字符串数组）与 sing-geoip 扁平字典，`GEOIP` 规则全面恢复判定；
+- **DIRECT 直连吞吐被卡 ~2 MB/s**：双重病根一次根除——`redir` 入站 `accept()` 补齐 `tune()`（`TCP_NODELAY`，消除与 Delayed-ACK 的 40ms Nagle 空转）；嗅探层 `PeekedStream` 透传底座 socket 与预读缓冲，直连流量在排空首包后全面切入 Linux `splice` 管道零拷贝；
+- **tproxy-port 收包后不处理**：全新原生 Linux `TproxyInbound`——TCP 侧 `IP_TRANSPARENT` 监听直接提取原始目标；UDP 侧 `recvmsg` 解析 `IP_ORIGDSTADDR` cmsg 辅助数据 + 绑定原目标的透明回包套接字，60 秒空闲 NAT 流表自动回收；
+- **dns.listen 被忽略**：`dns.listen` 解除对 `tun.enable` 的从属绑定，支持 `0.0.0.0:53` / `:53` / `127.0.0.1:1053` 等写法独立启动 UDP + TCP（RFC 7766）DNS 服务端。
+
+### 🆕 新特性
+- **Tailscale 出站（`type: tailscale`）**：经本机/远程 Tailscale Connector 的 SOCKS5 接口（默认 `127.0.0.1:1055`）接入 Tailnet，支持 `exit-node` 出口节点、UDP 中继、`dialer-proxy` 链式与 smux 包装；`*.ts.net`（MagicDNS）内置永不 Fake-IP，点对点 `100.64/10` 通信不被劫持；
+- **listeners 段统一多入站**：`inbounds:`/`listeners:` 段现支持 `tproxy` / `redir` / `mixed` / `socks5` / `http` 及全部协议服务端，新增 `listen` 绑定字段，与顶层 `tproxy-port` / `redir-port` 并存兼容；
+- **TPROXY 健壮性加固**：UDP 收包循环锁外投递与建连（消除持锁死锁链：流任务终止回收与通道满互等可致全局收包器瘫痪）；cmsg 缺失严格报错丢弃（iptables 误用 REDIRECT 目标时不再静默错误路由）。
+
+### 🔧 数据面微调
+- 转发泵链读阈值由"读满整块"放宽为"≥2KB 持续灌入"，保持"探一眼"绝不持数据等待的死锁防线；
+- AEAD 微基准改为 `#[ignore]` 手动压测，常规 `cargo test` 套件提速约 1 分钟。
+
+---
+
 # 🚀 VP_Core v1.2.0 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.2.0**！本版正式打通外部控制器 REST API 模式热切能力，实现「规则 / 全局 / 直连」运行中免停秒级无感热切换：

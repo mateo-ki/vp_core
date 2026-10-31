@@ -1,4 +1,19 @@
-# 🚀 VP_Core v1.3.0 发布说明 / Release Notes
+# 🚀 VP_Core v1.3.1 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.3.1**！本版是 **Windows TUN 防回环专项 + ECH 回退修复**，根治"开启 TUN 后整机断网"与"节点 ECH 被拒后连接判死"两大故障：
+
+### 🛡 TUN 防回环专项（Windows，P0）
+- **出站套接字补齐源 IP 显式绑定**：只设 `IP_UNICAST_IF` 时，Windows 的源地址 / 路由选择仍按路由表走 —— auto-route 下即 TUN 自身（198.18.0.1），节点拨号与 DNS 查询全部流回自己形成回环，表现为 **TUN 开启后整机断网**（Baidu 直连域名也解析失败：DNS 上游一并被吞）。现在 TCP / UDP 出站统一 `UNICAST_IF + 源 IP 绑定`（`GetIpAddrTable` 解析网卡 IP），节点拨号、DoH、DoT、UDP 上游全覆盖；
+- **DNS 上游裸拨号根治**：DoH / DoT / DNS-over-TCP 三处裸 `TcpStream::connect`（未绑物理网卡）统一切换绑卡拨号 `connect_tcp_bound`；此前 auto-route 下内核自己的 DNS 上游查询会以 TUN 地址为源回流，被当成客户端流量再走 PROXY，雪崩式放大；
+- **auto-route 可观测性**：双 /1 接管路由的 `route add` 逐条校验并落日志，报错详情从 stdout 提取（route.exe 报错打在 stdout 且中文系统为 GBK），失败时明确告警"仅成功 N/2，TUN 无法接管全部系统流量"。
+
+### 🔐 ECH 被拒回退修复（P0）
+- **不再用同一份被拒配置反复撞墙**：服务端拒绝 ECH 且原样吐回同一份 retry config 时，旧逻辑无条件缓存并重拨重试 —— `dial` 单次重拨撞同一堵墙，普通 TLS 永远轮不到，连接以 `ECH_REJECTED_FALLBACK` 判死，节点整体不可用；
+- **新的状态机**：仅当服务端给出**不同于刚被拒那份**的新 retry config 才按标准 ECH 流程再试一次；否则清缓存、标记主机，重拨直接走普通 TLS，收敛路径固定为 `ECH(DNS 配置) → ECH(retry) → 普通 TLS`，之后该主机记住结论不再浪费握手；
+- 新增决策边界回归测试；节点服务端 ECH 配置轮换（Cloudflare 常见）不再导致节点假死。
+
+---
+
 
 🎉 欢迎使用 **VP_Core v1.3.0**！本版是 **Linux 透明网关（Armbian / N1 / 软路由）生产级修复专项 + Tailscale 集成**，同时修复 4 项透明网关重大故障、全新 TPROXY 数据面与 Tailscale 出站：
 

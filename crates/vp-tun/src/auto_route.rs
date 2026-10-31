@@ -8,7 +8,9 @@
 
 use std::net::IpAddr;
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
 
 use vp_common::{Error, Result};
 

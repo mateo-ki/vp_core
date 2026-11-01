@@ -157,6 +157,18 @@ pub fn run(args: GenServerArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     yaml.push_str("listeners:\n");
 
+    if domain_opt.is_some() {
+        yaml.push_str(
+            "  # 0. VLESS + WebSocket 监听 (由 Nginx / Caddy 443 反代，完美穿透 Cloudflare CDN 拯救被墙 VPS)\n",
+        );
+        yaml.push_str("  - name: vless-ws-in\n");
+        yaml.push_str("    type: vless\n");
+        yaml.push_str("    listen: 127.0.0.1\n");
+        yaml.push_str("    port: 28289\n");
+        yaml.push_str("    users:\n");
+        yaml.push_str(&format!("      - \"{uuid}\"\n\n"));
+    }
+
     if gen_reality {
         yaml.push_str(&format!(
             "  # 1. VLESS + REALITY 原生监听 (端口 {} / 借用大厂证书伪装与透明探测回落)\n",
@@ -772,7 +784,7 @@ mod tests {
         let yaml = fs::read_to_string(&out_file).unwrap();
         let cfg = vp_config::parse_and_validate(&yaml, vp_config::Format::Yaml)
             .expect("生成的服务端 YAML 应当通过格式与逻辑校验");
-        assert_eq!(cfg.listeners.len(), 3);
+        assert_eq!(cfg.listeners.len(), 4);
         assert_eq!(cfg.external_controller.as_deref(), Some("0.0.0.0:2080"));
         assert_eq!(cfg.secret.as_deref(), Some("testtoken123"));
 

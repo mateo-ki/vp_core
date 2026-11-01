@@ -89,17 +89,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let buf = read_until_header_end(&mut io).await?;
-    let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
-    if !head.contains("upgrade: websocket") {
+    let head = String::from_utf8_lossy(&buf);
+    let head_lower = head.to_ascii_lowercase();
+    if !head_lower.contains("upgrade: websocket") {
         return Err(Error::Proto("ws: 非 websocket 升级请求"));
     }
-    let key = extract_header(&head, "sec-websocket-key")
+    let key = extract_header_case_insensitive(&head, "sec-websocket-key")
         .ok_or(Error::Proto("ws: 缺少 Sec-WebSocket-Key"))?;
-    let mut hasher = sha1::Sha1::new();
-    use sha1::Digest;
-    hasher.update(key.as_bytes());
-    hasher.update(GUID.as_bytes());
-    let accept = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+    let accept = compute_ws_accept(&key);
     io.write_all(
         format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -145,10 +142,10 @@ async fn read_until_header_end<S: AsyncRead + Unpin>(io: &mut S) -> Result<Vec<u
     }
 }
 
-fn extract_header(head_lower: &str, name: &str) -> Option<String> {
-    for line in head_lower.lines() {
+fn extract_header_case_insensitive(head: &str, name: &str) -> Option<String> {
+    for line in head.lines() {
         if let Some((k, v)) = line.split_once(':') {
-            if k.trim() == name {
+            if k.trim().eq_ignore_ascii_case(name) {
                 return Some(v.trim().to_string());
             }
         }

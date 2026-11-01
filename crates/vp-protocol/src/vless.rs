@@ -472,7 +472,7 @@ impl VlessInbound {
 
     async fn handle_fallback_or_err(
         &self,
-        stream: tokio::net::TcpStream,
+        stream: Box<dyn ProxyStream>,
         peeked: &[u8],
         err: Error,
     ) -> Result<()> {
@@ -501,7 +501,28 @@ impl VlessInbound {
 
     async fn serve(
         self: &Arc<Self>,
-        mut stream: tokio::net::TcpStream,
+        stream: tokio::net::TcpStream,
+        src: std::net::SocketAddr,
+        ctx: &InboundCtx,
+    ) -> Result<()> {
+        let mut peek = [0u8; 512];
+        let is_ws = match stream.peek(&mut peek).await {
+            Ok(n) if n >= 4 => {
+                let s = String::from_utf8_lossy(&peek[..n]).to_ascii_lowercase();
+                s.contains("upgrade: websocket")
+            }
+            _ => false,
+        };
+        if is_ws {
+            let ws = vp_transport::ws_handshake_server(stream).await?;
+            return self.serve_stream(Box::new(ws), src, ctx).await;
+        }
+        self.serve_stream(Box::new(stream), src, ctx).await
+    }
+
+    async fn serve_stream(
+        self: &Arc<Self>,
+        mut stream: Box<dyn ProxyStream>,
         src: std::net::SocketAddr,
         ctx: &InboundCtx,
     ) -> Result<()> {
@@ -817,6 +838,68 @@ mod tests {
         if enc.is_some() {
             crate::test_support::assert_udp_second_target(&mut conn).await;
         }
+    }
+
+    #[tokio::test]
+    async fn vless_ws_inbound_outbound_e2e() {
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 1024];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let uuid = "4a4cb40d-d1a7-493e-a54d-5f154534cd93".to_string();
+        let server =
+            VlessInbound::new("127.0.0.1", 0, "vl-ws-srv", std::slice::from_ref(&uuid)).unwrap();
+        let port = Arc::new(server).start(ctx).await.unwrap();
+
+        let out = VlessOutbound::new(&VlessCfg {
+            server: "127.0.0.1".into(),
+            port,
+            uuid,
+            flow: None,
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            alpn: None,
+            network: Some("ws".into()),
+            ws_opts: Some(vp_config::WsOpts {
+                path: Some("/vpcore-tunnel".into()),
+                headers: None,
+                max_early_data: None,
+                v2ray_http_upgrade: false,
+            }),
+            grpc_opts: None,
+            http_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
+        })
+        .unwrap();
+        let dst = DstAddr::new("127.0.0.1", echo_addr.port());
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out.connect_stream(&sess, &dst).await.unwrap();
+        s.write_all(b"ping-vless-ws").await.unwrap();
+        let mut buf = [0u8; 13];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-vless-ws");
     }
 
     #[tokio::test]

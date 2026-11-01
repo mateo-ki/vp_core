@@ -1,7 +1,9 @@
-//! uTLS 指纹：手写 TLS 1.3 客户端（Chrome 指纹）。
+//! uTLS：REALITY 专用的手写 TLS 1.3 客户端。
 //!
-//! 服务器侧指纹（JA3/JA4 等）只看 ClientHello：本模块自绘 Chrome 风格 CH
-//! （套件/扩展/顺序对齐 Chrome），随后以标准 TLS 1.3 握手完成后续（RFC 8446）。
+//! 服务器侧指纹（JA3/JA4 等）只看 ClientHello：本模块只有一套内置 CH 模板，扩展顺序参照
+//! 早期 Chrome，但不含 GREASE / compress_certificate / ALPS / 后量子密钥交换等，与当前真实
+//! Chrome 的指纹并不一致；client-fingerprint 只做取值校验，不会切换模板。
+//! 随后以标准 TLS 1.3 握手完成后续（RFC 8446）。
 //! 密码原语全部复用 ring（rustls 已链接，零新增依赖、零体积增量）：
 //! x25519（agreement）/ HKDF-SHA256 / SHA256 / HMAC / AES-GCM / CHACHA20-POLY1305。
 //!
@@ -44,48 +46,32 @@ const HRR_RANDOM: [u8; 32] = [
     0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 ];
 
-/// 支持的 TLS ClientHello 浏览器指纹
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fingerprint {
-    Chrome,
-    Firefox,
-    Safari,
-    Ios,
-    Edge,
-    Android,
-    Qq,
-    Random,
-}
-
-impl Fingerprint {
-    pub fn parse(s: &str) -> Result<Self> {
-        let lower = s.trim().to_ascii_lowercase();
-        if lower == "chrome" || lower.starts_with("chrome_") {
-            Ok(Fingerprint::Chrome)
-        } else if lower == "firefox" || lower.starts_with("firefox_") {
-            Ok(Fingerprint::Firefox)
-        } else if lower == "safari" || lower.starts_with("safari_") {
-            Ok(Fingerprint::Safari)
-        } else if lower == "ios" || lower.starts_with("ios_") {
-            Ok(Fingerprint::Ios)
-        } else if lower == "edge" || lower.starts_with("edge_") {
-            Ok(Fingerprint::Edge)
-        } else if lower == "android" || lower.starts_with("android_") {
-            Ok(Fingerprint::Android)
-        } else if lower == "qq" || lower == "360" {
-            Ok(Fingerprint::Qq)
-        } else if lower == "random" || lower == "randomized" {
-            Ok(Fingerprint::Random)
-        } else {
-            Err(Error::Unsupported(format!(
-                "TLS 指纹 {lower:?} 暂不支持（支持 chrome/firefox/safari/ios/edge/android/qq/random）"
-            )))
-        }
+/// 校验 client-fingerprint 取值。ClientHello 只有一套内置模板（build_ch），取值不改变发出的报文：
+/// Ok(true) 为 chrome 系；Ok(false) 为合法但未单独实现的指纹（调用方负责告警）；未知取值报错。
+pub fn is_chrome_fingerprint(s: &str) -> Result<bool> {
+    let lower = s.trim().to_ascii_lowercase();
+    let family = |name: &str| {
+        lower == name
+            || lower
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('_'))
+    };
+    if family("chrome") {
+        Ok(true)
+    } else if ["firefox", "safari", "ios", "edge", "android"]
+        .into_iter()
+        .any(family)
+        || matches!(lower.as_str(), "qq" | "360" | "random" | "randomized")
+    {
+        Ok(false)
+    } else {
+        Err(Error::Unsupported(format!(
+            "TLS 指纹 {lower:?} 暂不支持（支持 chrome/firefox/safari/ios/edge/android/qq/360/random）"
+        )))
     }
 }
 
 pub struct UtlsConfig {
-    pub fingerprint: Fingerprint,
     pub server_name: Option<String>,
     pub alpn: Vec<String>,
     pub skip_cert_verify: bool,
@@ -1660,7 +1646,6 @@ mod tests {
             tcp,
             "localhost",
             &UtlsConfig {
-                fingerprint: Fingerprint::Chrome,
                 server_name: Some("localhost".into()),
                 alpn: Vec::new(),
                 skip_cert_verify: true,
@@ -1737,7 +1722,6 @@ mod tests {
             tcp,
             "localhost",
             &UtlsConfig {
-                fingerprint: Fingerprint::Chrome,
                 server_name: Some("localhost".into()),
                 alpn: vec!["h2".into(), "http/1.1".into()],
                 skip_cert_verify: true,
@@ -1752,25 +1736,27 @@ mod tests {
         assert_eq!(&buf, b"alpn-ok");
     }
 
-    #[tokio::test]
-    async fn e2e_fingerprint_config_error() {
-        for valid in [
-            "chrome",
+    #[test]
+    fn fingerprint_names_validated() {
+        assert!(is_chrome_fingerprint("chrome").unwrap());
+        assert!(is_chrome_fingerprint(" Chrome_120 ").unwrap());
+        for other in [
             "firefox",
             "safari",
             "ios",
             "edge",
             "android",
             "qq",
+            "360",
             "random",
             "randomized",
         ] {
             assert!(
-                Fingerprint::parse(valid).is_ok(),
-                "{valid} 指纹应当解析成功"
+                !is_chrome_fingerprint(other).unwrap(),
+                "{other} 合法但未单独实现，应走告警分支"
             );
         }
-        assert!(Fingerprint::parse("unknown_browser").is_err());
+        assert!(is_chrome_fingerprint("unknown_browser").is_err());
     }
 
     #[test]
@@ -2177,7 +2163,6 @@ mod tests {
                 client_tcp,
                 "www.apple.com",
                 &UtlsConfig {
-                    fingerprint: Fingerprint::Chrome,
                     server_name: Some("www.apple.com".into()),
                     alpn: Vec::new(),
                     skip_cert_verify: false,
@@ -2407,7 +2392,6 @@ mod tests {
                 client_tcp2,
                 "www.apple.com",
                 &UtlsConfig {
-                    fingerprint: Fingerprint::Chrome,
                     server_name: Some("www.apple.com".into()),
                     alpn: Vec::new(),
                     skip_cert_verify: false,

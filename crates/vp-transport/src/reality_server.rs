@@ -717,7 +717,7 @@ where
 mod tests {
     use super::*;
     use crate::RealityConfig;
-    use crate::utls::{Fingerprint, UtlsConfig, utls_connect};
+    use crate::utls::{UtlsConfig, utls_connect};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
@@ -762,7 +762,6 @@ mod tests {
             .await
             .unwrap();
         let utls_cfg = UtlsConfig {
-            fingerprint: Fingerprint::Chrome,
             server_name: Some("www.apple.com".into()),
             alpn: vec!["h2".into(), "http/1.1".into()],
             skip_cert_verify: false,

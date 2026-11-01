@@ -67,7 +67,7 @@ rules:
 | :--- | :--- |
 | **入站 (Inbound)** | Mixed (HTTP+Socks5 自适应)、TUN (用户态网络栈)、Redir / TProxy、服务端监听 (Trojan/VLESS/SS 等) |
 | **出站 (Outbound)** | VLESS (Vision/REALITY)、VMess、Trojan、Shadowsocks (AEAD/2022)、Snell v1-v4、Hysteria 2、TUIC v5、ShadowsocksR、WireGuard、SSH、Direct、Reject |
-| **传输层 (Transport)** | TCP、TLS 1.3、WebSocket、gRPC、QUIC、uTLS 真实指纹、XTLS-Vision 流控、smux 多路复用 |
+| **传输层 (Transport)** | TCP、TLS 1.3、WebSocket、gRPC、QUIC、uTLS ClientHello（仅 REALITY）、XTLS-Vision 流控、smux 多路复用 |
 | **分流与规则** | DOMAIN、DOMAIN-SUFFIX、IP-CIDR、GEOIP / GEOSITE (`.dat` 与 `.mmdb` 双格式)、RULE-SET、PROCESS-NAME、逻辑组合 (AND/OR/NOT) |
 | **策略组** | Select (手动选择)、Url-Test (自动优选)、Fallback (故障转移)、Load-Balance (负载均衡)、Relay (链式代理) |
 | **外部控制** | 兼容 Clash RESTful API（适配 Yacd / Metacubexd / Clash-Verge 面板），支持平滑热重载 |

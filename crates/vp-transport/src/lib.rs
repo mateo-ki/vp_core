@@ -184,7 +184,8 @@ pub struct TransportConfig {
     pub tls: bool,
     pub server_name: Option<String>,
     pub skip_cert_verify: bool,
-    /// uTLS 指纹（"chrome"）：设置时 TLS 走手写指纹客户端
+    /// client-fingerprint 原值：仅 REALITY 握手使用（内置单一 ClientHello 模板）；
+    /// 其余 TLS 走 rustls，设置了也不生效（运行时提示一次）
     pub fingerprint: Option<String>,
     /// 节点显式声明的 ALPN；为空时按传输类型推导（grpc→h2，ws→http/1.1）
     pub alpn: Vec<String>,
@@ -222,6 +223,17 @@ pub async fn wrap_transport(
     server_host: &str,
     cfg: &TransportConfig,
 ) -> Result<Box<dyn ProxyStream>> {
+    // 只提示走 TLS 的节点（gRPC 恒走 TLS）：明文节点配指纹本无意义，不算"写了却不生效"
+    if cfg.reality.is_none() && (cfg.tls || cfg.grpc.is_some()) {
+        if let Some(fp) = &cfg.fingerprint {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "client-fingerprint {fp:?} 未生效：浏览器指纹模板只用于 REALITY 握手，其余 TLS 走 rustls 标准握手（本提示每进程一次）"
+                )
+            });
+        }
+    }
     if let Some(g) = &cfg.grpc {
         // grpc 生态默认 TLS + ALPN h2
         let tls = tls::tls_connect(
@@ -242,7 +254,8 @@ pub async fn wrap_transport(
         // uTLS（浏览器指纹）只在 REALITY 握手认证时使用：REALITY 依赖 uTLS ClientHello
         // 里的 auth 载荷。普通 TLS 站点（尤其 CDN 前置的 ws/grpc 节点）实测与手写 uTLS
         // 存在互操作缺陷（服务端 TLS 栈半卡：ws 帧头可达、payload 永不到达），一律走
-        // rustls 标准栈——Mihomo 的 Go TLS 同样不是真 uTLS，指纹差异不影响可用性。
+        // rustls 标准栈。代价：普通 TLS 节点的 client-fingerprint 不生效（mihomo 会用
+        // uTLS 模拟浏览器指纹），函数入口处会提示一次。
         // ECH 配置解析（ech-opts.config 优先，其次 DoH / DNS HTTPS 记录；解析器带缓存）
         let ech_config: Option<Arc<Vec<u8>>> = match &cfg.ech {
             Some(req) => match &req.config {
@@ -275,12 +288,19 @@ pub async fn wrap_transport(
         };
         let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() {
             let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
+            if !utls::is_chrome_fingerprint(fp)? {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "client-fingerprint {fp:?} 尚未实现：REALITY 只有一套内置 ClientHello 模板，仍按该模板发送（本提示每进程一次）"
+                    )
+                });
+            }
             let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = utls::utls_connect(
                 stream,
                 server_host,
                 &utls::UtlsConfig {
-                    fingerprint: utls::Fingerprint::parse(fp)?,
                     server_name: cfg.server_name.clone(),
                     alpn,
                     skip_cert_verify: cfg.skip_cert_verify,

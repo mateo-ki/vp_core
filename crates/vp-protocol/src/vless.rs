@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use vp_common::{DstAddr, Error, Host, Result};
+use vp_common::{DstAddr, Error, Result};
 use vp_config::VlessCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
@@ -16,7 +16,9 @@ use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::vmess_kdf::parse_uuid;
 
-use crate::uot::{PacketFraming, StreamPacketConn, UdpEgress};
+use crate::uot::{
+    PACKET_ADDR_MAGIC, PacketFraming, StreamPacketConn, UdpEgress, UdpEncoding, xudp_dst,
+};
 
 use crate::direct::DirectOutbound;
 use crate::vless_vision::{VISION_FLOW_BYTES, VisionStream};
@@ -27,8 +29,10 @@ const VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
 
+const CMD_MUX: u8 = 0x03;
+
 fn encode_addr(dst: &DstAddr, cmd: u8, is_vision: bool, out: &mut Vec<u8>) {
-    // [addons len][cmd][port][atyp][addr]（版本与 UUID 由调用方前置）
+    // [addons len][cmd][port][atyp][addr]（版本与 UUID 由调用方前置；Mux 命令不带地址）
     if is_vision {
         out.push(VISION_FLOW_BYTES.len() as u8);
         out.extend_from_slice(VISION_FLOW_BYTES);
@@ -36,27 +40,14 @@ fn encode_addr(dst: &DstAddr, cmd: u8, is_vision: bool, out: &mut Vec<u8>) {
         out.push(0); // addons len
     }
     out.push(cmd);
-    out.extend_from_slice(&dst.port.to_be_bytes());
-    match &dst.host {
-        Host::Ip(std::net::IpAddr::V4(v4)) => {
-            out.push(0x01);
-            out.extend_from_slice(&v4.octets());
-        }
-        Host::Ip(std::net::IpAddr::V6(v6)) => {
-            out.push(0x03);
-            out.extend_from_slice(&v6.octets());
-        }
-        Host::Domain(d) => {
-            out.push(0x02);
-            out.push(d.len() as u8);
-            out.extend_from_slice(d.as_bytes());
-        }
+    if cmd != CMD_MUX {
+        vp_common::addr::encode_v2ray_addr(dst, out);
     }
 }
 
-/// 解析请求头：(uuid, 目标, 是否 vision, 是否 UDP, 头长度)
-fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, bool, usize)> {
-    if buf.len() < 3 + 16 + 1 + 1 + 2 + 1 {
+/// 解析请求头：(uuid, 目标, 是否 vision, 命令, 头长度)。Mux 命令（XUDP）不带地址
+fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, u8, usize)> {
+    if buf.len() < 1 + 16 + 1 + 1 {
         return Err(Error::Proto("vless 请求头过短"));
     }
     if buf[0] != VERSION {
@@ -66,66 +57,30 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, bool, usize)> 
     uuid.copy_from_slice(&buf[1..17]);
     let addons_len = buf[17] as usize;
     let mut i = 18;
-    let mut is_vision = false;
-    if addons_len > 0 {
-        if buf.len() < i + addons_len {
-            return Err(Error::Proto("vless 请求头截断"));
-        }
-        if &buf[i..i + addons_len] == VISION_FLOW_BYTES {
-            is_vision = true;
-        }
-        i += addons_len;
-    }
-    if buf.len() < i + 4 {
+    if buf.len() < i + addons_len + 1 {
         return Err(Error::Proto("vless 请求头截断"));
     }
+    let is_vision = addons_len > 0 && &buf[i..i + addons_len] == VISION_FLOW_BYTES;
+    i += addons_len;
     let cmd = buf[i];
     i += 1;
-    if cmd != CMD_TCP && cmd != CMD_UDP {
-        return Err(Error::Unsupported(
-            "vless 入站仅支持 TCP / UDP（不支持 Mux）".into(),
-        ));
-    }
-    let port = u16::from_be_bytes([buf[i], buf[i + 1]]);
-    i += 2;
-    let atyp = buf[i];
-    i += 1;
-    let host = match atyp {
-        0x01 => {
-            if buf.len() < i + 4 {
-                return Err(Error::Proto("vless 地址截断"));
+    let dst = match cmd {
+        CMD_MUX => crate::uot::xudp_dst(),
+        CMD_TCP | CMD_UDP => match vp_common::addr::decode_v2ray_addr(&buf[i..]) {
+            Ok((dst, used)) => {
+                i += used;
+                dst
             }
-            let o: [u8; 4] = buf[i..i + 4].try_into().unwrap();
-            i += 4;
-            Host::Ip(std::net::IpAddr::V4(o.into()))
+            Err(Error::Proto("address truncated")) => return Err(Error::Proto("vless 地址截断")),
+            Err(_) => return Err(Error::Proto("vless atyp 非法")),
+        },
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "vless 入站: 不支持的命令 {cmd}"
+            )));
         }
-        0x02 => {
-            if buf.len() < i + 1 {
-                return Err(Error::Proto("vless 地址截断"));
-            }
-            let n = buf[i] as usize;
-            i += 1;
-            if buf.len() < i + n {
-                return Err(Error::Proto("vless 地址截断"));
-            }
-            let d = std::str::from_utf8(&buf[i..i + n])
-                .map_err(|_| Error::Proto("域名非 utf-8"))?
-                .to_ascii_lowercase();
-            i += n;
-            Host::Domain(d)
-        }
-        0x03 => {
-            if buf.len() < i + 16 {
-                return Err(Error::Proto("vless 地址截断"));
-            }
-            let mut o = [0u8; 16];
-            o.copy_from_slice(&buf[i..i + 16]);
-            i += 16;
-            Host::Ip(std::net::IpAddr::V6(o.into()))
-        }
-        _ => return Err(Error::Proto("vless atyp 非法")),
     };
-    Ok((uuid, DstAddr { host, port }, is_vision, cmd == CMD_UDP, i))
+    Ok((uuid, dst, is_vision, cmd, i))
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +95,7 @@ pub struct VlessOutbound {
     flow: Option<String>,
     transport: transport::TransportConfig,
     udp: bool,
+    udp_encoding: UdpEncoding,
 }
 
 impl VlessOutbound {
@@ -174,16 +130,21 @@ impl VlessOutbound {
             flow: cfg.flow.clone(),
             transport: t,
             udp: cfg.udp,
+            udp_encoding: UdpEncoding::from_cfg(
+                cfg.packet_encoding.as_deref(),
+                cfg.xudp,
+                cfg.packet_addr,
+            )?,
         })
     }
 
-    async fn handshake<S>(&self, io: S, dst: &DstAddr, udp: bool) -> Result<Box<dyn ProxyStream>>
+    async fn handshake<S>(&self, io: S, dst: &DstAddr, cmd: u8) -> Result<Box<dyn ProxyStream>>
     where
         S: ProxyStream,
     {
-        // UDP 不走 vision（同 Xray 客户端：UDP 请求清空 flow；Xray 服务端拒绝 vision + UDP 命令，
-        // 但接受 flow 为空的 UDP 请求，即使该用户配置了 vision）
-        let is_vision = !udp
+        // UDP / XUDP（Mux）不走 vision：Xray 服务端拒绝 vision + UDP 命令，但接受 flow 为空的
+        // UDP / Mux 请求，即使该用户配置了 vision（真实 Xray 节点实测 XUDP 可用）
+        let is_vision = cmd == CMD_TCP
             && self
                 .flow
                 .as_deref()
@@ -191,7 +152,6 @@ impl VlessOutbound {
                 .unwrap_or(false);
 
         let mut req = Vec::with_capacity(48);
-        let cmd = if udp { CMD_UDP } else { CMD_TCP };
         encode_addr(dst, cmd, is_vision, &mut req);
         let mut full = Vec::with_capacity(1 + 16 + req.len());
         full.push(VERSION);
@@ -390,7 +350,7 @@ impl Outbound for VlessOutbound {
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         let io = transport::dial(&self.server, self.port, &self.transport).await?;
-        self.handshake(io, dst, false).await
+        self.handshake(io, dst, CMD_TCP).await
     }
 
     async fn connect_over(
@@ -400,24 +360,30 @@ impl Outbound for VlessOutbound {
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
         let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
-        self.handshake(io, dst, false).await
+        self.handshake(io, dst, CMD_TCP).await
     }
 
     fn support_udp(&self) -> bool {
         self.udp
     }
 
-    /// 原生 UDP（mihomo 缺省的原始 packet-encoding）：每个目标一条流，帧为 `[len][data]`。
-    /// ponytail: 未实现 xudp / packetaddr 编码；配置了 packet-encoding: xudp 也按原始编码发，
-    /// Xray / sing-box 服务端都接受原始编码，需要 full-cone 时再加 xudp
+    /// 原生 UDP，按 packet-encoding：
+    /// - 原始编码：命令 0x02，每个目标一条流，帧为 `[len][data]`
+    /// - xudp：命令 0x03（Mux.Cool，不带地址），一条流承载多目标（Xray full-cone）
+    /// - packetaddr：命令 0x02 发往魔法地址，每个数据报自带 IP 目标（v2ray 5+）
     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         let io = transport::dial(&self.server, self.port, &self.transport).await?;
-        let stream = self.handshake(io, dst, true).await?;
-        Ok(Box::new(StreamPacketConn::new(
-            stream,
-            dst,
-            PacketFraming::Len(dst.clone()),
-        )))
+        let (cmd, req_dst, framing) = match self.udp_encoding {
+            UdpEncoding::Raw => (CMD_UDP, dst.clone(), PacketFraming::Len(dst.clone())),
+            UdpEncoding::Xudp => (CMD_MUX, xudp_dst(), PacketFraming::xudp_client(dst)),
+            UdpEncoding::PacketAddr => (
+                CMD_UDP,
+                DstAddr::new(PACKET_ADDR_MAGIC, 0),
+                PacketFraming::PacketAddr { vmess: false },
+            ),
+        };
+        let stream = self.handshake(io, &req_dst, cmd).await?;
+        Ok(Box::new(StreamPacketConn::new(stream, dst, framing)))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -474,21 +440,32 @@ impl VlessInbound {
             }
             filled += n;
             match decode_request(&buf[..filled]) {
-                Ok((uuid, dst, is_vision, udp, used)) => {
+                Ok((uuid, dst, is_vision, cmd, used)) => {
                     if !self.uuids.contains(&uuid) {
                         return Err(Error::Proto("vless: 用户认证失败"));
                     }
-                    if udp {
-                        // UDP：回响应头后，流上是 [len][data] 数据报帧（请求头后的早数据即首帧）
+                    if cmd != CMD_TCP {
+                        // UDP：回响应头后流上是数据报帧（请求头后的早数据即首帧）。
+                        // 帧格式：Mux → XUDP；发往 packetaddr 魔法地址 → packetaddr；否则 [len][data]
                         stream.write_all(&[VERSION, 0]).await?;
                         let stream = vp_core::PeekedStream::new(stream, buf[used..filled].to_vec());
-                        let sess = Session::new_udp(self.tag.clone(), Some(src), dst.clone());
+                        // Xray 客户端 vision + XUDP 时 Mux 流也走 vision 填充
+                        let client: Box<dyn ProxyStream> = if is_vision {
+                            Box::new(VisionStream::new(stream, uuid))
+                        } else {
+                            Box::new(stream)
+                        };
+                        let framing = if cmd == CMD_MUX {
+                            PacketFraming::xudp_server()
+                        } else if dst.host.as_domain() == Some(PACKET_ADDR_MAGIC) {
+                            PacketFraming::PacketAddr { vmess: false }
+                        } else {
+                            PacketFraming::Len(dst.clone())
+                        };
+                        let sess = Session::new_udp(self.tag.clone(), Some(src), dst);
                         let egress = UdpEgress::Fixed(self.direct.clone());
                         tokio::spawn(async move {
-                            let framing = PacketFraming::Len(dst);
-                            let _ =
-                                crate::uot::serve_packets(egress, sess, Box::new(stream), framing)
-                                    .await;
+                            let _ = crate::uot::serve_packets(egress, sess, client, framing).await;
                         });
                         return Ok(());
                     }
@@ -626,6 +603,9 @@ mod tests {
             reality_opts: None,
             ech_opts: None,
             udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = DstAddr::new("127.0.0.1", echo_addr.port());
@@ -637,10 +617,16 @@ mod tests {
         assert_eq!(&buf, b"echo:ping-vless", "请求头后的早数据必须转发给目标");
     }
 
-    /// UDP：出站 connect_packet ↔ 本地 vless 入站 ↔ UDP echo。
-    /// 配了 vision 也要能走 UDP（UDP 请求不带 flow，同 Xray）
+    /// UDP：出站 connect_packet ↔ 本地 vless 入站 ↔ UDP echo，三种编码。
+    /// 配了 vision 也要能走 UDP（UDP 请求不带 flow，同 Xray）；xudp / packetaddr 单连接多目标
     #[tokio::test]
     async fn vless_udp_roundtrip() {
+        for enc in [None, Some("xudp"), Some("packetaddr")] {
+            vless_udp_roundtrip_with(enc).await;
+        }
+    }
+
+    async fn vless_udp_roundtrip_with(enc: Option<&str>) {
         let echo = crate::test_support::udp_echo().await;
         let ctx = InboundCtx {
             router: Arc::new(crate::test_support::NoopRouter()),
@@ -668,6 +654,9 @@ mod tests {
             reality_opts: None,
             ech_opts: None,
             udp: true,
+            packet_encoding: enc.map(Into::into),
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         assert!(out.support_udp());
@@ -675,6 +664,9 @@ mod tests {
         let sess = Session::new_udp("t".into(), None, dst.clone());
         let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
         crate::test_support::assert_udp_roundtrip(&mut conn, echo).await;
+        if enc.is_some() {
+            crate::test_support::assert_udp_second_target(&mut conn).await;
+        }
     }
 
     #[tokio::test]
@@ -723,6 +715,9 @@ mod tests {
             reality_opts: None,
             ech_opts: None,
             udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
 

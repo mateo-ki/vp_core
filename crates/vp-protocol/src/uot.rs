@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -135,44 +136,224 @@ fn parse_uot_addr(buf: &[u8]) -> Result<Option<(DstAddr, usize)>> {
     Ok(Some((DstAddr { host, port }, p + 2)))
 }
 
+/// packetaddr（v2ray 5+）魔法目标：VLESS / VMess UDP 请求发往它时，每个数据报自带 IP 目标
+pub const PACKET_ADDR_MAGIC: &str = "sp.packet-addr.v2fly.arpa";
+
+/// XUDP 请求在日志 / 会话里显示的目标（线上不携带地址）
+pub fn xudp_dst() -> DstAddr {
+    DstAddr::new("v1.mux.cool", 666)
+}
+
+/// VLESS / VMess 的 UDP 编码（mihomo 语义：packet-encoding 优先，其次 xudp / packet-addr
+/// 布尔开关；都没配时为原始编码，每个目标一条连接）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpEncoding {
+    Raw,
+    /// Xray XUDP：一条连接承载多目标（full-cone），Mux.Cool 帧
+    Xudp,
+    /// v2ray packetaddr：一条连接承载多目标，目标只能是 IP
+    PacketAddr,
+}
+
+impl UdpEncoding {
+    pub fn from_cfg(packet_encoding: Option<&str>, xudp: bool, packet_addr: bool) -> Result<Self> {
+        match packet_encoding.map(str::trim).unwrap_or_default() {
+            "xudp" => Ok(UdpEncoding::Xudp),
+            "packetaddr" | "packet" => Ok(UdpEncoding::PacketAddr),
+            "" | "none" if xudp => Ok(UdpEncoding::Xudp),
+            "" | "none" if packet_addr => Ok(UdpEncoding::PacketAddr),
+            "" | "none" => Ok(UdpEncoding::Raw),
+            other => Err(Error::Config(format!("未知的 packet-encoding: {other:?}"))),
+        }
+    }
+}
+
 /// 代理流上承载数据报的帧格式（UoT 与 VLESS / Trojan / VMess 原生 UDP 共用）
 #[derive(Clone, Debug)]
 pub enum PacketFraming {
     /// UoT v1 / v2 非连接模式：`[UoT 地址][len][data]`
     Uot,
-    /// `[len][data]`，地址恒为给定目标：UoT v2 连接模式、VLESS（mihomo 缺省的原始 packet-encoding）
+    /// `[len][data]`，地址恒为给定目标：UoT v2 连接模式、VLESS 原始编码
     Len(DstAddr),
     /// Trojan：`[SOCKS 地址][len][CRLF][data]`
     Trojan,
     /// VMess：一个数据报占一个 body 分块。写方向由 VmessStream 按每次写入分块（这里不加长度）；
     /// 读方向由包模式的 VmessStream 给每个分块补上 `[len]`，因此按 Len 解析
     Vmess(DstAddr),
+    /// packetaddr：外层同 Len（vmess = false）/ Vmess（vmess = true），载荷前加
+    /// `[1=IPv4 / 2=IPv6][ip][port]`（不支持域名）
+    PacketAddr { vmess: bool },
+    /// XUDP：Mux.Cool 帧 `[metaLen][sid=0][status][opt][net=UDP][V2Ray 地址]` + `[len][data]`。
+    /// 客户端首帧为 New、其后 Keep；服务端回包一律为带来源地址的 Keep。
+    /// target：对端的 Keep 帧不带地址时的缺省目标（服务端为 None，这种帧丢弃）
+    Xudp {
+        new_pending: Arc<AtomicBool>,
+        target: Option<DstAddr>,
+    },
+}
+
+/// 一帧的解析结果
+enum Frame {
+    /// (地址, 数据起点, 帧终点)
+    Packet(DstAddr, usize, usize),
+    /// 不含数据报的控制帧（XUDP 保活等）：跳过前 n 字节
+    Skip(usize),
+}
+
+/// buf[pos..] 处的 `[len u16be][data]`：(数据起点, 帧终点)；不全时 None
+fn len_prefixed(buf: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let h = buf.get(pos..pos + 2)?;
+    let start = pos + 2;
+    let end = start + u16::from_be_bytes([h[0], h[1]]) as usize;
+    (buf.len() >= end).then_some((start, end))
+}
+
+/// VMess 一个分块即一个数据报：空包会被对端当成流结束，超过单块上限（0x3FFF）会被
+/// VmessStream 拆成多块、对端当成多个数据报——两者都只能丢弃
+fn vmess_chunk(c: Vec<u8>) -> Option<Vec<u8>> {
+    (!c.is_empty() && c.len() <= 0x3FFF).then_some(c)
+}
+
+/// packetaddr 载荷头 `[1=IPv4 / 2=IPv6][ip][port]`：(地址, 头长度)
+fn parse_packet_addr(p: &[u8]) -> Result<(DstAddr, usize)> {
+    match p.first() {
+        Some(1) if p.len() >= 7 => {
+            let ip = IpAddr::from([p[1], p[2], p[3], p[4]]);
+            Ok((DstAddr::ip(ip, u16::from_be_bytes([p[5], p[6]])), 7))
+        }
+        Some(2) if p.len() >= 19 => {
+            let o: [u8; 16] = p[1..17].try_into().unwrap();
+            Ok((
+                DstAddr::ip(IpAddr::from(o), u16::from_be_bytes([p[17], p[18]])),
+                19,
+            ))
+        }
+        _ => Err(Error::Proto("packetaddr: 地址非法")),
+    }
+}
+
+/// 解析一个 XUDP（Mux.Cool）帧
+fn parse_xudp(buf: &[u8], target: Option<&DstAddr>) -> Result<Option<Frame>> {
+    let Some(h) = buf.get(..2) else {
+        return Ok(None);
+    };
+    let l = u16::from_be_bytes([h[0], h[1]]) as usize;
+    if l < 4 {
+        return Err(Error::Proto("xudp: 帧头过短"));
+    }
+    let Some(meta) = buf.get(2..2 + l) else {
+        return Ok(None);
+    };
+    let (status, opt) = (meta[2], meta[3]);
+    let mut end = 2 + l;
+    let data = if opt & 0x01 != 0 {
+        let Some(r) = len_prefixed(buf, end) else {
+            return Ok(None);
+        };
+        end = r.1;
+        Some(r)
+    } else {
+        None
+    };
+    if opt & 0x02 != 0 {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "xudp: 对端报错关闭",
+        )));
+    }
+    match status {
+        // New / Keep：带 UDP 网络字节时紧跟目标地址（其后可能有 8 字节 GlobalID，忽略）
+        0x01 | 0x02 => {
+            let addr = if l > 4 && meta[4] == 0x02 {
+                Some(vp_common::addr::decode_v2ray_addr(&meta[5..])?.0)
+            } else if status == 0x01 {
+                return Err(Error::Unsupported(
+                    "Mux.Cool TCP 子连接未实现（仅支持 XUDP）".into(),
+                ));
+            } else {
+                // ponytail: 服务端收到不带地址的 Keep 帧直接丢弃；Xray / sing-box 客户端的
+                // UDP 帧总带地址，需要兼容别的实现时再记下 New 帧的目标
+                target.cloned()
+            };
+            Ok(Some(match (addr, data) {
+                (Some(a), Some((s, e))) => Frame::Packet(a, s, e),
+                _ => Frame::Skip(end),
+            }))
+        }
+        0x03 => Err(Error::Io(std::io::ErrorKind::UnexpectedEof.into())),
+        0x04 => Ok(Some(Frame::Skip(end))),
+        s => Err(Error::ProtoMsg(format!("xudp: 未知帧类型 {s}"))),
+    }
 }
 
 impl PacketFraming {
-    /// 编码一个数据报；addr 只有自带地址的格式（Uot / Trojan）才用。
-    /// None = 该格式承载不了这个数据报，只能丢弃：VMess 一个分块即一个数据报，空包会被对端
-    /// 当成流结束，超过单块上限（0x3FFF）会被 VmessStream 拆成多块、对端当成多个数据报
+    pub fn xudp_client(target: &DstAddr) -> Self {
+        PacketFraming::Xudp {
+            new_pending: Arc::new(AtomicBool::new(true)),
+            target: Some(target.clone()),
+        }
+    }
+
+    pub fn xudp_server() -> Self {
+        PacketFraming::Xudp {
+            new_pending: Arc::new(AtomicBool::new(false)),
+            target: None,
+        }
+    }
+
+    /// 编码一个数据报；addr 只有自带地址的格式才用。
+    /// None = 该格式承载不了这个数据报，只能丢弃（见 vmess_chunk；packetaddr 不能带域名）
     pub fn encode(&self, addr: &DstAddr, data: &[u8]) -> Option<Vec<u8>> {
         let mut f = Vec::with_capacity(data.len() + 32);
         match self {
             PacketFraming::Uot => return Some(encode_frame(addr, data)),
-            PacketFraming::Vmess(_) => {
-                return (!data.is_empty() && data.len() <= 0x3FFF).then(|| data.to_vec());
-            }
-            PacketFraming::Len(_) => f.extend_from_slice(&(data.len() as u16).to_be_bytes()),
+            PacketFraming::Vmess(_) => return vmess_chunk(data.to_vec()),
+            PacketFraming::Len(_) => {}
             PacketFraming::Trojan => {
                 vp_common::addr::encode_socks_addr(addr, &mut f);
                 f.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 f.extend_from_slice(b"\r\n");
+                f.extend_from_slice(data);
+                return Some(f);
+            }
+            PacketFraming::PacketAddr { vmess } => {
+                let mut inner = Vec::with_capacity(data.len() + 19);
+                match &addr.host {
+                    Host::Ip(IpAddr::V4(v4)) => {
+                        inner.push(1);
+                        inner.extend_from_slice(&v4.octets());
+                    }
+                    Host::Ip(IpAddr::V6(v6)) => {
+                        inner.push(2);
+                        inner.extend_from_slice(&v6.octets());
+                    }
+                    Host::Domain(_) => return None,
+                }
+                inner.extend_from_slice(&addr.port.to_be_bytes());
+                inner.extend_from_slice(data);
+                if *vmess {
+                    return vmess_chunk(inner);
+                }
+                f.extend_from_slice(&(inner.len() as u16).to_be_bytes());
+                f.extend_from_slice(&inner);
+                return Some(f);
+            }
+            PacketFraming::Xudp { new_pending, .. } => {
+                let new = new_pending.swap(false, Ordering::Relaxed);
+                // [sid 0][New=1 / Keep=2][opt=Data][net=UDP][地址]
+                let mut meta = vec![0, 0, if new { 0x01 } else { 0x02 }, 0x01, 0x02];
+                vp_common::addr::encode_v2ray_addr(addr, &mut meta);
+                f.extend_from_slice(&(meta.len() as u16).to_be_bytes());
+                f.extend_from_slice(&meta);
             }
         }
+        f.extend_from_slice(&(data.len() as u16).to_be_bytes());
         f.extend_from_slice(data);
         Some(f)
     }
 
-    /// 从 buf 开头解析一帧：(地址, 数据起点, 帧终点)；数据不全时 Ok(None)
-    fn parse(&self, buf: &[u8]) -> Result<Option<(DstAddr, usize, usize)>> {
+    /// 从 buf 开头解析一帧；数据不全时 Ok(None)
+    fn parse(&self, buf: &[u8]) -> Result<Option<Frame>> {
         let (addr, pos) = match self {
             PacketFraming::Uot => match parse_uot_addr(buf)? {
                 Some(x) => x,
@@ -184,21 +365,27 @@ impl PacketFraming {
                 Err(Error::Proto("address truncated")) => return Ok(None),
                 Err(e) => return Err(e),
             },
+            PacketFraming::PacketAddr { .. } => {
+                let Some((start, end)) = len_prefixed(buf, 0) else {
+                    return Ok(None);
+                };
+                let (addr, used) = parse_packet_addr(&buf[start..end])?;
+                return Ok(Some(Frame::Packet(addr, start + used, end)));
+            }
+            PacketFraming::Xudp { target, .. } => return parse_xudp(buf, target.as_ref()),
         };
-        let crlf = if matches!(self, PacketFraming::Trojan) {
-            2
-        } else {
-            0
-        };
-        let Some(h) = buf.get(pos..pos + 2 + crlf) else {
-            return Ok(None);
-        };
-        if h[2..] != b"\r\n"[..crlf] {
-            return Err(Error::Proto("trojan: UDP 包缺少 CRLF"));
+        if matches!(self, PacketFraming::Trojan) {
+            let Some(crlf) = buf.get(pos + 2..pos + 4) else {
+                return Ok(None);
+            };
+            if crlf != b"\r\n" {
+                return Err(Error::Proto("trojan: UDP 包缺少 CRLF"));
+            }
+            let len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+            let (start, end) = (pos + 4, pos + 4 + len);
+            return Ok((buf.len() >= end).then_some(Frame::Packet(addr, start, end)));
         }
-        let start = pos + 2 + crlf;
-        let end = start + u16::from_be_bytes([h[0], h[1]]) as usize;
-        Ok((buf.len() >= end).then_some((addr, start, end)))
+        Ok(len_prefixed(buf, pos).map(|(start, end)| Frame::Packet(addr, start, end)))
     }
 }
 
@@ -228,11 +415,14 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// 读一帧：(地址, 数据)
     pub async fn next(&mut self, framing: &PacketFraming) -> Result<(DstAddr, Bytes)> {
         loop {
-            if let Some((addr, start, end)) = framing.parse(&self.buf)? {
-                let data = self.buf.split_to(end).freeze().slice(start..);
-                return Ok((addr, data));
+            match framing.parse(&self.buf)? {
+                Some(Frame::Packet(addr, start, end)) => {
+                    let data = self.buf.split_to(end).freeze().slice(start..);
+                    return Ok((addr, data));
+                }
+                Some(Frame::Skip(n)) => self.buf.advance(n),
+                None => self.fill().await?,
             }
-            self.fill().await?;
         }
     }
 
@@ -329,16 +519,35 @@ impl<S: ProxyStream> StreamPacketConn<S> {
 impl<S: ProxyStream> PacketConn for StreamPacketConn<S> {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
         // 目标是域名时帧里写域名，由远端解析：TUN + Fake-IP 下 pkt.dst 是 198.18.x.x 这类
-        // 只在本机有意义的地址，原样发给远端就是黑洞（同 hysteria2 的处理）
-        let dst = if matches!(self.target.host, Host::Domain(_)) || pkt.dst.ip().is_loopback() {
+        // 只在本机有意义的地址，原样发给远端就是黑洞（同 hysteria2 的处理）。
+        // pkt.dst 为占位（未指定 / 回环）时也用会话目标；但会话目标本身就是回环时，
+        // 发往别的回环端口是真实的多目标（XUDP / packetaddr full-cone），不能替换
+        let use_target = match &self.target.host {
+            Host::Domain(_) => true,
+            Host::Ip(t) => {
+                pkt.dst.ip().is_unspecified() || (pkt.dst.ip().is_loopback() && !t.is_loopback())
+            }
+        };
+        let mut dst = if use_target {
             self.target.clone()
         } else {
             DstAddr::ip(pkt.dst.ip(), pkt.dst.port())
         };
+        // packetaddr 只能带 IP：域名目标先在本地解析
+        if matches!(self.framing, PacketFraming::PacketAddr { .. })
+            && matches!(dst.host, Host::Domain(_))
+        {
+            let s = resolve_dst_socket(&dst).await?;
+            if s.ip().is_unspecified() {
+                return Ok(());
+            }
+            dst = DstAddr::ip(s.ip(), s.port());
+        }
+        // 编码放在写锁内：XUDP 首帧必须是 New，并发 send 时不能让 Keep 帧抢先写出
+        let mut w = self.wr.lock().await;
         let Some(frame) = self.framing.encode(&dst, &pkt.data) else {
             return Ok(()); // 承载不了：同 UDP 语义静默丢弃
         };
-        let mut w = self.wr.lock().await;
         w.write_all(&frame).await?;
         w.flush().await?;
         Ok(())
@@ -561,6 +770,59 @@ mod tests {
         assert_eq!(addr.host, Host::Domain("dns.example.com".into()));
         assert_eq!(addr.port, 53);
         assert_eq!(&data[..], b"q");
+    }
+
+    /// XUDP 线格式对齐 Xray xudp.go：首帧 New、其后 Keep，均带 UDP 网络字节与 V2Ray 地址
+    #[test]
+    fn xudp_frame_layout() {
+        let to = dst4([8, 8, 8, 8], 53);
+        let f = PacketFraming::xudp_client(&to);
+        let first = f.encode(&to, b"q").unwrap();
+        // [metaLen=12][sid 0 0][New][Data][UDP][port 53][atyp 1][8.8.8.8][len 1]["q"]
+        assert_eq!(
+            first,
+            vec![0, 12, 0, 0, 1, 1, 2, 0, 53, 1, 8, 8, 8, 8, 0, 1, b'q']
+        );
+        let second = f.encode(&to, b"q").unwrap();
+        assert_eq!(second[4], 0x02, "第二帧应为 Keep");
+        // 服务端回的 Keep 帧解析出来源地址；保活帧被跳过
+        let mut buf = vec![0, 4, 0, 0, 4, 0]; // KeepAlive，无数据
+        buf.extend_from_slice(&second);
+        assert!(matches!(
+            PacketFraming::xudp_server().parse(&buf).unwrap(),
+            Some(Frame::Skip(6))
+        ));
+        match PacketFraming::xudp_server().parse(&buf[6..]).unwrap() {
+            Some(Frame::Packet(a, s, e)) => {
+                assert_eq!(a, to);
+                assert_eq!(&buf[6 + s..6 + e], b"q");
+            }
+            _ => panic!("应解析出数据帧"),
+        }
+        // End 帧 → EOF
+        assert!(
+            PacketFraming::xudp_server()
+                .parse(&[0, 4, 0, 0, 3, 0])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn udp_encoding_from_cfg_like_mihomo() {
+        assert_eq!(
+            UdpEncoding::from_cfg(None, false, false).unwrap(),
+            UdpEncoding::Raw
+        );
+        assert_eq!(
+            UdpEncoding::from_cfg(None, true, false).unwrap(),
+            UdpEncoding::Xudp
+        );
+        assert_eq!(
+            UdpEncoding::from_cfg(Some("packetaddr"), true, false).unwrap(),
+            UdpEncoding::PacketAddr,
+            "packet-encoding 优先于布尔开关"
+        );
+        assert!(UdpEncoding::from_cfg(Some("bogus"), false, false).is_err());
     }
 
     #[test]

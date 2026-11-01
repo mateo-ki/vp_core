@@ -175,9 +175,82 @@ pub fn decode_socks_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
     }
 }
 
+/// 编码 V2Ray 风格地址（port 在前，ATYP 1=IPv4 / 2=域名 / 3=IPv6）：VMess / VLESS / XUDP 共用
+pub fn encode_v2ray_addr(dst: &DstAddr, out: &mut Vec<u8>) {
+    out.extend_from_slice(&dst.port.to_be_bytes());
+    match &dst.host {
+        Host::Ip(IpAddr::V4(v4)) => {
+            out.push(0x01);
+            out.extend_from_slice(&v4.octets());
+        }
+        Host::Ip(IpAddr::V6(v6)) => {
+            out.push(0x03);
+            out.extend_from_slice(&v6.octets());
+        }
+        Host::Domain(d) => {
+            out.push(0x02);
+            out.push(d.len() as u8);
+            out.extend_from_slice(d.as_bytes());
+        }
+    }
+}
+
+/// 解码 V2Ray 风格地址，返回地址与消费的字节数；数据不全报 "address truncated"
+pub fn decode_v2ray_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
+    let need = |n: usize| -> Result<()> {
+        if buf.len() < n {
+            Err(Error::Proto("address truncated"))
+        } else {
+            Ok(())
+        }
+    };
+    need(3)?;
+    let port = u16::from_be_bytes([buf[0], buf[1]]);
+    match buf[2] {
+        0x01 => {
+            need(7)?;
+            let ip = IpAddr::from([buf[3], buf[4], buf[5], buf[6]]);
+            Ok((DstAddr::ip(ip, port), 7))
+        }
+        0x02 => {
+            need(4)?;
+            let n = buf[3] as usize;
+            need(4 + n)?;
+            let d = std::str::from_utf8(&buf[4..4 + n])
+                .map_err(|_| Error::Proto("domain not utf-8"))?
+                .to_ascii_lowercase();
+            Ok((
+                DstAddr {
+                    host: Host::Domain(d),
+                    port,
+                },
+                4 + n,
+            ))
+        }
+        0x03 => {
+            need(19)?;
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[3..19]);
+            Ok((DstAddr::ip(IpAddr::from(o), port), 19))
+        }
+        _ => Err(Error::Proto("invalid atyp")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2ray_addr_roundtrip() {
+        for s in ["example.com:443", "1.2.3.4:80", "[2001:db8::1]:22"] {
+            let d = DstAddr::parse(s).unwrap();
+            let mut b = Vec::new();
+            encode_v2ray_addr(&d, &mut b);
+            assert_eq!(decode_v2ray_addr(&b).unwrap(), (d, b.len()));
+            assert!(decode_v2ray_addr(&b[..b.len() - 1]).is_err());
+        }
+    }
 
     #[test]
     fn parse_forms() {

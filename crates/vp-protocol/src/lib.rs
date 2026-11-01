@@ -96,7 +96,7 @@ impl<T: Outbound> Outbound for NamedOutbound<T> {
     }
 }
 pub use direct::DirectOutbound;
-pub use inbound::{InboundKind, build_inbound, dispatch_stream};
+pub use inbound::{InboundKind, build_inbound, build_inbound_with_gate, dispatch_stream};
 
 /// 出站构建依赖
 #[derive(Clone)]
@@ -608,6 +608,7 @@ fn build_naive(cfg: &ProxyCfg, n: &NaiveCfg) -> Result<Arc<dyn Outbound>> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use async_trait::async_trait;
+    use std::sync::Arc;
 
     use vp_core::{Resolution, Router as RouterTrait, Session};
 
@@ -616,7 +617,15 @@ pub(crate) mod test_support {
     #[async_trait]
     impl RouterTrait for NoopRouter {
         async fn pick(&self, _sess: &Session) -> Resolution {
-            unreachable!("noop router")
+            let direct = Arc::new(crate::direct::DirectOutbound::new(
+                Arc::new(vp_dns::Resolver::system()),
+                false,
+            ));
+            Resolution {
+                outbound: direct,
+                via: "DIRECT".into(),
+                rule: None,
+            }
         }
     }
 }

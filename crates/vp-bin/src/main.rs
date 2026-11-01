@@ -6,6 +6,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod gen_server;
+mod update;
+
 #[derive(Parser)]
 #[command(
     name = "vpcore",
@@ -75,6 +78,91 @@ enum Cmd {
     },
     /// 应急清理所有系统 TUN 历史残留路由（恢复网络）
     CleanRoutes,
+    /// 一键生成服务端配置及客户端分享链接
+    #[command(name = "gen-server", alias = "init-server")]
+    GenServer {
+        /// 生成协议组合（可选：all, reality, hy2, ss2022, ss，默认 all）
+        #[arg(short = 'p', long, default_value = "all")]
+        protocols: String,
+
+        /// 服务器公网 IP 或域名（缺省自动请求公共 API 探测本机 IP）
+        #[arg(long)]
+        ip: Option<String>,
+
+        /// 绑定 CDN/反向代理穿透域名（例如 your-domain.com）
+        #[arg(short, long, alias = "host")]
+        domain: Option<String>,
+
+        /// 伪装域名（用于 REALITY，默认 www.amazon.com）
+        #[arg(long, default_value = "www.amazon.com")]
+        sni: String,
+
+        /// REALITY 监听端口（默认 443）
+        #[arg(long, default_value_t = 443)]
+        reality_port: u16,
+
+        /// Hysteria 2 监听端口（默认 31889）
+        #[arg(long, default_value_t = 31889)]
+        hy2_port: u16,
+
+        /// Shadowsocks-2022 监听端口（默认 31888）
+        #[arg(long, default_value_t = 31888)]
+        ss_port: u16,
+
+        /// 订阅服务 / 外部控制器监听端口（默认 2080）
+        #[arg(long, default_value_t = 2080)]
+        sub_port: u16,
+
+        /// 订阅访问 Token / Secret（缺省自动生成高强度随机 Token）
+        #[arg(long)]
+        sub_token: Option<String>,
+
+        /// 配置文件输出路径（默认优先 /etc/vpcore/config.yaml，无权限或不存在时自动使用 ./vpcore-server.yaml）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// 证书与私钥保存目录（默认与输出配置文件同目录）
+        #[arg(long)]
+        cert_dir: Option<PathBuf>,
+    },
+    /// 导出或生成客户端订阅链接与配置
+    #[command(name = "gen-sub", alias = "export-sub")]
+    GenSub {
+        /// 配置文件路径（默认优先 /etc/vpcore/config.yaml 或 ./config.yaml）
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// 覆盖公网 IP 或域名
+        #[arg(long)]
+        host: Option<String>,
+
+        /// 订阅端口（默认读取配置中的 external-controller 端口，或 2080）
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// 订阅访问 Token
+        #[arg(long)]
+        token: Option<String>,
+
+        /// 输出格式：all (终端向导展示), base64 (仅输出 Base64 订阅文本), clash (仅输出 Clash YAML), url (仅输出通用订阅链接), clash-url (仅输出 Clash 订阅链接)
+        #[arg(short, long, default_value = "all")]
+        format: String,
+    },
+    /// 自动检查并更新 vpcore 至最新版本
+    #[command(name = "update", alias = "upgrade", alias = "self-update")]
+    Update {
+        /// 强制重新安装/更新（即使已是最新版本）
+        #[arg(short, long)]
+        force: bool,
+
+        /// 仅检查更新信息，不实际下载替换
+        #[arg(short, long)]
+        check: bool,
+
+        /// 自定义更新源或直接指定二进制下载 URL
+        #[arg(short, long)]
+        url: Option<String>,
+    },
 }
 
 /// HTTP GET 拉取（ureq 默认跟随重定向，支持代理与标准客户端 User-Agent）
@@ -158,6 +246,60 @@ fn trim_working_set() {}
 async fn main() {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::GenServer {
+            protocols,
+            ip,
+            domain,
+            sni,
+            reality_port,
+            hy2_port,
+            ss_port,
+            sub_port,
+            sub_token,
+            output,
+            cert_dir,
+        } => {
+            if let Err(e) = gen_server::run(gen_server::GenServerArgs {
+                protocols,
+                ip,
+                domain,
+                sni,
+                reality_port,
+                hy2_port,
+                ss_port,
+                sub_port,
+                sub_token,
+                output,
+                cert_dir,
+            }) {
+                eprintln!("\x1b[31m[!] 生成失败: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+        Cmd::GenSub {
+            config,
+            host,
+            port,
+            token,
+            format,
+        } => {
+            if let Err(e) = gen_server::run_sub(gen_server::GenSubArgs {
+                config,
+                host,
+                port,
+                token,
+                format,
+            }) {
+                eprintln!("\x1b[31m[!] 导出订阅失败: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
+        Cmd::Update { force, check, url } => {
+            if let Err(e) = update::run(update::UpdateArgs { force, check, url }) {
+                eprintln!("\x1b[31m[!] 更新失败: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
         Cmd::ImportLinks { input, output } => {
             let result = (|| -> Result<(), String> {
                 let text = std::fs::read_to_string(&input).map_err(|e| e.to_string())?;

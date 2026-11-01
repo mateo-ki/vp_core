@@ -5,7 +5,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
 use vp_common::addr::decode_socks_addr;
@@ -21,14 +20,25 @@ pub struct Socks5Inbound {
     bind: String,
     port: u16,
     tag: Arc<str>,
+    gate: Option<Arc<vp_core::InboundGate>>,
 }
 
 impl Socks5Inbound {
     pub fn new(bind: String, port: u16, tag: &str) -> Self {
+        Self::with_gate(bind, port, tag, None)
+    }
+
+    pub fn with_gate(
+        bind: String,
+        port: u16,
+        tag: &str,
+        gate: Option<Arc<vp_core::InboundGate>>,
+    ) -> Self {
         Socks5Inbound {
             bind,
             port,
             tag: tag.into(),
+            gate,
         }
     }
 }
@@ -40,13 +50,31 @@ impl vp_core::Inbound for Socks5Inbound {
     }
 
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
-        let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+        use std::net::ToSocketAddrs;
+        let addr = match (self.bind.as_str(), self.port).to_socket_addrs() {
+            Ok(mut it) => it.next().ok_or_else(|| {
+                Error::Config(format!("无法解析绑定地址 {}:{}", self.bind, self.port))
+            })?,
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "无法解析绑定地址 {}:{}: {e}",
+                    self.bind, self.port
+                )));
+            }
+        };
+        let listener = vp_transport::bind_tcp_listener(addr)?;
         let bound = listener.local_addr()?.port();
         let tag = self.tag.clone();
+        let this = self.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, src)) => {
+                        if let Some(ref g) = this.gate {
+                            if !g.check_accept(src.ip()) {
+                                continue;
+                            }
+                        }
                         vp_transport::tune(&stream);
                         let ctx = ctx.clone();
                         let tag = tag.clone();

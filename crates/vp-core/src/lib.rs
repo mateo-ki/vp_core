@@ -4,9 +4,11 @@
 //! 不依赖任何具体协议与配置实现。
 
 pub mod conn_table;
+pub mod gate;
 pub mod inbound;
 pub mod outbound;
 pub mod process;
+pub mod rate_limit;
 pub mod router;
 pub mod session;
 pub mod sniff;
@@ -14,12 +16,16 @@ pub mod sniff;
 pub mod splice;
 pub mod stream;
 pub mod tunnel;
+pub mod user;
 
 pub use conn_table::{ConnMeta, ConnSnapshot, ConnTable};
+pub use gate::{InboundGate, KnockGate, RrlDecision, UdpRrlLimiter};
 pub use inbound::{Inbound, InboundCtx};
 pub use outbound::{ChainedOutbound, Outbound};
+pub use rate_limit::{BandwidthLimiter, BrutalPacer, TokenBucket};
 pub use router::{Resolution, Router, RuleHit};
 pub use session::{Network, Session};
 pub use sniff::{PeekedStream, parse_http_host, parse_tls_sni, sniff_stream};
 pub use stream::{PacketConn, ProxyStream, UdpPacket};
 pub use tunnel::{RelayHook, relay};
+pub use user::{UserAccount, UserManager, UserSnapshot};

@@ -551,6 +551,8 @@ pub struct TuicInbound {
     /// 证书（PEM）
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    user_manager: Option<Arc<vp_core::UserManager>>,
+    gate: Option<Arc<vp_core::InboundGate>>,
 }
 
 impl TuicInbound {
@@ -562,6 +564,41 @@ impl TuicInbound {
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
     ) -> Self {
+        Self::with_options(bind, port, tag, users, cert_pem, key_pem, None)
+    }
+
+    pub fn with_options(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        users: Vec<(String, String)>,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        user_manager: Option<Arc<vp_core::UserManager>>,
+    ) -> Self {
+        Self::with_gate(
+            bind,
+            port,
+            tag,
+            users,
+            cert_pem,
+            key_pem,
+            user_manager,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_gate(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        users: Vec<(String, String)>,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        user_manager: Option<Arc<vp_core::UserManager>>,
+        gate: Option<Arc<vp_core::InboundGate>>,
+    ) -> Self {
         TuicInbound {
             bind: bind.into(),
             port,
@@ -569,6 +606,8 @@ impl TuicInbound {
             users,
             cert_pem,
             key_pem,
+            user_manager,
+            gate,
         }
     }
 }
@@ -606,6 +645,12 @@ impl Inbound for TuicInbound {
         let this = self.clone();
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
+                let remote_addr = incoming.remote_address();
+                if let Some(ref g) = this.gate {
+                    if !g.check_accept(remote_addr.ip()) {
+                        continue;
+                    }
+                }
                 let Ok(conn) = incoming.await else { continue };
                 let this = this.clone();
                 let ctx = ctx.clone();
@@ -634,13 +679,21 @@ impl ToAddrsDyn for (&str, u16) {
 impl TuicInbound {
     /// UDP 会话：登记目标 + 建socket + 回包泵（datagram 模式回发）
     async fn udp_session_relay(
+        &self,
         conn: &quinn::Connection,
         udp_sessions: &mut std::collections::HashMap<
             u16,
             std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
         >,
         pkt: PacketOpt,
+        user: Option<Arc<vp_core::UserAccount>>,
     ) -> Result<()> {
+        if let Some(ref u) = user {
+            if u.is_quota_exceeded() {
+                return Ok(());
+            }
+            u.add_up(pkt.payload.len() as u64);
+        }
         let sess = udp_sessions
             .entry(pkt.assoc)
             .or_insert_with(|| {
@@ -658,15 +711,27 @@ impl TuicInbound {
         let _ = sock.send(&pkt.payload).await;
         let conn2 = conn.clone();
         let assoc = pkt.assoc;
+        let return_user = user.clone();
+        let self_gate = self.gate.clone();
+        let remote_ip = conn.remote_address().ip();
         tokio::spawn(async move {
             let mut rbuf = [0u8; 65535];
             loop {
                 let recv = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
+                    std::time::Duration::from_secs(180),
                     sock.recv_from(&mut rbuf),
                 )
                 .await;
                 let Ok(Ok((n, from))) = recv else { break };
+                if let Some(ref u) = return_user {
+                    u.add_down(n as u64);
+                }
+                if let Some(ref g) = self_gate {
+                    match g.check_rrl(remote_ip) {
+                        vp_core::RrlDecision::Drop => continue,
+                        vp_core::RrlDecision::Allow | vp_core::RrlDecision::Slip => {}
+                    }
+                }
                 let mut addr = Vec::new();
                 encode_addr(&DstAddr::ip(from.ip(), from.port()), &mut addr);
                 let size = addr.len() + n;
@@ -687,24 +752,43 @@ impl TuicInbound {
     }
 
     /// 已认证的连接：认证（首个 uni 流）成功前不处理其它命令
+    #[allow(clippy::type_complexity)]
     async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
         // 并发接受 uni/bi 流与 datagram；认证在首个 uni 流上
         let authed = Arc::new(tokio::sync::Notify::new());
+        let authenticated_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
         let mut udp_sessions: std::collections::HashMap<
             u16,
             std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
         > = std::collections::HashMap::new();
 
-        // 期望 token 集合
-        let expect: Vec<([u8; 16], [u8; 32])> = self
+        // 期望 token 集合与用户映射
+        let mut expect: Vec<([u8; 16], [u8; 32], Option<Arc<vp_core::UserAccount>>)> = self
             .users
             .iter()
             .filter_map(|(uuid, pw)| {
                 let u16b = parse_uuid16(uuid).ok()?;
                 let t = token(&conn, &u16b, pw).ok()?;
-                Some((u16b, t))
+                let acc = self.user_manager.as_ref().and_then(|um| {
+                    um.authenticate_uuid(&u16b)
+                        .or_else(|| um.get_user_by_uuid(&u16b))
+                });
+                Some((u16b, t, acc))
             })
             .collect();
+
+        if let Some(ref um) = self.user_manager {
+            for acc in um.all_users() {
+                if let Ok(u16b) = parse_uuid16(&acc.secret) {
+                    if !expect.iter().any(|(u, _, _)| *u == u16b) {
+                        if let Ok(t) = token(&conn, &u16b, &acc.secret) {
+                            expect.push((u16b, t, Some(acc)));
+                        }
+                    }
+                }
+            }
+        }
 
         loop {
             tokio::select! {
@@ -727,13 +811,26 @@ impl TuicInbound {
                             uuid.copy_from_slice(&body[..16]);
                             let mut tok = [0u8; 32];
                             tok.copy_from_slice(&body[16..]);
-                            let ok = expect.iter().any(|(u, t)| *u == uuid && *t == tok);
-                            tracing::debug!("tuic auth uuid={:02x?} ok={ok}", uuid);
-                            if !ok {
+                            let matched = expect.iter().find(|(u, t, _)| *u == uuid && *t == tok);
+                            if let Some((_, _, acc)) = matched {
+                                if let Some(account) = acc {
+                                    if account.is_quota_exceeded() {
+                                        tracing::warn!("tuic 用户 {} 流量超额被阻断", account.username);
+                                        conn.close(quinn::VarInt::from_u32(0x1f), b"quota exceeded");
+                                        break;
+                                    }
+                                    *authenticated_user.write().await = Some(account.clone());
+                                }
+                                tracing::debug!("tuic auth uuid={:02x?} ok", uuid);
+                                if let Some(ref g) = self.gate {
+                                    g.mark_authenticated(conn.remote_address().ip());
+                                }
+                                authed.notify_waiters();
+                            } else {
+                                tracing::debug!("tuic auth failed uuid={:02x?}", uuid);
                                 conn.close(quinn::VarInt::from_u32(0x1f), b"auth failed");
                                 break;
                             }
-                            authed.notify_waiters();
                         }
                         T_PACKET => {
                             let mut opt = Vec::with_capacity(1500);
@@ -752,7 +849,8 @@ impl TuicInbound {
                                 }
                             }
                             let Some(pkt) = parse_packet_opt(&opt) else { continue };
-                            let _ = Self::udp_session_relay(&conn, &mut udp_sessions, pkt).await;
+                            let cur_user = authenticated_user.read().await.clone();
+                            let _ = self.udp_session_relay(&conn, &mut udp_sessions, pkt, cur_user).await;
                         }
                         T_DISSOCIATE => {
                             let mut a = [0u8; 2];
@@ -793,14 +891,27 @@ impl TuicInbound {
                         continue;
                     }
                     let src = conn.remote_address();
-                    let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+                    let authed_wait = authed.clone();
+                    let authed_user = authenticated_user.clone();
+                    let tag = self.tag.clone();
                     let ctx2 = ctx.clone();
                     tokio::spawn(async move {
-                        let direct = crate::direct::DirectOutbound::new(
-                            Arc::new(vp_dns::Resolver::system()),
-                            false,
-                        );
-                        match direct.connect_stream(&sess, &dst).await {
+                        if authed_user.read().await.is_none() {
+                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), authed_wait.notified()).await;
+                        }
+                        let user = authed_user.read().await.clone();
+                        let mut sess = Session::new_tcp(tag, Some(src), dst.clone());
+                        if let Some(ref u) = user {
+                            sess.inbound_user = Some(u.username.clone());
+                        }
+                        let res = ctx2.router.pick(&sess).await;
+                        let rule_tag = res.rule.as_ref().map(|r| r.rule.clone());
+                        let chain_tag = if res.outbound.name() != res.via.as_ref() {
+                            format!("{}[{}]", res.via, res.outbound.name())
+                        } else {
+                            res.outbound.name().to_string()
+                        };
+                        match res.outbound.connect_stream(&sess, &dst).await {
                             Ok(remote) => {
                                 let client: Box<dyn ProxyStream> =
                                     Box::new(crate::hysteria2::QuicBiStream { send, recv });
@@ -812,14 +923,18 @@ impl TuicInbound {
                                     dst_port: dst.port,
                                     src: Some(src.to_string()),
                                     process: None,
-                                    rule: None,
-                                    chain: Some("tuic-server".into()),
+                                    user: user.as_ref().map(|u| u.username.clone()),
+                                    rule: rule_tag,
+                                    chain: Some(chain_tag.into()),
                                     start: vp_common::now_millis(),
                                 };
                                 let hook = RelayHook {
                                     table: Some(ctx2.conns.clone()),
                                     meta: Some(meta),
                                     stats: Some(ctx2.stats.clone()),
+                                    user: user.clone(),
+                                    limiter: user.as_ref().and_then(|u| u.limiter.clone()),
+                                    brutal: user.as_ref().and_then(|u| u.brutal_pacer.clone()),
                                 };
                                 let _ = relay(client, remote, hook).await;
                             }
@@ -833,7 +948,8 @@ impl TuicInbound {
                     let Ok(dg) = dg else { break };
                     if dg.len() >= 2 && dg[0] == VER && dg[1] == T_PACKET {
                         let Some(pkt) = parse_packet_opt(&dg[2..]) else { continue };
-                        let _ = Self::udp_session_relay(&conn, &mut udp_sessions, pkt).await;
+                        let cur_user = authenticated_user.read().await.clone();
+                        let _ = self.udp_session_relay(&conn, &mut udp_sessions, pkt, cur_user).await;
                     }
                     // Heartbeat 忽略
                 }
@@ -968,6 +1084,85 @@ mod tests {
             .expect("udp 2 超时")
             .unwrap();
         assert_eq!(&resp2.data[..], b"echo:tuic-udp-2");
+    }
+
+    #[tokio::test]
+    async fn test_tuic_server_user_accounting_and_routing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp_echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = tcp_echo.accept().await.unwrap();
+            let mut b = [0u8; 1024];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        let user_mgr = Arc::new(vp_core::UserManager::new());
+        let user_acc = Arc::new(vp_core::UserAccount::new(
+            "tuic-vip",
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+            Some(1024 * 1024),
+            None,
+        ));
+        user_mgr.add_user(user_acc.clone());
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ctx = vp_core::InboundCtx {
+            router: std::sync::Arc::new(crate::test_support::NoopRouter()),
+            stats: std::sync::Arc::new(vp_common::Stats::default()),
+            conns: std::sync::Arc::new(vp_core::ConnTable::new()),
+        };
+        let server = TuicInbound::with_options(
+            "127.0.0.1",
+            0,
+            "tuic-user-srv",
+            vec![(
+                "b831381d-6324-4d53-ad4f-8cda48b30811".to_string(),
+                "vip-pw".to_string(),
+            )],
+            cert.cert.pem().into_bytes(),
+            cert.key_pair.serialize_pem().into_bytes(),
+            Some(user_mgr),
+        );
+        let port = std::sync::Arc::new(server).start(ctx).await.unwrap();
+
+        let out = TuicOutbound::new(&vp_config::TuicCfg {
+            server: "127.0.0.1".into(),
+            port,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+            password: "vip-pw".into(),
+            sni: None,
+            skip_cert_verify: true,
+            congestion_controller: None,
+            udp_relay_mode: None,
+        })
+        .unwrap();
+
+        let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), tcp_port);
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out.connect_stream(&sess, &dst).await.unwrap();
+        s.write_all(b"tuic-accounting-data").await.unwrap();
+        let mut buf = [0u8; 20];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"tuic-accounting-data");
+
+        // 验证用户流量完成记账
+        let mut recorded = false;
+        for _ in 0..20 {
+            if user_acc.upload.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(recorded);
     }
 
     #[test]

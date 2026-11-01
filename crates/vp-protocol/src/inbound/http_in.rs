@@ -4,10 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tracing::{debug, warn};
 
-use vp_common::{DstAddr, Result};
+use vp_common::{DstAddr, Error, Result};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 
@@ -17,14 +16,25 @@ pub struct HttpInbound {
     bind: String,
     port: u16,
     tag: Arc<str>,
+    gate: Option<Arc<vp_core::InboundGate>>,
 }
 
 impl HttpInbound {
     pub fn new(bind: String, port: u16, tag: &str) -> Self {
+        Self::with_gate(bind, port, tag, None)
+    }
+
+    pub fn with_gate(
+        bind: String,
+        port: u16,
+        tag: &str,
+        gate: Option<Arc<vp_core::InboundGate>>,
+    ) -> Self {
         HttpInbound {
             bind,
             port,
             tag: tag.into(),
+            gate,
         }
     }
 }
@@ -36,13 +46,31 @@ impl vp_core::Inbound for HttpInbound {
     }
 
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
-        let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+        use std::net::ToSocketAddrs;
+        let addr = match (self.bind.as_str(), self.port).to_socket_addrs() {
+            Ok(mut it) => it.next().ok_or_else(|| {
+                Error::Config(format!("无法解析绑定地址 {}:{}", self.bind, self.port))
+            })?,
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "无法解析绑定地址 {}:{}: {e}",
+                    self.bind, self.port
+                )));
+            }
+        };
+        let listener = vp_transport::bind_tcp_listener(addr)?;
         let bound = listener.local_addr()?.port();
         let tag = self.tag.clone();
+        let this = self.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, src)) => {
+                        if let Some(ref g) = this.gate {
+                            if !g.check_accept(src.ip()) {
+                                continue;
+                            }
+                        }
                         vp_transport::tune(&stream);
                         let ctx = ctx.clone();
                         let tag = tag.clone();
@@ -187,6 +215,7 @@ where
                     dst_port: sess.dst.port,
                     src: sess.src.map(|s| s.to_string()),
                     process: sess.process.clone(),
+                    user: None,
                     rule: outbound
                         .rule
                         .as_ref()
@@ -195,6 +224,7 @@ where
                     start: vp_common::now_millis(),
                 }),
                 stats: Some(ctx.stats.clone()),
+                ..Default::default()
             };
             let _ = vp_core::tunnel::relay(client, remote, hook).await;
             Ok(())

@@ -23,20 +23,20 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 
 use vp_common::{Error, Result};
 
-const REC_APPDATA: u8 = 23;
-const REC_ALERT: u8 = 21;
-const REC_HANDSHAKE: u8 = 22;
+pub(crate) const REC_APPDATA: u8 = 23;
+pub(crate) const REC_ALERT: u8 = 21;
+pub(crate) const REC_HANDSHAKE: u8 = 22;
 /// TLS 1.3 记录密文上限（2^14 + 255 tag/padding）
-const MAX_CIPHERTEXT: usize = 16_384 + 256;
+pub(crate) const MAX_CIPHERTEXT: usize = 16_384 + 256;
 
 // 握手消息类型
-const HS_EE: u8 = 8;
-const HS_CERT: u8 = 11;
-const HS_CERT_STATUS: u8 = 22;
-const HS_CERT_VERIFY: u8 = 15;
-const HS_FINISHED: u8 = 20;
-const HS_CERT_REQUEST: u8 = 13;
-const HS_KEY_UPDATE: u8 = 24;
+pub(crate) const HS_EE: u8 = 8;
+pub(crate) const HS_CERT: u8 = 11;
+pub(crate) const HS_CERT_STATUS: u8 = 22;
+pub(crate) const HS_CERT_VERIFY: u8 = 15;
+pub(crate) const HS_FINISHED: u8 = 20;
+pub(crate) const HS_CERT_REQUEST: u8 = 13;
+pub(crate) const HS_KEY_UPDATE: u8 = 24;
 
 // HRR 随机值（RFC 8446 §4.1.3）
 const HRR_RANDOM: [u8; 32] = [
@@ -265,7 +265,7 @@ impl ring::hkdf::KeyType for OkmLen {
     }
 }
 
-fn hkdf_expand_label(
+pub(crate) fn hkdf_expand_label(
     prk: &ring::hkdf::Prk,
     label: &str,
     context: &[u8],
@@ -289,7 +289,7 @@ fn hkdf_expand_label(
     Ok(out)
 }
 
-fn hkdf_expand_raw(prk: &ring::hkdf::Prk, info: &[u8], len: usize) -> Result<Vec<u8>> {
+pub(crate) fn hkdf_expand_raw(prk: &ring::hkdf::Prk, info: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; len];
     let info_ref: [&[u8]; 1] = [info];
     let okm = prk
@@ -300,7 +300,7 @@ fn hkdf_expand_raw(prk: &ring::hkdf::Prk, info: &[u8], len: usize) -> Result<Vec
     Ok(out)
 }
 
-fn aes_256_gcm_seal(
+pub(crate) fn aes_256_gcm_seal(
     key: &[u8; 32],
     nonce: &[u8; 12],
     aad: &[u8],
@@ -315,8 +315,24 @@ fn aes_256_gcm_seal(
     Ok(())
 }
 
+pub(crate) fn aes_256_gcm_open(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    in_out: &mut [u8],
+) -> Result<Vec<u8>> {
+    let uk = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key)
+        .map_err(|_| Error::Proto("utls: reality aes-gcm key 失败"))?;
+    let lsk = ring::aead::LessSafeKey::new(uk);
+    let n = ring::aead::Nonce::assume_unique_for_key(*nonce);
+    let plain = lsk
+        .open_in_place(n, ring::aead::Aad::from(aad), in_out)
+        .map_err(|_| Error::Proto("utls: reality aes-gcm 解密失败"))?;
+    Ok(plain.to_vec())
+}
+
 /// Extract(salt, ikm) - REALITY ClientHello auth
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Result<ring::hkdf::Prk> {
+pub(crate) fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> Result<ring::hkdf::Prk> {
     Ok(ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt).extract(ikm))
 }
 
@@ -386,7 +402,7 @@ pub fn suite_def(suite: u16) -> Option<SuiteDef> {
 }
 
 /// 单方向记录层密钥
-struct Direction {
+pub(crate) struct Direction {
     alg: &'static ring::aead::Algorithm,
     key: Vec<u8>,
     iv: [u8; 12],
@@ -395,7 +411,7 @@ struct Direction {
 }
 
 impl Direction {
-    fn new(suite: SuiteDef, secret: &[u8]) -> Result<Self> {
+    pub(crate) fn new(suite: SuiteDef, secret: &[u8]) -> Result<Self> {
         let prk = ring::hkdf::Prk::new_less_safe(suite.hkdf_alg, secret);
         let key = hkdf_expand_label(&prk, "key", &[], suite.alg.key_len())?;
         let iv = hkdf_expand_label(&prk, "iv", &[], 12)?;
@@ -423,7 +439,7 @@ impl Direction {
         Ok(ring::aead::LessSafeKey::new(uk))
     }
 
-    fn seal(&mut self, aad: &[u8], content: &mut BytesMut) -> Result<()> {
+    pub(crate) fn seal(&mut self, aad: &[u8], content: &mut BytesMut) -> Result<()> {
         let n = ring::aead::Nonce::assume_unique_for_key(self.nonce());
         self.key()?
             .seal_in_place_append_tag(n, ring::aead::Aad::from(aad), content)
@@ -433,7 +449,7 @@ impl Direction {
     }
 
     /// 解密密文（含 tag），返回内层内容（去 padding / inner type 前的数据）
-    fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
+    pub(crate) fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
         let n = ring::aead::Nonce::assume_unique_for_key(self.nonce());
         let mut buf = ciphertext.to_vec();
         let plain = self
@@ -469,7 +485,7 @@ impl Direction {
 }
 
 /// 由流量密钥（transcript 密钥）派生 Direction
-fn traffic_direction(suite: SuiteDef, secret: &[u8]) -> Result<Direction> {
+pub(crate) fn traffic_direction(suite: SuiteDef, secret: &[u8]) -> Result<Direction> {
     Direction::new(suite, secret)
 }
 
@@ -477,7 +493,7 @@ fn traffic_direction(suite: SuiteDef, secret: &[u8]) -> Result<Direction> {
 // 记录读写
 // ---------------------------------------------------------------------------
 
-async fn read_record_raw<S: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn read_record_raw<S: tokio::io::AsyncRead + Unpin>(
     s: &mut S,
 ) -> Result<(u8, [u8; 3], Vec<u8>)> {
     use tokio::io::AsyncReadExt;
@@ -493,12 +509,12 @@ async fn read_record_raw<S: tokio::io::AsyncRead + Unpin>(
 }
 
 /// 一条记录（已解密）；Closed = 对端 close_notify（干净关闭）
-enum Frame {
+pub(crate) enum Frame {
     Data { inner: u8, data: Vec<u8> },
     Closed,
 }
 
-async fn read_record<S: tokio::io::AsyncRead + Unpin>(
+pub(crate) async fn read_record<S: tokio::io::AsyncRead + Unpin>(
     s: &mut S,
     rx: Option<&mut Direction>,
 ) -> Result<Frame> {
@@ -546,25 +562,25 @@ async fn read_record<S: tokio::io::AsyncRead + Unpin>(
 // 握手消息解析辅助
 // ---------------------------------------------------------------------------
 
-struct MsgIter {
+pub(crate) struct MsgIter {
     buf: Vec<u8>,
     pos: usize,
 }
 
 impl MsgIter {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         MsgIter {
             buf: Vec::new(),
             pos: 0,
         }
     }
 
-    fn push(&mut self, data: &[u8]) {
+    pub(crate) fn push(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
     }
 
     /// 取一条完整消息：(type, 内容)。缓冲不足返回 None
-    fn next_msg(&mut self) -> Option<(u8, Vec<u8>)> {
+    pub(crate) fn next_msg(&mut self) -> Option<(u8, Vec<u8>)> {
         if self.buf.len() < self.pos + 4 {
             return None;
         }
@@ -584,27 +600,27 @@ impl MsgIter {
         Some((ty, msg))
     }
 
-    fn compact(&mut self) {
+    pub(crate) fn compact(&mut self) {
         self.buf.drain(..self.pos);
         self.pos = 0;
     }
 }
 
-struct Cursor<'a> {
-    b: &'a [u8],
-    pos: usize,
+pub(crate) struct Cursor<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Cursor { b, pos: 0 }
     }
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         let v = *self.b.get(self.pos).ok_or(Error::Proto("utls: 解析越界"))?;
         self.pos += 1;
         Ok(v)
     }
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         let v = self
             .b
             .get(self.pos..self.pos + 2)
@@ -612,7 +628,7 @@ impl<'a> Cursor<'a> {
         self.pos += 2;
         Ok(u16::from_be_bytes([v[0], v[1]]))
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         let v = self
             .b
             .get(self.pos..self.pos + n)
@@ -620,7 +636,7 @@ impl<'a> Cursor<'a> {
         self.pos += n;
         Ok(v)
     }
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         self.pos >= self.b.len()
     }
 }
@@ -1207,6 +1223,23 @@ pub struct UtlsStream<S> {
 impl<S> vp_core::ProxyStream for UtlsStream<S> where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
 {
+}
+
+impl<S> UtlsStream<S> {
+    pub(crate) fn new(conn: S, tx: Direction, rx: Direction) -> Self {
+        Self {
+            conn,
+            tx,
+            rx,
+            raw: BytesMut::with_capacity(16 * 1024),
+            plaintext: BytesMut::with_capacity(16 * 1024),
+            tx_buf: BytesMut::with_capacity(16 * 1024),
+            state: RxState::Header { need: 5, got: 0 },
+            hdr: [0; 5],
+            rx_closed: false,
+            tx_closed: false,
+        }
+    }
 }
 
 impl<S: tokio::io::AsyncRead + Unpin> UtlsStream<S> {

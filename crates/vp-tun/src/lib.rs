@@ -391,6 +391,7 @@ async fn dispatch_tcp(
         dst_port: sess.dst.port,
         src: sess.src.map(|s| s.to_string()),
         process: sess.process.clone(),
+        user: None,
         rule: res
             .rule
             .as_ref()
@@ -404,6 +405,7 @@ async fn dispatch_tcp(
                 table: Some(ctx.conns.clone()),
                 meta: Some(meta),
                 stats: Some(ctx.stats.clone()),
+                ..Default::default()
             };
             let _ = vp_core::relay(client, remote, hook).await;
         }

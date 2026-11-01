@@ -254,7 +254,7 @@ impl Router {
             if depth > 8 {
                 break;
             }
-            cur = g.pick(sess);
+            cur = g.pick_for(sess);
             name = cur.name().into();
             depth += 1;
         }

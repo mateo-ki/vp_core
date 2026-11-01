@@ -26,12 +26,24 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
 
     /// 标记已消费预读字节（与 unconsumed_peek 配合，在切入 splice 前排空）
     fn consume_peek(&mut self, _len: usize) {}
+
+    /// XTLS Vision 收到 PaddingDirect 后，下行改为绕过外层 TLS、直接读底层连接。
+    /// 实现者须先交出已解密未读的明文，再交出已收到但未解密的原始字节，此后直读底层；
+    /// 写方向不受影响。返回 false 表示做不到（调用方应报错，而不是把裸数据当 TLS 记录解析）。
+    fn switch_to_raw_read(&mut self) -> bool {
+        false
+    }
 }
 
 /// 裸 socket：ProxyStream + raw_socket_fd 全开。
 impl ProxyStream for tokio::net::TcpStream {
     fn raw_socket(&self) -> Option<&tokio::net::TcpStream> {
         Some(self)
+    }
+
+    /// 本身没有外层 TLS，"直读底层"天然成立
+    fn switch_to_raw_read(&mut self) -> bool {
+        true
     }
 }
 
@@ -57,6 +69,10 @@ impl ProxyStream for Box<dyn ProxyStream> {
 
     fn consume_peek(&mut self, len: usize) {
         (**self).consume_peek(len);
+    }
+
+    fn switch_to_raw_read(&mut self) -> bool {
+        (**self).switch_to_raw_read()
     }
 }
 

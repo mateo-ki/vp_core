@@ -169,9 +169,9 @@ impl VlessOutbound {
         })
     }
 
-    async fn handshake<S>(&self, mut io: S, dst: &DstAddr) -> Result<Box<dyn ProxyStream>>
+    async fn handshake<S>(&self, io: S, dst: &DstAddr) -> Result<Box<dyn ProxyStream>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: ProxyStream,
     {
         let is_vision = self
             .flow
@@ -185,39 +185,28 @@ impl VlessOutbound {
         full.push(VERSION);
         full.extend_from_slice(&self.uuid);
         full.extend_from_slice(&req);
-        tracing::debug!(
-            "vless 请求 {} 字节: {}",
-            full.len(),
-            full.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
+        // 只记长度：请求里含 UUID（认证凭据），整段打印会在用户贴出的 debug 日志里泄露
+        tracing::debug!("vless 请求 {} 字节 -> {dst}", full.len());
 
-        if is_vision {
-            io.write_all(&full).await?;
-            // 响应头：[ver][addon_len]
-            let mut resp = [0u8; 2];
-            io.read_exact(&mut resp).await?;
-            if resp[0] != VERSION {
-                return Err(Error::Proto("vless 响应版本不匹配"));
-            }
-            let addon_len = resp[1] as usize;
-            if addon_len > 0 {
-                let mut skip = vec![0u8; addon_len];
-                io.read_exact(&mut skip).await?;
-            }
-            Ok(Box::new(VisionStream::new(io)))
+        // 懒握手：vless 请求不单独成帧、也不阻塞等响应头，而是与消费方的首个载荷
+        // （vision 时即首个填充帧）合并同一帧写出；响应侧的 [ver][addon_len][addon]
+        // 头由 VlessStream 读取时透明剥离。
+        // - Xray 服务端只在目标首包回来时才连同响应头一起发出：先等响应头，HTTP 这类
+        //   "客户端先说话"的协议就会互等到超时
+        // - Cloudflare Worker 型服务端只在首条消息里同时拿到 vless 头+初始载荷才建立
+        //   上游；空的 vless 首帧会让其对端静默等待（mihomo 的中继同样把早数据并入首帧）
+        let stream = VlessStream {
+            inner: io,
+            request: Some(full),
+            strip: RespStrip::default(),
+            decoded: BytesMut::new(),
+        };
+        let out: Box<dyn ProxyStream> = if is_vision {
+            Box::new(VisionStream::new(stream, self.uuid))
         } else {
-            // 懒握手：vless 请求不单独成帧、也不阻塞等响应头，而是与消费方的
-            // 首个载荷合并同一帧写出。Cloudflare Worker 型服务端只在首条消息里
-            // 同时拿到 vless 头+初始载荷才建立上游；空的 vless 首帧会让其对端
-            // 静默等待（mihomo 的中继同样把早数据并入首帧）。响应侧的
-            // [ver][addon_len][addon] 头由 VlessStream 读取时透明剥离。
-            Ok(Box::new(VlessStream {
-                inner: io,
-                request: Some(full),
-                strip: RespStrip::default(),
-                decoded: BytesMut::new(),
-            }))
-        }
+            Box::new(stream)
+        };
+        Ok(out)
     }
 }
 
@@ -273,9 +262,11 @@ pub struct VlessStream<S> {
     decoded: BytesMut,
 }
 
-impl<S> vp_core::ProxyStream for VlessStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
-{
+impl<S: vp_core::ProxyStream> vp_core::ProxyStream for VlessStream<S> {
+    /// decoded 里已读出的余量照常先交付（poll_read 先吐 decoded），切换只影响其后的 inner 读取
+    fn switch_to_raw_read(&mut self) -> bool {
+        self.inner.switch_to_raw_read()
+    }
 }
 
 impl<S> VlessStream<S> {
@@ -304,19 +295,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<S> {
         if this.request.is_some() {
             std::task::ready!(this.ensure_request_sent(cx))?;
         }
-        if this.strip.phase < 2 {
-            // 头未剥离完：经内部缓冲
-            while this.decoded.is_empty() {
-                let mut tmp = [0u8; 16 * 1024];
-                let mut rb = ReadBuf::new(&mut tmp);
-                std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
-                let filled = rb.filled();
-                if filled.is_empty() {
-                    return Poll::Ready(Ok(())); // EOF
-                }
-                let rest = this.strip.strip(filled);
-                this.decoded.extend_from_slice(rest);
+        // 头未剥离完：经内部缓冲剥离（可能连带读入其后的载荷）
+        while this.strip.phase < 2 && this.decoded.is_empty() {
+            let mut tmp = [0u8; 16 * 1024];
+            let mut rb = ReadBuf::new(&mut tmp);
+            std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+            let filled = rb.filled();
+            if filled.is_empty() {
+                return Poll::Ready(Ok(())); // EOF
             }
+            let rest = this.strip.strip(filled);
+            this.decoded.extend_from_slice(rest);
+        }
+        // 剥离时连带读入的载荷必须先交付完：调用方读缓冲小于余量时（如 vision 逐 5 字节读帧头），
+        // 若此处只看"头已剥完"就转去直读 inner，余量会被静默丢弃
+        if !this.decoded.is_empty() {
             let n = this.decoded.len().min(buf.remaining());
             buf.put_slice(&this.decoded[..n]);
             this.decoded.advance(n);
@@ -432,7 +425,6 @@ impl VlessInbound {
                     if !self.uuids.contains(&uuid) {
                         return Err(Error::Proto("vless: 用户认证失败"));
                     }
-                    let extra = filled - used;
                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
                     let remote = self.direct.connect_stream(&sess, &dst).await?;
                     // 响应：如果启用了 vision，回送 [VERSION, 18, VISION_FLOW_BYTES]
@@ -444,9 +436,9 @@ impl VlessInbound {
                     } else {
                         stream.write_all(&[VERSION, 0]).await?;
                     }
-                    if extra > 0 {
-                        stream.write_all(&buf[used..filled]).await?;
-                    }
+                    // 请求头之后已读入的早数据属于上行载荷（Xray / mihomo 客户端会把它与
+                    // 请求头合并发出），放回读取侧随后续数据一起转发——不能回写给客户端
+                    let stream = vp_core::PeekedStream::new(stream, buf[used..filled].to_vec());
                     let meta = vp_core::conn_table::ConnMeta {
                         id: sess.id,
                         inbound: self.tag.clone(),
@@ -465,7 +457,7 @@ impl VlessInbound {
                         stats: Some(ctx.stats.clone()),
                     };
                     let client: Box<dyn ProxyStream> = if is_vision {
-                        Box::new(VisionStream::new_server(stream))
+                        Box::new(VisionStream::new(stream, uuid))
                     } else {
                         Box::new(stream)
                     };
@@ -525,6 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn vless_loopback() {
+        // 目标服务回 "echo:" + 收到的数据：区分"真正经目标往返"与"服务端把早数据回写给客户端"
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
         tokio::spawn(async move {
@@ -535,6 +528,7 @@ mod tests {
                 if n == 0 {
                     break;
                 }
+                s.write_all(b"echo:").await.unwrap();
                 s.write_all(&b[..n]).await.unwrap();
             }
         });
@@ -571,9 +565,9 @@ mod tests {
         let sess = Session::new_tcp("t".into(), None, dst.clone());
         let mut s = out.connect_stream(&sess, &dst).await.unwrap();
         s.write_all(b"ping-vless").await.unwrap();
-        let mut buf = [0u8; 10];
+        let mut buf = [0u8; 15];
         s.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping-vless");
+        assert_eq!(&buf, b"echo:ping-vless", "请求头后的早数据必须转发给目标");
     }
 
     #[tokio::test]

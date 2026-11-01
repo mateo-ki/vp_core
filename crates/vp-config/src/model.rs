@@ -516,9 +516,12 @@ pub struct SmuxConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyCfg {
     pub name: String,
-    /// UDP over TCP（UoT v1）：仅流型协议出站生效
-    #[serde(default, alias = "udp_over_tcp")]
+    /// UDP over TCP（UoT）：仅流型协议出站生效
+    #[serde(default, alias = "udp-over-tcp")]
     pub udp_over_tcp: bool,
+    /// UoT 协议版本（1 / 2）。缺省：naive / anytls 用 2（sing-box 与 anytls 规范），其余用 1（同 mihomo）
+    #[serde(default, alias = "udp-over-tcp-version")]
+    pub udp_over_tcp_version: Option<u8>,
     /// 链式代理/前置代理（dialer-proxy / detour）
     #[serde(alias = "dialer-proxy", alias = "detour", default)]
     pub dialer_proxy: Option<String>,
@@ -614,20 +617,22 @@ impl ProxyKind {
         }
     }
 
-    /// 探测协议是否支持原生 UDP 转发
+    /// 探测协议是否支持 UDP 转发（须与出站实现一致：分组按它挑选 UDP 成员）
     pub fn support_udp(&self) -> bool {
         match self {
             ProxyKind::Ss(s) => s.udp,
-            ProxyKind::Ssr(s) => s.udp,
-            ProxyKind::Vmess(v) => v.udp,
-            ProxyKind::Vless(v) => v.udp,
-            ProxyKind::Trojan(t) => t.udp,
+            // 以下协议的原生 UDP 尚未实现，只能经 udp-over-tcp（由 LazyOutbound 另行判断）
+            ProxyKind::Ssr(_)
+            | ProxyKind::Vmess(_)
+            | ProxyKind::Vless(_)
+            | ProxyKind::Trojan(_) => false,
             ProxyKind::Snell(s) => s.udp,
-            ProxyKind::Anytls(_) => true,
+            // anytls / naive 只在 udp: true 时才包装 UoT（见 vp-protocol build_anytls / build_naive）
+            ProxyKind::Anytls(a) => a.udp,
             ProxyKind::Ssh(_) => false,
             ProxyKind::Brook(b) => b.udp,
             ProxyKind::Mieru(_) => false,
-            ProxyKind::Naive(_) => true,
+            ProxyKind::Naive(n) => n.udp,
             ProxyKind::Socks5(s) => s.udp,
             ProxyKind::Tuic(_) => true,
             ProxyKind::Hysteria(_) => true,

@@ -1,25 +1,24 @@
-//! UDP over TCP（UoT v1）—— 与 Clash.Meta/mihomo/sing-box 互通。
+//! UDP over TCP（UoT）—— 与 Clash.Meta/mihomo/sing-box 互通，v1 / v2 两个版本。
 //!
-//! 客户端经代理发起一条到魔法地址 `sp.udp-over-tcp.arpa` 的 TCP 流，
-//! 随后每一帧自带目标地址（v1 每帧寻址，天然多目标）：
+//! 客户端经代理发起一条到魔法地址的 TCP 流，随后在流上收发数据报：
 //!
-//! ```text
-//! [ATYP][addr][port u16be][len u16be][data]
-//! ```
+//! - v1（`sp.udp-over-tcp.arpa`）：每帧自带地址 `[ATYP][addr][port u16be][len u16be][data]`
+//! - v2（`sp.v2.udp-over-tcp.arpa`）：先发一次请求头 `[isConnect u8][SOCKS 地址]`；
+//!   isConnect=0 时帧同 v1，isConnect=1（连接模式）时帧为 `[len u16be][data]`、目标恒为请求头地址
 //!
-//! ATYP 为 UoT 非标准取值：0x00=IPv4、0x01=IPv6、0x02=域名。
+//! 帧内 ATYP 为 UoT 非标准取值：0x00=IPv4、0x01=IPv6、0x02=域名；v2 请求头用标准 SOCKS 取值。
 //!
-//! - 出站侧：`UotOutbound` 包装任意流型出站（vmess/vless/trojan/ss…），
-//!   配置 `udp-over-tcp: true` 时其 PacketConn 建立在该魔法流上。
-//! - 入站侧：分发层识别魔法地址后进入 `serve_client`，把帧解包为
-//!   UDP 数据报按目标路由，回包以帧写回（地址为数据报源地址）。
+//! - 出站侧：`UotOutbound` 包装任意流型出站；v2 一律用非连接模式（同 anytls-go）。
+//! - 服务侧：[`serve_client`]。入站分发（socks5 / http / redir / tproxy）按路由逐目标转发；
+//!   协议服务端监听器（ss / vless / trojan / anytls / naive …）经 DIRECT 拨号魔法地址时由
+//!   DIRECT 在本地承接、直连收发（见 direct.rs）。
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use bytes::{Buf, Bytes, BytesMut};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 
 use vp_common::{DstAddr, Error, Host, Result};
@@ -31,14 +30,27 @@ use vp_core::stream::{PacketConn, ProxyStream, UdpPacket};
 pub const MAGIC_HOST_V1: &str = "sp.udp-over-tcp.arpa";
 pub const MAGIC_HOST_V2: &str = "sp.v2.udp-over-tcp.arpa";
 
-/// UoT v1 魔法目标（端口任意，惯例 443）
-pub fn magic_dst() -> DstAddr {
-    DstAddr::new(MAGIC_HOST_V1, 443)
+/// UoT 魔法目标（端口任意，惯例 443）
+pub fn magic_dst(version: u8) -> DstAddr {
+    let host = if version >= 2 {
+        MAGIC_HOST_V2
+    } else {
+        MAGIC_HOST_V1
+    };
+    DstAddr::new(host, 443)
 }
 
-/// 是否 UoT 魔法地址（v1 服务端中继；v2 帧格式不同，明确拒绝）
+/// 魔法地址对应的 UoT 版本；非魔法地址为 None
+pub fn magic_version(dst: &DstAddr) -> Option<u8> {
+    match &dst.host {
+        Host::Domain(d) if d.eq_ignore_ascii_case(MAGIC_HOST_V1) => Some(1),
+        Host::Domain(d) if d.eq_ignore_ascii_case(MAGIC_HOST_V2) => Some(2),
+        _ => None,
+    }
+}
+
 pub fn is_magic(dst: &DstAddr) -> bool {
-    matches!(&dst.host, Host::Domain(d) if d == MAGIC_HOST_V1 || d == MAGIC_HOST_V2)
+    magic_version(dst).is_some()
 }
 
 const ATYP_V4: u8 = 0x00;
@@ -77,57 +89,119 @@ pub fn encode_frame(addr: &DstAddr, data: &[u8]) -> Vec<u8> {
     f
 }
 
-async fn read_n<R: AsyncRead + Unpin>(r: &mut R, n: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf).await.map_err(Error::Io)?;
-    Ok(buf)
-}
-
-/// 读一帧：返回 (地址, 数据)
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<(DstAddr, Bytes)> {
-    let atyp = read_n(r, 1).await?[0];
-    let (host, port) = match atyp {
-        ATYP_V4 => {
-            let b = read_n(r, 6).await?;
-            let oct: [u8; 4] = b[0..4].try_into().unwrap();
-            (
-                Host::Ip(IpAddr::V4(oct.into())),
-                u16::from_be_bytes([b[4], b[5]]),
-            )
+/// 从 buf 开头解析一帧，返回 (地址, 数据起点, 帧终点)；数据不全时 Ok(None)。
+/// connect = Some(dst) 为 v2 连接模式：帧不带地址，地址恒为 dst。
+fn parse_frame(buf: &[u8], connect: Option<&DstAddr>) -> Result<Option<(DstAddr, usize, usize)>> {
+    let (addr, pos) = match connect {
+        Some(dst) => (dst.clone(), 0),
+        None => {
+            let Some(&atyp) = buf.first() else {
+                return Ok(None);
+            };
+            let (host, addr_len) = match atyp {
+                ATYP_V4 => {
+                    let Some(b) = buf.get(1..5) else {
+                        return Ok(None);
+                    };
+                    let o: [u8; 4] = b.try_into().unwrap();
+                    (Host::Ip(IpAddr::V4(o.into())), 4)
+                }
+                ATYP_V6 => {
+                    let Some(b) = buf.get(1..17) else {
+                        return Ok(None);
+                    };
+                    let o: [u8; 16] = b.try_into().unwrap();
+                    (Host::Ip(IpAddr::V6(o.into())), 16)
+                }
+                ATYP_DOMAIN => {
+                    let Some(&n) = buf.get(1) else {
+                        return Ok(None);
+                    };
+                    if n == 0 {
+                        return Err(Error::Proto("uot: 空域名"));
+                    }
+                    let Some(b) = buf.get(2..2 + n as usize) else {
+                        return Ok(None);
+                    };
+                    (
+                        Host::Domain(String::from_utf8_lossy(b).into_owned()),
+                        1 + n as usize,
+                    )
+                }
+                a => return Err(Error::ProtoMsg(format!("uot: 非法 ATYP {a:#04x}"))),
+            };
+            let p = 1 + addr_len;
+            let Some(b) = buf.get(p..p + 2) else {
+                return Ok(None);
+            };
+            let port = u16::from_be_bytes([b[0], b[1]]);
+            (DstAddr { host, port }, p + 2)
         }
-        ATYP_V6 => {
-            let b = read_n(r, 18).await?;
-            let oct: [u8; 16] = b[0..16].try_into().unwrap();
-            (
-                Host::Ip(IpAddr::V6(oct.into())),
-                u16::from_be_bytes([b[16], b[17]]),
-            )
-        }
-        ATYP_DOMAIN => {
-            let n = read_n(r, 1).await?[0] as usize;
-            if n == 0 {
-                return Err(Error::Proto("uot: 空域名"));
-            }
-            let b = read_n(r, n + 2).await?;
-            (
-                Host::Domain(String::from_utf8_lossy(&b[..n]).into_owned()),
-                u16::from_be_bytes([b[n], b[n + 1]]),
-            )
-        }
-        a => return Err(Error::ProtoMsg(format!("uot: 非法 ATYP {a:#04x}"))),
     };
-    let len = u16::from_be_bytes(read_n(r, 2).await?.try_into().unwrap()) as usize;
-    let data = read_n(r, len).await?;
-    Ok((DstAddr { host, port }, Bytes::from(data)))
+    let Some(b) = buf.get(pos..pos + 2) else {
+        return Ok(None);
+    };
+    let start = pos + 2;
+    let end = start + u16::from_be_bytes([b[0], b[1]]) as usize;
+    Ok((buf.len() >= end).then_some((addr, start, end)))
 }
 
-fn dst_to_socket(dst: &DstAddr) -> Result<SocketAddr> {
+/// 缓冲帧读取。每个 await 点只有一次 read_buf（可取消、不丢字节），
+/// 所以放进 select! 里被别的分支打断也不会丢掉读到一半的帧，后续帧不会错位。
+pub struct FrameReader<R> {
+    rd: R,
+    buf: BytesMut,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(rd: R) -> Self {
+        FrameReader {
+            rd,
+            buf: BytesMut::new(),
+        }
+    }
+
+    async fn fill(&mut self) -> Result<()> {
+        self.buf.reserve(4096);
+        if self.rd.read_buf(&mut self.buf).await? == 0 {
+            return Err(Error::Io(std::io::ErrorKind::UnexpectedEof.into()));
+        }
+        Ok(())
+    }
+
+    /// 读一帧：(地址, 数据)
+    pub async fn next(&mut self, connect: Option<&DstAddr>) -> Result<(DstAddr, Bytes)> {
+        loop {
+            if let Some((addr, start, end)) = parse_frame(&self.buf, connect)? {
+                let data = self.buf.split_to(end).freeze().slice(start..);
+                return Ok((addr, data));
+            }
+            self.fill().await?;
+        }
+    }
+
+    /// v2 请求头：(isConnect, 目标)
+    async fn request(&mut self) -> Result<(bool, DstAddr)> {
+        loop {
+            if let Some(&flag) = self.buf.first() {
+                match vp_common::addr::decode_socks_addr(&self.buf[1..]) {
+                    Ok((dst, used)) => {
+                        self.buf.advance(1 + used);
+                        return Ok((flag == 1, dst));
+                    }
+                    Err(Error::Proto("address truncated")) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            self.fill().await?;
+        }
+    }
+}
+
+fn dst_to_socket(dst: &DstAddr) -> SocketAddr {
     match &dst.host {
-        Host::Ip(ip) => Ok(SocketAddr::new(*ip, dst.port)),
-        Host::Domain(_) => Ok(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            dst.port,
-        )),
+        Host::Ip(ip) => SocketAddr::new(*ip, dst.port),
+        Host::Domain(_) => SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), dst.port),
     }
 }
 
@@ -159,60 +233,71 @@ async fn resolve_dst_socket(dst: &DstAddr) -> Result<SocketAddr> {
 // 客户端（出站包装层）
 // ---------------------------------------------------------------------------
 
-/// UoT 客户端 PacketConn：代理流上的数据报通道（v1 每帧自带地址，天然多目标）
+/// UoT 客户端 PacketConn：代理流上的数据报通道（帧自带地址，天然多目标）。
+/// 读写分半：recv 等数据时不占写锁，不会卡住 send。
 pub struct UotClientConn<S> {
-    stream: Mutex<S>,
-    default_dst: SocketAddr,
+    /// Mutex 只为让本结构 Sync（send 经 &self 调用，ReadHalf<S> 在 S 非 Sync 时不 Sync）；
+    /// recv 持 &mut self，经 get_mut 访问，从不加锁
+    rd: Mutex<FrameReader<ReadHalf<S>>>,
+    wr: Mutex<WriteHalf<S>>,
+    /// connect_packet 的目标（可能是域名）
+    target: DstAddr,
 }
 
 impl<S: ProxyStream> UotClientConn<S> {
-    pub fn new(stream: S, default_dst: SocketAddr) -> Self {
-        UotClientConn {
-            stream: Mutex::new(stream),
-            default_dst,
+    /// stream 为已连到魔法地址的代理流；version >= 2 时先写 v2 请求头（非连接模式）
+    pub async fn connect(mut stream: S, dst: &DstAddr, version: u8) -> Result<Self> {
+        if version >= 2 {
+            let mut req = vec![0u8]; // isConnect = 0：帧自带地址
+            vp_common::addr::encode_socks_addr(dst, &mut req);
+            stream.write_all(&req).await?;
+            stream.flush().await?;
         }
+        let (rd, wr) = tokio::io::split(stream);
+        Ok(UotClientConn {
+            rd: Mutex::new(FrameReader::new(rd)),
+            wr: Mutex::new(wr),
+            target: dst.clone(),
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl<S: ProxyStream> PacketConn for UotClientConn<S> {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
-        let dst = DstAddr {
-            host: Host::Ip(pkt.dst.ip()),
-            port: pkt.dst.port(),
+        // 目标是域名时帧里写域名，由远端解析：TUN + Fake-IP 下 pkt.dst 是 198.18.x.x 这类
+        // 只在本机有意义的地址，原样发给远端就是黑洞（同 hysteria2 的处理）
+        let dst = if matches!(self.target.host, Host::Domain(_)) || pkt.dst.ip().is_loopback() {
+            self.target.clone()
+        } else {
+            DstAddr::ip(pkt.dst.ip(), pkt.dst.port())
         };
         let frame = encode_frame(&dst, &pkt.data);
-        self.stream
-            .lock()
-            .await
-            .write_all(&frame)
-            .await
-            .map_err(Error::Io)
+        let mut w = self.wr.lock().await;
+        w.write_all(&frame).await?;
+        w.flush().await?;
+        Ok(())
     }
 
     async fn recv(&mut self) -> Result<UdpPacket> {
-        let mut s = self.stream.lock().await;
-        let (src_addr, data) = read_frame(&mut *s).await?;
-        drop(s);
-        let src = dst_to_socket(&src_addr).unwrap_or_else(|_| {
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), src_addr.port)
-        });
+        let (src, data) = self.rd.get_mut().next(None).await?;
         Ok(UdpPacket {
-            src,
-            dst: self.default_dst,
+            src: dst_to_socket(&src),
+            dst: dst_to_socket(&self.target),
             data,
         })
     }
 }
 
-/// 出站包装层：为任意流型出站提供 UDP over TCP（配置 udp-over-tcp: true 时启用）
+/// 出站包装层：为任意流型出站提供 UDP over TCP
 pub struct UotOutbound {
     inner: Arc<dyn Outbound>,
+    version: u8,
 }
 
 impl UotOutbound {
-    pub fn new(inner: Arc<dyn Outbound>) -> Self {
-        UotOutbound { inner }
+    pub fn new(inner: Arc<dyn Outbound>, version: u8) -> Self {
+        UotOutbound { inner, version }
     }
 }
 
@@ -240,12 +325,13 @@ impl Outbound for UotOutbound {
     }
 
     async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        // 魔法地址流；回包 dst 用调用方目标（仅展示用，实际按帧源地址）
-        let stream = self.inner.connect_stream(sess, &magic_dst()).await?;
-        let default_dst = dst_to_socket(dst).unwrap_or_else(|_| {
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), dst.port)
-        });
-        Ok(Box::new(UotClientConn::new(stream, default_dst)))
+        let stream = self
+            .inner
+            .connect_stream(sess, &magic_dst(self.version))
+            .await?;
+        Ok(Box::new(
+            UotClientConn::connect(stream, dst, self.version).await?,
+        ))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -254,32 +340,52 @@ impl Outbound for UotOutbound {
 }
 
 // ---------------------------------------------------------------------------
-// 服务端（入站分发层）
+// 服务侧
 // ---------------------------------------------------------------------------
 
-/// 入站侧 UoT 中继：客户端流上的帧 → 按目标路由 → 出站 UDP；
-/// 回包以帧（源地址）写回。流结束（EOF/错帧）即回收全部会话。
+/// 服务侧数据报出站：入站分发按路由逐目标选择；协议服务端监听器固定直连
+pub enum UdpEgress<'a> {
+    Route(&'a InboundCtx),
+    Fixed(Arc<dyn Outbound>),
+}
+
+type ClientWriter = Arc<Mutex<WriteHalf<Box<dyn ProxyStream>>>>;
+
+/// 服务侧 UoT 中继：客户端流上的帧 → 出站 UDP；回包按帧写回。
+/// sess.dst 为魔法地址（决定 v1 / v2）；流结束（EOF / 错帧）即回收全部会话。
 pub async fn serve_client(
-    ctx: &InboundCtx,
+    egress: UdpEgress<'_>,
     mut sess: Session,
     client: Box<dyn ProxyStream>,
 ) -> Result<()> {
-    let (mut rd, wr) = tokio::io::split(client);
+    let version = magic_version(&sess.dst).unwrap_or(1);
+    let (rd, wr) = tokio::io::split(client);
     let wr = Arc::new(Mutex::new(wr));
+    let mut rd = FrameReader::new(rd);
+    // v2 先读请求头；连接模式下帧不带地址，目标恒为请求头里的地址
+    let connect = if version >= 2 {
+        let (is_connect, dst) = rd.request().await?;
+        is_connect.then_some(dst)
+    } else {
+        None
+    };
     // 目标 → 发送队列（会话存活标志）
     let mut sessions: HashMap<DstAddr, tokio::sync::mpsc::Sender<UdpPacket>> = HashMap::new();
-
-    loop {
-        let (dst, data) = match read_frame(&mut rd).await {
-            Ok(x) => x,
-            Err(_) => break, // EOF 或错帧：结束
-        };
+    while let Ok((dst, data)) = rd.next(connect.as_ref()).await {
         let tx = match sessions.get(&dst) {
             Some(tx) => tx.clone(),
             None => {
-                let tx = spawn_session(ctx, &mut sess, &dst, wr.clone()).await?;
-                sessions.insert(dst.clone(), tx.clone());
-                tx
+                // 单个目标建会话失败（解析失败 / 出站不支持 UDP）只丢这个包，不断开整条流
+                match spawn_session(&egress, &mut sess, &dst, wr.clone(), connect.is_some()).await {
+                    Ok(tx) => {
+                        sessions.insert(dst.clone(), tx.clone());
+                        tx
+                    }
+                    Err(e) => {
+                        tracing::debug!("uot: 目标 {dst} 建立 UDP 会话失败，丢弃数据报: {e}");
+                        continue;
+                    }
+                }
             }
         };
         let dst_sock = resolve_dst_socket(&dst).await?;
@@ -295,53 +401,50 @@ pub async fn serve_client(
 }
 
 async fn spawn_session(
-    ctx: &InboundCtx,
+    egress: &UdpEgress<'_>,
     sess: &mut Session,
     dst: &DstAddr,
-    wr: Arc<Mutex<tokio::io::WriteHalf<Box<dyn ProxyStream>>>>,
+    wr: ClientWriter,
+    connect: bool,
 ) -> Result<tokio::sync::mpsc::Sender<UdpPacket>> {
     sess.dst = dst.clone();
     sess.network = vp_core::session::Network::Udp;
-    let res = ctx.router.pick(sess).await;
-    if !res.outbound.support_udp() {
+    let outbound = match egress {
+        UdpEgress::Route(ctx) => ctx.router.pick(sess).await.outbound,
+        UdpEgress::Fixed(o) => o.clone(),
+    };
+    if !outbound.support_udp() {
         return Err(Error::Unsupported(format!(
             "uot: 出站 {} 不支持 UDP",
-            res.outbound.name()
+            outbound.name()
         )));
     }
-    let mut conn = res.outbound.connect_packet(sess, dst).await?;
+    let mut conn = outbound.connect_packet(sess, dst).await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 biased;
-                // 出站 → 客户端（帧化，地址为数据报源地址）
+                // 出站 → 客户端（帧化；非连接模式带上数据报源地址）
                 r = conn.recv() => {
-                    match r {
-                        Ok(pkt) => {
-                            let frame = encode_frame(
-                                &DstAddr {
-                                    host: Host::Ip(pkt.src.ip()),
-                                    port: pkt.src.port(),
-                                },
-                                &pkt.data,
-                            );
-                            if wr.lock().await.write_all(&frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                    let Ok(pkt) = r else { break };
+                    let frame = if connect {
+                        let mut f = (pkt.data.len() as u16).to_be_bytes().to_vec();
+                        f.extend_from_slice(&pkt.data);
+                        f
+                    } else {
+                        encode_frame(&DstAddr::ip(pkt.src.ip(), pkt.src.port()), &pkt.data)
+                    };
+                    let mut w = wr.lock().await;
+                    if w.write_all(&frame).await.is_err() || w.flush().await.is_err() {
+                        break;
                     }
                 }
                 // 客户端 → 出站
                 out = rx.recv() => {
-                    match out {
-                        Some(pkt) => {
-                            if conn.send(&pkt).await.is_err() {
-                                break;
-                            }
-                        }
-                        None => break,
+                    let Some(pkt) = out else { break };
+                    if conn.send(&pkt).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -360,24 +463,18 @@ mod tests {
 
     #[tokio::test]
     async fn frame_roundtrip() {
-        let (mut a, mut b) = tokio::io::duplex(1024);
-        let frame = encode_frame(&dst4([10, 0, 0, 1], 5353), b"hello");
-        a.write_all(&frame).await.unwrap();
-        a.flush().await.unwrap();
-        let (addr, data) = read_frame(&mut b).await.unwrap();
+        let (mut a, b) = tokio::io::duplex(1024);
+        a.write_all(&encode_frame(&dst4([10, 0, 0, 1], 5353), b"hello"))
+            .await
+            .unwrap();
+        a.write_all(&encode_frame(&DstAddr::new("dns.example.com", 53), b"q"))
+            .await
+            .unwrap();
+        let mut r = FrameReader::new(b);
+        let (addr, data) = r.next(None).await.unwrap();
         assert_eq!(addr, dst4([10, 0, 0, 1], 5353));
         assert_eq!(&data[..], b"hello");
-    }
-
-    #[tokio::test]
-    async fn frame_domain_roundtrip() {
-        let (mut client, mut server) = tokio::io::duplex(1024);
-        let frame = encode_frame(&DstAddr::new("dns.example.com", 53), b"q");
-        let h = tokio::spawn(async move {
-            client.write_all(&frame).await.unwrap();
-        });
-        let (addr, data) = read_frame(&mut server).await.unwrap();
-        h.await.unwrap();
+        let (addr, data) = r.next(None).await.unwrap();
         assert_eq!(addr.host, Host::Domain("dns.example.com".into()));
         assert_eq!(addr.port, 53);
         assert_eq!(&data[..], b"q");
@@ -385,8 +482,8 @@ mod tests {
 
     #[test]
     fn magic_detection() {
-        assert!(is_magic(&DstAddr::new(MAGIC_HOST_V1, 443)));
-        assert!(is_magic(&DstAddr::new(MAGIC_HOST_V2, 443)));
+        assert_eq!(magic_version(&magic_dst(1)), Some(1));
+        assert_eq!(magic_version(&magic_dst(2)), Some(2));
         assert!(!is_magic(&DstAddr::new("example.com", 443)));
         assert!(!is_magic(&dst4([1, 2, 3, 4], 443)));
     }
@@ -399,5 +496,105 @@ mod tests {
             f,
             vec![0x00, 10, 0, 0, 1, 0x14, 0xE9, 0x00, 0x02, b'a', b'b']
         );
+    }
+
+    /// 回归：recv 放在 select! 里被打断时，读到一半的帧不能丢（否则后续帧全部错位）
+    #[tokio::test]
+    async fn recv_is_cancel_safe_mid_frame() {
+        let (near, mut far) = tokio::io::duplex(1024);
+        let mut conn = UotClientConn::connect(near, &dst4([10, 0, 0, 1], 53), 1)
+            .await
+            .unwrap();
+        let frame = encode_frame(&dst4([8, 8, 8, 8], 53), b"0123456789");
+        far.write_all(&frame[..6]).await.unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_millis(50), conn.recv()).await;
+        assert!(r.is_err(), "半帧时应当还在等待");
+        far.write_all(&frame[6..]).await.unwrap();
+        let pkt = conn.recv().await.unwrap();
+        assert_eq!(&pkt.data[..], b"0123456789");
+        assert_eq!(pkt.src, "8.8.8.8:53".parse().unwrap());
+    }
+
+    /// v1 / v2 客户端 ↔ 服务侧直连中继 ↔ UDP echo 全链路
+    #[tokio::test]
+    async fn client_server_roundtrip_v1_and_v2() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+        let direct: Arc<dyn Outbound> = Arc::new(crate::DirectOutbound::new(
+            Arc::new(vp_dns::Resolver::system()),
+            false,
+        ));
+        for version in [1u8, 2] {
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let sess = Session::new_tcp("t".into(), None, magic_dst(version));
+            let egress = UdpEgress::Fixed(direct.clone());
+            tokio::spawn(async move {
+                let _ = serve_client(egress, sess, Box::new(far)).await;
+            });
+            let target = DstAddr::ip(echo_addr.ip(), echo_addr.port());
+            let mut conn = UotClientConn::connect(near, &target, version)
+                .await
+                .unwrap();
+            for payload in [&b"first"[..], b"second"] {
+                conn.send(&UdpPacket {
+                    src: "0.0.0.0:0".parse().unwrap(),
+                    dst: echo_addr,
+                    data: Bytes::copy_from_slice(payload),
+                })
+                .await
+                .unwrap();
+                let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv())
+                    .await
+                    .expect("回包超时")
+                    .unwrap();
+                assert_eq!(&pkt.data[..], payload, "v{version}");
+                assert_eq!(pkt.src, echo_addr, "v{version}");
+            }
+        }
+    }
+
+    /// v2 连接模式（sing-box 客户端会用）：帧不带地址
+    #[tokio::test]
+    async fn server_accepts_v2_connect_mode() {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+        let direct: Arc<dyn Outbound> = Arc::new(crate::DirectOutbound::new(
+            Arc::new(vp_dns::Resolver::system()),
+            false,
+        ));
+        let (mut near, far) = tokio::io::duplex(64 * 1024);
+        let sess = Session::new_tcp("t".into(), None, magic_dst(2));
+        tokio::spawn(async move {
+            let _ = serve_client(UdpEgress::Fixed(direct), sess, Box::new(far)).await;
+        });
+        let mut req = vec![1u8]; // isConnect = 1
+        vp_common::addr::encode_socks_addr(
+            &DstAddr::ip(echo_addr.ip(), echo_addr.port()),
+            &mut req,
+        );
+        req.extend_from_slice(&[0, 4]);
+        req.extend_from_slice(b"ping");
+        near.write_all(&req).await.unwrap();
+        let mut resp = [0u8; 6];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            near.read_exact(&mut resp),
+        )
+        .await
+        .expect("回包超时")
+        .unwrap();
+        assert_eq!(&resp, b"\x00\x04ping", "连接模式回包也不带地址");
     }
 }

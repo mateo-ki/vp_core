@@ -243,11 +243,7 @@ impl TuicOutbound {
 
     /// QUIC 连接 + Authenticate
     async fn dial(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
-        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
-            .await
-            .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
-            .next()
-            .ok_or(Error::Addr("无地址".into()))?;
+        let addr = vp_transport::resolve_node_addrs(&self.server, self.port).await?[0];
         let bind: &'static str = if addr.is_ipv4() {
             "0.0.0.0:0"
         } else {

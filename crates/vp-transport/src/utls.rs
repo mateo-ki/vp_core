@@ -432,7 +432,7 @@ impl Direction {
         Ok(())
     }
 
-    /// 解密密文（含 tag），返回内层内容（去 padding / inner type 前的数据）
+    /// 解密密文（含 tag），返回 (inner content type, 内容)
     fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
         let n = ring::aead::Nonce::assume_unique_for_key(self.nonce());
         let mut buf = ciphertext.to_vec();
@@ -447,16 +447,14 @@ impl Direction {
                 ))
             })?;
         self.seq += 1;
-        if plain.is_empty() {
-            return Err(Error::Proto("utls: 空记录"));
-        }
-        // 末字节为 inner content type，其前全零为 padding
-        let inner = plain[plain.len() - 1];
-        let mut end = plain.len() - 1;
-        while end > 0 && plain[end - 1] == 0 {
-            end -= 1;
-        }
-        Ok((inner, plain[..end].to_vec()))
+        // RFC 8446 §5.2：明文 = 内容 || 内容类型(1B) || 零填充。从尾部跳过填充，第一个非零字节
+        // 才是内容类型（REALITY 服务端会把握手记录填充到伪装站的长度）；内容本身可以以 0 结尾，
+        // 不能当成填充剥掉，否则数据被静默截断
+        let pos = plain
+            .iter()
+            .rposition(|&b| b != 0)
+            .ok_or(Error::Proto("utls: 记录缺少内容类型"))?;
+        Ok((plain[pos], plain[..pos].to_vec()))
     }
 
     /// 密钥更新（KeyUpdate）：traffic upd
@@ -1177,6 +1175,7 @@ where
         hdr: [0; 5],
         rx_closed: false,
         tx_closed: false,
+        raw_read: false,
     })
 }
 
@@ -1202,11 +1201,26 @@ pub struct UtlsStream<S> {
     hdr: [u8; 5],
     rx_closed: bool,
     tx_closed: bool,
+    /// XTLS Vision PaddingDirect 之后：读方向不再解密，原始字节直通（写方向照旧加密）
+    raw_read: bool,
 }
 
-impl<S> vp_core::ProxyStream for UtlsStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+impl<S> vp_core::ProxyStream for UtlsStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    fn switch_to_raw_read(&mut self) -> bool {
+        // 记录只在被读走时才解密，切换时尚未解密的字节都还在 raw 里；
+        // 若下一条记录的头已被切走（等待记录体），把它放回原始字节最前面
+        if let RxState::Body { .. } = self.state {
+            let mut back = BytesMut::from(&self.hdr[..]);
+            back.extend_from_slice(&self.raw);
+            self.raw = back;
+        }
+        self.state = RxState::Header { need: 5, got: 0 };
+        self.raw_read = true;
+        true
+    }
 }
 
 impl<S: tokio::io::AsyncRead + Unpin> UtlsStream<S> {
@@ -1314,16 +1328,24 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncRe
                 this.plaintext.advance(n);
                 return Poll::Ready(Ok(()));
             }
+            if this.raw_read && !this.raw.is_empty() {
+                let n = this.raw.len().min(buf.remaining());
+                buf.put_slice(&this.raw[..n]);
+                this.raw.advance(n);
+                return Poll::Ready(Ok(()));
+            }
             if this.rx_closed {
                 return Poll::Ready(Ok(()));
             }
             // 推进状态机（可能产出明文）
-            match this.try_progress() {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => {
-                    this.rx_closed = true;
-                    return Poll::Ready(Err(io::Error::other(e.to_string())));
+            if !this.raw_read {
+                match this.try_progress() {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        this.rx_closed = true;
+                        return Poll::Ready(Err(io::Error::other(e.to_string())));
+                    }
                 }
             }
             // 如果待发缓冲区有未发出数据，在等待对端响应前主动冲刷（防止双向通信下写后未显式 flush 造成的管线死锁）
@@ -1336,6 +1358,9 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> tokio::io::AsyncRe
             }
             if this.tx_buf.is_empty() {
                 let _ = Pin::new(&mut this.conn).poll_flush(cx);
+            }
+            if this.raw_read {
+                return Pin::new(&mut this.conn).poll_read(cx, buf);
             }
             // 需要更多原始字节
             this.raw.reserve(16 * 1024);
@@ -1528,6 +1553,33 @@ mod tests {
     }
 
     /// 测试辅助：从 CH 记录中删除指定扩展并修正各长度
+
+    #[test]
+    fn open_strips_padding_but_keeps_trailing_zero_content() {
+        // RFC 8446 §5.2：内容 || 类型 || 零填充。真实 REALITY 服务端会填充握手记录，
+        // 内容本身也可能以 0 结尾——两者都必须原样还原
+        let suite = suite_def(SUITE_AES128).unwrap();
+        let mut tx = Direction::new(suite, &[7u8; 32]).unwrap();
+        let mut rx = Direction::new(suite, &[7u8; 32]).unwrap();
+        let aad = [REC_APPDATA, 0x03, 0x03, 0, 0];
+        for (content, pad) in [
+            (&b"abc\0\0"[..], 0usize),
+            (&b"abc\0\0"[..], 5),
+            (&b"x"[..], 300),
+        ] {
+            let mut buf = BytesMut::from(content);
+            buf.put_u8(REC_HANDSHAKE);
+            buf.put_bytes(0, pad);
+            tx.seal(&aad, &mut buf).unwrap();
+            let (inner, data) = rx.open(&aad, &buf).unwrap();
+            assert_eq!(inner, REC_HANDSHAKE, "pad={pad}");
+            assert_eq!(data, content, "pad={pad}");
+        }
+        // 全零：没有内容类型，必须报错
+        let mut buf = BytesMut::from(&[0u8; 4][..]);
+        tx.seal(&aad, &mut buf).unwrap();
+        assert!(rx.open(&aad, &buf).is_err());
+    }
 
     #[test]
     fn ch_profile_chrome_like() {

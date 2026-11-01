@@ -5,8 +5,9 @@
 //!   导出（label=UUID 字符串，context=原始密码，RFC 5705）
 //! - Connect `0x01`（bi 流）：`ADDR_TYPE(1) ADDR PORT(2)`，无应答直接中继
 //!   ADDR_TYPE：`0x00` 域名（首字节长度）/ `0x01` IPv4 / `0x02` IPv6 / `0xff` None
-//! - Packet `0x02`（uni 流）：`ASSOC(2) PKT(2) FRAG_TOTAL(1) FRAG(1) SIZE(2) ADDR`
-//!   SIZE = ADDR 编码长 + payload 长
+//! - Packet `0x02`（native 模式走 datagram，quic 模式走 uni 流）：
+//!   `ASSOC(2) PKT(2) FRAG_TOTAL(1) FRAG(1) SIZE(2) ADDR PAYLOAD`，SIZE = 本片 payload 长（不含 ADDR）；
+//!   超过 datagram 上限时分片，只有首片带地址，其余 ADDR 为 None（`0xff`）
 //! - Dissociate `0x03`（uni 流）：`ASSOC(2)`
 //! - Heartbeat `0x04`（datagram）：空 OPT
 //!
@@ -27,6 +28,8 @@ use vp_core::session::Session;
 use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
 
+use crate::hysteria2::{Defragger, UdpSessions, split_frags, udp_session};
+
 const VER: u8 = 0x05;
 const T_AUTH: u8 = 0x00;
 const T_CONNECT: u8 = 0x01;
@@ -34,6 +37,8 @@ const T_PACKET: u8 = 0x02;
 const T_DISSOCIATE: u8 = 0x03;
 #[allow(dead_code)]
 const T_HEARTBEAT: u8 = 0x04;
+/// 一条 uni 流命令的上限：头 + 最长地址（域名）+ 16 位 SIZE 能表示的最大载荷
+const MAX_UNI_CMD: usize = 2 + 8 + 259 + u16::MAX as usize;
 
 // ---------------------------------------------------------------------------
 // 地址编解码（TUIC 风格，与 SOCKS 不同：0x00 域名 / 0x01 v4 / 0x02 v6）
@@ -116,6 +121,47 @@ fn decode_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
     }
 }
 
+/// 编码 Packet 命令，超过 `max` 时分片（只有首片带地址，其余 ADDR 为 None）
+fn packet_frames(assoc: u16, pkt_id: u16, addr: &DstAddr, data: &[u8], max: usize) -> Vec<Bytes> {
+    let mut a = Vec::with_capacity(24);
+    encode_addr(addr, &mut a);
+    let head = 10 + a.len();
+    // SIZE 只有 16 位：uni 流不限长时也按它切
+    split_frags(data, head, max.min(head + u16::MAX as usize))
+        .into_iter()
+        .map(|(id, total, part)| {
+            let mut m = Vec::with_capacity(head + part.len());
+            m.extend_from_slice(&[VER, T_PACKET]);
+            m.extend_from_slice(&assoc.to_be_bytes());
+            m.extend_from_slice(&pkt_id.to_be_bytes());
+            m.extend_from_slice(&[total, id]);
+            m.extend_from_slice(&(part.len() as u16).to_be_bytes());
+            if id == 0 {
+                m.extend_from_slice(&a);
+            } else {
+                m.push(0xff);
+            }
+            m.extend_from_slice(part);
+            Bytes::from(m)
+        })
+        .collect()
+}
+
+/// 开一条 uni 流写入一条完整命令
+async fn send_uni(conn: &quinn::Connection, cmd: &[u8]) -> Result<()> {
+    let io = |e: String| Error::Io(std::io::Error::other(e));
+    let mut uni = conn
+        .open_uni()
+        .await
+        .map_err(|e| io(format!("tuic open_uni: {e}")))?;
+    uni.write_all(cmd)
+        .await
+        .map_err(|e| io(format!("tuic uni 写入: {e}")))?;
+    uni.finish()
+        .map_err(|e| io(format!("tuic uni finish: {e}")))?;
+    Ok(())
+}
+
 fn token(conn: &quinn::Connection, uuid16: &[u8; 16], password: &str) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     // tuic v5 规范：label = 16 字节原始 UUID（官方实现 uuid.as_ref()），不是带连字符的字符串
@@ -137,6 +183,8 @@ pub struct TuicOutbound {
     sni: Option<String>,
     skip_verify: bool,
     _congestion_controller: Option<String>,
+    /// udp-relay-mode: quic（每包一条 uni 流）；默认 native（QUIC datagram，同 mihomo）
+    udp_over_stream: bool,
     assoc_counter: AtomicU16,
     session: Mutex<Option<Arc<TuicSession>>>,
 }
@@ -164,25 +212,57 @@ impl TuicUdpDemuxer {
             Arc::new(RwLock::new(HashMap::new()));
         let listeners_cloned = listeners.clone();
         let task = tokio::spawn(async move {
-            while let Ok(stream) = conn.read_datagram().await {
-                if stream.len() < 2 || stream[0] != VER {
-                    continue;
-                }
-                match stream[1] {
-                    T_PACKET => {
-                        let Some(pkt) = parse_packet_opt(&stream[2..]) else {
-                            continue;
-                        };
-                        let guard = listeners_cloned.read().await;
-                        if let Some(tx) = guard.get(&pkt.assoc) {
-                            let _ = tx.try_send(UdpPacket {
-                                src: pkt.src,
-                                dst: pkt.src,
-                                data: pkt.payload,
-                            });
+            let mut defrag: HashMap<u16, Defragger<SocketAddr>> = HashMap::new();
+            loop {
+                // 服务端按 assoc 首包的模式回包：native → datagram，quic → 每包一条 uni 流
+                let cmd = tokio::select! {
+                    d = conn.read_datagram() => match d {
+                        Ok(d) => d,
+                        Err(_) => break,
+                    },
+                    u = conn.accept_uni() => {
+                        let Ok(mut u) = u else { break };
+                        match u.read_to_end(MAX_UNI_CMD).await {
+                            Ok(b) => Bytes::from(b),
+                            Err(_) => continue,
                         }
                     }
-                    _ => continue,
+                };
+                if cmd.len() < 2 || cmd[0] != VER || cmd[1] != T_PACKET {
+                    continue;
+                }
+                let Some(p) = parse_packet_opt(cmd.slice(2..)) else {
+                    continue;
+                };
+                let src = match p.addr {
+                    None => None,
+                    Some(DstAddr {
+                        host: Host::Ip(ip),
+                        port,
+                    }) => Some(SocketAddr::new(ip, port)),
+                    Some(_) => continue,
+                };
+                let guard = listeners_cloned.read().await;
+                let Some(tx) = guard.get(&p.assoc) else {
+                    continue;
+                };
+                // 已注销 assoc 的重组状态批量清掉
+                if defrag.len() > guard.len() + 64 {
+                    defrag.retain(|k, _| guard.contains_key(k));
+                }
+                let whole = defrag.entry(p.assoc).or_default().feed(
+                    p.pkt_id,
+                    p.frag_id,
+                    p.frag_total,
+                    src,
+                    p.payload,
+                );
+                if let Some((src, data)) = whole {
+                    let _ = tx.try_send(UdpPacket {
+                        src,
+                        dst: src,
+                        data,
+                    });
                 }
             }
         });
@@ -198,6 +278,13 @@ impl TuicUdpDemuxer {
 
     pub async fn unregister(&self, assoc: u16) {
         self.listeners.write().await.remove(&assoc);
+    }
+}
+
+impl Drop for TuicUdpDemuxer {
+    /// 接收任务持有连接副本：不停掉它，被替换的旧连接会靠 keepalive 一直活着
+    fn drop(&mut self) {
+        self._task.abort();
     }
 }
 
@@ -218,6 +305,10 @@ impl TuicOutbound {
                 .or_else(|| Some(cfg.server.clone())),
             skip_verify: cfg.skip_cert_verify,
             _congestion_controller: cfg.congestion_controller.clone(),
+            udp_over_stream: cfg
+                .udp_relay_mode
+                .as_deref()
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case("quic")),
             assoc_counter: AtomicU16::new(1),
             session: Mutex::new(None),
         })
@@ -283,10 +374,6 @@ impl TuicOutbound {
 
     /// Authenticate（uni 流）
     async fn authenticate(&self, conn: &quinn::Connection) -> Result<()> {
-        let mut uni = conn
-            .open_uni()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic open_uni: {e}"))))?;
         let uuid16 = parse_uuid16(&self.uuid)?;
         let tok = token(conn, &uuid16, &self.password)?;
         let mut auth = Vec::with_capacity(2 + 16 + 32);
@@ -294,12 +381,7 @@ impl TuicOutbound {
         auth.push(T_AUTH);
         auth.extend_from_slice(&uuid16);
         auth.extend_from_slice(&tok);
-        uni.write_all(&auth)
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic auth 写入: {e}"))))?;
-        uni.finish()
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic auth finish: {e}"))))?;
-        Ok(())
+        send_uni(conn, &auth).await
     }
 }
 
@@ -361,6 +443,7 @@ impl Outbound for TuicOutbound {
             pkt: AtomicU16::new(1),
             rx,
             target: dst.clone(),
+            over_stream: self.udp_over_stream,
         }))
     }
 
@@ -369,7 +452,7 @@ impl Outbound for TuicOutbound {
     }
 }
 
-/// UDP：uni 流模式 Packet 命令（回包走 QUIC datagram，由 TuicUdpDemuxer 统一路由）
+/// UDP 关联（assoc）：Packet 命令按 udp-relay-mode 走 datagram 或 uni 流，回包由 TuicUdpDemuxer 路由
 struct TuicPacketConn {
     conn: quinn::Connection,
     demux: Arc<TuicUdpDemuxer>,
@@ -377,14 +460,20 @@ struct TuicPacketConn {
     pkt: AtomicU16,
     rx: mpsc::Receiver<UdpPacket>,
     target: DstAddr,
+    over_stream: bool,
 }
 
 impl Drop for TuicPacketConn {
     fn drop(&mut self) {
         let demux = self.demux.clone();
+        let conn = self.conn.clone();
         let assoc = self.assoc;
         tokio::spawn(async move {
             demux.unregister(assoc).await;
+            // Dissociate：让服务端释放该 assoc 的套接字
+            let mut m = vec![VER, T_DISSOCIATE];
+            m.extend_from_slice(&assoc.to_be_bytes());
+            let _ = send_uni(&conn, &m).await;
         });
     }
 }
@@ -392,7 +481,6 @@ impl Drop for TuicPacketConn {
 #[async_trait]
 impl PacketConn for TuicPacketConn {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
-        let mut addr = Vec::with_capacity(24);
         let dst_to_encode =
             if pkt.dst.ip().is_loopback() || matches!(self.target.host, Host::Domain(_)) {
                 &self.target
@@ -402,28 +490,22 @@ impl PacketConn for TuicPacketConn {
                     port: pkt.dst.port(),
                 }
             };
-        encode_addr(dst_to_encode, &mut addr);
-        let size = addr.len() + pkt.data.len();
-        let mut msg = Vec::with_capacity(2 + 8 + size);
-        msg.push(VER);
-        msg.push(T_PACKET);
-        msg.extend_from_slice(&self.assoc.to_be_bytes());
-        msg.extend_from_slice(&(self.pkt.fetch_add(1, Ordering::Relaxed)).to_be_bytes());
-        msg.push(1); // frag total
-        msg.push(0); // frag id
-        msg.extend_from_slice(&(size as u16).to_be_bytes());
-        msg.extend_from_slice(&addr);
-        msg.extend_from_slice(&pkt.data);
-        let mut uni = self
+        let pkt_id = self.pkt.fetch_add(1, Ordering::Relaxed);
+        if self.over_stream {
+            for m in packet_frames(self.assoc, pkt_id, dst_to_encode, &pkt.data, usize::MAX) {
+                send_uni(&self.conn, &m).await?;
+            }
+            return Ok(());
+        }
+        let max = self
             .conn
-            .open_uni()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic pkt open_uni: {e}"))))?;
-        uni.write_all(&msg)
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic pkt 写入: {e}"))))?;
-        uni.finish()
-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic pkt finish: {e}"))))?;
+            .max_datagram_size()
+            .ok_or(Error::Proto("tuic: 对端未启用 QUIC datagram"))?;
+        for m in packet_frames(self.assoc, pkt_id, dst_to_encode, &pkt.data, max) {
+            self.conn
+                .send_datagram(m)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("tuic datagram: {e}"))))?;
+        }
         Ok(())
     }
 
@@ -437,35 +519,37 @@ impl PacketConn for TuicPacketConn {
 
 struct PacketOpt {
     assoc: u16,
-    src: SocketAddr,
+    pkt_id: u16,
+    frag_total: u8,
+    frag_id: u8,
+    /// 非首片为 None（ADDR 类型 0xff）
+    addr: Option<DstAddr>,
     payload: Bytes,
 }
 
-/// 解析 Packet OPT：ASSOC(2) PKT(2) FRAG_TOTAL(1) FRAG(1) SIZE(2) ADDR PAYLOAD
-fn parse_packet_opt(opt: &[u8]) -> Option<PacketOpt> {
-    if opt.len() < 8 {
+/// 解析 Packet OPT：ASSOC(2) PKT(2) FRAG_TOTAL(1) FRAG(1) SIZE(2) ADDR PAYLOAD(SIZE)
+fn parse_packet_opt(opt: Bytes) -> Option<PacketOpt> {
+    if opt.len() < 9 {
         return None;
-    }
-    let assoc = u16::from_be_bytes([opt[0], opt[1]]);
-    let frag_total = opt[4];
-    if frag_total != 1 {
-        return None; // 分片不支持
     }
     let size = u16::from_be_bytes([opt[6], opt[7]]) as usize;
-    let rest = &opt[8..];
-    if rest.len() < size {
+    let (addr, used) = if opt[8] == 0xff {
+        (None, 1)
+    } else {
+        let (d, n) = decode_addr(&opt[8..]).ok()?;
+        (Some(d), n)
+    };
+    let start = 8 + used;
+    if opt.len() < start + size {
         return None;
     }
-    let body = &rest[..size];
-    let (dst, used) = decode_addr(body).ok()?;
-    let ip = match dst.host {
-        Host::Ip(ip) => ip,
-        Host::Domain(_) => return None,
-    };
     Some(PacketOpt {
-        assoc,
-        src: SocketAddr::new(ip, dst.port),
-        payload: Bytes::copy_from_slice(&body[used..]),
+        assoc: u16::from_be_bytes([opt[0], opt[1]]),
+        pkt_id: u16::from_be_bytes([opt[2], opt[3]]),
+        frag_total: opt[4],
+        frag_id: opt[5],
+        addr,
+        payload: opt.slice(start..start + size),
     })
 }
 
@@ -645,68 +729,46 @@ impl ToAddrsDyn for (&str, u16) {
 }
 
 impl TuicInbound {
-    /// UDP 会话：登记目标 + 建socket + 回包泵（datagram 模式回发）
-    async fn udp_session_relay(
+    /// 一条 Packet 命令交给 assoc 的会话（每 assoc 一个套接字）；回包沿用该 assoc 首包的模式
+    fn relay_packet(
         conn: &quinn::Connection,
-        udp_sessions: &mut std::collections::HashMap<
-            u16,
-            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
-        >,
-        pkt: PacketOpt,
-    ) -> Result<()> {
-        let sess = udp_sessions
-            .entry(pkt.assoc)
-            .or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Mutex::new("127.0.0.1:0".parse().unwrap()))
-            })
-            .clone();
-        let mut guard = sess.lock().await;
-        if guard.port() == 0 {
-            *guard = pkt.src;
-        }
-        let target = *guard;
-        drop(guard);
-        let sock = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
-        sock.connect(target).await?;
-        let _ = sock.send(&pkt.payload).await;
-        let conn2 = conn.clone();
-        let assoc = pkt.assoc;
-        tokio::spawn(async move {
-            let mut rbuf = [0u8; 65535];
-            loop {
-                let recv = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    sock.recv_from(&mut rbuf),
-                )
-                .await;
-                let Ok(Ok((n, from))) = recv else { break };
-                let mut addr = Vec::new();
-                encode_addr(&DstAddr::ip(from.ip(), from.port()), &mut addr);
-                let size = addr.len() + n;
-                let mut msg = vec![VER, T_PACKET];
-                msg.extend_from_slice(&assoc.to_be_bytes());
-                msg.extend_from_slice(&1u16.to_be_bytes());
-                msg.push(1);
-                msg.push(0);
-                msg.extend_from_slice(&(size as u16).to_be_bytes());
-                msg.extend_from_slice(&addr);
-                msg.extend_from_slice(&rbuf[..n]);
-                if conn2.send_datagram(Bytes::from(msg)).is_err() {
-                    break;
+        udp_sessions: &mut UdpSessions<u16, DstAddr>,
+        p: PacketOpt,
+        over_stream: bool,
+    ) {
+        let assoc = p.assoc;
+        let (tx, defrag) = udp_session(udp_sessions, assoc, || {
+            let conn = conn.clone();
+            let mut pkt_id = 0u16;
+            move |from: SocketAddr, data: &[u8]| {
+                pkt_id = pkt_id.wrapping_add(1);
+                let src = DstAddr::ip(from.ip(), from.port());
+                if over_stream {
+                    for m in packet_frames(assoc, pkt_id, &src, data, usize::MAX) {
+                        let conn = conn.clone();
+                        tokio::spawn(async move {
+                            let _ = send_uni(&conn, &m).await;
+                        });
+                    }
+                } else {
+                    let max = conn.max_datagram_size().unwrap_or(0);
+                    for m in packet_frames(assoc, pkt_id, &src, data, max) {
+                        let _ = conn.send_datagram(m);
+                    }
                 }
+                conn.close_reason().is_none()
             }
         });
-        Ok(())
+        if let Some(whole) = defrag.feed(p.pkt_id, p.frag_id, p.frag_total, p.addr, p.payload) {
+            let _ = tx.try_send(whole);
+        }
     }
 
     /// 已认证的连接：认证（首个 uni 流）成功前不处理其它命令
     async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
         // 并发接受 uni/bi 流与 datagram；认证在首个 uni 流上
         let authed = Arc::new(tokio::sync::Notify::new());
-        let mut udp_sessions: std::collections::HashMap<
-            u16,
-            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
-        > = std::collections::HashMap::new();
+        let mut udp_sessions: UdpSessions<u16, DstAddr> = HashMap::new();
 
         // 期望 token 集合
         let expect: Vec<([u8; 16], [u8; 32])> = self
@@ -749,23 +811,9 @@ impl TuicInbound {
                             authed.notify_waiters();
                         }
                         T_PACKET => {
-                            let mut opt = Vec::with_capacity(1500);
-                            let mut lim = 0usize;
-                            loop {
-                                let mut b = [0u8; 1];
-                                match uni.read(&mut b).await {
-                                    Ok(None) | Err(_) => break,
-                                    Ok(Some(_)) => {
-                                        opt.push(b[0]);
-                                        lim += 1;
-                                        if lim > 65535 {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            let Some(pkt) = parse_packet_opt(&opt) else { continue };
-                            let _ = Self::udp_session_relay(&conn, &mut udp_sessions, pkt).await;
+                            let Ok(opt) = uni.read_to_end(MAX_UNI_CMD).await else { continue };
+                            let Some(p) = parse_packet_opt(opt.into()) else { continue };
+                            Self::relay_packet(&conn, &mut udp_sessions, p, true);
                         }
                         T_DISSOCIATE => {
                             let mut a = [0u8; 2];
@@ -845,8 +893,8 @@ impl TuicInbound {
                 dg = conn.read_datagram() => {
                     let Ok(dg) = dg else { break };
                     if dg.len() >= 2 && dg[0] == VER && dg[1] == T_PACKET {
-                        let Some(pkt) = parse_packet_opt(&dg[2..]) else { continue };
-                        let _ = Self::udp_session_relay(&conn, &mut udp_sessions, pkt).await;
+                        let Some(p) = parse_packet_opt(dg.slice(2..)) else { continue };
+                        Self::relay_packet(&conn, &mut udp_sessions, p, false);
                     }
                     // Heartbeat 忽略
                 }
@@ -984,22 +1032,76 @@ mod tests {
     }
 
     #[test]
-    fn packet_opt_roundtrip() {
-        let mut addr = Vec::new();
-        encode_addr(&DstAddr::ip("9.9.9.9".parse().unwrap(), 53), &mut addr);
-        let payload = b"hello";
-        let size = addr.len() + payload.len();
-        let mut opt = Vec::new();
-        opt.extend_from_slice(&0x0102u16.to_be_bytes()); // assoc
-        opt.extend_from_slice(&7u16.to_be_bytes()); // pkt
-        opt.push(1);
-        opt.push(0);
-        opt.extend_from_slice(&(size as u16).to_be_bytes());
-        opt.extend_from_slice(&addr);
-        opt.extend_from_slice(payload);
-        let p = parse_packet_opt(&opt).unwrap();
-        assert_eq!(p.assoc, 0x0102);
-        assert_eq!(p.src.to_string(), "9.9.9.9:53");
+    fn packet_frames_roundtrip() {
+        let dst = DstAddr::ip("9.9.9.9".parse().unwrap(), 53);
+        // 单片：SIZE 只计 payload（规范与 mihomo 一致，不含 ADDR）
+        let one = packet_frames(0x0102, 7, &dst, b"hello", 1200);
+        assert_eq!(one.len(), 1);
+        assert_eq!(&one[0][8..10], &5u16.to_be_bytes());
+        let p = parse_packet_opt(one[0].slice(2..)).unwrap();
+        assert_eq!(
+            (p.assoc, p.pkt_id, p.frag_total, p.frag_id),
+            (0x0102, 7, 1, 0)
+        );
+        assert_eq!(p.addr.as_ref(), Some(&dst));
         assert_eq!(&p.payload[..], b"hello");
+
+        // 分片：只有首片带地址（其余 ADDR=None），乱序到达照样重组
+        let big: Vec<u8> = (0..8000u32).map(|i| i as u8).collect();
+        let frags = packet_frames(9, 42, &dst, &big, 1200);
+        assert!(frags.len() > 1 && frags.iter().all(|f| f.len() <= 1200));
+        let mut d = Defragger::default();
+        let mut out = None;
+        for f in frags.iter().rev() {
+            let p = parse_packet_opt(f.slice(2..)).unwrap();
+            assert_eq!(p.addr.is_some(), p.frag_id == 0);
+            assert_eq!(p.payload.len(), u16::from_be_bytes([f[8], f[9]]) as usize);
+            out = d.feed(p.pkt_id, p.frag_id, p.frag_total, p.addr, p.payload);
+        }
+        assert_eq!(out, Some((dst.clone(), Bytes::from(big.clone()))));
+
+        // uni 流不限长：一片装下（SIZE 16 位以内）
+        assert_eq!(packet_frames(9, 43, &dst, &big, usize::MAX).len(), 1);
+        // 截断的命令不解析
+        assert!(parse_packet_opt(frags[0].slice(2..frags[0].len() - 1)).is_none());
+    }
+
+    /// 两种 udp-relay-mode 下的大包往返：native 双向分片 / 重组，quic 走 uni 流且服务端按同模式回包
+    #[tokio::test]
+    async fn tuic_udp_large_packets() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ctx = vp_core::InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let server = TuicInbound::new(
+            "127.0.0.1",
+            0,
+            "tuic-srv",
+            vec![(uuid.to_string(), "pw".to_string())],
+            cert.cert.pem().into_bytes(),
+            cert.key_pair.serialize_pem().into_bytes(),
+        );
+        let port = Arc::new(server).start(ctx).await.unwrap();
+        for mode in [None, Some("quic")] {
+            let out = TuicOutbound::new(&vp_config::TuicCfg {
+                server: "127.0.0.1".into(),
+                port,
+                uuid: uuid.into(),
+                password: "pw".into(),
+                sni: None,
+                skip_cert_verify: true,
+                congestion_controller: None,
+                udp_relay_mode: mode.map(Into::into),
+            })
+            .unwrap();
+            let echo = crate::test_support::udp_echo().await;
+            let dst = DstAddr::ip(echo.ip(), echo.port());
+            let sess = Session::new_udp("t".into(), None, dst.clone());
+            let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
+            crate::test_support::assert_udp_roundtrip(&mut conn, echo).await;
+        }
     }
 }

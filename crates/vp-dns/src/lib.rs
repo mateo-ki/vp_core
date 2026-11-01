@@ -71,8 +71,14 @@ pub fn get_bind_interface_name() -> Option<String> {
     BIND_INTERFACE_NAME.read().unwrap().clone()
 }
 
+/// 网卡名 → 接口索引。接受三种写法：数字索引、网卡别名（"WLAN"、"以太网"，mihomo 的
+/// interface-name 就是这种）、适配器名（"{GUID}" / "\DEVICE\TCPIP_{GUID}"）。
 #[cfg(windows)]
 pub fn resolve_windows_interface_index(name: &str) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, GetAdapterIndex,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
     if let Ok(idx) = name.parse::<u32>() {
         return Some(idx);
     }
@@ -81,14 +87,33 @@ pub fn resolve_windows_interface_index(name: &str) -> Option<u32> {
     wide.push(0);
     let mut idx = 0u32;
     unsafe {
-        if windows_sys::Win32::NetworkManagement::IpHelper::GetAdapterIndex(wide.as_ptr(), &mut idx)
-            == 0
+        let mut luid: NET_LUID_LH = std::mem::zeroed();
+        if ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) == 0
+            && ConvertInterfaceLuidToIndex(&luid, &mut idx) == 0
             && idx > 0
         {
             return Some(idx);
         }
+        if GetAdapterIndex(wide.as_ptr(), &mut idx) == 0 && idx > 0 {
+            return Some(idx);
+        }
     }
+    // 每条连接都会走到这里：只提示一次，避免刷屏
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED
+        .call_once(|| tracing::warn!("找不到网卡 {name:?}，出站不绑定该网卡（本提示每进程一次）"));
     None
+}
+
+/// Windows 出站绑定的网卡：节点专属名称 > 全局名称（interface-name）> 全局索引（TUN 自动探测）。
+/// 显式配置优先于自动探测；名称解析失败时退回自动探测的索引
+#[cfg(windows)]
+fn windows_bind_index(if_name_opt: Option<&str>) -> Option<u32> {
+    if_name_opt
+        .map(str::to_owned)
+        .or_else(get_bind_interface_name)
+        .and_then(|n| resolve_windows_interface_index(&n))
+        .or_else(get_bind_interface_index)
 }
 
 #[cfg(unix)]
@@ -171,10 +196,7 @@ pub fn create_udp_socket_with_opts(
     {
         let _ = routing_mark_opt;
         if !bind_addr.ip().is_loopback() {
-            let if_idx = if_name_opt
-                .and_then(resolve_windows_interface_index)
-                .or_else(get_bind_interface_index);
-            if let Some(if_idx) = if_idx {
+            if let Some(if_idx) = windows_bind_index(if_name_opt) {
                 let domain = match bind_addr {
                     SocketAddr::V4(_) => socket2::Domain::IPV4,
                     SocketAddr::V6(_) => socket2::Domain::IPV6,
@@ -289,10 +311,7 @@ pub async fn connect_tcp_bound_with_opts(
     {
         let _ = routing_mark_opt;
         if !addr.ip().is_loopback() {
-            let if_idx = if_name_opt
-                .and_then(resolve_windows_interface_index)
-                .or_else(get_bind_interface_index);
-            if let Some(if_idx) = if_idx {
+            if let Some(if_idx) = windows_bind_index(if_name_opt) {
                 let domain = match addr {
                     SocketAddr::V4(_) => socket2::Domain::IPV4,
                     SocketAddr::V6(_) => socket2::Domain::IPV6,
@@ -1536,6 +1555,19 @@ async fn read_http_body<S: tokio::io::AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use tokio::net::UdpSocket;
+
+    /// interface-name 写网卡别名（mihomo 写法）也必须能解析；此前只认适配器 GUID 名，
+    /// 写 "WLAN" / "以太网" 会静默不绑定，开着别的 TUN 时流量照样被它吞掉
+    #[cfg(windows)]
+    #[test]
+    fn windows_interface_alias_resolves() {
+        assert_eq!(resolve_windows_interface_index("1"), Some(1));
+        assert_eq!(
+            resolve_windows_interface_index("Loopback Pseudo-Interface 1"),
+            Some(1)
+        );
+        assert_eq!(resolve_windows_interface_index("no-such-nic-xyz"), None);
+    }
 
     #[test]
     fn server_parsing() {

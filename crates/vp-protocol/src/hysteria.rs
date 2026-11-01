@@ -199,11 +199,7 @@ impl Hysteria1Outbound {
     }
 
     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
-        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
-            .await
-            .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
-            .next()
-            .ok_or(Error::Addr("无地址".into()))?;
+        let addr = vp_transport::resolve_node_addrs(&self.server, self.port).await?[0];
         tracing::debug!(target: "hy1", %addr, sni = %self.sni, alpn = ?self.alpn, "hy1: 开始 QUIC 握手");
         let mut ep = match &self.obfs {
             Some(ob) => {

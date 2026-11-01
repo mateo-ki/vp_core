@@ -424,7 +424,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
         | ProxyKind::Brook(_)
         | ProxyKind::Direct
         | ProxyKind::Reject => o,
-        _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o)),
+        _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o, uot_version(cfg))),
         _ => o,
     };
     // smux 多路复用包装（仅流型协议出站生效）
@@ -585,12 +585,21 @@ fn build_trojan(_name: &str, _tr_cfg: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
     Err(Error::Unsupported("此构建未启用 trojan".into()))
 }
 
+/// UoT 版本：显式配置优先；naive / anytls 缺省 2（sing-box 与 anytls 规范：anytls-go 服务端
+/// 不论魔法地址都按 v2 读请求头），其余缺省 1（同 mihomo 文档）
+fn uot_version(cfg: &ProxyCfg) -> u8 {
+    cfg.udp_over_tcp_version.unwrap_or(match cfg.kind {
+        ProxyKind::Naive(_) | ProxyKind::Anytls(_) => 2,
+        _ => 1,
+    })
+}
+
 fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
     let base: Arc<dyn Outbound> =
         Arc::new(anytls::AnytlsOutbound::new_named(cfg.name.as_str(), a)?);
     // anytls 无原生 UDP：udp: true 时经 UoT 提供（显式 udp-over-tcp 标志避免双包装）
     if a.udp && !cfg.udp_over_tcp {
-        Ok(Arc::new(uot::UotOutbound::new(base)))
+        Ok(Arc::new(uot::UotOutbound::new(base, uot_version(cfg))))
     } else {
         Ok(base)
     }
@@ -599,7 +608,7 @@ fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
 fn build_naive(cfg: &ProxyCfg, n: &NaiveCfg) -> Result<Arc<dyn Outbound>> {
     let base: Arc<dyn Outbound> = Arc::new(naive::NaiveOutbound::new_named(cfg.name.as_str(), n)?);
     if n.udp && !cfg.udp_over_tcp {
-        Ok(Arc::new(uot::UotOutbound::new(base)))
+        Ok(Arc::new(uot::UotOutbound::new(base, uot_version(cfg))))
     } else {
         Ok(base)
     }

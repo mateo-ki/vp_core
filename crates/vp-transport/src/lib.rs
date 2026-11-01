@@ -288,7 +288,8 @@ pub async fn wrap_transport(
                 },
             )
             .await?;
-            Box::new(vp_core::stream::Opaque(s))
+            // 直接装箱（不经 Opaque）：XTLS Vision 需要经 ProxyStream::switch_to_raw_read 触达 UtlsStream
+            Box::new(s)
         } else {
             let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = tls::tls_connect(
@@ -544,6 +545,30 @@ pub async fn dial_tcp_multi_with_opts(
         tune(&tcp);
         return Ok(tcp);
     }
+    let addrs = resolve_node_addrs(host, port).await?;
+    if addrs.len() == 1 {
+        let tcp = tokio::time::timeout(budget, connect_tcp_stream_with_opts(addrs[0], opts))
+            .await
+            .map_err(|_| {
+                vp_common::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("连接 {host}:{port} 超时"),
+                ))
+            })??;
+        tune(&tcp);
+        return Ok(tcp);
+    }
+    dial_addrs_multi_with_opts(&addrs, host, port, budget, opts).await
+}
+
+/// 节点服务器域名 → 地址列表（内置 DNS 的答案排在前面）。
+/// TCP 拨号与 QUIC / UDP 类出站（hysteria / tuic / ss UDP）共用：只走系统解析的话，
+/// 开着 TUN + Fake-IP 时（本内核或别的客户端）拿到的是 198.18.x.x 这类假地址，绑定物理网卡后发出去就是黑洞。
+pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
     let mut addrs: Vec<SocketAddr> = Vec::new();
     // 1) 内置 DNS（多上游并发 + 缓存 + 污染过滤）：节点域名优先走它
     if let Some((resolver, ipv6)) = global_node_resolver() {
@@ -568,19 +593,7 @@ pub async fn dial_tcp_multi_with_opts(
     if addrs.is_empty() {
         return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
     }
-    if addrs.len() == 1 {
-        let tcp = tokio::time::timeout(budget, connect_tcp_stream_with_opts(addrs[0], opts))
-            .await
-            .map_err(|_| {
-                vp_common::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("连接 {host}:{port} 超时"),
-                ))
-            })??;
-        tune(&tcp);
-        return Ok(tcp);
-    }
-    dial_addrs_multi_with_opts(&addrs, host, port, budget, opts).await
+    Ok(addrs)
 }
 
 /// 对既定地址列表竞速拨号（[`dial_tcp_multi`] 的核心，独立出来便于测试）。

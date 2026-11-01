@@ -765,9 +765,9 @@ impl App {
                                         if is_same {
                                             continue;
                                         }
-                                        if let Err(e) =
-                                            vp_rule::provider::load_payload(&new_text, behavior)
-                                        {
+                                        if let Err(e) = vp_rule::provider::load_payload(
+                                            &new_text, behavior, None,
+                                        ) {
                                             warn!(
                                                 "rule-provider {name} 定时拉取内容校验未通过: {e}"
                                             );
@@ -1392,7 +1392,7 @@ async fn load_providers(
             .await
             .map_err(|e| Error::Config(format!("拉取任务失败: {e}")))?;
             match res {
-                Ok(t) if vp_rule::provider::load_payload(&t, behavior).is_ok() => {
+                Ok(t) if vp_rule::provider::load_payload(&t, behavior, None).is_ok() => {
                     if let Some(parent) = cache_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }

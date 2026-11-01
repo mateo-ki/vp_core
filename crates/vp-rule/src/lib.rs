@@ -161,7 +161,7 @@ impl Matcher {
             Matcher::SubRules(list) => list.iter().any(|r| r.matcher.r#match(ctx)),
             Matcher::RuleSetDomain(d) => ctx.host.is_some_and(|h| d.matches(h)),
             Matcher::RuleSetIp(s) => ctx.dst_ip.is_some_and(|ip| s.contains(ip)),
-            Matcher::RuleSetClassical(c) => c.matches(ctx.host, ctx.dst_ip, ctx.dst_port),
+            Matcher::RuleSetClassical(c) => c.matches(ctx),
         }
     }
 
@@ -195,11 +195,32 @@ impl Matcher {
             #[cfg(feature = "geoip")]
             Matcher::IpAsn { src: false, .. } => true,
             Matcher::RuleSetIp(_) => true,
-            Matcher::RuleSetClassical(c) => !c.ips.is_empty(),
+            Matcher::RuleSetClassical(c) => c.needs_dst_ip(),
             Matcher::Logic { subs, .. } => subs.iter().any(|m| m.needs_dst_ip()),
             Matcher::SubRules(list) => list.iter().any(|r| r.matcher.needs_dst_ip()),
             _ => false,
         }
+    }
+
+    /// 是否含降级占位（NeverMatch：缺数据库 / 未知类型 / 嵌套过深）
+    fn is_degraded(&self) -> bool {
+        match self {
+            Matcher::NeverMatch => true,
+            Matcher::Logic { subs, .. } => subs.iter().any(Matcher::is_degraded),
+            _ => false,
+        }
+    }
+}
+
+/// 组装逻辑规则。NOT 之下若含降级占位，取反会把"永不匹配"变成"全匹配"，
+/// 因此整条 NOT 一并降级为 NeverMatch（降级原因解析器已告警）。
+fn logic(op: LogicOp, subs: Vec<Matcher>) -> Matcher {
+    if op == LogicOp::Not && subs.iter().any(Matcher::is_degraded) {
+        return Matcher::NeverMatch;
+    }
+    Matcher::Logic {
+        op,
+        subs: Arc::new(subs),
     }
 }
 
@@ -613,38 +634,13 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
         if parts.len() != 3 {
             return Err(format!("{ty} 需要规则组与目标: {raw:?}"));
         }
-        let inner = parts[1]
-            .trim()
-            .strip_prefix('(')
-            .and_then(|s| s.strip_suffix(')'))
-            .ok_or_else(|| format!("{ty} 规则组需要括号包裹: {raw:?}"))?;
         let target = check_target(parts[2].trim(), env, raw)?;
-        let op = match ty.as_str() {
-            "AND" => LogicOp::And,
-            "OR" => LogicOp::Or,
-            _ => LogicOp::Not,
-        };
-        let subs: Vec<Matcher> = split_rules_group(inner)
-            .drain(..)
-            .map(|s| {
-                let s = s
-                    .trim()
-                    .strip_prefix('(')
-                    .and_then(|x| x.strip_suffix(')'))
-                    .unwrap_or_else(|| s.trim());
-                parse_plain_rule(s, env, depth + 1, raw)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if subs.is_empty() {
-            return Err(format!("{ty} 规则组为空: {raw:?}"));
-        }
+        // 条件与 SUB-RULE 条件、classical 逻辑行共用 compile_logic_str（支持嵌套逻辑）
+        let cond = format!("{ty},{}", parts[1].trim());
         return Ok(CompiledRule {
             raw: raw.into(),
             target,
-            matcher: Matcher::Logic {
-                op,
-                subs: Arc::new(subs),
-            },
+            matcher: compile_logic_str(&cond, env, depth + 1)?,
             no_resolve: false,
         });
     }
@@ -682,6 +678,45 @@ fn parse_plain_rule(
     let ty = parts[0].trim().to_ascii_uppercase();
     let payload = parts[1].trim();
     parse_matcher(&ty, payload, env, depth, full)
+}
+
+/// classical 规则集的一行（无目标，可带 no-resolve 等参数），与顶层规则共用解析器。
+/// 返回 `(匹配器, no_resolve)`；None 表示解析器已告警降级（未知类型 / 缺数据库）。
+fn compile_classical_line(line: &str, env: &CompileEnv) -> Result<Option<(Matcher, bool)>, String> {
+    let parts = split_top_level(line);
+    let ty = parts
+        .first()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    // 对齐 mihomo：classical 内不支持 MATCH / RULE-SET / SUB-RULE
+    if matches!(ty.as_str(), "MATCH" | "RULE-SET" | "SUB-RULE") {
+        return Err(format!("classical 规则集内不支持 {ty}"));
+    }
+    // 逻辑规则里嵌套的 RULE-SET 同样禁止：providers 置空，防止规则集互相引用无限递归
+    let no_providers = HashMap::new();
+    let env = &CompileEnv {
+        providers: &no_providers,
+        ..*env
+    };
+    let (matcher, no_resolve) = if matches!(ty.as_str(), "AND" | "OR" | "NOT") {
+        (compile_logic_str(line, env, 1)?, false)
+    } else {
+        // DOMAIN-REGEX 的正则可能含逗号：同 mihomo，类型之后的全部内容都是 payload
+        let payload = if ty == "DOMAIN-REGEX" {
+            line.split_once(',').map(|(_, p)| p)
+        } else {
+            parts.get(1).map(String::as_str)
+        }
+        .map(str::trim)
+        .filter(|p| !p.is_empty()) // 空正则会匹配一切，与缺 payload 同样拒收
+        .ok_or_else(|| format!("规则格式应为 TYPE,payload: {line:?}"))?;
+        let no_resolve = parts
+            .iter()
+            .skip(2)
+            .any(|p| p.trim().eq_ignore_ascii_case("no-resolve"));
+        (parse_matcher(&ty, payload, env, 1, line)?, no_resolve)
+    };
+    Ok((!matches!(matcher, Matcher::NeverMatch)).then_some((matcher, no_resolve)))
 }
 
 fn parse_matcher(
@@ -836,7 +871,7 @@ fn parse_matcher(
                 .providers
                 .get(payload)
                 .ok_or_else(|| format!("RULE-SET {payload:?} 未在 rule-providers 中定义"))?;
-            let loaded = provider::load_payload(text, *behavior)
+            let loaded = provider::load_payload(text, *behavior, Some(env))
                 .map_err(|e| format!("RULE-SET {payload:?} 加载失败: {e}"))?;
             Ok(match loaded {
                 provider::ProviderPayload::Domain(d) => Matcher::RuleSetDomain(Arc::from(d)),
@@ -855,6 +890,10 @@ fn parse_matcher(
 
 /// 逻辑条件字符串：AND,((A),(B)) 可嵌套；叶子为 TYPE,payload
 fn compile_logic_str(s: &str, env: &CompileEnv, depth: usize) -> Result<Matcher, String> {
+    // classical 规则集的行来自远端：限制嵌套深度，防止构造的深层括号递归打爆栈
+    if depth > 8 {
+        return Err("规则嵌套过深".into());
+    }
     let parts = split_top_level(s);
     if parts.is_empty() {
         return Err("空逻辑条件".into());
@@ -879,14 +918,24 @@ fn compile_logic_str(s: &str, env: &CompileEnv, depth: usize) -> Result<Matcher,
                     .strip_prefix('(')
                     .and_then(|y| y.strip_suffix(')'))
                     .unwrap_or_else(|| x.trim());
-                compile_logic_str(x, env, depth + 1)
-                    .or_else(|_| parse_plain_rule(x, env, depth + 1, s))
+                // 子项本身是逻辑表达式时保留它的真实错误（嵌套过深 / 叶子非法）；
+                // 退回 parse_plain_rule 会把 AND/NOT 当成"未知规则类型"，日志指错原因
+                let head = x.split(',').next().unwrap_or("").trim();
+                if ["AND", "OR", "NOT"]
+                    .iter()
+                    .any(|op| head.eq_ignore_ascii_case(op))
+                {
+                    compile_logic_str(x, env, depth + 1)
+                } else {
+                    parse_plain_rule(x, env, depth + 1, s)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        return Ok(Matcher::Logic {
-            op,
-            subs: Arc::new(subs),
-        });
+        // 空组：AND / NOT 对空集合恒为真，会变成全匹配
+        if subs.is_empty() {
+            return Err(format!("{ty} 规则组为空: {s:?}"));
+        }
+        return Ok(logic(op, subs));
     }
     parse_plain_rule(s, env, depth, s)
 }
@@ -1118,6 +1167,21 @@ mod tests {
     }
 
     #[test]
+    fn top_level_nested_logic() {
+        // 此前顶层 AND/OR/NOT 的子项不支持嵌套逻辑：OR 被当成未知类型，整条规则静默失效
+        let e = engine(&[
+            "AND,((NETWORK,UDP),(OR,((DST-PORT,443),(DST-PORT,80)))),REJECT",
+            "MATCH,DIRECT",
+        ]);
+        let mut c = ctx(Some("x.com"), None); // 默认 TCP / 443
+        assert_eq!(e.r#match(&c).unwrap().target, "DIRECT");
+        c.network = Net::Udp;
+        assert_eq!(e.r#match(&c).unwrap().target, "REJECT");
+        c.dst_port = 53;
+        assert_eq!(e.r#match(&c).unwrap().target, "DIRECT");
+    }
+
+    #[test]
     fn sub_rule() {
         let e = engine(&["SUB-RULE,(DOMAIN-SUFFIX,sub.com),sub1", "MATCH,REJECT"]);
         assert_eq!(
@@ -1187,6 +1251,112 @@ mod tests {
     }
 
     #[test]
+    fn classical_rule_set_compiles_all_rule_types() {
+        let classical = [
+            "DOMAIN-SUFFIX,github.com",
+            "PROCESS-NAME,telegram.exe",
+            "SRC-IP-CIDR,192.168.1.201/32",
+            "DST-PORT,8000-8100/9443",
+            "AND,((NETWORK,UDP),(DOMAIN-KEYWORD,quic))",
+            r"DOMAIN-REGEX,^api[0-9]{1,3}\.example\.com$",
+            "IP-CIDR,8.8.8.0/24,no-resolve",
+            // 以下各行均应告警跳过，而不是让整个规则集失败
+            "GEOIP,CN",
+            "MATCH",
+            "RULE-SET,cls",
+            "AND,((RULE-SET,cls),(NETWORK,TCP))",
+            "IP-CIDR,not-a-cidr",
+            "UNKNOWN-TYPE,x",
+            // 空 payload 不能把整个集合变成全匹配（下方 a.com → DIRECT 的断言兜底验证）
+            "DOMAIN-KEYWORD,",
+            "DOMAIN-SUFFIX",
+            "DOMAIN-REGEX,",
+            // NOT 包住降级的子规则（缺 GeoIP 库 / 嵌套逻辑解析失败）不能取反成全匹配
+            "NOT,((GEOIP,CN))",
+            "NOT,((AND,((NETWORK,ICMP),(DOMAIN,a.com))))",
+            // 空规则组：AND / NOT 对空集合恒真，同样不能变成全匹配
+            "AND,()",
+            "NOT,(())",
+        ]
+        .join("\n");
+        let mut providers = HashMap::new();
+        providers.insert(
+            "cls".to_string(),
+            (provider::Behavior::Classical, classical),
+        );
+        providers.insert(
+            "cls-ip".to_string(),
+            (provider::Behavior::Classical, "IP-CIDR,1.0.0.0/8\n".into()),
+        );
+        let env = CompileEnv {
+            is_known_target: &|t| matches!(t, "DIRECT" | "PROXY"),
+            geosite: &None,
+            #[cfg(feature = "geoip")]
+            geoip: &None,
+            #[cfg(feature = "geoip")]
+            asn: &None,
+            providers: &providers,
+            sub_rules: &HashMap::new(),
+        };
+        let eng = compile(
+            &["RULE-SET,cls,PROXY".to_string(), "MATCH,DIRECT".to_string()],
+            &env,
+        )
+        .unwrap();
+        let hit = |c: &MatchCtx| eng.r#match(c).unwrap().target.to_string();
+
+        assert_eq!(hit(&ctx(Some("x.github.com"), None)), "PROXY");
+        assert_eq!(hit(&ctx(Some("a.com"), None)), "DIRECT");
+
+        let mut c = ctx(Some("a.com"), None);
+        c.process = Some(r"C:\Apps\Telegram.exe");
+        assert_eq!(hit(&c), "PROXY", "PROCESS-NAME");
+
+        let mut c = ctx(Some("a.com"), None);
+        c.src_ip = Some("192.168.1.201".parse().unwrap());
+        assert_eq!(hit(&c), "PROXY", "SRC-IP-CIDR");
+
+        for (port, want) in [(9443, "PROXY"), (8050, "PROXY"), (8101, "DIRECT")] {
+            let mut c = ctx(Some("a.com"), None);
+            c.dst_port = port;
+            assert_eq!(hit(&c), want, "DST-PORT 多段 {port}");
+        }
+
+        let mut c = ctx(Some("quic.a.com"), None);
+        c.network = Net::Udp;
+        assert_eq!(hit(&c), "PROXY", "AND 逻辑规则");
+        c.network = Net::Tcp;
+        assert_eq!(hit(&c), "DIRECT");
+
+        assert_eq!(
+            hit(&ctx(Some("api12.example.com"), None)),
+            "PROXY",
+            "正则含逗号"
+        );
+        assert_eq!(hit(&ctx(None, Some("8.8.8.8".parse().unwrap()))), "PROXY");
+        // 唯一的目标 IP 行带 no-resolve：不应触发 DNS 解析
+        assert!(!eng.needs_dst_ip());
+
+        let eng_ip = compile(&["RULE-SET,cls-ip,PROXY".to_string()], &env).unwrap();
+        assert!(eng_ip.needs_dst_ip());
+    }
+
+    #[test]
+    fn deeply_nested_logic_rejected_instead_of_overflowing() {
+        // 远端规则集可以构造任意深度的嵌套：超过上限应报出真实原因，而不是递归到栈溢出
+        let n = 20_000;
+        let line = format!("{}DOMAIN,a.com{}", "NOT,((".repeat(n), "))".repeat(n));
+        let err = compile_logic_str(&line, &test_env(), 0)
+            .err()
+            .expect("超深嵌套应当报错");
+        assert!(err.contains("嵌套过深"), "{err}");
+        // 上限之内的正常嵌套照常工作
+        let ok = compile_logic_str("NOT,((NOT,((DOMAIN,a.com))))", &test_env(), 0).unwrap();
+        assert!(ok.r#match(&ctx(Some("a.com"), None)));
+        assert!(!ok.r#match(&ctx(Some("b.com"), None)));
+    }
+
+    #[test]
     fn process_and_network() {
         let e = engine(&[
             "PROCESS-NAME,chrome.exe,DIRECT",
@@ -1231,6 +1401,8 @@ mod tests {
     fn geoip_and_geosite_graceful_degradation() {
         // 在未加载 geoip/geosite 数据库的情况下，规则不应报错崩溃，而应优雅降级跳过
         let e = engine(&[
+            // NOT 包住降级规则：必须同样跳过，而不是取反成全匹配把流量全部 REJECT
+            "NOT,((GEOIP,CN)),REJECT",
             "GEOIP,CN,DIRECT,no-resolve",
             "GEOIP,GOOGLE,PROXY",
             "GEOSITE,category-ads-all,REJECT",

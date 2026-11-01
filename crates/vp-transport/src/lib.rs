@@ -6,6 +6,7 @@ pub mod grpc;
 pub mod hpke;
 pub mod http;
 pub mod quic;
+pub mod reality_server;
 pub mod tls;
 pub mod utls;
 pub mod ws;
@@ -13,6 +14,7 @@ pub mod ws;
 pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
 
 pub use http::{HttpConfig, HttpStream, http_handshake_client};
+pub use reality_server::{RealityHandshakeResult, RealityServerConfig, reality_server_handshake};
 pub use tls::{TlsClientConfig, connect_tls, tls_acceptor, tls_connect};
 pub use ws::{WsConfig, WsStream, ws_handshake_client, ws_handshake_server};
 
@@ -31,6 +33,9 @@ pub struct SocketTuning {
     pub sndbuf: usize,
     pub tcp_nodelay: bool,
     pub keepalive_secs: u64,
+    pub tcp_bbr: bool,
+    pub tcp_fast_open: bool,
+    pub reuse_port: bool,
 }
 
 static TUNING: std::sync::RwLock<SocketTuning> = std::sync::RwLock::new(SocketTuning {
@@ -38,6 +43,9 @@ static TUNING: std::sync::RwLock<SocketTuning> = std::sync::RwLock::new(SocketTu
     sndbuf: 0,
     tcp_nodelay: true,
     keepalive_secs: 60,
+    tcp_bbr: false,
+    tcp_fast_open: false,
+    reuse_port: false,
 });
 
 /// 当前生效的调优快照（一致读取）
@@ -46,7 +54,15 @@ pub fn tuning_snapshot() -> SocketTuning {
 }
 
 /// 全局配置套接字发送与接收缓冲区及 TCP 调优参数
-pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_keepalive_secs: u64) {
+pub fn set_global_tuning(
+    rcvbuf: usize,
+    sndbuf: usize,
+    tcp_nodelay: bool,
+    tcp_keepalive_secs: u64,
+    tcp_bbr: bool,
+    tcp_fast_open: bool,
+    reuse_port: bool,
+) {
     *TUNING.write().unwrap() = SocketTuning {
         rcvbuf,
         sndbuf,
@@ -56,13 +72,67 @@ pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_ke
         } else {
             tcp_keepalive_secs
         },
+        tcp_bbr,
+        tcp_fast_open,
+        reuse_port,
     };
+}
+
+/// 绑定带有高性能套接字选项的 TCP 监听器：
+/// - SO_REUSEPORT (Linux/Unix): 多线程内核级负载均衡
+/// - TCP_FASTOPEN (Linux): 降低握手延迟
+/// - SO_REUSEADDR (所有平台): 快速重启防端口占用
+pub fn bind_tcp_listener_with_opts(
+    addr: std::net::SocketAddr,
+    _reuse_port: bool,
+    _tcp_fast_open: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+    if _reuse_port {
+        let _ = socket.set_reuse_port(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    if _tcp_fast_open {
+        use std::os::unix::io::AsRawFd;
+        let qlen: libc::c_int = 256;
+        unsafe {
+            let _ = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &qlen as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&qlen) as libc::socklen_t,
+            );
+        }
+    }
+
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// 使用当前全局调优配置绑定 TCP 监听器
+pub fn bind_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let t = tuning_snapshot();
+    bind_tcp_listener_with_opts(addr, t.reuse_port, t.tcp_fast_open)
 }
 
 /// 套接字调优：内核持有的所有 TCP 连接统一设置。
 /// - TCP_NODELAY：关闭 Nagle，交互流量不被合并延迟（流畅的关键）
 /// - SO_RCVBUF / SO_SNDBUF：高带宽时延积 (BDP) 窗口放大
 /// - TCP keepalive：探测对端僵死连接，避免句柄泄漏（稳定的保障）
+/// - TCP BBR：Linux 平台下的拥塞控制优化
 pub fn tune(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let t = tuning_snapshot();
@@ -82,6 +152,21 @@ pub fn tune(stream: &tokio::net::TcpStream) {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let ka = ka.with_retries(3);
     let _ = sock.set_tcp_keepalive(&ka);
+
+    #[cfg(target_os = "linux")]
+    if t.tcp_bbr {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            let cc = b"bbr\0";
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                cc.as_ptr() as *const libc::c_void,
+                cc.len() as libc::socklen_t,
+            );
+        }
+    }
 }
 
 /// REALITY 扩展配置（VLESS / Trojan 专有，对标 Xray-core / sing-box）
@@ -732,6 +817,19 @@ mod tests {
         c.read_exact(&mut b).await.unwrap();
         assert_eq!(&b, b"ok");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_with_tuning() {
+        set_global_tuning(131072, 131072, true, 45, false, true, true);
+        let listener = bind_tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        assert_ne!(local_addr.port(), 0);
+
+        let cli = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        tune(&cli);
+        let (srv, _) = listener.accept().await.unwrap();
+        tune(&srv);
     }
 
     #[tokio::test]

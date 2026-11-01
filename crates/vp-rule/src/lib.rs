@@ -12,6 +12,11 @@ pub mod ipset;
 pub mod process;
 pub mod provider;
 
+#[cfg(feature = "geoip")]
+pub use asn::{AsnDb, AsnMatcher};
+#[cfg(feature = "geoip")]
+pub use geoip::{GeoIpDb, GeoIpMatcher};
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;

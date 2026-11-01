@@ -21,7 +21,7 @@ use crate::vless_vision::{VISION_FLOW_BYTES, VisionStream};
 use vp_dns::Resolver;
 use vp_transport as transport;
 
-const VERSION: u8 = 0x00;
+pub(crate) const VERSION: u8 = 0x00;
 const CMD_TCP: u8 = 0x01;
 
 fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
@@ -51,7 +51,7 @@ fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
     }
 }
 
-fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+pub(crate) fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
     if buf.len() < 3 + 16 + 1 + 1 + 2 + 1 {
         return Err(Error::Proto("vless 请求头过短"));
     }
@@ -388,25 +388,103 @@ pub struct VlessInbound {
     port: u16,
     tag: Arc<str>,
     uuids: Vec<[u8; 16]>,
+    fallback: Option<String>,
+    users_by_uuid: std::collections::HashMap<[u8; 16], Arc<vp_core::UserAccount>>,
+    user_mgr: Option<Arc<vp_core::UserManager>>,
+    gate: Option<Arc<vp_core::InboundGate>>,
     direct: Arc<DirectOutbound>,
 }
 
 impl VlessInbound {
     pub fn new(bind: &str, port: u16, tag: &str, uuids: &[String]) -> Result<Self> {
+        Self::with_options(bind, port, tag, uuids, None, None)
+    }
+
+    pub fn with_options(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        uuids: &[String],
+        fallback: Option<String>,
+        user_mgr: Option<Arc<vp_core::UserManager>>,
+    ) -> Result<Self> {
+        Self::with_gate(bind, port, tag, uuids, fallback, user_mgr, None)
+    }
+
+    pub fn with_gate(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        uuids: &[String],
+        fallback: Option<String>,
+        user_mgr: Option<Arc<vp_core::UserManager>>,
+        gate: Option<Arc<vp_core::InboundGate>>,
+    ) -> Result<Self> {
         let mut ids = Vec::new();
+        let mut users_by_uuid = std::collections::HashMap::new();
+
         for u in uuids {
-            ids.push(parse_uuid(u)?);
+            let id = parse_uuid(u)?;
+            ids.push(id);
+            if let Some(mgr) = &user_mgr {
+                if let Some(user) = mgr.get_user(u) {
+                    users_by_uuid.insert(id, user);
+                }
+            }
         }
-        if ids.is_empty() {
-            return Err(Error::Config("vless 入站需要至少一个用户".into()));
+        if let Some(mgr) = &user_mgr {
+            for user in mgr.all_users() {
+                if let Ok(id) = parse_uuid(&user.secret) {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                    users_by_uuid.insert(id, user);
+                }
+            }
+        }
+        if ids.is_empty() && fallback.is_none() {
+            return Err(Error::Config("vless 入站需要至少一个用户或回落目标".into()));
         }
         Ok(VlessInbound {
             bind: bind.to_string(),
             port,
             tag: tag.into(),
             uuids: ids,
+            fallback,
+            users_by_uuid,
+            user_mgr,
+            gate,
             direct: Arc::new(DirectOutbound::new(Arc::new(Resolver::system()), false)),
         })
+    }
+
+    async fn handle_fallback_or_err(
+        &self,
+        stream: tokio::net::TcpStream,
+        peeked: &[u8],
+        err: Error,
+    ) -> Result<()> {
+        if let Some(fb_target) = &self.fallback {
+            tracing::debug!(fallback = %fb_target, "VLESS 认证失败或探测流量，执行 Fallback 回落: {err}");
+            match tokio::net::TcpStream::connect(fb_target).await {
+                Ok(fb_stream) => {
+                    vp_transport::tune(&fb_stream);
+                    let client: Box<dyn ProxyStream> =
+                        Box::new(vp_core::PeekedStream::new(stream, peeked.to_vec()));
+                    let remote: Box<dyn ProxyStream> = Box::new(fb_stream);
+                    tokio::spawn(async move {
+                        let _ = relay(client, remote, RelayHook::default()).await;
+                    });
+                    Ok(())
+                }
+                Err(conn_err) => {
+                    tracing::warn!("VLESS 连接回落目标 {fb_target} 失败: {conn_err}");
+                    Err(err)
+                }
+            }
+        } else {
+            Err(err)
+        }
     }
 
     async fn serve(
@@ -420,7 +498,13 @@ impl VlessInbound {
         let mut filled = 0;
         loop {
             if filled >= buf.len() {
-                return Err(Error::Proto("vless 请求头过长"));
+                return self
+                    .handle_fallback_or_err(
+                        stream,
+                        &buf[..filled],
+                        Error::Proto("vless 请求头过长"),
+                    )
+                    .await;
             }
             let n = stream.read(&mut buf[filled..]).await?;
             if n == 0 {
@@ -429,12 +513,54 @@ impl VlessInbound {
             filled += n;
             match decode_request(&buf[..filled]) {
                 Ok((uuid, dst, is_vision, used)) => {
-                    if !self.uuids.contains(&uuid) {
-                        return Err(Error::Proto("vless: 用户认证失败"));
+                    let (matched, user) = if let Some(mgr) = &self.user_mgr {
+                        if let Some(u) = mgr.get_user_by_uuid(&uuid) {
+                            if u.is_quota_exceeded() {
+                                return self
+                                    .handle_fallback_or_err(
+                                        stream,
+                                        &buf[..filled],
+                                        Error::Proto("vless: 用户配额已超限"),
+                                    )
+                                    .await;
+                            }
+                            (true, Some(u))
+                        } else {
+                            (self.uuids.contains(&uuid), None)
+                        }
+                    } else {
+                        let m = self.uuids.contains(&uuid);
+                        let u = if let Some(u) = self.users_by_uuid.get(&uuid) {
+                            if u.is_quota_exceeded() {
+                                return self
+                                    .handle_fallback_or_err(
+                                        stream,
+                                        &buf[..filled],
+                                        Error::Proto("vless: 用户配额已超限"),
+                                    )
+                                    .await;
+                            }
+                            Some(u.clone())
+                        } else {
+                            None
+                        };
+                        (m, u)
+                    };
+                    if !matched {
+                        return self
+                            .handle_fallback_or_err(
+                                stream,
+                                &buf[..filled],
+                                Error::Proto("vless: 用户认证失败"),
+                            )
+                            .await;
+                    }
+                    if let Some(ref g) = self.gate {
+                        g.mark_authenticated(src.ip());
                     }
                     let extra = filled - used;
                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
-                    let remote = self.direct.connect_stream(&sess, &dst).await?;
+                    let mut remote = self.direct.connect_stream(&sess, &dst).await?;
                     // 响应：如果启用了 vision，回送 [VERSION, 18, VISION_FLOW_BYTES]
                     if is_vision {
                         stream
@@ -445,7 +571,7 @@ impl VlessInbound {
                         stream.write_all(&[VERSION, 0]).await?;
                     }
                     if extra > 0 {
-                        stream.write_all(&buf[used..filled]).await?;
+                        remote.write_all(&buf[used..filled]).await?;
                     }
                     let meta = vp_core::conn_table::ConnMeta {
                         id: sess.id,
@@ -455,6 +581,7 @@ impl VlessInbound {
                         dst_port: dst.port,
                         src: Some(src.to_string()),
                         process: None,
+                        user: user.as_ref().map(|u| u.username.clone()),
                         rule: None,
                         chain: Some("vless-server".into()),
                         start: vp_common::now_millis(),
@@ -463,6 +590,9 @@ impl VlessInbound {
                         table: Some(ctx.conns.clone()),
                         meta: Some(meta),
                         stats: Some(ctx.stats.clone()),
+                        user,
+                        limiter: None,
+                        brutal: None,
                     };
                     let client: Box<dyn ProxyStream> = if is_vision {
                         Box::new(VisionStream::new_server(stream))
@@ -478,7 +608,9 @@ impl VlessInbound {
                 {
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return self.handle_fallback_or_err(stream, &buf[..filled], e).await;
+                }
             }
         }
     }
@@ -491,19 +623,36 @@ impl Inbound for VlessInbound {
     }
 
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
-        let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+        use std::net::ToSocketAddrs;
+        let addr = match (self.bind.as_str(), self.port).to_socket_addrs() {
+            Ok(mut it) => it.next().ok_or_else(|| {
+                Error::Config(format!("无法解析绑定地址 {}:{}", self.bind, self.port))
+            })?,
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "无法解析绑定地址 {}:{}: {e}",
+                    self.bind, self.port
+                )));
+            }
+        };
+        let listener = vp_transport::bind_tcp_listener(addr)?;
         let bound = listener.local_addr()?.port();
         let this = self.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, src)) => {
+                        if let Some(ref g) = this.gate {
+                            if !g.check_accept(src.ip()) {
+                                continue;
+                            }
+                        }
                         vp_transport::tune(&stream);
                         let this = this.clone();
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             if let Err(e) = this.serve(stream, src, &ctx).await {
-                                tracing::warn!("vless 入站会话结束: {e}");
+                                tracing::debug!("vless 入站会话结束: {e}");
                             }
                         });
                     }

@@ -767,7 +767,19 @@ impl Inbound for BrookInbound {
     }
 
     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
-        let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+        use std::net::ToSocketAddrs;
+        let addr = match (self.bind.as_str(), self.port).to_socket_addrs() {
+            Ok(mut it) => it.next().ok_or_else(|| {
+                Error::Config(format!("无法解析绑定地址 {}:{}", self.bind, self.port))
+            })?,
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "无法解析绑定地址 {}:{}: {e}",
+                    self.bind, self.port
+                )));
+            }
+        };
+        let listener = transport::bind_tcp_listener(addr)?;
         let bound = listener.local_addr()?.port();
         let this = self.clone();
         tokio::spawn(async move {

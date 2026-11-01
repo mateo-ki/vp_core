@@ -108,6 +108,7 @@ pub async fn dispatch_stream(
         dst_port: sess.dst.port,
         src: sess.src.map(|s| s.to_string()),
         process: sess.process.clone(),
+        user: None,
         rule: res
             .rule
             .as_ref()
@@ -162,6 +163,7 @@ pub async fn dispatch_stream(
                 table: Some(ctx.conns.clone()),
                 meta: Some(meta),
                 stats: Some(ctx.stats.clone()),
+                ..Default::default()
             };
             let _ = relay(client, remote, hook).await;
         }

@@ -6,7 +6,7 @@
 //! - UDP：QUIC unreliable datagram，UDPMessage
 //!   `[u32 BE session][u16 BE pkt][u8 frag][u8 frag_total][varint |addr|][addr][payload]`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
@@ -270,7 +270,7 @@ pub struct Hysteria2Outbound {
     skip_verify: bool,
     _up_mbps: u32,
     down_mbps: u32,
-    _obfs: Option<SalamanderObfs>,
+    obfs: Option<SalamanderObfs>,
     udp_session: AtomicU32,
     session: Mutex<Option<Arc<Hysteria2Session>>>,
 }
@@ -315,7 +315,7 @@ impl Hysteria2Outbound {
             skip_verify: cfg.skip_cert_verify,
             _up_mbps: cfg.up.unwrap_or(0),
             down_mbps: cfg.down.unwrap_or(0),
-            _obfs: obfs,
+            obfs,
             udp_session: AtomicU32::new(1),
             session: Mutex::new(None),
         })
@@ -353,30 +353,95 @@ impl Hysteria2Outbound {
             .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
             .next()
             .ok_or(Error::Addr("无地址".into()))?;
-        let bind: &'static str = if addr.is_ipv4() {
-            "0.0.0.0:0"
+
+        if let Some(ref obfs) = self.obfs {
+            let local_proxy_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+            let local_proxy_addr = local_proxy_sock.local_addr()?;
+
+            let remote_sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+            remote_sock.connect(addr).await?;
+
+            let quinn_tokio_sock = vp_transport::create_udp_socket("127.0.0.1:0".parse().unwrap())?;
+            let std_sock = quinn_tokio_sock.into_std().map_err(Error::Io)?;
+            let mut ep = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                std_sock,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 endpoint: {e}"))))?;
+            ep.set_default_client_config(hysteria_client_config(
+                self.skip_verify,
+                self.sni.as_deref(),
+            ));
+
+            let l_recv = local_proxy_sock.clone();
+            let r_send = remote_sock.clone();
+            let obfs_c = obfs.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65535];
+                loop {
+                    let Ok((n, _)) = l_recv.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    let out = obfs_c.obfuscate(&buf[..n]);
+                    if r_send.send(&out).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let r_recv = remote_sock.clone();
+            let l_send = local_proxy_sock.clone();
+            let obfs_c2 = obfs.clone();
+            let quinn_local = ep.local_addr()?;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 65535];
+                loop {
+                    let Ok(n) = r_recv.recv(&mut buf).await else {
+                        break;
+                    };
+                    if let Some(plain) = obfs_c2.deobfuscate(&buf[..n]) {
+                        let _ = l_send.send_to(&plain, quinn_local).await;
+                    }
+                }
+            });
+
+            let conn = ep
+                .connect(
+                    local_proxy_addr,
+                    self.sni.as_deref().unwrap_or(&self.server),
+                )
+                .map_err(|e| Error::Addr(format!("hy2 连接参数: {e}")))?
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 QUIC 握手: {e}"))))?;
+            Ok((conn, ep))
         } else {
-            "[::]:0"
-        };
-        let tokio_sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
-        let std_sock = tokio_sock.into_std().map_err(Error::Io)?;
-        let mut ep = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            std_sock,
-            Arc::new(quinn::TokioRuntime),
-        )
-        .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 endpoint: {e}"))))?;
-        ep.set_default_client_config(hysteria_client_config(
-            self.skip_verify,
-            self.sni.as_deref(),
-        ));
-        let conn = ep
-            .connect(addr, self.sni.as_deref().unwrap_or(&self.server))
-            .map_err(|e| Error::Addr(format!("hy2 连接参数: {e}")))?
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 QUIC 握手: {e}"))))?;
-        Ok((conn, ep))
+            let bind: &'static str = if addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let tokio_sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
+            let std_sock = tokio_sock.into_std().map_err(Error::Io)?;
+            let mut ep = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                std_sock,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 endpoint: {e}"))))?;
+            ep.set_default_client_config(hysteria_client_config(
+                self.skip_verify,
+                self.sni.as_deref(),
+            ));
+            let conn = ep
+                .connect(addr, self.sni.as_deref().unwrap_or(&self.server))
+                .map_err(|e| Error::Addr(format!("hy2 连接参数: {e}")))?
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 QUIC 握手: {e}"))))?;
+            Ok((conn, ep))
+        }
     }
 
     /// HTTP/3 认证（返回关键控制流集合，必须由会话长久持有避免 260 错误）
@@ -708,9 +773,13 @@ pub struct Hysteria2Inbound {
     bind: String,
     port: u16,
     tag: Arc<str>,
-    password: String,
+    passwords: Arc<HashSet<String>>,
     cert_pem: Vec<u8>,
     key_pem: Vec<u8>,
+    user_manager: Option<Arc<vp_core::UserManager>>,
+    salamander: Option<Arc<SalamanderObfs>>,
+    ports: Option<Vec<u16>>,
+    gate: Option<Arc<vp_core::InboundGate>>,
 }
 
 impl Hysteria2Inbound {
@@ -718,17 +787,79 @@ impl Hysteria2Inbound {
         bind: &str,
         port: u16,
         tag: &str,
+        passwords: &[String],
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+    ) -> Self {
+        Self::with_options(
+            bind, port, tag, passwords, cert_pem, key_pem, None, None, None,
+        )
+    }
+
+    pub fn new_single(
+        bind: &str,
+        port: u16,
+        tag: &str,
         password: &str,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
+    ) -> Self {
+        Self::new(bind, port, tag, &[password.to_string()], cert_pem, key_pem)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_options(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        passwords: &[String],
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        user_manager: Option<Arc<vp_core::UserManager>>,
+        salamander_pw: Option<&str>,
+        ports: Option<Vec<u16>>,
+    ) -> Self {
+        Self::with_gate(
+            bind,
+            port,
+            tag,
+            passwords,
+            cert_pem,
+            key_pem,
+            user_manager,
+            salamander_pw,
+            ports,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_gate(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        passwords: &[String],
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        user_manager: Option<Arc<vp_core::UserManager>>,
+        salamander_pw: Option<&str>,
+        ports: Option<Vec<u16>>,
+        gate: Option<Arc<vp_core::InboundGate>>,
     ) -> Self {
         Hysteria2Inbound {
             bind: bind.into(),
             port,
             tag: tag.into(),
-            password: password.into(),
+            passwords: Arc::new(passwords.iter().map(|s| s.trim().to_string()).collect()),
             cert_pem,
             key_pem,
+            user_manager,
+            salamander: salamander_pw
+                .filter(|s| !s.is_empty())
+                .map(SalamanderObfs::new)
+                .map(Arc::new),
+            ports,
+            gate,
         }
     }
 }
@@ -759,36 +890,207 @@ impl Inbound for Hysteria2Inbound {
         t.datagram_receive_buffer_size(Some(1 << 20));
         scfg.transport_config(Arc::new(t));
 
-        let bind_addr: SocketAddr = format!("{}:{}", self.bind, self.port)
-            .parse()
-            .unwrap_or_else(|_| {
-                SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.port)
-            });
-        let endpoint = quinn::Endpoint::server(scfg, bind_addr)?;
-        let bound = endpoint.local_addr()?.port();
-        let this = self.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                let Ok(conn) = incoming.await else { continue };
-                let this = this.clone();
-                let ctx = ctx.clone();
+        let has_obfs = self.salamander.is_some();
+        let has_mport = self.ports.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+
+        let bound = if has_obfs || has_mport {
+            // 前置 Salamander 混淆与多端口汇聚中继模式
+            let endpoint = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap())?;
+            let quinn_local_addr = endpoint.local_addr()?;
+
+            let bind_addr: SocketAddr = format!("{}:{}", self.bind, self.port)
+                .parse()
+                .unwrap_or_else(|_| {
+                    SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.port)
+                });
+            let main_sock = Arc::new(tokio::net::UdpSocket::bind(bind_addr).await?);
+            let actual_port = main_sock.local_addr()?.port();
+
+            let mut all_socks = vec![main_sock.clone()];
+            if let Some(ref extra_ports) = self.ports {
+                for &ep in extra_ports {
+                    if ep != actual_port {
+                        let eaddr: SocketAddr =
+                            format!("{}:{}", self.bind, ep).parse().unwrap_or_else(|_| {
+                                SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), ep)
+                            });
+                        if let Ok(esock) = tokio::net::UdpSocket::bind(eaddr).await {
+                            all_socks.push(Arc::new(esock));
+                        }
+                    }
+                }
+            }
+
+            type SessionMap = Arc<
+                tokio::sync::Mutex<
+                    HashMap<
+                        SocketAddr,
+                        (
+                            Arc<tokio::net::UdpSocket>,
+                            Arc<std::sync::atomic::AtomicU64>,
+                        ),
+                    >,
+                >,
+            >;
+            let sessions: SessionMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+            for sock in all_socks {
+                let sessions = sessions.clone();
+                let salamander = self.salamander.clone();
+                let main_reply_sock = sock.clone();
+                let self_gate = self.gate.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = this.serve_conn(conn, &ctx).await {
-                        tracing::debug!("hy2 连接结束: {e}");
+                    let mut buf = [0u8; 65535];
+                    loop {
+                        let Ok((n, client_addr)) = sock.recv_from(&mut buf).await else {
+                            break;
+                        };
+                        // 门禁前置检查：未通过 GeoIP / ASN / 端口敲门过滤的直接丢弃
+                        if let Some(ref g) = self_gate {
+                            if !g.check_accept(client_addr.ip()) {
+                                continue;
+                            }
+                        }
+                        let payload = if let Some(ref obfs) = salamander {
+                            match obfs.deobfuscate(&buf[..n]) {
+                                Some(plain) => plain,
+                                None => continue, // 混淆校验失败（探针/扫描），直接丢弃
+                            }
+                        } else {
+                            buf[..n].to_vec()
+                        };
+
+                        let now_ts = vp_common::now_millis();
+                        let mut map = sessions.lock().await;
+                        let (pair_sock, _last_ts) = match map.get(&client_addr) {
+                            Some((s, ts)) => {
+                                ts.store(now_ts, Ordering::Relaxed);
+                                (s.clone(), ts.clone())
+                            }
+                            None => {
+                                let Ok(pair) = tokio::net::UdpSocket::bind("127.0.0.1:0").await
+                                else {
+                                    continue;
+                                };
+                                let pair = Arc::new(pair);
+                                let ts = Arc::new(std::sync::atomic::AtomicU64::new(now_ts));
+                                map.insert(client_addr, (pair.clone(), ts.clone()));
+
+                                // 启动反向接收：内部 Quinn -> 外部客户端
+                                let pair_recv = pair.clone();
+                                let reply_sock = main_reply_sock.clone();
+                                let obfs_sender = salamander.clone();
+                                let self_gate_reply = self_gate.clone();
+                                tokio::spawn(async move {
+                                    let mut resp_buf = [0u8; 65535];
+                                    loop {
+                                        let Ok((rn, _)) = pair_recv.recv_from(&mut resp_buf).await
+                                        else {
+                                            break;
+                                        };
+                                        // RRL 防放大检查：若未认证客户端超速则丢弃
+                                        if let Some(ref g) = self_gate_reply {
+                                            match g.check_rrl(client_addr.ip()) {
+                                                vp_core::RrlDecision::Drop => continue,
+                                                vp_core::RrlDecision::Allow
+                                                | vp_core::RrlDecision::Slip => {}
+                                            }
+                                        }
+                                        let out_data = if let Some(ref obfs) = obfs_sender {
+                                            obfs.obfuscate(&resp_buf[..rn])
+                                        } else {
+                                            resp_buf[..rn].to_vec()
+                                        };
+                                        if reply_sock.send_to(&out_data, client_addr).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                (pair, ts)
+                            }
+                        };
+                        drop(map);
+                        let _ = pair_sock.send_to(&payload, quinn_local_addr).await;
                     }
                 });
             }
-        });
+
+            // 定期清理超时的 client_sessions (180s)
+            let sess_clean = sessions.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    ticker.tick().await;
+                    let now = vp_common::now_millis();
+                    sess_clean.lock().await.retain(|_, (_, ts)| {
+                        now.saturating_sub(ts.load(Ordering::Relaxed)) < 180_000
+                    });
+                }
+            });
+
+            // 监听 Quinn 接收连接
+            let this = self.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let Ok(conn) = incoming.await else { continue };
+                    let this = this.clone();
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = this.serve_conn(conn, &ctx).await {
+                            tracing::debug!("hy2 连接结束: {e}");
+                        }
+                    });
+                }
+            });
+
+            actual_port
+        } else {
+            // 原生直连监听模式
+            let bind_addr: SocketAddr = format!("{}:{}", self.bind, self.port)
+                .parse()
+                .unwrap_or_else(|_| {
+                    SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.port)
+                });
+            let endpoint = quinn::Endpoint::server(scfg, bind_addr)?;
+            let bound = endpoint.local_addr()?.port();
+            let this = self.clone();
+            tokio::spawn(async move {
+                while let Some(incoming) = endpoint.accept().await {
+                    let remote_addr = incoming.remote_address();
+                    if let Some(ref g) = this.gate {
+                        if !g.check_accept(remote_addr.ip()) {
+                            continue;
+                        }
+                    }
+                    let Ok(conn) = incoming.await else { continue };
+                    let this = this.clone();
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = this.serve_conn(conn, &ctx).await {
+                            tracing::debug!("hy2 连接结束: {e}");
+                        }
+                    });
+                }
+            });
+            bound
+        };
+
         Ok(bound)
     }
 }
 
 impl Hysteria2Inbound {
     async fn serve_conn(self: Arc<Self>, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
+        let authenticated_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>> =
+            Arc::new(tokio::sync::RwLock::new(None));
         let mut udp_sessions: std::collections::HashMap<
             u32,
             std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
         > = std::collections::HashMap::new();
+
         loop {
             tokio::select! {
                 uni = conn.accept_uni() => {
@@ -818,8 +1120,10 @@ impl Hysteria2Inbound {
                         if first.len() == 2 && first == [0x44, 0x01] {
                             let this = self.clone();
                             let ctx = ctx.clone();
+                            let conn = conn.clone();
+                            let authed_user = authenticated_user.clone();
                             tokio::spawn(async move {
-                                this.serve_tcp(recv, send, &ctx).await;
+                                this.serve_tcp(recv, send, &conn, &ctx, authed_user).await;
                             });
                             break true;
                         }
@@ -830,8 +1134,9 @@ impl Hysteria2Inbound {
                                     let this = self.clone();
                                     let conn = conn.clone();
                                     let ctx = ctx.clone();
+                                    let authed_user = authenticated_user.clone();
                                     tokio::spawn(async move {
-                                        this.serve_auth(headers, send, &conn, &ctx).await;
+                                        this.serve_auth(headers, send, &conn, &ctx, authed_user).await;
                                     });
                                     break true;
                                 }
@@ -851,6 +1156,16 @@ impl Hysteria2Inbound {
                 dg = conn.read_datagram() => {
                     let Ok(dg) = dg else { break };
                     let Some(pkt) = parse_udp_message(&dg) else { continue };
+
+                    // 检查用户配额
+                    let cur_user = authenticated_user.read().await.clone();
+                    if let Some(ref u) = cur_user {
+                        if u.is_quota_exceeded() {
+                            break;
+                        }
+                        u.add_up(pkt.payload.len() as u64);
+                    }
+
                     let sess = udp_sessions
                         .entry(pkt.session)
                         .or_insert_with(|| {
@@ -873,13 +1188,17 @@ impl Hysteria2Inbound {
                     let _ = sock.send(&pkt.payload).await;
                     let conn2 = conn.clone();
                     let session = pkt.session;
+                    let return_user = cur_user.clone();
                     tokio::spawn(async move {
                         let mut rbuf = [0u8; 65535];
                         loop {
                             let Ok(Ok((n, from))) = tokio::time::timeout(
-                                std::time::Duration::from_secs(300),
+                                std::time::Duration::from_secs(180),
                                 sock.recv_from(&mut rbuf),
                             ).await else { break };
+                            if let Some(ref u) = return_user {
+                                u.add_down(n as u64);
+                            }
                             let addr = format!("{}:{}", from.ip(), from.port());
                             let mut msg = Vec::with_capacity(n + addr.len() + 16);
                             msg.extend_from_slice(&session.to_be_bytes());
@@ -907,6 +1226,7 @@ impl Hysteria2Inbound {
         mut send: quinn::SendStream,
         conn: &quinn::Connection,
         _ctx: &InboundCtx,
+        authed_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>>,
     ) {
         let path = headers
             .iter()
@@ -918,7 +1238,23 @@ impl Hysteria2Inbound {
             .find(|(k, _)| k == "hysteria-auth")
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        if path != "/auth" || got != self.password {
+
+        let mut matched_account: Option<Arc<vp_core::UserAccount>> = None;
+        if let Some(ref um) = self.user_manager {
+            if let Some(acc) = um.get_user(&got).or_else(|| um.get_user_by_target(&got)) {
+                if acc.is_quota_exceeded() {
+                    tracing::warn!("hy2 用户 {} 流量超额被阻断", acc.username);
+                    let _ = crate::h3_min::write_response_headers(&mut send, &[(":status", "403")])
+                        .await;
+                    let _ = send.finish();
+                    conn.close(quinn::VarInt::from_u32(8), b"quota exceeded");
+                    return;
+                }
+                matched_account = Some(acc);
+            }
+        }
+
+        if path != "/auth" || (matched_account.is_none() && !self.passwords.contains(&got)) {
             let _ = crate::h3_min::write_response_headers(&mut send, &[(":status", "404")]).await;
             let _ = send.finish();
             if path == "/auth" {
@@ -926,12 +1262,36 @@ impl Hysteria2Inbound {
             }
             return;
         }
+
+        // 计算 Brutal / QoS 客户端下行通告速率 (bps)
+        let cc_rx = if let Some(ref acc) = matched_account {
+            if let Some(ref bp) = acc.brutal_pacer {
+                (bp.rate_bytes_per_sec() * 8.0) as u64
+            } else if let Some(ref lim) = acc.limiter {
+                lim.down_rate_bytes_per_sec()
+                    .map(|r| (r * 8.0) as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let cc_rx_str = cc_rx.to_string();
+
+        if let Some(acc) = matched_account {
+            *authed_user.write().await = Some(acc);
+        }
+        if let Some(ref g) = self.gate {
+            g.mark_authenticated(conn.remote_address().ip());
+        }
+
         let _ = crate::h3_min::write_response_headers(
             &mut send,
             &[
                 (":status", "233"),
                 ("hysteria-udp", "true"),
-                ("hysteria-cc-rx", "0"),
+                ("hysteria-cc-rx", &cc_rx_str),
             ],
         )
         .await;
@@ -943,7 +1303,9 @@ impl Hysteria2Inbound {
         &self,
         mut recv: quinn::RecvStream,
         mut send: quinn::SendStream,
+        conn: &quinn::Connection,
         ctx: &InboundCtx,
+        authed_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>>,
     ) {
         let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
         let dst = loop {
@@ -995,10 +1357,23 @@ impl Hysteria2Inbound {
             let mut skip = vec![0u8; pad_len];
             let _ = recv.read_exact(&mut skip).await;
         }
-        let sess = Session::new_tcp(self.tag.clone(), None, dst.clone());
-        let direct =
-            crate::direct::DirectOutbound::new(Arc::new(vp_dns::Resolver::system()), false);
-        match direct.connect_stream(&sess, &dst).await {
+
+        let user = authed_user.read().await.clone();
+        let src = conn.remote_address();
+        let mut sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+        if let Some(ref u) = user {
+            sess.inbound_user = Some(u.username.clone());
+        }
+
+        let res = ctx.router.pick(&sess).await;
+        let rule_tag = res.rule.as_ref().map(|r| r.rule.clone());
+        let chain_tag = if res.outbound.name() != res.via.as_ref() {
+            format!("{}[{}]", res.via, res.outbound.name())
+        } else {
+            res.outbound.name().to_string()
+        };
+
+        match res.outbound.connect_stream(&sess, &dst).await {
             Ok(remote) => {
                 // TCPResponse: [0x00][varint 0][varint 0]
                 let _ = send.write_all(&[0x00, 0x00, 0x00]).await;
@@ -1009,20 +1384,25 @@ impl Hysteria2Inbound {
                     network: "tcp",
                     host: dst.host.to_string(),
                     dst_port: dst.port,
-                    src: None,
+                    src: Some(src.to_string()),
                     process: None,
-                    rule: None,
-                    chain: Some("hy2-server".into()),
+                    user: user.as_ref().map(|u| u.username.clone()),
+                    rule: rule_tag,
+                    chain: Some(chain_tag.into()),
                     start: vp_common::now_millis(),
                 };
                 let hook = RelayHook {
                     table: Some(ctx.conns.clone()),
                     meta: Some(meta),
                     stats: Some(ctx.stats.clone()),
+                    user: user.clone(),
+                    limiter: user.as_ref().and_then(|u| u.limiter.clone()),
+                    brutal: user.as_ref().and_then(|u| u.brutal_pacer.clone()),
                 };
                 let _ = relay(client, remote, hook).await;
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::debug!("hy2 目标连接失败: {e}");
                 let _ = send.reset(quinn::VarInt::from_u32(0x8));
             }
         }
@@ -1189,7 +1569,7 @@ mod tests {
             "127.0.0.1",
             0,
             "hy2-srv",
-            "s3cret",
+            &["s3cret".to_string()],
             cert.cert.pem().into_bytes(),
             cert.key_pair.serialize_pem().into_bytes(),
         );
@@ -1281,6 +1661,164 @@ mod tests {
         .unwrap();
         let sess = Session::new_tcp("t".into(), None, dst.clone());
         assert!(bad.connect_stream(&sess, &dst).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_hy2_server_user_quota_and_brutal_cc() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = tcp_l.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 || s.write_all(&b[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let user_mgr = Arc::new(vp_core::UserManager::new());
+        let user_acc = Arc::new(
+            vp_core::UserAccount::new("hy2-vip", "vip-secret-123", Some(1024 * 1024), None)
+                .with_brutal(Some(Arc::new(vp_core::BrutalPacer::from_mbps(50)))),
+        );
+        user_mgr.add_user(user_acc.clone());
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let server = Hysteria2Inbound::with_options(
+            "127.0.0.1",
+            0,
+            "hy2-user-srv",
+            &[],
+            cert.cert.pem().into_bytes(),
+            cert.key_pair.serialize_pem().into_bytes(),
+            Some(user_mgr),
+            None,
+            None,
+        );
+        let port = Arc::new(server).start(ctx).await.unwrap();
+
+        let out = Hysteria2Outbound::new(&vp_config::Hysteria2Cfg {
+            server: "127.0.0.1".into(),
+            port,
+            password: "vip-secret-123".into(),
+            sni: None,
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            hop_interval: None,
+        })
+        .unwrap();
+
+        let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), tcp_port);
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out.connect_stream(&sess, &dst).await.unwrap();
+        s.write_all(b"test-traffic-accounting").await.unwrap();
+        let mut buf = [0u8; 23];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"test-traffic-accounting");
+
+        // 验证用户流量完成记账
+        assert!(user_acc.upload.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn test_hy2_server_salamander_obfs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tcp_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = tcp_l.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 || s.write_all(&b[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let server = Hysteria2Inbound::with_options(
+            "127.0.0.1",
+            0,
+            "hy2-obfs-srv",
+            &["obfs-pass".to_string()],
+            cert.cert.pem().into_bytes(),
+            cert.key_pair.serialize_pem().into_bytes(),
+            None,
+            Some("salamander-pwd-999"),
+            None,
+        );
+        let port = Arc::new(server).start(ctx).await.unwrap();
+
+        // 开启了 Salamander 混淆的客户端
+        let out = Hysteria2Outbound::new(&vp_config::Hysteria2Cfg {
+            server: "127.0.0.1".into(),
+            port,
+            password: "obfs-pass".into(),
+            sni: None,
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: Some("salamander".into()),
+            obfs_password: Some("salamander-pwd-999".into()),
+            ports: None,
+            hop_interval: None,
+        })
+        .unwrap();
+
+        let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), tcp_port);
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out.connect_stream(&sess, &dst).await.unwrap();
+        s.write_all(b"obfs-handshake-ok").await.unwrap();
+        let mut buf = [0u8; 17];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"obfs-handshake-ok");
+
+        // 未开启混淆的客户端连接应当因解混淆校验失败而无法建立连接
+        let plain_out = Hysteria2Outbound::new(&vp_config::Hysteria2Cfg {
+            server: "127.0.0.1".into(),
+            port,
+            password: "obfs-pass".into(),
+            sni: None,
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            hop_interval: None,
+        })
+        .unwrap();
+        let plain_sess = Session::new_tcp("t".into(), None, dst.clone());
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            plain_out.connect_stream(&plain_sess, &dst),
+        )
+        .await;
+        assert!(res.is_err() || res.unwrap().is_err());
     }
 
     #[test]

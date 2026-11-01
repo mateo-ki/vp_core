@@ -182,7 +182,6 @@ async fn vless_staged_timing() {
             Box::new(tcp),
             &cfg.server,
             &UtlsConfig {
-                fingerprint: vp_transport::utls::Fingerprint::Chrome,
                 server_name: cfg.server_name.clone(),
                 alpn: Vec::new(),
                 skip_cert_verify: false,

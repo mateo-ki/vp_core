@@ -14,15 +14,20 @@ use tokio::task::JoinHandle;
 use vp_common::{Stats, get_buf};
 
 use crate::conn_table::{ConnMeta, ConnTable};
+use crate::rate_limit::{BandwidthLimiter, BrutalPacer, TokenBucket};
 #[cfg(target_os = "linux")]
 use crate::splice;
 use crate::stream::ProxyStream;
+use crate::user::UserAccount;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RelayHook {
     pub table: Option<Arc<ConnTable>>,
     pub meta: Option<ConnMeta>,
     pub stats: Option<Arc<Stats>>,
+    pub user: Option<Arc<UserAccount>>,
+    pub limiter: Option<Arc<BandwidthLimiter>>,
+    pub brutal: Option<Arc<BrutalPacer>>,
 }
 
 /// RAII 连接清理守卫：确保无论任务是正常结束、遇到 panic 还是被上层取消 (cancelled/aborted)，
@@ -31,6 +36,7 @@ struct RelayGuard {
     table: Option<Arc<ConnTable>>,
     id: Option<u64>,
     stats: Option<Arc<Stats>>,
+    user: Option<Arc<UserAccount>>,
     t1: Option<tokio::task::AbortHandle>,
     t2: Option<tokio::task::AbortHandle>,
 }
@@ -48,6 +54,9 @@ impl Drop for RelayGuard {
         }
         if let Some(s) = self.stats.take() {
             s.conn_close();
+        }
+        if let Some(u) = self.user.take() {
+            u.conn_close();
         }
     }
 }
@@ -68,7 +77,8 @@ pub async fn relay(
     // 建管道失败发生在任何数据移动之前，撤销注册后落回通用泵。
     #[cfg(target_os = "linux")]
     {
-        if left.raw_socket().is_some() && right.raw_socket().is_some() {
+        let has_qos = hook.limiter.is_some() || hook.user.is_some();
+        if !has_qos && left.raw_socket().is_some() && right.raw_socket().is_some() {
             // 若某侧持有嗅探/预读未消费的首包字节，在切入内核态 splice 前先写出至对端，防首包丢失
             let mut pre_up = 0u64;
             let mut pre_down = 0u64;
@@ -122,6 +132,7 @@ pub async fn relay(
                         } else {
                             None
                         },
+                        user: hook.user.clone(),
                         t1: None,
                         t2: None,
                     };
@@ -140,12 +151,21 @@ pub async fn relay(
         }
     }
     // 连接注册
+    if let Some(u) = &hook.user {
+        u.conn_open();
+    }
     let registered = match (&hook.table, &hook.meta) {
         (Some(t), Some(m)) => {
             if let Some(s) = &hook.stats {
                 s.conn_open();
             }
-            Some(t.register(m.clone()))
+            let mut meta = m.clone();
+            if meta.user.is_none() {
+                if let Some(u) = &hook.user {
+                    meta.user = Some(u.username.clone());
+                }
+            }
+            Some(t.register(meta))
         }
         _ => None,
     };
@@ -162,8 +182,55 @@ pub async fn relay(
     let (rr, rw) = tokio::io::split(right);
 
     let stats = hook.stats.clone();
-    let t1: JoinHandle<()> = tokio::spawn(pump(lr, rw, up.clone(), stats.clone(), Dir::Up));
-    let t2: JoinHandle<()> = tokio::spawn(pump(rr, lw, down.clone(), stats, Dir::Down));
+    let up_bucket = hook
+        .limiter
+        .as_ref()
+        .and_then(|l| l.up.clone())
+        .or_else(|| {
+            hook.user
+                .as_ref()
+                .and_then(|u| u.limiter.as_ref().and_then(|l| l.up.clone()))
+        });
+
+    let down_bucket = hook
+        .limiter
+        .as_ref()
+        .and_then(|l| l.down.clone())
+        .or_else(|| {
+            hook.user
+                .as_ref()
+                .and_then(|u| u.limiter.as_ref().and_then(|l| l.down.clone()))
+        });
+
+    let brutal_pacer = hook
+        .brutal
+        .clone()
+        .or_else(|| hook.user.as_ref().and_then(|u| u.brutal_pacer.clone()));
+
+    let fused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let t1: JoinHandle<()> = tokio::spawn(pump(
+        lr,
+        rw,
+        up.clone(),
+        stats.clone(),
+        hook.user.clone(),
+        up_bucket,
+        brutal_pacer.clone(),
+        fused.clone(),
+        Dir::Up,
+    ));
+    let t2: JoinHandle<()> = tokio::spawn(pump(
+        rr,
+        lw,
+        down.clone(),
+        stats,
+        hook.user.clone(),
+        down_bucket,
+        brutal_pacer,
+        fused.clone(),
+        Dir::Down,
+    ));
 
     if let (Some(t), Some(id)) = (&hook.table, id) {
         t.attach_aborts(id, vec![t1.abort_handle(), t2.abort_handle()]);
@@ -177,6 +244,7 @@ pub async fn relay(
         } else {
             None
         },
+        user: hook.user.clone(),
         t1: Some(t1.abort_handle()),
         t2: Some(t2.abort_handle()),
     };
@@ -271,11 +339,16 @@ enum Probe {
 ///     [MAX_CHAIN] 块并成**一次** vectored 写：128KB 生意只需要 4 读 + 1 写。
 ///     链读收集不到更多（对端停顿）就立刻把已攒数据写出去，不持数据等待。
 ///   - 链块惰性租借：交互式连接全程只有主块，内存不变；块用完归还全局池。
+#[allow(clippy::too_many_arguments)]
 async fn pump<R, W>(
     mut r: R,
     mut w: W,
     counter: Arc<AtomicU64>,
     stats: Option<Arc<Stats>>,
+    user: Option<Arc<UserAccount>>,
+    limiter: Option<Arc<TokenBucket>>,
+    brutal: Option<Arc<BrutalPacer>>,
+    fused: Arc<std::sync::atomic::AtomicBool>,
     dir: Dir,
 ) where
     R: AsyncRead + Unpin,
@@ -286,6 +359,9 @@ async fn pump<R, W>(
     bufs.push(get_buf());
     let mut lens = [0usize; MAX_CHAIN];
     loop {
+        if fused.load(Ordering::Relaxed) {
+            break;
+        }
         let mut eof = false;
         let mut count;
         match r.read(bufs[0].spare_mut()).await {
@@ -317,6 +393,26 @@ async fn pump<R, W>(
             }
         }
         let total: usize = lens[..count].iter().sum();
+
+        // Brutal 暴力恒速平滑发包调度（忽略丢包拥塞退避）
+        if let Some(pacer) = &brutal {
+            pacer.pace(total).await;
+        }
+
+        // QoS 限速流量整形
+        if let Some(bucket) = &limiter {
+            bucket.acquire(total).await;
+        }
+
+        // 用户配额熔断检查
+        if let Some(u) = &user {
+            if u.is_quota_exceeded() {
+                tracing::warn!(user = %u.username, "用户配额已超限，熔断断开连接");
+                fused.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+
         let write_ok = {
             let mut ok = true;
             for b in &bufs[..count] {
@@ -338,6 +434,17 @@ async fn pump<R, W>(
             match dir {
                 Dir::Up => s.add_up(total as u64),
                 Dir::Down => s.add_down(total as u64),
+            }
+        }
+        if let Some(u) = &user {
+            match dir {
+                Dir::Up => u.add_up(total as u64),
+                Dir::Down => u.add_down(total as u64),
+            }
+            if u.is_quota_exceeded() {
+                tracing::warn!(user = %u.username, "传输期间用户配额耗尽，终止传输");
+                fused.store(true, Ordering::Relaxed);
+                break;
             }
         }
         if eof {
@@ -446,6 +553,7 @@ mod tests {
             dst_port: 80,
             src: None,
             process: None,
+            user: None,
             rule: None,
             chain: None,
             start: 0,
@@ -458,6 +566,7 @@ mod tests {
                 table: Some(t),
                 meta: Some(meta),
                 stats: Some(stats.clone()),
+                ..Default::default()
             };
             relay(Box::new(a1), Box::new(b1), h).await
         });
@@ -556,5 +665,43 @@ mod tests {
         let (up, down) = handle.await.unwrap();
         assert_eq!(up, N as u64, "上行字节数不符");
         assert_eq!(down, N as u64, "下行字节数不符");
+    }
+
+    #[tokio::test]
+    async fn user_quota_and_rate_limit_integration() {
+        let user = Arc::new(UserAccount::new(
+            "tester",
+            "pwd123",
+            Some(200), // 配额只有 200 字节
+            Some(Arc::new(BandwidthLimiter::from_mbps(Some(10), Some(10)))),
+        ));
+        let (a1, mut a2) = duplex(4096);
+        let (b1, mut b2) = duplex(4096);
+        let hook = RelayHook {
+            user: Some(user.clone()),
+            ..Default::default()
+        };
+        let handle = tokio::spawn(relay(Box::new(a1), Box::new(b1), hook));
+
+        // 尝试发送 500 字节（超过 200 字节配额）
+        tokio::spawn(async move {
+            let _ = a2.write_all(&[1u8; 500]).await;
+        });
+
+        // 接收端读取数据
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        loop {
+            match b2.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        drop(b2);
+        let _ = handle.await.unwrap();
+
+        // 验证用户配额熔断生效，连接被断开，且计数已记录
+        assert!(user.is_quota_exceeded());
+        assert!(user.upload.load(Ordering::Relaxed) >= 200);
     }
 }

@@ -16,6 +16,7 @@ pub struct ConnMeta {
     pub dst_port: u16,
     pub src: Option<String>,
     pub process: Option<Arc<str>>,
+    pub user: Option<Arc<str>>,
     /// 命中的规则（若有）
     pub rule: Option<String>,
     /// 出站链（组穿透后的最终节点）
@@ -127,6 +128,28 @@ impl ConnTable {
         n
     }
 
+    /// 强杀指定用户的所有活跃连接并从表中移除
+    pub fn kill_by_user(&self, username: &str) -> usize {
+        let mut killed = 0;
+        for shard in &self.shards {
+            let mut inner = shard.lock().unwrap();
+            let to_remove: Vec<u64> = inner
+                .iter()
+                .filter(|(_, e)| e.meta.user.as_deref() == Some(username))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in to_remove {
+                if let Some(e) = inner.remove(&id) {
+                    for h in e.aborts {
+                        h.abort();
+                    }
+                    killed += 1;
+                }
+            }
+        }
+        killed
+    }
+
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
     }
@@ -190,6 +213,7 @@ mod tests {
             dst_port: 443,
             src: None,
             process: None,
+            user: None,
             rule: None,
             chain: None,
             start: vp_common::now_millis(),
@@ -203,6 +227,64 @@ mod tests {
         assert!(t.kill(7));
         assert!(t.is_empty());
         assert!(!t.kill(7));
+    }
+
+    #[test]
+    fn test_kill_by_user() {
+        let t = ConnTable::new();
+        let u1: Arc<str> = Arc::from("alice");
+        let u2: Arc<str> = Arc::from("bob");
+
+        let m1 = ConnMeta {
+            id: 1,
+            inbound: "mux".into(),
+            network: "tcp",
+            host: "apple.com".into(),
+            dst_port: 443,
+            src: None,
+            process: None,
+            user: Some(u1.clone()),
+            rule: None,
+            chain: None,
+            start: vp_common::now_millis(),
+        };
+        let m2 = ConnMeta {
+            id: 2,
+            inbound: "mux".into(),
+            network: "tcp",
+            host: "google.com".into(),
+            dst_port: 443,
+            src: None,
+            process: None,
+            user: Some(u1.clone()),
+            rule: None,
+            chain: None,
+            start: vp_common::now_millis(),
+        };
+        let m3 = ConnMeta {
+            id: 3,
+            inbound: "mux".into(),
+            network: "tcp",
+            host: "bing.com".into(),
+            dst_port: 443,
+            src: None,
+            process: None,
+            user: Some(u2),
+            rule: None,
+            chain: None,
+            start: vp_common::now_millis(),
+        };
+
+        t.register(m1);
+        t.register(m2);
+        t.register(m3);
+        assert_eq!(t.len(), 3);
+
+        let killed = t.kill_by_user("alice");
+        assert_eq!(killed, 2);
+        assert_eq!(t.len(), 1);
+        let remaining = t.list();
+        assert_eq!(remaining[0].meta.id, 3);
     }
 
     #[test]

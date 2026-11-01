@@ -17,9 +17,6 @@ use vp_core::session::Session;
 use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::ss::{AeadChunkCodec, Cipher};
-
-use crate::direct::DirectOutbound;
-use vp_dns::Resolver;
 use vp_transport as transport;
 
 // ---------------------------------------------------------------------------
@@ -392,8 +389,10 @@ pub struct SsInbound {
     tag: Arc<str>,
     cipher: Cipher,
     key: Vec<u8>,
-    direct: Arc<DirectOutbound>,
+    user_manager: Option<Arc<vp_core::UserManager>>,
+    user_keys: Vec<(Arc<vp_core::UserAccount>, Vec<u8>)>,
     shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
+    gate: Option<Arc<vp_core::InboundGate>>,
 }
 
 impl SsInbound {
@@ -410,20 +409,81 @@ impl SsInbound {
         password: &str,
         shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
     ) -> Result<Self> {
+        Self::with_options(bind, port, tag, cipher, password, shadow_tls, None)
+    }
+
+    /// 完整选项构造器（支持多用户凭据识别与限速）
+    pub fn with_options(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        cipher: &str,
+        default_password: &str,
+        shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
+        user_manager: Option<Arc<vp_core::UserManager>>,
+    ) -> Result<Self> {
+        Self::with_gate(
+            bind,
+            port,
+            tag,
+            cipher,
+            default_password,
+            shadow_tls,
+            user_manager,
+            None,
+        )
+    }
+
+    /// 支持安全门禁与 RRL 防放大的构造器
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_gate(
+        bind: &str,
+        port: u16,
+        tag: &str,
+        cipher: &str,
+        default_password: &str,
+        shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
+        user_manager: Option<Arc<vp_core::UserManager>>,
+        gate: Option<Arc<vp_core::InboundGate>>,
+    ) -> Result<Self> {
         let cipher = Cipher::parse(cipher)?;
-        let key = cipher.derive_key(password)?;
+
+        let mut user_keys = Vec::new();
+        if let Some(ref um) = user_manager {
+            for u in um.all_users() {
+                if let Ok(ukey) = cipher.derive_key(&u.secret) {
+                    user_keys.push((u, ukey));
+                }
+            }
+        }
+
+        let key = if !default_password.is_empty() {
+            cipher.derive_key(default_password)?
+        } else if let Some(first_user) = user_keys.first() {
+            first_user.1.clone()
+        } else {
+            return Err(Error::Config("ss listener 缺少有效密钥".into()));
+        };
+
         Ok(SsInbound {
             bind: bind.to_string(),
             port,
             tag: tag.into(),
             cipher,
             key,
-            direct: Arc::new(DirectOutbound::new(Arc::new(Resolver::system()), false)),
+            user_manager,
+            user_keys,
             shadow_tls,
+            gate,
         })
     }
 
+    pub fn user_manager(&self) -> Option<&Arc<vp_core::UserManager>> {
+        self.user_manager.as_ref()
+    }
+
     /// ss UDP 服务端：每包独立 salt；client→target 直连转发；回包重新加密
+    #[allow(clippy::type_complexity)]
     async fn serve_udp(self: Arc<Self>, sock: tokio::net::UdpSocket) -> Result<()> {
         use std::collections::HashMap;
         let sock = Arc::new(sock);
@@ -434,19 +494,56 @@ impl SsInbound {
             let Ok((n, from)) = sock.recv_from(&mut buf).await else {
                 continue;
             };
+            // 门禁前置检查：未通过 GeoIP / ASN / 端口敲门过滤的直接丢弃
+            if let Some(ref g) = self.gate {
+                if !g.check_accept(from.ip()) {
+                    continue;
+                }
+            }
             let salt_len = self.cipher.salt_len();
             if n <= salt_len {
                 continue;
             }
-            let Ok(sub) = self.cipher.subkey(&self.key, &buf[..salt_len]) else {
-                continue;
+            let salt = &buf[..salt_len];
+            let chunk = &buf[salt_len..n];
+
+            // 尝试单端口多用户 PSK 解密
+            let mut matched_udp: Option<(Option<Arc<vp_core::UserAccount>>, Vec<u8>, Vec<u8>)> =
+                None;
+            if !self.user_keys.is_empty() {
+                for (user, k) in &self.user_keys {
+                    if user.is_quota_exceeded() {
+                        continue;
+                    }
+                    let Ok(sub) = self.cipher.subkey(k, salt) else {
+                        continue;
+                    };
+                    let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) else {
+                        continue;
+                    };
+                    if let Some(Ok((plain, _))) = codec.try_open_chunk(chunk) {
+                        user.add_up(n as u64);
+                        matched_udp = Some((Some(user.clone()), k.clone(), plain.to_vec()));
+                        break;
+                    }
+                }
+            } else if let Ok(sub) = self.cipher.subkey(&self.key, salt) {
+                if let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) {
+                    if let Some(Ok((plain, _))) = codec.try_open_chunk(chunk) {
+                        matched_udp = Some((None, self.key.clone(), plain.to_vec()));
+                    }
+                }
+            }
+
+            let (matched_user, use_key, plain) = match matched_udp {
+                Some(m) => m,
+                None => continue,
             };
-            let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) else {
-                continue;
-            };
-            let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else {
-                continue;
-            };
+
+            if let Some(ref g) = self.gate {
+                g.mark_authenticated(from.ip());
+            }
+
             let Ok((dst, used)) = decode_socks_addr(&plain) else {
                 continue;
             };
@@ -473,9 +570,11 @@ impl SsInbound {
                 let target = target.clone();
                 let sock2 = sock.clone();
                 let cipher = self.cipher.clone();
-                let key = self.key.clone();
+                let key = use_key;
                 let nat2 = nat.clone();
                 let client = from;
+                let return_user = matched_user.clone();
+                let self_gate = self.gate.clone();
                 tokio::spawn(async move {
                     let mut rbuf = [0u8; 65535];
                     loop {
@@ -489,6 +588,16 @@ impl SsInbound {
                             Err(_) => break, // 空闲超时
                         };
                         let Ok((rn, rfrom)) = recv else { break };
+                        if let Some(ref u) = return_user {
+                            u.add_down(rn as u64);
+                        }
+                        // RRL 防放大检查：如果该客户端超速且未认证，按 RRL 丢弃
+                        if let Some(ref g) = self_gate {
+                            match g.check_rrl(client.ip()) {
+                                vp_core::RrlDecision::Drop => continue,
+                                vp_core::RrlDecision::Allow | vp_core::RrlDecision::Slip => {}
+                            }
+                        }
                         // 回包：[salt][chunk(socks addr + payload)]
                         let mut plain = Vec::with_capacity(rn + 24);
                         encode_socks_addr(&DstAddr::ip(rfrom.ip(), rfrom.port()), &mut plain);
@@ -524,6 +633,7 @@ impl SsInbound {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     async fn serve<S>(
         self: &Arc<Self>,
         mut stream: S,
@@ -536,25 +646,55 @@ impl SsInbound {
         // 读客户端 salt
         let mut salt = vec![0u8; self.cipher.salt_len()];
         stream.read_exact(&mut salt).await?;
-        let sub = self.cipher.subkey(&self.key, &salt)?;
-        let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
-        // 读首个分块 → 目标地址（可能附带额外数据）
+
+        // 读首个分块并尝试解密匹配用户
         let mut raw = BytesMut::new();
-        let first = loop {
-            raw.reserve(16 * 1024);
-            let n = stream.read_buf(&mut raw).await?;
-            if n == 0 {
-                return Err(Error::Proto("ss 入站: 首包中断"));
-            }
-            match dec.try_open_chunk(&raw) {
-                Some(Ok((payload, used))) => {
-                    raw.advance(used);
-                    break payload;
+        raw.reserve(16 * 1024);
+        let n = stream.read_buf(&mut raw).await?;
+        if n == 0 {
+            return Err(Error::Proto("ss 入站: 首包中断"));
+        }
+
+        let mut matched: Option<(
+            Option<Arc<vp_core::UserAccount>>,
+            Vec<u8>,
+            AeadChunkCodec,
+            Vec<u8>,
+            usize,
+        )> = None;
+        if !self.user_keys.is_empty() {
+            for (user, k) in &self.user_keys {
+                if user.is_quota_exceeded() {
+                    continue;
                 }
-                Some(Err(e)) => return Err(e),
-                None => continue,
+                let Ok(sub) = self.cipher.subkey(k, &salt) else {
+                    continue;
+                };
+                let Ok(mut dec) = AeadChunkCodec::new(&self.cipher, &sub) else {
+                    continue;
+                };
+                if let Some(Ok((payload, used))) = dec.try_open_chunk(&raw) {
+                    matched = Some((Some(user.clone()), k.clone(), dec, payload, used));
+                    break;
+                }
             }
+        } else {
+            let sub = self.cipher.subkey(&self.key, &salt)?;
+            let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
+            if let Some(Ok((payload, used))) = dec.try_open_chunk(&raw) {
+                matched = Some((None, self.key.clone(), dec, payload, used));
+            }
+        }
+
+        let (matched_user, use_key, dec, first, used) = match matched {
+            Some(m) => m,
+            None => return Err(Error::Proto("ss 入站: 身份验证失败或秘钥不匹配")),
         };
+        if let Some(ref g) = self.gate {
+            g.mark_authenticated(src.ip());
+        }
+        raw.advance(used);
+
         let addr_buf: &[u8] = if self.cipher.is_2022 {
             if first.len() < 8 {
                 return Err(Error::Proto("ss 入站: 2022 首块缺时间戳"));
@@ -571,17 +711,26 @@ impl SsInbound {
         } else {
             &first[..]
         };
-        let (dst, used) = decode_socks_addr(addr_buf)?;
-        if addr_buf.len() > used {
-            raw.extend_from_slice(&addr_buf[used..]);
+        let (dst, used_addr) = decode_socks_addr(addr_buf)?;
+        if addr_buf.len() > used_addr {
+            raw.extend_from_slice(&addr_buf[used_addr..]);
         }
 
-        // 目标直连（服务端模式不做策略路由）
-        let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
-        let remote = self.direct.connect_stream(&sess, &dst).await?;
+        // 策略路由决策
+        let mut sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+        if let Some(ref u) = matched_user {
+            sess.inbound_user = Some(u.username.clone());
+        }
+        let res = ctx.router.pick(&sess).await;
+        let rule_tag = res.rule.as_ref().map(|r| r.rule.clone());
+        let chain_tag = if res.outbound.name() != res.via.as_ref() {
+            format!("{}[{}]", res.via, res.outbound.name())
+        } else {
+            res.outbound.name().to_string()
+        };
+        let remote = res.outbound.connect_stream(&sess, &dst).await?;
 
-        let client =
-            SsCryptoStream::new_server(stream, self.cipher.clone(), self.key.clone(), dec, raw)?;
+        let client = SsCryptoStream::new_server(stream, self.cipher.clone(), use_key, dec, raw)?;
         let meta = vp_core::conn_table::ConnMeta {
             id: sess.id,
             inbound: self.tag.clone(),
@@ -590,14 +739,18 @@ impl SsInbound {
             dst_port: dst.port,
             src: Some(src.to_string()),
             process: None,
-            rule: None,
-            chain: Some("ss-server".into()),
+            user: matched_user.as_ref().map(|u| u.username.clone()),
+            rule: rule_tag,
+            chain: Some(chain_tag.into()),
             start: vp_common::now_millis(),
         };
         let hook = RelayHook {
             table: Some(ctx.conns.clone()),
             meta: Some(meta),
             stats: Some(ctx.stats.clone()),
+            user: matched_user.clone(),
+            limiter: matched_user.as_ref().and_then(|u| u.limiter.clone()),
+            brutal: matched_user.as_ref().and_then(|u| u.brutal_pacer.clone()),
         };
         tokio::spawn(async move {
             let _ = relay(Box::new(client), remote, hook).await;
@@ -653,11 +806,19 @@ impl Inbound for SsInbound {
                     }
                 }
             } else {
-                let listener =
-                    match tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await {
-                        Ok(l) => l,
-                        Err(e) => return Err(e.into()),
-                    };
+                use std::net::ToSocketAddrs;
+                let addr = match (self.bind.as_str(), self.port).to_socket_addrs() {
+                    Ok(mut it) => it.next().ok_or_else(|| {
+                        Error::Config(format!("无法解析绑定地址 {}:{}", self.bind, self.port))
+                    })?,
+                    Err(e) => {
+                        return Err(Error::Config(format!(
+                            "无法解析绑定地址 {}:{}: {e}",
+                            self.bind, self.port
+                        )));
+                    }
+                };
+                let listener = vp_transport::bind_tcp_listener(addr)?;
                 let bound = listener.local_addr()?.port();
                 match tokio::net::UdpSocket::bind((self.bind.as_str(), bound)).await {
                     Ok(u) => (listener, u, bound),
@@ -684,6 +845,11 @@ impl Inbound for SsInbound {
                 loop {
                     match listener.accept().await {
                         Ok((stream, src)) => {
+                            if let Some(ref g) = this.gate {
+                                if !g.check_accept(src.ip()) {
+                                    continue;
+                                }
+                            }
                             vp_transport::tune(&stream);
                             let this = this.clone();
                             let ctx = ctx.clone();
@@ -796,5 +962,92 @@ mod tests {
         let k256 = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
         roundtrip("2022-blake3-aes-128-gcm", &k128).await;
         roundtrip("2022-blake3-aes-256-gcm", &k256).await;
+    }
+
+    #[tokio::test]
+    async fn test_ss_2022_server_multi_user() {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 1024];
+            while let Ok(n) = s.read(&mut b).await {
+                if n == 0 || s.write_all(&b[..n]).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let k1 = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        let k2 = base64::engine::general_purpose::STANDARD.encode([2u8; 16]);
+
+        let user_mgr = Arc::new(vp_core::UserManager::new());
+        let user1 = Arc::new(vp_core::UserAccount::new(
+            "ss-user-1",
+            k1.as_str(),
+            Some(1024 * 1024),
+            None,
+        ));
+        let user2 = Arc::new(vp_core::UserAccount::new(
+            "ss-user-2",
+            k2.as_str(),
+            Some(1024 * 1024),
+            None,
+        ));
+        user_mgr.add_user(user1.clone());
+        user_mgr.add_user(user2.clone());
+
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+
+        let server = SsInbound::with_options(
+            "127.0.0.1",
+            0,
+            "ss-2022-srv",
+            "2022-blake3-aes-128-gcm",
+            "",
+            None,
+            Some(user_mgr),
+        )
+        .unwrap();
+        let port = Arc::new(server).start(ctx).await.unwrap();
+
+        // 客户端 1 经 k1 连接
+        let out1 = SsOutbound::new(&SsCfg {
+            server: "127.0.0.1".into(),
+            port,
+            cipher: "2022-blake3-aes-128-gcm".into(),
+            password: k1,
+            udp: false,
+            plugin: None,
+            plugin_opts: None,
+        })
+        .unwrap();
+
+        let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), echo_addr.port());
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out1.connect_stream(&sess, &dst).await.unwrap();
+        s.write_all(b"msg-from-user1").await.unwrap();
+        let mut buf = [0u8; 14];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"msg-from-user1");
+
+        // 校验 user1 产生流量，user2 无流量
+        let mut recorded = false;
+        for _ in 0..20 {
+            if user1.upload.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                recorded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+        assert!(recorded);
+        assert_eq!(user2.upload.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 }

@@ -644,18 +644,20 @@ pub async fn serve_client(
     } else {
         PacketFraming::Uot
     };
-    relay_packets(egress, sess, rd, wr, framing).await
+    relay_packets(egress, sess, rd, wr, framing, None).await
 }
 
 /// 协议服务端（vless / trojan / vmess 入站）收到 UDP 请求：按该协议的帧格式中继
+/// user：入站认证出的用户，流内 UDP 同样计入其流量、受配额限制（TCP 由 RelayHook 计）
 pub async fn serve_packets(
     egress: UdpEgress<'_>,
     sess: Session,
     client: Box<dyn ProxyStream>,
     framing: PacketFraming,
+    user: Option<Arc<vp_core::UserAccount>>,
 ) -> Result<()> {
     let (rd, wr) = tokio::io::split(client);
-    relay_packets(egress, sess, FrameReader::new(rd), wr, framing).await
+    relay_packets(egress, sess, FrameReader::new(rd), wr, framing, user).await
 }
 
 async fn relay_packets(
@@ -664,16 +666,24 @@ async fn relay_packets(
     mut rd: FrameReader<ReadHalf<Box<dyn ProxyStream>>>,
     wr: WriteHalf<Box<dyn ProxyStream>>,
     framing: PacketFraming,
+    user: Option<Arc<vp_core::UserAccount>>,
 ) -> Result<()> {
     let wr = Arc::new(Mutex::new(wr));
     // 目标 → 发送队列（会话存活标志）
     let mut sessions: HashMap<DstAddr, tokio::sync::mpsc::Sender<UdpPacket>> = HashMap::new();
     while let Ok((dst, data)) = rd.next(&framing).await {
+        if let Some(u) = &user {
+            if u.is_quota_exceeded() {
+                break;
+            }
+            u.add_up(data.len() as u64);
+        }
         let tx = match sessions.get(&dst) {
             Some(tx) => tx.clone(),
             None => {
                 // 单个目标建会话失败（解析失败 / 出站不支持 UDP）只丢这个包，不断开整条流
-                match spawn_session(&egress, &mut sess, &dst, wr.clone(), framing.clone()).await {
+                let (w, f, u) = (wr.clone(), framing.clone(), user.clone());
+                match spawn_session(&egress, &mut sess, &dst, w, f, u).await {
                     Ok(tx) => {
                         sessions.insert(dst.clone(), tx.clone());
                         tx
@@ -703,6 +713,7 @@ async fn spawn_session(
     dst: &DstAddr,
     wr: ClientWriter,
     framing: PacketFraming,
+    user: Option<Arc<vp_core::UserAccount>>,
 ) -> Result<tokio::sync::mpsc::Sender<UdpPacket>> {
     sess.dst = dst.clone();
     sess.network = vp_core::session::Network::Udp;
@@ -725,6 +736,9 @@ async fn spawn_session(
                 // 出站 → 客户端（按帧格式封装；自带地址的格式写上数据报源地址）
                 r = conn.recv() => {
                     let Ok(pkt) = r else { break };
+                    if let Some(u) = &user {
+                        u.add_down(pkt.data.len() as u64);
+                    }
                     let src = DstAddr::ip(pkt.src.ip(), pkt.src.port());
                     let Some(frame) = framing.encode(&src, &pkt.data) else { continue };
                     let mut w = wr.lock().await;

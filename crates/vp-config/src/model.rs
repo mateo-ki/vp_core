@@ -236,6 +236,24 @@ pub struct Config {
     /// 静态域名解析映射表（hosts 节，值可为单个 IP 字符串或 IP 列表）
     #[serde(default, deserialize_with = "de_hosts_map")]
     pub hosts: HashMap<String, Vec<String>>,
+    /// 全局入站地理位置访问控制：仅允许特定国家代码（如 ["CN", "LAN"]）
+    #[serde(alias = "allow-geoip", alias = "allow_geoip", default)]
+    pub allow_geoip: Vec<String>,
+    /// 全局入站地理位置访问控制：阻断特定国家代码（如 ["US", "RU"]）
+    #[serde(alias = "block-geoip", alias = "block_geoip", default)]
+    pub block_geoip: Vec<String>,
+    /// 全局入站 ASN 访问控制：仅允许特定 ASN（如 [4134, 4837]）
+    #[serde(alias = "allow-asn", alias = "allow_asn", default)]
+    pub allow_asn: Vec<u32>,
+    /// 全局入站 ASN 访问控制：阻断特定 ASN（如 [16509, 14061]）
+    #[serde(alias = "block-asn", alias = "block_asn", default)]
+    pub block_asn: Vec<u32>,
+    /// 全局 UDP 响应速率限制（RRL）默认配置
+    #[serde(default)]
+    pub rrl: Option<RrlConfig>,
+    /// 全局端口敲门（Port Knocking）隐身门禁
+    #[serde(default)]
+    pub knock: Option<KnockConfig>,
 }
 
 fn de_hosts_map<'de, D>(deserializer: D) -> Result<HashMap<String, Vec<String>>, D::Error>
@@ -303,13 +321,49 @@ pub struct TuningConfig {
     /// TCP Keepalive 保活空闲周期（秒，默认 60）
     #[serde(alias = "tcp-keepalive-secs", alias = "tcp_keepalive_secs", default)]
     pub tcp_keepalive_secs: Option<u64>,
+    /// 启用 Linux TCP BBR 拥塞控制算法
+    #[serde(alias = "tcp-bbr", alias = "tcp_bbr", default)]
+    pub tcp_bbr: bool,
+    /// 启用 TCP Fast Open (TFO)
+    #[serde(alias = "tcp-fast-open", alias = "tcp_fast_open", default)]
+    pub tcp_fast_open: bool,
+    /// 启用 SO_REUSEPORT 多队列内核级负载均衡
+    #[serde(alias = "reuse-port", alias = "reuse_port", default)]
+    pub reuse_port: bool,
 }
 
-/// 服务端入站定义（支持 tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss）
+/// 单用户详细配置（认证凭据、带宽速率限制与总流量配额）
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub secret: String,
+    #[serde(
+        alias = "rate-limit-up",
+        alias = "rate_limit_up",
+        default,
+        deserialize_with = "de_opt_bandwidth_mbps"
+    )]
+    pub rate_limit_up: Option<u32>,
+    #[serde(
+        alias = "rate-limit-down",
+        alias = "rate_limit_down",
+        default,
+        deserialize_with = "de_opt_bandwidth_mbps"
+    )]
+    pub rate_limit_down: Option<u32>,
+    #[serde(alias = "quota-bytes", alias = "quota_bytes", default)]
+    pub quota_bytes: Option<u64>,
+    /// Brutal 暴力恒速发送目标带宽（Mbps）
+    #[serde(alias = "brutal-mbps", alias = "brutal_mbps", default)]
+    pub brutal_mbps: Option<u32>,
+}
+
+/// 服务端入站定义（支持 tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss/tuic/hysteria2）
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListenerCfg {
     pub name: String,
-    /// trojan / vmess / vless / ss / anytls / mieru / tproxy / redir / mixed / socks5 / http
+    /// trojan / vmess / vless / ss / anytls / mieru / brook / snell / naive / tuic / hysteria2 / tproxy / redir / mixed / socks5 / http
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
@@ -323,15 +377,22 @@ pub struct ListenerCfg {
         default
     )]
     pub listen: Option<String>,
-    /// trojan: 密码列表；vmess/vless: uuid 列表；ss: 单密码
+    /// trojan: 密码列表；vmess/vless: uuid 列表；ss: 单密码；tuic: uuid:password 列表；hy2: 密码列表
     #[serde(default)]
     pub users: Vec<String>,
+    /// 多用户结构化配置（包含限速与流量配额），优先级高于基础 users 字段
+    #[serde(alias = "user-configs", alias = "user_configs", default)]
+    pub user_configs: Vec<UserConfig>,
+    /// 回落目标（如 "127.0.0.1:8080"）：当认证失败或探测流量到达时透明反代给本地 Web 服务
+    #[serde(default)]
+    pub fallback: Option<String>,
     /// ss 加密方式
     #[serde(default)]
     pub cipher: Option<String>,
-    /// TLS 证书 PEM 路径（可选；提供则套 TLS）
+    /// TLS 证书 PEM 路径或内联 PEM 内容
     #[serde(default)]
     pub cert: Option<String>,
+    /// TLS 私钥 PEM 路径或内联 PEM 内容
     #[serde(default)]
     pub key: Option<String>,
     /// shadow-tls v3 外层伪装（ss listener 可选；host 为伪装转发目标）
@@ -343,6 +404,97 @@ pub struct ListenerCfg {
         default
     )]
     pub shadow_tls: Option<ShadowTlsCfg>,
+    /// REALITY 服务端原生监听配置（借用大厂证书伪装与探测透明反代）
+    #[serde(
+        alias = "reality",
+        alias = "reality-opts",
+        alias = "reality_opts",
+        default
+    )]
+    pub reality: Option<RealityListenerCfg>,
+    /// 动态多 SNI 分流路由表（SNI 域名 -> 转发目标或特定伪装站点）
+    #[serde(alias = "sni-routes", alias = "sni_routes", default)]
+    pub sni_routes: HashMap<String, String>,
+    /// 混淆类型（如 "salamander"）
+    #[serde(alias = "obfs", default)]
+    pub obfs: Option<String>,
+    /// 混淆密码（Salamander 密钥，若未填写则使用 users[0]）
+    #[serde(alias = "obfs-password", alias = "obfs_password", default)]
+    pub obfs_password: Option<String>,
+    /// 端口跳跃 / 多端口范围（如 "20000-20050" 或 "20000,20001,20002"）
+    #[serde(alias = "mport", alias = "ports", default)]
+    pub ports: Option<String>,
+    /// 入站访问控制：仅允许特定国家代码（如 ["CN", "LAN"]）
+    #[serde(alias = "allow-geoip", alias = "allow_geoip", default)]
+    pub allow_geoip: Vec<String>,
+    /// 入站访问控制：阻断特定国家代码（如 ["US", "RU"]）
+    #[serde(alias = "block-geoip", alias = "block_geoip", default)]
+    pub block_geoip: Vec<String>,
+    /// 入站访问控制：仅允许特定 ASN（如 [4134, 4837]）
+    #[serde(alias = "allow-asn", alias = "allow_asn", default)]
+    pub allow_asn: Vec<u32>,
+    /// 入站访问控制：阻断特定 ASN（如 [16509, 14061]）
+    #[serde(alias = "block-asn", alias = "block_asn", default)]
+    pub block_asn: Vec<u32>,
+    /// 端口敲门防扫描（Knock Server 验证通过后向源 IP 临时开门）
+    #[serde(default)]
+    pub knock: Option<KnockConfig>,
+    /// UDP 响应速率限制（RRL）防反射放大攻击与限频
+    #[serde(default)]
+    pub rrl: Option<RrlConfig>,
+}
+
+/// 端口敲门防扫描配置
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct KnockConfig {
+    /// 敲门监听端口（支持 UDP / TCP）
+    #[serde(default)]
+    #[serde(deserialize_with = "de_u16_lenient")]
+    pub port: u16,
+    /// 敲门共享密码/密钥
+    pub secret: String,
+    /// 敲门开门持续秒数（默认 60 秒）
+    #[serde(alias = "timeout-secs", alias = "timeout_secs", default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// UDP 响应速率限制（Response Rate Limiting, RRL）配置
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct RrlConfig {
+    /// 未认证客户端每秒最大响应包数（默认 10）
+    #[serde(alias = "max-qps", alias = "max_qps", default)]
+    pub max_qps: Option<u32>,
+    /// 突发容量（默认 20）
+    #[serde(default)]
+    pub burst: Option<u32>,
+    /// 速率超标时的抽样丢弃因子（默认 2：每超速 2 个丢 1 个抽样回复；0 为完全丢弃）
+    #[serde(default)]
+    pub slip: Option<u32>,
+}
+
+/// REALITY 服务端监听配置段
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct RealityListenerCfg {
+    #[serde(alias = "private-key", alias = "private_key", alias = "pri_key")]
+    pub private_key: String,
+    #[serde(
+        alias = "short-ids",
+        alias = "short_ids",
+        alias = "shortId",
+        alias = "sid",
+        default
+    )]
+    pub short_ids: Vec<String>,
+    #[serde(default)]
+    pub dest: String,
+    #[serde(
+        alias = "server-names",
+        alias = "server_names",
+        alias = "sni",
+        alias = "snis",
+        default
+    )]
+    pub server_names: Vec<String>,
 }
 
 /// TUN 配置段（Clash 风格）
@@ -1392,7 +1544,7 @@ pub struct RuleProviderCfg {
     /// domain / ipcidr / classical
     #[serde(default)]
     pub behavior: Option<String>,
-    /// yaml / text / mrs
+    /// yaml / text（mrs 二进制格式暂不支持，校验阶段报错）
     #[serde(default)]
     pub format: Option<String>,
     pub path: Option<String>,

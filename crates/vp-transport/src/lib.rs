@@ -6,6 +6,7 @@ pub mod grpc;
 pub mod hpke;
 pub mod http;
 pub mod quic;
+pub mod reality_server;
 pub mod tls;
 pub mod utls;
 pub mod ws;
@@ -13,6 +14,7 @@ pub mod ws;
 pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
 
 pub use http::{HttpConfig, HttpStream, http_handshake_client};
+pub use reality_server::{RealityHandshakeResult, RealityServerConfig, reality_server_handshake};
 pub use tls::{TlsClientConfig, connect_tls, tls_acceptor, tls_connect};
 pub use ws::{WsConfig, WsStream, ws_handshake_client, ws_handshake_server};
 
@@ -31,6 +33,9 @@ pub struct SocketTuning {
     pub sndbuf: usize,
     pub tcp_nodelay: bool,
     pub keepalive_secs: u64,
+    pub tcp_bbr: bool,
+    pub tcp_fast_open: bool,
+    pub reuse_port: bool,
 }
 
 static TUNING: std::sync::RwLock<SocketTuning> = std::sync::RwLock::new(SocketTuning {
@@ -38,6 +43,9 @@ static TUNING: std::sync::RwLock<SocketTuning> = std::sync::RwLock::new(SocketTu
     sndbuf: 0,
     tcp_nodelay: true,
     keepalive_secs: 60,
+    tcp_bbr: false,
+    tcp_fast_open: false,
+    reuse_port: false,
 });
 
 /// 当前生效的调优快照（一致读取）
@@ -46,7 +54,15 @@ pub fn tuning_snapshot() -> SocketTuning {
 }
 
 /// 全局配置套接字发送与接收缓冲区及 TCP 调优参数
-pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_keepalive_secs: u64) {
+pub fn set_global_tuning(
+    rcvbuf: usize,
+    sndbuf: usize,
+    tcp_nodelay: bool,
+    tcp_keepalive_secs: u64,
+    tcp_bbr: bool,
+    tcp_fast_open: bool,
+    reuse_port: bool,
+) {
     *TUNING.write().unwrap() = SocketTuning {
         rcvbuf,
         sndbuf,
@@ -56,13 +72,67 @@ pub fn set_global_tuning(rcvbuf: usize, sndbuf: usize, tcp_nodelay: bool, tcp_ke
         } else {
             tcp_keepalive_secs
         },
+        tcp_bbr,
+        tcp_fast_open,
+        reuse_port,
     };
+}
+
+/// 绑定带有高性能套接字选项的 TCP 监听器：
+/// - SO_REUSEPORT (Linux/Unix): 多线程内核级负载均衡
+/// - TCP_FASTOPEN (Linux): 降低握手延迟
+/// - SO_REUSEADDR (所有平台): 快速重启防端口占用
+pub fn bind_tcp_listener_with_opts(
+    addr: std::net::SocketAddr,
+    _reuse_port: bool,
+    _tcp_fast_open: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let domain = if addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
+    if _reuse_port {
+        let _ = socket.set_reuse_port(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    if _tcp_fast_open {
+        use std::os::unix::io::AsRawFd;
+        let qlen: libc::c_int = 256;
+        unsafe {
+            let _ = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_FASTOPEN,
+                &qlen as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&qlen) as libc::socklen_t,
+            );
+        }
+    }
+
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// 使用当前全局调优配置绑定 TCP 监听器
+pub fn bind_tcp_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let t = tuning_snapshot();
+    bind_tcp_listener_with_opts(addr, t.reuse_port, t.tcp_fast_open)
 }
 
 /// 套接字调优：内核持有的所有 TCP 连接统一设置。
 /// - TCP_NODELAY：关闭 Nagle，交互流量不被合并延迟（流畅的关键）
 /// - SO_RCVBUF / SO_SNDBUF：高带宽时延积 (BDP) 窗口放大
 /// - TCP keepalive：探测对端僵死连接，避免句柄泄漏（稳定的保障）
+/// - TCP BBR：Linux 平台下的拥塞控制优化
 pub fn tune(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let t = tuning_snapshot();
@@ -82,6 +152,21 @@ pub fn tune(stream: &tokio::net::TcpStream) {
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let ka = ka.with_retries(3);
     let _ = sock.set_tcp_keepalive(&ka);
+
+    #[cfg(target_os = "linux")]
+    if t.tcp_bbr {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            let cc = b"bbr\0";
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                cc.as_ptr() as *const libc::c_void,
+                cc.len() as libc::socklen_t,
+            );
+        }
+    }
 }
 
 /// REALITY 扩展配置（VLESS / Trojan 专有，对标 Xray-core / sing-box）
@@ -184,7 +269,8 @@ pub struct TransportConfig {
     pub tls: bool,
     pub server_name: Option<String>,
     pub skip_cert_verify: bool,
-    /// uTLS 指纹（"chrome"）：设置时 TLS 走手写指纹客户端
+    /// client-fingerprint 原值：仅 REALITY 握手使用（内置单一 ClientHello 模板）；
+    /// 其余 TLS 走 rustls，设置了也不生效（运行时提示一次）
     pub fingerprint: Option<String>,
     /// 节点显式声明的 ALPN；为空时按传输类型推导（grpc→h2，ws→http/1.1）
     pub alpn: Vec<String>,
@@ -222,6 +308,17 @@ pub async fn wrap_transport(
     server_host: &str,
     cfg: &TransportConfig,
 ) -> Result<Box<dyn ProxyStream>> {
+    // 只提示走 TLS 的节点（gRPC 恒走 TLS）：明文节点配指纹本无意义，不算"写了却不生效"
+    if cfg.reality.is_none() && (cfg.tls || cfg.grpc.is_some()) {
+        if let Some(fp) = &cfg.fingerprint {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "client-fingerprint {fp:?} 未生效：浏览器指纹模板只用于 REALITY 握手，其余 TLS 走 rustls 标准握手（本提示每进程一次）"
+                )
+            });
+        }
+    }
     if let Some(g) = &cfg.grpc {
         // grpc 生态默认 TLS + ALPN h2
         let tls = tls::tls_connect(
@@ -242,7 +339,8 @@ pub async fn wrap_transport(
         // uTLS（浏览器指纹）只在 REALITY 握手认证时使用：REALITY 依赖 uTLS ClientHello
         // 里的 auth 载荷。普通 TLS 站点（尤其 CDN 前置的 ws/grpc 节点）实测与手写 uTLS
         // 存在互操作缺陷（服务端 TLS 栈半卡：ws 帧头可达、payload 永不到达），一律走
-        // rustls 标准栈——Mihomo 的 Go TLS 同样不是真 uTLS，指纹差异不影响可用性。
+        // rustls 标准栈。代价：普通 TLS 节点的 client-fingerprint 不生效（mihomo 会用
+        // uTLS 模拟浏览器指纹），函数入口处会提示一次。
         // ECH 配置解析（ech-opts.config 优先，其次 DoH / DNS HTTPS 记录；解析器带缓存）
         let ech_config: Option<Arc<Vec<u8>>> = match &cfg.ech {
             Some(req) => match &req.config {
@@ -275,12 +373,19 @@ pub async fn wrap_transport(
         };
         let tls: Box<dyn ProxyStream> = if cfg.reality.is_some() {
             let fp = cfg.fingerprint.as_deref().unwrap_or("chrome");
+            if !utls::is_chrome_fingerprint(fp)? {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "client-fingerprint {fp:?} 尚未实现：REALITY 只有一套内置 ClientHello 模板，仍按该模板发送（本提示每进程一次）"
+                    )
+                });
+            }
             let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = utls::utls_connect(
                 stream,
                 server_host,
                 &utls::UtlsConfig {
-                    fingerprint: utls::Fingerprint::parse(fp)?,
                     server_name: cfg.server_name.clone(),
                     alpn,
                     skip_cert_verify: cfg.skip_cert_verify,
@@ -829,6 +934,19 @@ mod tests {
         c.read_exact(&mut b).await.unwrap();
         assert_eq!(&b, b"ok");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_with_tuning() {
+        set_global_tuning(131072, 131072, true, 45, false, true, true);
+        let listener = bind_tcp_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        assert_ne!(local_addr.port(), 0);
+
+        let cli = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+        tune(&cli);
+        let (srv, _) = listener.accept().await.unwrap();
+        tune(&srv);
     }
 
     #[tokio::test]

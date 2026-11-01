@@ -11,6 +11,7 @@
 - ⚡ **极小体积**：Linux 纯静态 Musl 单文件仅 **4.3 MB**，比传统 Go 内核缩小 80%+，路由器 16M Flash 亦可直接载入。
 - 💾 **极致低内存 (Zero-GC)**：空载常驻内存 (RSS) 仅 **10~20 MB**（内存占用仅约 2%），无 Go 语言 GC 停顿与内存波动，512MB / 1GB 低配 VPS 轻松跑满。
 - 🚀 **极高吞吐**：基于 Rust + Tokio 异步运行时，全链路池化零拷贝转发，支持 Linux `splice` 快速路径，千兆线速轻松拉满。
+- ☁️ **Cloudflare CDN 穿透 (拯救被墙 VPS)**：原生支持 VLESS-WebSocket 服务端入站与协议升级，无需 3x-ui / xray 等外部面板，借由 Cloudflare 443 免费 Anycast CDN 实现被墙 IP 直连秒通。
 - 🛡️ **生产级安全防御矩阵**：
   - **UDP RRL (Response Rate Limiting)**：IPv4 `/24` 与 IPv6 `/56` 子网聚合漏桶与 Slip 采样丢弃，防止 VPS 沦为 DDoS 反射放大肉鸡；认证通过后自动进入 1 小时全速白名单；
   - **端口敲门 (Port Knocking)**：未开门源探测直接 RST/Drop，资产扫描器（Shodan/Censys）中显示为 Filtered 隐身状态；
@@ -116,7 +117,7 @@ rules:
 
 | 维度 | 支持协议 / 特性 |
 | :--- | :--- |
-| **服务端 (Inbound Server)** | Shadowsocks-2022 (`2022-blake3-aes-128-gcm`/`aes-256-gcm`)、Hysteria 2、VLESS-REALITY、Trojan、TUIC v5、Mixed (HTTP+Socks5)、TUN (用户态网络栈)、Redir / TProxy |
+| **服务端 (Inbound Server)** | VLESS (REALITY / WebSocket CDN 穿透)、Shadowsocks-2022 (`2022-blake3-aes-128-gcm`/`aes-256-gcm`)、Hysteria 2、Trojan、TUIC v5、Mixed (HTTP+Socks5)、TUN (用户态网络栈)、Redir / TProxy |
 | **主动防御 (Security)** | UDP RRL 防反射限速与 Slip 采样、端口敲门 (Port Knocking) 隐身防御、GeoIP/ASN 前置拦截、Full-Cone NAT 高水位主动 GC |
 | **订阅引擎 (Subscription)** | 动态 HTTP 端点 `/sub`（自适应 Clash YAML 与 Base64 订阅文本）、Token 鉴权、`Subscription-Userinfo` 标头、CLI `gen-sub` 导出 |
 | **客户端出站 (Outbound)** | VLESS (Vision/REALITY)、VMess、Trojan、Shadowsocks (AEAD/2022)、Snell v1-v4、Hysteria 2、TUIC v5、ShadowsocksR、WireGuard、SSH、Direct、Reject |

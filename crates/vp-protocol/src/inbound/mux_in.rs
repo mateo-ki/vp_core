@@ -921,7 +921,7 @@ mod tests {
         // Server Name Indication (0x0000)
         exts.extend_from_slice(&[0x00, 0x00]);
         let sni_list_len = (3 + sni_bytes.len()) as u16;
-        let ext_len = (2 + sni_list_len) as u16;
+        let ext_len = 2 + sni_list_len;
         exts.extend_from_slice(&ext_len.to_be_bytes());
         exts.extend_from_slice(&sni_list_len.to_be_bytes());
         exts.push(0x00); // host_name type

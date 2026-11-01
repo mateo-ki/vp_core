@@ -1373,7 +1373,7 @@ pub struct RuleProviderCfg {
     /// domain / ipcidr / classical
     #[serde(default)]
     pub behavior: Option<String>,
-    /// yaml / text / mrs
+    /// yaml / text（mrs 二进制格式暂不支持，校验阶段报错）
     #[serde(default)]
     pub format: Option<String>,
     pub path: Option<String>,

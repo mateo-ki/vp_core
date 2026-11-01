@@ -15,6 +15,7 @@ quinn.workspace = true
 boringtun.workspace = true
 smoltcp.workspace = true
 rustls.workspace = true
+tokio-rustls.workspace = true
 ring.workspace = true
 webpki-roots.workspace = true
 rustls-pemfile.workspace = true

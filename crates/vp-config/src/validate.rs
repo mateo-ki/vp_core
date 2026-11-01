@@ -145,6 +145,19 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
         }
     }
 
+    // 7. rule-provider 的 mrs（mihomo 二进制规则集）尚未实现：在此明确报错，
+    //    否则会在启动加载时把二进制当文本读，只得到一句费解的 UTF-8 错误
+    for (name, p) in &cfg.rule_providers {
+        if p.format
+            .as_deref()
+            .is_some_and(|f| f.trim().eq_ignore_ascii_case("mrs"))
+        {
+            errs.push(format!(
+                "rule-providers[{name:?}]: 暂不支持 mrs 二进制格式，请改用 format: yaml 或 text 的规则文件"
+            ));
+        }
+    }
+
     if errs.is_empty() { Ok(()) } else { Err(errs) }
 }
 
@@ -187,5 +200,18 @@ mod tests {
             "mixed-port: 7890\nproxies:\n  - name: p1\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-128-gcm\n    password: x\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies: [p1, DIRECT]\nrules:\n  - DOMAIN-SUFFIX,example.com,PROXY\n  - MATCH,DIRECT\n",
         );
         assert!(super::validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn mrs_rule_provider_rejected_with_clear_error() {
+        let provider = |format: &str| {
+            cfg_from_yaml(&format!(
+                "rule-providers:\n  g:\n    type: http\n    behavior: domain\n    format: {format}\n    url: https://example.com/g\n    path: ./g\nrules:\n  - RULE-SET,g,DIRECT\n  - MATCH,DIRECT\n"
+            ))
+        };
+        let errs = super::validate(&provider("mrs")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("mrs")));
+        assert!(super::validate(&provider("yaml")).is_ok());
+        assert!(super::validate(&provider("text")).is_ok());
     }
 }

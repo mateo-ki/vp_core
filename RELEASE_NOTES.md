@@ -1,3 +1,35 @@
+# 🚀 VP_Core v1.4.0 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.4.0**！本版是 **高性能服务端生产级矩阵 + CLI 一键开服 + 内核自我更新** 重大里程碑版本：
+
+### ⚡ 高性能服务端矩阵与全协议栈支持 (Zero-GC Server Inbounds)
+- **多协议全功能服务端实现**：支持 Shadowsocks-2022（`2022-blake3-aes-128-gcm` / `aes-256-gcm`）、Hysteria 2、VLESS-REALITY、Trojan、TUIC 等服务端原生监听与分发；
+- **极致内存控制 (Zero-GC)**：基于 Rust 零成本抽象，Linux VPS 实测常驻内存 (RSS) 仅 ~20MB（内存占用仅 2%），无 Go 语言 GC 停顿与内存波动，完美适配 512MB / 1GB 低配 VPS；
+- **UDP RRL (Response Rate Limiting) 防反射放大**：内置 IPv4 `/24`、IPv6 `/56` 子网聚合漏桶与 Slip 采样丢弃机制，防止 VPS 沦为 DDoS 放大肉鸡；认证通过后自动进入 1 小时全速白名单；
+- **端口敲门 (Port Knocking) 与隐身防御**：未敲门探测直接丢弃/RST，端口在资产扫描器（Shodan/Censys）中显示为 Filtered 隐身状态；支持 GeoIP / ASN 前置拦截；
+- **Full-Cone NAT 高水位主动 GC**：4096 映射表高水位控制，定时清理过期及空闲 UDP NAT 映射，彻底杜绝内存泄漏与 OOM 隐患。
+
+### 🚀 CLI 一键开服与节点生成 (`vpcore gen-server` / `init-server`)
+- **零门槛全自动配置**：多源探测公网 IP，全自动生成 UUID v4、x25519 密钥对、SS-2022 Blake3 密钥以及有效期 10 年的高性能自签 TLS 证书；
+- **客户端分享与 Clash 配置全套输出**：生成完成直接在终端格式化输出标准 `vless://`、`hysteria2://`、`ss://` 链接以及可直接粘贴的 Clash `proxies` 节点 YAML 片段；
+- **支持 `--domain` 域名联动与 CDN 穿透**：一键生成 Cloudflare Anycast CDN + WebSocket 节点，助推受阻断 VPS 国内免翻墙直连复活。
+
+### 🌐 全协议客户端订阅引擎与动态 /sub 端点
+- **服务端原生动态订阅接口 (`GET /sub`)**：自动适配客户端类型与请求参数（`?format=clash` 或 Clash User-Agent 自动输出完整 Clash 订阅包；默认输出标准 Base64 订阅文本）；支持安全 Token 鉴权与 `Subscription-Userinfo` 标头；
+- **CLI 静态订阅落盘与一键订阅链接**：`gen-server` 自动生成并在终端高亮输出通用订阅 URL、Clash 专用订阅 URL 与 Base64 订阅码，同步离线生成 `sub.txt` 与 `sub-clash.yaml`；
+- **随时导出与查看订阅 (`vpcore gen-sub`)**：支持根据现有配置文件随时一键导出订阅链接、Base64 订阅码或 Clash YAML 配置。
+
+### 🔄 内核自我更新与跨平台热替换 (`vpcore update` / `upgrade`)
+- **自动适配架构下载**：识别 Linux / Windows / macOS 的 x86_64 与 aarch64 架构，支持官方 Release 与自定义加速镜像源；
+- **严格前置健康检查**：覆盖前在临时路径执行 `--version` 自检，验证失败立即终止更新，防止坏包损坏服务；
+- **跨平台原子热替换**：Linux 下利用 inode unlink/rename，Windows 下利用 `.exe.old` 转移策略，进程运行中平滑升级；
+- **systemd 托管平滑重载**：Linux 环境下自动检测 systemd 托管状态并触发 `systemctl restart vpcore` 平滑生效。
+
+### 📦 一键自动化部署脚本 (`install.sh`)
+- 提供全新跨发行版一键脚本，自动检测架构、安装二进制、部署 systemd 守护进程并调用 `gen-server` 输出节点。
+
+---
+
 # 🚀 VP_Core v1.3.2 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.3.2**！本版聚焦 **Windows TUN 模式 DNS 劫持拦截与 Fake-IP 冲突修复**，彻底解决 TUN 模式下 YouTube 访问失败与 DNS 超时问题：

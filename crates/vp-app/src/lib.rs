@@ -13,7 +13,7 @@ use vp_common::{Error, Result, Stats};
 use vp_config::Format;
 use vp_core::{ConnTable, InboundCtx, Outbound, Resolution, Router, Session};
 use vp_dns::Resolver;
-use vp_protocol::{InboundKind, OutboundDeps, build_inbound, build_outbound, group_spec};
+use vp_protocol::{InboundKind, OutboundDeps, build_inbound_with_gate, build_outbound, group_spec};
 use vp_router::{Router as InnerRouter, RouterSpec};
 use vp_rule::{CompileEnv, geosite::GeoSiteDb};
 
@@ -305,6 +305,8 @@ pub struct App {
     pub dns_status: Arc<RwLock<DnsStatus>>,
     /// 全局 DNS 解析器：热开启 TUN 时复用它建 fake-ip 劫持服务器
     pub dns: Arc<Resolver>,
+    /// 多用户管理器（控制面动态管理 + 认证配额限速）
+    pub user_manager: Arc<vp_core::UserManager>,
 }
 
 impl App {
@@ -522,7 +524,15 @@ impl App {
             let snd = tuning.so_sndbuf.or(tuning.socket_buffer_size).unwrap_or(0);
             let nodelay = tuning.tcp_nodelay;
             let ka_secs = tuning.tcp_keepalive_secs.unwrap_or(60);
-            vp_transport::set_global_tuning(rcv, snd, nodelay, ka_secs);
+            vp_transport::set_global_tuning(
+                rcv,
+                snd,
+                nodelay,
+                ka_secs,
+                tuning.tcp_bbr,
+                tuning.tcp_fast_open,
+                tuning.reuse_port,
+            );
         }
 
         if let Some(mark) = cfg.routing_mark {
@@ -711,6 +721,7 @@ impl App {
             max_connections_per_inbound: cfg.resource_limits.max_connections_per_inbound,
         });
         let conns = Arc::new(ConnTable::new());
+        let user_manager = Arc::new(vp_core::UserManager::new());
 
         // 规则提供者定时后台更新任务
         if start_listeners {
@@ -765,9 +776,9 @@ impl App {
                                         if is_same {
                                             continue;
                                         }
-                                        if let Err(e) =
-                                            vp_rule::provider::load_payload(&new_text, behavior)
-                                        {
+                                        if let Err(e) = vp_rule::provider::load_payload(
+                                            &new_text, behavior, None,
+                                        ) {
                                             warn!(
                                                 "rule-provider {name} 定时拉取内容校验未通过: {e}"
                                             );
@@ -845,13 +856,48 @@ impl App {
                 stats: stats.clone(),
                 conns: conns.clone(),
             };
+
+            // 全局敲门门禁服务与全局 InboundGate
+            let global_knock_gate = if let Some(ref kc) = cfg.knock {
+                let k = Arc::new(vp_core::KnockGate::new(
+                    &kc.secret,
+                    std::time::Duration::from_secs(kc.timeout_secs.unwrap_or(60)),
+                ));
+                match k.clone().spawn_listener(&bind, kc.port).await {
+                    Ok(bound_port) => {
+                        info!(
+                            "全局 knock 监听 UDP {bind}:{bound_port} (window: {}s)",
+                            kc.timeout_secs.unwrap_or(60)
+                        );
+                    }
+                    Err(e) => {
+                        warn!("全局端口敲门服务启动失败: {e}");
+                    }
+                }
+                Some(k)
+            } else {
+                None
+            };
+
+            let global_gate = compile_inbound_gate(
+                &cfg.allow_geoip,
+                &cfg.block_geoip,
+                &cfg.allow_asn,
+                &cfg.block_asn,
+                global_knock_gate.clone(),
+                cfg.rrl.as_ref(),
+                geoip.as_ref(),
+                asn.as_ref(),
+            );
+
             for (kind, port, tag) in [
                 (InboundKind::Mixed, cfg.mixed_port, "mixed"),
                 (InboundKind::Http, cfg.port, "http"),
                 (InboundKind::Socks5, cfg.socks_port, "socks5"),
             ] {
                 if let Some(p) = port {
-                    let inb = build_inbound(kind, bind.clone(), p, tag);
+                    let inb =
+                        build_inbound_with_gate(kind, bind.clone(), p, tag, global_gate.clone());
                     let bound = inb.clone().start(inb_ctx.clone()).await?;
                     info!("{tag} 监听 {bind}:{bound}");
                     listen_ports.push((tag.to_string(), bound));
@@ -890,13 +936,69 @@ impl App {
 
             // 协议服务端入站（listeners）
             for l in &cfg.listeners {
-                let inb: Arc<dyn vp_core::Inbound> = match build_listener(l) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        warn!("listener {:?} 构建失败: {e}", l.name);
-                        continue;
+                let knock_gate = if let Some(ref kc) = l.knock {
+                    let k = Arc::new(vp_core::KnockGate::new(
+                        &kc.secret,
+                        std::time::Duration::from_secs(kc.timeout_secs.unwrap_or(60)),
+                    ));
+                    match k.clone().spawn_listener(&bind, kc.port).await {
+                        Ok(bound_port) => {
+                            info!(
+                                "listener [{}] 独立 knock 监听 UDP {bind}:{bound_port} (window: {}s)",
+                                l.name,
+                                kc.timeout_secs.unwrap_or(60)
+                            );
+                        }
+                        Err(e) => {
+                            warn!("listener {} 端口敲门服务启动失败: {e}", l.name);
+                        }
                     }
+                    Some(k)
+                } else {
+                    global_knock_gate.clone()
                 };
+
+                let allow_geo = if !l.allow_geoip.is_empty() {
+                    &l.allow_geoip
+                } else {
+                    &cfg.allow_geoip
+                };
+                let block_geo = if !l.block_geoip.is_empty() {
+                    &l.block_geoip
+                } else {
+                    &cfg.block_geoip
+                };
+                let allow_asn = if !l.allow_asn.is_empty() {
+                    &l.allow_asn
+                } else {
+                    &cfg.allow_asn
+                };
+                let block_asn = if !l.block_asn.is_empty() {
+                    &l.block_asn
+                } else {
+                    &cfg.block_asn
+                };
+                let rrl_cfg = l.rrl.as_ref().or(cfg.rrl.as_ref());
+
+                let gate = compile_inbound_gate(
+                    allow_geo,
+                    block_geo,
+                    allow_asn,
+                    block_asn,
+                    knock_gate,
+                    rrl_cfg,
+                    geoip.as_ref(),
+                    asn.as_ref(),
+                );
+
+                let inb: Arc<dyn vp_core::Inbound> =
+                    match build_listener(l, user_manager.clone(), gate) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            warn!("listener {:?} 构建失败: {e}", l.name);
+                            continue;
+                        }
+                    };
                 match inb.clone().start(inb_ctx.clone()).await {
                     Ok(bound) => {
                         info!("listener {} [{}] 监听 {bind}:{bound}", l.name, l.kind);
@@ -1024,6 +1126,7 @@ impl App {
                     tun_status: tun_status.clone(),
                     dns_status: dns_status.clone(),
                     dns: dns.clone(),
+                    user_manager: user_manager.clone(),
                 };
                 let listener = tokio::net::TcpListener::bind(&addr).await?;
                 api::spawn_on(listener, Arc::new(app_ref));
@@ -1042,6 +1145,7 @@ impl App {
             tun_status,
             dns_status,
             dns,
+            user_manager,
         };
         Ok(Arc::new(app))
     }
@@ -1144,8 +1248,191 @@ impl App {
     }
 }
 
+fn populate_user_manager(
+    mgr: &vp_core::UserManager,
+    user_configs: &[vp_config::UserConfig],
+    plain_users: &[String],
+) {
+    for uc in user_configs {
+        let limiter = if uc.rate_limit_up.is_some() || uc.rate_limit_down.is_some() {
+            Some(Arc::new(vp_core::BandwidthLimiter::from_mbps(
+                uc.rate_limit_up,
+                uc.rate_limit_down,
+            )))
+        } else {
+            None
+        };
+        let username = uc.name.clone().unwrap_or_else(|| uc.secret.clone());
+        let brutal = uc
+            .brutal_mbps
+            .map(|mbps| Arc::new(vp_core::BrutalPacer::from_mbps(mbps)));
+        let account = Arc::new(
+            vp_core::UserAccount::new(username, uc.secret.clone(), uc.quota_bytes, limiter)
+                .with_brutal(brutal),
+        );
+        mgr.add_user(account);
+    }
+    for u in plain_users {
+        if mgr.get_user(u).is_none() {
+            let account = Arc::new(vp_core::UserAccount::new(u.clone(), u.clone(), None, None));
+            mgr.add_user(account);
+        }
+    }
+}
+
+fn parse_ports_list(s: &str) -> Vec<u16> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.trim().parse::<u16>(), end.trim().parse::<u16>()) {
+                for p in s..=e {
+                    out.push(p);
+                }
+            }
+        } else if let Ok(p) = part.parse::<u16>() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// 编译入站安全门禁（GeoIP / ASN 白黑名单、端口敲门与 UDP RRL 速率限制）
+#[allow(clippy::too_many_arguments)]
+pub fn compile_inbound_gate(
+    allow_geoip: &[String],
+    block_geoip: &[String],
+    allow_asn: &[u32],
+    block_asn: &[u32],
+    knock: Option<Arc<vp_core::KnockGate>>,
+    rrl_cfg: Option<&vp_config::RrlConfig>,
+    geoip: Option<&vp_rule::GeoIpDb>,
+    asn: Option<&vp_rule::AsnDb>,
+) -> Option<Arc<vp_core::InboundGate>> {
+    let has_geoip = !allow_geoip.is_empty() || !block_geoip.is_empty();
+    let has_asn = !allow_asn.is_empty() || !block_asn.is_empty();
+
+    let ip_filter: Option<Arc<dyn Fn(std::net::IpAddr) -> bool + Send + Sync>> = if has_geoip
+        || has_asn
+    {
+        let mut allow_geo_matchers = Vec::new();
+        for code in allow_geoip {
+            let code_up = code.trim().to_ascii_uppercase();
+            if code_up == "LAN" || code_up == "PRIVATE" {
+                allow_geo_matchers.push(vp_rule::GeoIpMatcher::LanOrPrivate);
+            } else if let Some(db) = geoip {
+                if let Some(m) = db.matcher(code.clone()) {
+                    allow_geo_matchers.push(m);
+                }
+            } else {
+                warn!("配置了 allow_geoip: {code} 但未加载 GeoIP 数据库，该规则将无法匹配外网 IP");
+            }
+        }
+
+        let mut block_geo_matchers = Vec::new();
+        for code in block_geoip {
+            let code_up = code.trim().to_ascii_uppercase();
+            if code_up == "LAN" || code_up == "PRIVATE" {
+                block_geo_matchers.push(vp_rule::GeoIpMatcher::LanOrPrivate);
+            } else if let Some(db) = geoip {
+                if let Some(m) = db.matcher(code.clone()) {
+                    block_geo_matchers.push(m);
+                }
+            }
+        }
+
+        let allow_asn_matcher = if !allow_asn.is_empty() {
+            if let Some(db) = asn {
+                let s = allow_asn
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                db.matcher(&s)
+            } else {
+                warn!("配置了 allow_asn 但未加载 ASN 数据库");
+                None
+            }
+        } else {
+            None
+        };
+
+        let block_asn_matcher = if !block_asn.is_empty() {
+            if let Some(db) = asn {
+                let s = block_asn
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                db.matcher(&s)
+            } else {
+                warn!("配置了 block_asn 但未加载 ASN 数据库");
+                None
+            }
+        } else {
+            None
+        };
+
+        let has_allow_geo = !allow_geoip.is_empty();
+        let has_allow_asn = !allow_asn.is_empty();
+
+        Some(Arc::new(move |ip: std::net::IpAddr| {
+            // 1. 显式黑名单 block_geoip 匹配直接拒绝
+            for m in &block_geo_matchers {
+                if m.matches(ip) {
+                    return false;
+                }
+            }
+            // 2. 显式黑名单 block_asn 匹配直接拒绝
+            if let Some(ref m) = block_asn_matcher {
+                if m.matches(ip) {
+                    return false;
+                }
+            }
+            // 3. 白名单 allow_geoip 检查（非空时必须命中任一）
+            if has_allow_geo {
+                let matched = allow_geo_matchers.iter().any(|m| m.matches(ip));
+                if !matched {
+                    return false;
+                }
+            }
+            // 4. 白名单 allow_asn 检查（非空时必须命中任一）
+            if has_allow_asn {
+                let matched = allow_asn_matcher
+                    .as_ref()
+                    .map(|m| m.matches(ip))
+                    .unwrap_or(false);
+                if !matched {
+                    return false;
+                }
+            }
+            true
+        }))
+    } else {
+        None
+    };
+
+    let rrl = rrl_cfg.map(|rc| {
+        Arc::new(vp_core::UdpRrlLimiter::new(
+            rc.max_qps.unwrap_or(10),
+            rc.burst.unwrap_or(20),
+            rc.slip.unwrap_or(2),
+        ))
+    });
+
+    if ip_filter.is_some() || knock.is_some() || rrl.is_some() {
+        Some(Arc::new(vp_core::InboundGate::new(ip_filter, knock, rrl)))
+    } else {
+        None
+    }
+}
+
 /// 构建 listeners / inbounds 段的服务端入站（tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss...）
-fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound>> {
+fn build_listener(
+    l: &vp_config::ListenerCfg,
+    global_user_mgr: Arc<vp_core::UserManager>,
+    gate: Option<Arc<vp_core::InboundGate>>,
+) -> Result<Arc<dyn vp_core::Inbound>> {
     let tag = l.name.as_str();
     let bind = l.listen.as_deref().unwrap_or("0.0.0.0");
     match l.kind.as_str() {
@@ -1155,27 +1442,45 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
         "redir" => Ok(Arc::new(vp_protocol::redir::RedirInbound::new(
             bind, l.port, tag,
         ))),
-        "mixed" => Ok(Arc::new(vp_protocol::inbound::MixedInbound::new(
+        "mixed" => Ok(Arc::new(vp_protocol::inbound::MixedInbound::with_gate(
             bind.to_string(),
             l.port,
             tag,
+            gate,
         ))),
-        "socks" | "socks5" => Ok(Arc::new(vp_protocol::inbound::Socks5Inbound::new(
+        "socks" | "socks5" => Ok(Arc::new(vp_protocol::inbound::Socks5Inbound::with_gate(
             bind.to_string(),
             l.port,
             tag,
+            gate,
         ))),
-        "http" => Ok(Arc::new(vp_protocol::inbound::HttpInbound::new(
+        "http" => Ok(Arc::new(vp_protocol::inbound::HttpInbound::with_gate(
             bind.to_string(),
             l.port,
             tag,
+            gate,
         ))),
         "trojan" => {
-            if l.users.is_empty() {
-                return Err(Error::Config("trojan listener 需要 users（密码）".into()));
+            populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
+            let mut users = l.users.clone();
+            for u in global_user_mgr.all_users() {
+                if !users.iter().any(|s| s == &*u.secret) {
+                    users.push(u.secret.to_string());
+                }
             }
-            Ok(Arc::new(vp_protocol::trojan::TrojanInbound::new(
-                bind, l.port, tag, &l.users,
+            if users.is_empty() && l.fallback.is_none() {
+                return Err(Error::Config(
+                    "trojan listener 需要 users（密码）或 fallback 回落目标".into(),
+                ));
+            }
+            Ok(Arc::new(vp_protocol::trojan::TrojanInbound::with_gate(
+                bind,
+                l.port,
+                tag,
+                &users,
+                l.fallback.clone(),
+                Some(global_user_mgr),
+                gate,
             )?))
         }
         "vmess" => {
@@ -1187,11 +1492,26 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
             )?))
         }
         "vless" => {
-            if l.users.is_empty() {
-                return Err(Error::Config("vless listener 需要 users（uuid）".into()));
+            populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
+            let mut users = l.users.clone();
+            for u in global_user_mgr.all_users() {
+                if !users.iter().any(|s| s == &*u.secret) {
+                    users.push(u.secret.to_string());
+                }
             }
-            Ok(Arc::new(vp_protocol::vless::VlessInbound::new(
-                bind, l.port, tag, &l.users,
+            if users.is_empty() && l.fallback.is_none() {
+                return Err(Error::Config(
+                    "vless listener 需要 users（uuid）或 fallback 回落目标".into(),
+                ));
+            }
+            Ok(Arc::new(vp_protocol::vless::VlessInbound::with_gate(
+                bind,
+                l.port,
+                tag,
+                &users,
+                l.fallback.clone(),
+                Some(global_user_mgr),
+                gate,
             )?))
         }
         "anytls" => {
@@ -1245,10 +1565,13 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
             )?))
         }
         "ss" => {
-            let password = l
-                .users
-                .first()
-                .ok_or_else(|| Error::Config("ss listener 需要 users[0]（密码）".into()))?;
+            populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
+            let password = l.users.first().cloned().unwrap_or_else(|| {
+                l.user_configs
+                    .first()
+                    .map(|u| u.secret.clone())
+                    .unwrap_or_default()
+            });
             let cipher = l.cipher.as_deref().unwrap_or("aes-128-gcm");
             let stls = match &l.shadow_tls {
                 Some(o) => {
@@ -1267,13 +1590,165 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
                 }
                 None => None,
             };
-            Ok(Arc::new(vp_protocol::ss::SsInbound::new_with_shadow_tls(
-                bind, l.port, tag, cipher, password, stls,
+            Ok(Arc::new(vp_protocol::ss::SsInbound::with_gate(
+                bind,
+                l.port,
+                tag,
+                cipher,
+                &password,
+                stls,
+                Some(global_user_mgr),
+                gate,
+            )?))
+        }
+        "tuic" | "tuic5" | "tuic-v5" => {
+            populate_user_manager(&global_user_mgr, &l.user_configs, &[]);
+            let cert_val = l.cert.as_deref().ok_or_else(|| {
+                Error::Config("tuic listener 需要 cert 证书配置 (文件路径或 PEM)".into())
+            })?;
+            let key_val = l.key.as_deref().ok_or_else(|| {
+                Error::Config("tuic listener 需要 key 私钥配置 (文件路径或 PEM)".into())
+            })?;
+            let cert_pem = load_pem(cert_val, "tuic cert")?;
+            let key_pem = load_pem(key_val, "tuic key")?;
+            if l.users.is_empty() && l.user_configs.is_empty() {
+                return Err(Error::Config(
+                    "tuic listener 需要 users（'uuid:password' 格式）或 user_configs".into(),
+                ));
+            }
+            let mut users = Vec::new();
+            for u in &l.users {
+                if let Some((uuid, pw)) = u.split_once(':') {
+                    users.push((uuid.trim().to_string(), pw.trim().to_string()));
+                } else {
+                    return Err(Error::Config(format!(
+                        "tuic user 格式非法 (期望 'uuid:password'，收到: {u})"
+                    )));
+                }
+            }
+            for uc in &l.user_configs {
+                if let Some((uuid, pw)) = uc.secret.split_once(':') {
+                    users.push((uuid.trim().to_string(), pw.trim().to_string()));
+                } else if let Some(ref name) = uc.name {
+                    users.push((name.trim().to_string(), uc.secret.trim().to_string()));
+                }
+            }
+            Ok(Arc::new(vp_protocol::tuic::TuicInbound::with_gate(
+                bind,
+                l.port,
+                tag,
+                users,
+                cert_pem,
+                key_pem,
+                Some(global_user_mgr),
+                gate,
+            )))
+        }
+        "hy2" | "hysteria2" => {
+            populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
+            let cert_val = l.cert.as_deref().ok_or_else(|| {
+                Error::Config("hysteria2 listener 需要 cert 证书配置 (文件路径或 PEM)".into())
+            })?;
+            let key_val = l.key.as_deref().ok_or_else(|| {
+                Error::Config("hysteria2 listener 需要 key 私钥配置 (文件路径或 PEM)".into())
+            })?;
+            let cert_pem = load_pem(cert_val, "hysteria2 cert")?;
+            let key_pem = load_pem(key_val, "hysteria2 key")?;
+            let mut users = l.users.clone();
+            for u in global_user_mgr.all_users() {
+                if !users.iter().any(|s| s == &*u.secret) {
+                    users.push(u.secret.to_string());
+                }
+            }
+            if users.is_empty() {
+                return Err(Error::Config(
+                    "hysteria2 listener 需要 users（密码列表）或 user_configs".into(),
+                ));
+            }
+            let salamander_pw = if l.obfs.as_deref() == Some("salamander") {
+                l.obfs_password
+                    .as_deref()
+                    .or_else(|| users.first().map(|s| s.as_str()))
+            } else {
+                l.obfs_password.as_deref()
+            };
+            let ports = l.ports.as_deref().map(parse_ports_list);
+            Ok(Arc::new(
+                vp_protocol::hysteria2::Hysteria2Inbound::with_gate(
+                    bind,
+                    l.port,
+                    tag,
+                    &users,
+                    cert_pem,
+                    key_pem,
+                    Some(global_user_mgr),
+                    salamander_pw,
+                    ports,
+                    gate,
+                ),
+            ))
+        }
+        "mux" | "multiplex" | "tls-mux" => {
+            populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
+            let mut users = l.users.clone();
+            for u in global_user_mgr.all_users() {
+                if !users.iter().any(|s| s == &*u.secret) {
+                    users.push(u.secret.to_string());
+                }
+            }
+            let cert_pem = match l.cert.as_deref() {
+                Some(c) => Some(load_pem(c, "tls-mux cert")?),
+                None => None,
+            };
+            let key_pem = match l.key.as_deref() {
+                Some(k) => Some(load_pem(k, "tls-mux key")?),
+                None => None,
+            };
+            let reality = if let Some(ref r) = l.reality {
+                let pri_key =
+                    vp_transport::reality_server::parse_reality_private_key(&r.private_key)?;
+                let mut sids = Vec::new();
+                for sid_str in &r.short_ids {
+                    sids.push(vp_transport::reality_server::parse_short_id(sid_str)?);
+                }
+                Some(Arc::new(
+                    vp_transport::reality_server::RealityServerConfig::new(
+                        pri_key,
+                        sids,
+                        r.dest.clone(),
+                        r.server_names.clone(),
+                    ),
+                ))
+            } else {
+                None
+            };
+
+            let options = vp_protocol::inbound::TlsMuxOptions {
+                cert_pem,
+                key_pem,
+                reality,
+                sni_routes: l.sni_routes.clone(),
+                fallback: l.fallback.clone(),
+                users,
+                user_mgr: Some(global_user_mgr),
+                gate,
+            };
+            Ok(Arc::new(vp_protocol::inbound::TlsMuxInbound::new(
+                bind, l.port, tag, options,
             )?))
         }
         other => Err(Error::Unsupported(format!(
-            "listener 类型 {other:?}（支持 tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss 等）"
+            "listener 类型 {other:?}（支持 tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss/tuic/hysteria2/mux 等）"
         ))),
+    }
+}
+
+fn load_pem(val: &str, what: &str) -> Result<Vec<u8>> {
+    let trimmed = val.trim_start();
+    if trimmed.starts_with("-----BEGIN") {
+        Ok(val.as_bytes().to_vec())
+    } else {
+        std::fs::read(val).map_err(|e| Error::Config(format!("读取 {what} 失败 ({val}): {e}")))
     }
 }
 
@@ -1392,7 +1867,7 @@ async fn load_providers(
             .await
             .map_err(|e| Error::Config(format!("拉取任务失败: {e}")))?;
             match res {
-                Ok(t) if vp_rule::provider::load_payload(&t, behavior).is_ok() => {
+                Ok(t) if vp_rule::provider::load_payload(&t, behavior, None).is_ok() => {
                     if let Some(parent) = cache_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -2026,9 +2501,10 @@ listeners:
     port: {ss_port}
     users: [pw]
     cipher: aes-128-gcm
-rules: ['MATCH,ss-uot']
+rules: ['IN-NAME,uot-srv,DIRECT', 'MATCH,ss-uot']
 "
         );
+        // listener 流量也走规则（v1.4.0）：服务端侧必须出 DIRECT，否则 MATCH 把它再送回 ss-uot 自环
         let _app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
             .await
             .unwrap();
@@ -2558,5 +3034,827 @@ rules:
         assert_eq!(&got, b"fakeip-ok");
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    /// listeners 段端到端：tuic 服务端入站 ← TuicOutbound ← echo
+    #[tokio::test]
+    async fn tuic_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path =
+            std::env::temp_dir().join(format!("tuic_cert_{}.pem", vp_common::now_millis()));
+        let key_path =
+            std::env::temp_dir().join(format!("tuic_key_{}.pem", vp_common::now_millis()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let cert_str = cert_path.to_str().unwrap().replace('\\', "/");
+        let key_str = key_path.to_str().unwrap().replace('\\', "/");
+
+        let cfg = format!(
+            "listeners:
+  - name: srv-tuic
+    type: tuic
+    port: 0
+    cert: \"{cert_str}\"
+    key: \"{key_str}\"
+    users: [\"b831381d-6324-4d53-ad4f-8cda48b30811:pw-tuic\"]
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let tuic_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-tuic")
+            .map(|(_, p)| *p)
+            .expect("tuic listener 应已监听");
+
+        let out = vp_protocol::tuic::TuicOutbound::new(&vp_config::TuicCfg {
+            server: "127.0.0.1".into(),
+            port: tuic_port,
+            uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+            password: "pw-tuic".into(),
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            congestion_controller: None,
+            udp_relay_mode: None,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("tuic 出站应成功");
+        s.write_all(b"tuic-listener-e2e").await.unwrap();
+        let mut buf = [0u8; 17];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"tuic-listener-e2e");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// listeners 段端到端：hysteria2 服务端入站 ← Hysteria2Outbound ← echo
+    #[tokio::test]
+    async fn hysteria2_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path =
+            std::env::temp_dir().join(format!("hy2_cert_{}.pem", vp_common::now_millis()));
+        let key_path =
+            std::env::temp_dir().join(format!("hy2_key_{}.pem", vp_common::now_millis()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let cert_str = cert_path.to_str().unwrap().replace('\\', "/");
+        let key_str = key_path.to_str().unwrap().replace('\\', "/");
+
+        let cfg = format!(
+            "listeners:
+  - name: srv-hy2
+    type: hysteria2
+    port: 0
+    cert: \"{cert_str}\"
+    key: \"{key_str}\"
+    users: [\"pw-hy2\"]
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let hy2_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-hy2")
+            .map(|(_, p)| *p)
+            .expect("hysteria2 listener 应已监听");
+
+        let out = vp_protocol::hysteria2::Hysteria2Outbound::new(&vp_config::Hysteria2Cfg {
+            server: "127.0.0.1".into(),
+            port: hy2_port,
+            password: "pw-hy2".into(),
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            hop_interval: None,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("hysteria2 出站应成功");
+        s.write_all(b"hy2-listener-e2e").await.unwrap();
+        let mut buf = [0u8; 16];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hy2-listener-e2e");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// listeners 段端到端：Trojan Fallback（探测回落至 Web 伪装站点）与合法 Trojan 代理共存
+    #[tokio::test]
+    async fn trojan_fallback_and_multi_user_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. 启动本地 Web 伪装/回落服务（Decoy Server）
+        let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_port = decoy.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = decoy.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 512];
+                    if let Ok(n) = s.read(&mut req).await {
+                        if n > 0 {
+                            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello Decoy!";
+                            let _ = s.write_all(resp).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        // 2. 启动回声服务端（作为合法代理目标）
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 256];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = s.write_all(&b[..n]).await;
+                    }
+                });
+            }
+        });
+
+        // 3. 配置 Trojan 监听器（启用 fallback 到 decoy）
+        let cfg = format!(
+            "listeners:
+  - name: srv-trojan
+    type: trojan
+    port: 0
+    fallback: \"127.0.0.1:{decoy_port}\"
+    user-configs:
+      - name: alice
+        secret: \"pwd-alice\"
+        rate-limit-up: 50Mbps
+        rate-limit-down: 50Mbps
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let trojan_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-trojan")
+            .map(|(_, p)| *p)
+            .expect("trojan listener 应当已监听");
+
+        // 4. 测试主动探测流量（发送非法 HTTP GET 请求）应当被透明回落到 Web 伪装站点并获得合法响应
+        let mut probe = tokio::net::TcpStream::connect(("127.0.0.1", trojan_port))
+            .await
+            .unwrap();
+        probe
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut probe_resp = vec![0u8; 128];
+        let n = probe.read(&mut probe_resp).await.unwrap();
+        assert!(n > 0, "回落服务应返回 HTTP 响应报文");
+        let resp_str = String::from_utf8_lossy(&probe_resp[..n]);
+        assert!(
+            resp_str.contains("HTTP/1.1 200 OK") && resp_str.contains("Hello Decoy!"),
+            "非法/探测流量应透明回落至本地伪装服务: {resp_str}"
+        );
+
+        // 5. 测试合法 Trojan 客户端代理流量正常通信
+        let trojan_out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+            server: "127.0.0.1".into(),
+            port: trojan_port,
+            password: "pwd-alice".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: true,
+            client_fingerprint: None,
+            network: None,
+            alpn: None,
+            ws_opts: None,
+            grpc_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            http_opts: None,
+            udp: false,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut client_stream = trojan_out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("合法 Trojan 握手代理应当成功");
+        client_stream.write_all(b"ping-trojan").await.unwrap();
+        let mut buf = [0u8; 11];
+        client_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-trojan");
+    }
+
+    /// listeners 段端到端：VLESS Fallback（非 VLESS 探测流量透明回落）
+    #[tokio::test]
+    async fn vless_fallback_and_user_quota_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. 启动本地 Web 伪装/回落服务
+        let decoy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_port = decoy.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = decoy.accept().await {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 512];
+                    if let Ok(n) = s.read(&mut req).await {
+                        if n > 0 {
+                            let resp =
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello V-Decoy";
+                            let _ = s.write_all(resp).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let uuid = "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8";
+        let cfg = format!(
+            "listeners:
+  - name: srv-vless
+    type: vless
+    port: 0
+    fallback: \"127.0.0.1:{decoy_port}\"
+    user-configs:
+      - name: bob
+        secret: \"{uuid}\"
+        quota-bytes: 1048576
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let vless_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-vless")
+            .map(|(_, p)| *p)
+            .expect("vless listener 应当已监听");
+
+        // 2. 发送探测流量（非 VLESS 头部，常规浏览器请求），验证命中回落
+        let mut probe = tokio::net::TcpStream::connect(("127.0.0.1", vless_port))
+            .await
+            .unwrap();
+        probe
+            .write_all(b"GET /index.html HTTP/1.1\r\nHost: test.org\r\n\r\n")
+            .await
+            .unwrap();
+        let mut probe_resp = vec![0u8; 128];
+        let n = probe.read(&mut probe_resp).await.unwrap();
+        assert!(n > 0, "VLESS 回落应当返回合法 HTTP 响应");
+        let resp_str = String::from_utf8_lossy(&probe_resp[..n]);
+        assert!(
+            resp_str.contains("Hello V-Decoy"),
+            "探测流量应被透明代理至回落服务: {resp_str}"
+        );
+    }
+
+    /// listeners 段端到端：多用户配额管控与超额断开
+    #[tokio::test]
+    async fn trojan_user_quota_cutoff_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 256];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = s.write_all(&b[..n]).await;
+                    }
+                });
+            }
+        });
+
+        let cfg = r#"
+listeners:
+  - name: srv-quota
+    type: trojan
+    port: 0
+    user-configs:
+      - name: charlie
+        secret: "pwd-charlie"
+        quota-bytes: 60
+rules: ['MATCH,DIRECT']
+"#;
+        let app = App::start(cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-quota")
+            .map(|(_, p)| *p)
+            .unwrap();
+
+        let trojan_out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+            server: "127.0.0.1".into(),
+            port,
+            password: "pwd-charlie".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: true,
+            client_fingerprint: None,
+            network: None,
+            alpn: None,
+            ws_opts: None,
+            grpc_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            http_opts: None,
+            udp: false,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut client_stream = trojan_out.connect_stream(&sess, &dst).await.unwrap();
+
+        // 试图发送 200 字节（超过 60 字节配额）
+        client_stream.write_all(&[9u8; 200]).await.unwrap();
+        let mut recv_buf = vec![0u8; 300];
+        let mut total_read = 0;
+        loop {
+            match client_stream.read(&mut recv_buf[total_read..]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total_read += n;
+                    if total_read >= 300 {
+                        break;
+                    }
+                }
+            }
+        }
+        // 验证因配额熔断而关闭了连接
+        assert!(total_read <= 200);
+
+        // 再次建立连接：配额已耗尽，握手认证直接被拒
+        let sess2 = vp_core::Session::new_tcp("t2".into(), None, dst.clone());
+        let res = trojan_out.connect_stream(&sess2, &dst).await;
+        if let Ok(mut s2) = res {
+            let mut check = [0u8; 10];
+            let n = s2.read(&mut check).await.unwrap_or(0);
+            assert_eq!(n, 0, "配额超额后连接应当被关闭");
+        }
+    }
+
+    /// listeners 段端到端：Hysteria2 Salamander UDP 报文混淆 + user-configs Brutal 协商
+    #[tokio::test]
+    async fn hysteria2_salamander_listener_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut b = [0u8; 256];
+            loop {
+                let n = s.read(&mut b).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&b[..n]).await.unwrap();
+            }
+        });
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path =
+            std::env::temp_dir().join(format!("hy2_obfs_cert_{}.pem", vp_common::now_millis()));
+        let key_path =
+            std::env::temp_dir().join(format!("hy2_obfs_key_{}.pem", vp_common::now_millis()));
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let cert_str = cert_path.to_str().unwrap().replace('\\', "/");
+        let key_str = key_path.to_str().unwrap().replace('\\', "/");
+
+        let cfg = format!(
+            "listeners:
+  - name: srv-hy2-salamander
+    type: hysteria2
+    port: 0
+    cert: \"{cert_str}\"
+    key: \"{key_str}\"
+    obfs: salamander
+    obfs-password: \"obfs-secret-test\"
+    user-configs:
+      - name: user-hy2
+        secret: \"pw-hy2-obfs\"
+        brutal-mbps: 100
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let hy2_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-hy2-salamander")
+            .map(|(_, p)| *p)
+            .expect("hysteria2 listener 应已监听");
+
+        let out = vp_protocol::hysteria2::Hysteria2Outbound::new(&vp_config::Hysteria2Cfg {
+            server: "127.0.0.1".into(),
+            port: hy2_port,
+            password: "pw-hy2-obfs".into(),
+            sni: Some("localhost".into()),
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: Some("salamander".into()),
+            obfs_password: Some("obfs-secret-test".into()),
+            ports: None,
+            hop_interval: None,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("hysteria2 salamander 出站应成功");
+        s.write_all(b"hy2-salamander-e2e").await.unwrap();
+        let mut buf = [0u8; 18];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hy2-salamander-e2e");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    /// listeners 段端到端：Shadowsocks-2022 单端口多用户识别与独立记账
+    #[tokio::test]
+    async fn ss_2022_multi_user_listener_e2e() {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 256];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = s.write_all(&b[..n]).await;
+                    }
+                });
+            }
+        });
+
+        let key_alice_raw = [0x11u8; 16];
+        let key_bob_raw = [0x22u8; 16];
+        let key_alice = base64::engine::general_purpose::STANDARD.encode(key_alice_raw);
+        let key_bob = base64::engine::general_purpose::STANDARD.encode(key_bob_raw);
+
+        let cfg = format!(
+            "listeners:
+  - name: srv-ss-multi
+    type: ss
+    port: 0
+    cipher: 2022-blake3-aes-128-gcm
+    user-configs:
+      - name: alice
+        secret: \"{key_alice}\"
+      - name: bob
+        secret: \"{key_bob}\"
+rules: ['MATCH,DIRECT']
+"
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let ss_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-ss-multi")
+            .map(|(_, p)| *p)
+            .expect("ss listener 应已监听");
+
+        let out_alice = vp_protocol::ss::SsOutbound::new(&vp_config::SsCfg {
+            server: "127.0.0.1".into(),
+            port: ss_port,
+            password: key_alice.clone(),
+            cipher: "2022-blake3-aes-128-gcm".into(),
+            udp: true,
+            plugin: None,
+            plugin_opts: None,
+        })
+        .unwrap();
+
+        let out_bob = vp_protocol::ss::SsOutbound::new(&vp_config::SsCfg {
+            server: "127.0.0.1".into(),
+            port: ss_port,
+            password: key_bob.clone(),
+            cipher: "2022-blake3-aes-128-gcm".into(),
+            udp: true,
+            plugin: None,
+            plugin_opts: None,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+
+        // 1. Alice 连接
+        let sess_a = vp_core::Session::new_tcp("ta".into(), None, dst.clone());
+        let mut sa = out_alice
+            .connect_stream(&sess_a, &dst)
+            .await
+            .expect("alice 连接应当成功");
+        sa.write_all(b"hello from alice").await.unwrap();
+        let mut buf_a = [0u8; 16];
+        sa.read_exact(&mut buf_a).await.unwrap();
+        assert_eq!(&buf_a, b"hello from alice");
+
+        // 2. Bob 连接
+        let sess_b = vp_core::Session::new_tcp("tb".into(), None, dst.clone());
+        let mut sb = out_bob
+            .connect_stream(&sess_b, &dst)
+            .await
+            .expect("bob 连接应当成功");
+        sb.write_all(b"hello from bob!").await.unwrap();
+        let mut buf_b = [0u8; 15];
+        sb.read_exact(&mut buf_b).await.unwrap();
+        assert_eq!(&buf_b, b"hello from bob!");
+
+        // 3. 验证 Alice 与 Bob 各自独立记账
+        let um = &app.user_manager;
+        let user_a = um.get_user_by_target("alice").expect("alice 账户应当存在");
+        let user_b = um.get_user_by_target("bob").expect("bob 账户应当存在");
+        let snap_a = user_a.snapshot();
+        let snap_b = user_b.snapshot();
+        assert!(snap_a.upload + snap_a.download > 0, "alice 流量应当被记账");
+        assert!(snap_b.upload + snap_b.download > 0, "bob 流量应当被记账");
+    }
+
+    /// 入站安全门禁端到端：GeoIP 探针门禁拦截与放行（LAN 阻断与放行）
+    #[tokio::test]
+    async fn inbound_geoip_gate_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. 启动一个阻断 LAN 访问的 Trojan 监听器（模拟公网防内网扫描）
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 256];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = s.write_all(&b[..n]).await;
+                    }
+                });
+            }
+        });
+
+        let cfg_blocked = "
+listeners:
+  - name: srv-blocked
+    type: trojan
+    port: 0
+    users: [\"pw-gate\"]
+    block-geoip: [\"LAN\"]
+rules: ['MATCH,DIRECT']
+";
+        let app_blocked = App::start(cfg_blocked, Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let blocked_port = app_blocked
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-blocked")
+            .map(|(_, p)| *p)
+            .unwrap();
+
+        // 从 127.0.0.1 (属于 LAN/Private) 发起连接，应被门禁第一时间静默切断
+        let mut conn = tokio::net::TcpStream::connect(("127.0.0.1", blocked_port))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 10];
+        let n = conn.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "命中 block-geoip 的来源 IP 应当被立即切断连接");
+
+        // 2. 启动允许 LAN 访问的 Trojan 监听器
+        let cfg_allowed = "
+listeners:
+  - name: srv-allowed
+    type: trojan
+    port: 0
+    users: [\"pw-gate\"]
+    allow-geoip: [\"LAN\"]
+rules: ['MATCH,DIRECT']
+";
+        let app_allowed = App::start(cfg_allowed, Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let allowed_port = app_allowed
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-allowed")
+            .map(|(_, p)| *p)
+            .unwrap();
+
+        let out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+            server: "127.0.0.1".into(),
+            port: allowed_port,
+            password: "pw-gate".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            alpn: None,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            http_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            udp: false,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("命中 allow-geoip 的白名单 IP 应当连接成功");
+        s.write_all(b"gate-pass").await.unwrap();
+        let mut pass_buf = [0u8; 9];
+        s.read_exact(&mut pass_buf).await.unwrap();
+        assert_eq!(&pass_buf, b"gate-pass");
+    }
+
+    /// 入站安全门禁端到端：端口敲门 (Port Knocking) 隐身防御与动态开门
+    #[tokio::test]
+    async fn inbound_port_knocking_e2e() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut b = [0u8; 256];
+                    while let Ok(n) = s.read(&mut b).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = s.write_all(&b[..n]).await;
+                    }
+                });
+            }
+        });
+
+        // 预选一个可用 UDP 端口作为 knock 端口
+        let knock_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let knock_port = knock_sock.local_addr().unwrap().port();
+        drop(knock_sock);
+
+        let cfg = format!(
+            "
+listeners:
+  - name: srv-stealth
+    type: trojan
+    port: 0
+    users: [\"pw-stealth\"]
+    knock:
+      port: {knock_port}
+      secret: \"knock-secret-123\"
+      timeout-secs: 5
+rules: ['MATCH,DIRECT']
+"
+        );
+
+        let app = App::start(&cfg, Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+        let trojan_port = app
+            .listen_ports
+            .iter()
+            .find(|(t, _)| t == "srv-stealth")
+            .map(|(_, p)| *p)
+            .unwrap();
+
+        // 1. 未敲门阶段：直接发起连接，被静默阻断
+        let mut probe = tokio::net::TcpStream::connect(("127.0.0.1", trojan_port))
+            .await
+            .unwrap();
+        let mut check_buf = [0u8; 10];
+        let n = probe.read(&mut check_buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "未敲门客户端应当被完全阻断（端口处于隐身状态）");
+
+        // 2. 发送敲门包（口令验证模式）
+        let client_sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sender
+            .send_to(b"knock-secret-123\n", ("127.0.0.1", knock_port))
+            .await
+            .unwrap();
+
+        // 稍微等待后台 UDP 敲门处理协程开门
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3. 敲门成功后：再次发起代理连接，应当顺畅连通
+        let out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+            server: "127.0.0.1".into(),
+            port: trojan_port,
+            password: "pw-stealth".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            alpn: None,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            http_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            udp: false,
+        })
+        .unwrap();
+
+        let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
+        let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = out
+            .connect_stream(&sess, &dst)
+            .await
+            .expect("敲门成功后代理连接应当建立成功");
+        s.write_all(b"knock-ok").await.unwrap();
+        let mut ok_buf = [0u8; 8];
+        s.read_exact(&mut ok_buf).await.unwrap();
+        assert_eq!(&ok_buf, b"knock-ok");
     }
 }

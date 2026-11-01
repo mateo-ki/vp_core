@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, RwLock};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -25,6 +27,8 @@ pub struct ApiState {
     pub dns_status: Arc<RwLock<crate::DnsStatus>>,
     /// 全局 DNS 解析器：热开启 TUN 时复用它建 fake-ip 劫持服务器
     pub dns: Arc<vp_dns::Resolver>,
+    /// 多用户管理器（控制面动态管理 + 认证配额限速）
+    pub user_manager: Arc<vp_core::UserManager>,
 }
 
 /// 监听已建立的 controller：启动 accept 循环（同步返回，切断类型环）
@@ -57,6 +61,8 @@ struct Req {
     query: String,
     body: Vec<u8>,
     auth: Option<String>,
+    user_agent: Option<String>,
+    host: Option<String>,
     ws_key: Option<String>,
     is_ws: bool,
 }
@@ -84,6 +90,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
     let method = parts.next()?.to_string();
     let target = parts.next()?.to_string();
     let mut auth = None;
+    let mut user_agent = None;
+    let mut host = None;
     let mut ws_key = None;
     let mut is_ws = false;
     let mut content_length = 0usize;
@@ -93,6 +101,10 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
             let v = v.trim();
             if k == "authorization" {
                 auth = Some(v.to_string());
+            } else if k == "user-agent" {
+                user_agent = Some(v.to_string());
+            } else if k == "host" {
+                host = Some(v.to_string());
             } else if k == "content-length" {
                 content_length = v.parse().unwrap_or(0);
             } else if k == "sec-websocket-key" {
@@ -116,6 +128,8 @@ async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Req> {
         query,
         body,
         auth,
+        user_agent,
+        host,
         ws_key,
         is_ws,
     })
@@ -318,6 +332,68 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 }),
             )
             .await;
+        }
+        ("GET", ["sub"]) | ("GET", ["sub", "clash"]) | ("GET", ["subscription"]) => {
+            let is_clash = segs.get(1) == Some(&"clash")
+                || query_param(&req.query, "format")
+                    .map(|f| f.eq_ignore_ascii_case("clash"))
+                    .unwrap_or(false)
+                || req
+                    .user_agent
+                    .as_ref()
+                    .map(|ua| {
+                        let ua_lower = ua.to_ascii_lowercase();
+                        ua_lower.contains("clash")
+                            || ua_lower.contains("meta")
+                            || ua_lower.contains("stash")
+                            || ua_lower.contains("verge")
+                            || ua_lower.contains("mihomo")
+                    })
+                    .unwrap_or(false);
+
+            let (base_dir, cfg_text) = {
+                let meta_guard = st.config_meta.read().unwrap();
+                if let Some(ref meta) = *meta_guard {
+                    (meta.base_dir.clone(), meta.text.clone())
+                } else {
+                    (std::path::PathBuf::from("."), String::new())
+                }
+            };
+
+            if is_clash {
+                let clash_content =
+                    if let Ok(c) = std::fs::read_to_string(base_dir.join("sub-clash.yaml")) {
+                        c
+                    } else if let Ok(c) = std::fs::read_to_string(base_dir.join("clash.yaml")) {
+                        c
+                    } else {
+                        generate_clash_sub_from_text(&cfg_text, req.host.as_deref())
+                    };
+                reply_subscription(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &clash_content,
+                    "text/yaml; charset=utf-8",
+                    "vpcore-clash.yaml",
+                )
+                .await;
+            } else {
+                let sub_content = if let Ok(c) = std::fs::read_to_string(base_dir.join("sub.txt")) {
+                    c.trim().to_string()
+                } else {
+                    generate_base64_sub_from_text(&cfg_text, req.host.as_deref())
+                };
+                reply_subscription(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &sub_content,
+                    "text/plain; charset=utf-8",
+                    "vpcore-sub.txt",
+                )
+                .await;
+            }
         }
         ("GET", ["proxies"]) => {
             let mut proxies = serde_json::Map::new();
@@ -1124,6 +1200,243 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
                 reply(&mut stream, 200, "OK", &json!({"logs": []})).await;
             }
         }
+        ("GET", ["metrics"]) => {
+            let mut out = String::with_capacity(2048);
+            let version = env!("CARGO_PKG_VERSION");
+            out.push_str("# HELP vpcore_build_info Build information\n");
+            out.push_str("# TYPE vpcore_build_info gauge\n");
+            out.push_str(&format!("vpcore_build_info{{version=\"{version}\"}} 1\n\n"));
+
+            use std::sync::atomic::Ordering;
+            let up = st.stats.upload.load(Ordering::Relaxed);
+            let down = st.stats.download.load(Ordering::Relaxed);
+            out.push_str("# HELP vpcore_traffic_upload_bytes_total Total uploaded bytes\n");
+            out.push_str("# TYPE vpcore_traffic_upload_bytes_total counter\n");
+            out.push_str(&format!("vpcore_traffic_upload_bytes_total {up}\n\n"));
+
+            out.push_str("# HELP vpcore_traffic_download_bytes_total Total downloaded bytes\n");
+            out.push_str("# TYPE vpcore_traffic_download_bytes_total counter\n");
+            out.push_str(&format!("vpcore_traffic_download_bytes_total {down}\n\n"));
+
+            let active_conns = st.conns.len();
+            out.push_str(
+                "# HELP vpcore_connections_active Number of currently active connections\n",
+            );
+            out.push_str("# TYPE vpcore_connections_active gauge\n");
+            out.push_str(&format!("vpcore_connections_active {active_conns}\n\n"));
+
+            let (budget_active, budget_rejected) = st.stats.conn_budget.snapshot();
+            out.push_str(
+                "# HELP vpcore_connections_budget_active Number of budgeted connections\n",
+            );
+            out.push_str("# TYPE vpcore_connections_budget_active gauge\n");
+            out.push_str(&format!(
+                "vpcore_connections_budget_active {budget_active}\n\n"
+            ));
+
+            out.push_str("# HELP vpcore_connections_budget_rejected_total Rejected connections due to budget limits\n");
+            out.push_str("# TYPE vpcore_connections_budget_rejected_total counter\n");
+            out.push_str(&format!(
+                "vpcore_connections_budget_rejected_total {budget_rejected}\n\n"
+            ));
+
+            let pool = vp_common::bufpool::stats();
+            out.push_str("# HELP vpcore_bufpool_active_buffers Number of buffers currently active in buffer pool\n");
+            out.push_str("# TYPE vpcore_bufpool_active_buffers gauge\n");
+            out.push_str(&format!(
+                "vpcore_bufpool_active_buffers {}\n\n",
+                pool.active
+            ));
+
+            out.push_str(
+                "# HELP vpcore_bufpool_idle_buffers Number of idle buffers in buffer pool\n",
+            );
+            out.push_str("# TYPE vpcore_bufpool_idle_buffers gauge\n");
+            out.push_str(&format!("vpcore_bufpool_idle_buffers {}\n\n", pool.idle));
+
+            out.push_str("# HELP vpcore_bufpool_hits_total Buffer pool hit count\n");
+            out.push_str("# TYPE vpcore_bufpool_hits_total counter\n");
+            out.push_str(&format!("vpcore_bufpool_hits_total {}\n\n", pool.pool_hits));
+
+            out.push_str("# HELP vpcore_bufpool_misses_total Buffer pool miss count\n");
+            out.push_str("# TYPE vpcore_bufpool_misses_total counter\n");
+            out.push_str(&format!(
+                "vpcore_bufpool_misses_total {}\n\n",
+                pool.pool_misses
+            ));
+
+            let users = st.user_manager.all_users();
+            if !users.is_empty() {
+                out.push_str("# HELP vpcore_user_upload_bytes_total Uploaded bytes by user\n");
+                out.push_str("# TYPE vpcore_user_upload_bytes_total counter\n");
+                for u in &users {
+                    let snap = u.snapshot();
+                    out.push_str(&format!(
+                        "vpcore_user_upload_bytes_total{{user=\"{}\"}} {}\n",
+                        snap.username, snap.upload
+                    ));
+                }
+                out.push('\n');
+
+                out.push_str("# HELP vpcore_user_download_bytes_total Downloaded bytes by user\n");
+                out.push_str("# TYPE vpcore_user_download_bytes_total counter\n");
+                for u in &users {
+                    let snap = u.snapshot();
+                    out.push_str(&format!(
+                        "vpcore_user_download_bytes_total{{user=\"{}\"}} {}\n",
+                        snap.username, snap.download
+                    ));
+                }
+                out.push('\n');
+
+                out.push_str(
+                    "# HELP vpcore_user_active_connections Number of active connections by user\n",
+                );
+                out.push_str("# TYPE vpcore_user_active_connections gauge\n");
+                for u in &users {
+                    let snap = u.snapshot();
+                    out.push_str(&format!(
+                        "vpcore_user_active_connections{{user=\"{}\"}} {}\n",
+                        snap.username, snap.active_conns
+                    ));
+                }
+                out.push('\n');
+
+                out.push_str("# HELP vpcore_user_quota_bytes Total quota in bytes for user (0 = unlimited)\n");
+                out.push_str("# TYPE vpcore_user_quota_bytes gauge\n");
+                for u in &users {
+                    let snap = u.snapshot();
+                    let q = snap.quota_bytes.unwrap_or(0);
+                    out.push_str(&format!(
+                        "vpcore_user_quota_bytes{{user=\"{}\"}} {q}\n",
+                        snap.username
+                    ));
+                }
+                out.push('\n');
+
+                out.push_str("# HELP vpcore_user_quota_exceeded Whether user quota is exceeded (1=true, 0=false)\n");
+                out.push_str("# TYPE vpcore_user_quota_exceeded gauge\n");
+                for u in &users {
+                    let snap = u.snapshot();
+                    let exceeded = if snap.quota_exceeded { 1 } else { 0 };
+                    out.push_str(&format!(
+                        "vpcore_user_quota_exceeded{{user=\"{}\"}} {exceeded}\n",
+                        snap.username
+                    ));
+                }
+                out.push('\n');
+            }
+
+            reply_text(
+                &mut stream,
+                200,
+                "OK",
+                &out,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
+            .await;
+        }
+        ("GET", ["users"]) | ("GET", ["api", "v1", "users"]) => {
+            let users = st.user_manager.all_users();
+            let mut snapshots = Vec::with_capacity(users.len());
+            for u in users {
+                snapshots.push(u.snapshot());
+            }
+            snapshots.sort_by(|a, b| a.username.cmp(&b.username));
+            reply(&mut stream, 200, "OK", &json!({ "users": snapshots })).await;
+        }
+        ("GET", ["users", target]) | ("GET", ["api", "v1", "users", target]) => {
+            if let Some(user) = st.user_manager.get_user_by_target(target) {
+                reply(&mut stream, 200, "OK", &json!(user.snapshot())).await;
+            } else {
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": format!("user '{target}' not found")}),
+                )
+                .await;
+            }
+        }
+        ("POST", ["users"]) | ("POST", ["api", "v1", "users"]) => {
+            #[derive(serde::Deserialize)]
+            struct AddUserReq {
+                name: Option<String>,
+                secret: String,
+                quota_bytes: Option<u64>,
+                rate_limit_up: Option<f64>,
+                rate_limit_down: Option<f64>,
+                brutal_mbps: Option<u32>,
+            }
+            match serde_json::from_slice::<AddUserReq>(&req.body) {
+                Ok(r) => {
+                    let username = r.name.unwrap_or_else(|| r.secret.clone());
+                    let limiter = if r.rate_limit_up.is_some() || r.rate_limit_down.is_some() {
+                        Some(Arc::new(vp_core::BandwidthLimiter::from_bytes_per_sec(
+                            r.rate_limit_up,
+                            r.rate_limit_down,
+                        )))
+                    } else {
+                        None
+                    };
+                    let brutal = r
+                        .brutal_mbps
+                        .map(|m| Arc::new(vp_core::BrutalPacer::from_mbps(m)));
+                    let user = Arc::new(
+                        vp_core::UserAccount::new(username, r.secret, r.quota_bytes, limiter)
+                            .with_brutal(brutal),
+                    );
+                    st.user_manager.add_user(user.clone());
+                    reply(&mut stream, 200, "OK", &json!(user.snapshot())).await;
+                }
+                Err(e) => {
+                    reply(
+                        &mut stream,
+                        400,
+                        "Bad Request",
+                        &json!({"message": format!("invalid user json: {e}")}),
+                    )
+                    .await;
+                }
+            }
+        }
+        ("DELETE", ["users", target]) | ("DELETE", ["api", "v1", "users", target]) => {
+            if let Some(user) = st.user_manager.remove_user(target) {
+                let killed = st.conns.kill_by_user(&user.username);
+                reply(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &json!({
+                        "message": format!("user '{}' removed", user.username),
+                        "killed_connections": killed,
+                    }),
+                )
+                .await;
+            } else {
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": format!("user '{target}' not found")}),
+                )
+                .await;
+            }
+        }
+        ("POST", ["users", target, "reset"])
+        | ("POST", ["api", "v1", "users", target, "reset"]) => {
+            if let Some(user) = st.user_manager.reset_traffic(target) {
+                reply(&mut stream, 200, "OK", &json!(user.snapshot())).await;
+            } else {
+                reply(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    &json!({"message": format!("user '{target}' not found")}),
+                )
+                .await;
+            }
+        }
         _ => {
             reply(
                 &mut stream,
@@ -1187,6 +1500,204 @@ async fn reply(
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(&payload).await;
     let _ = stream.shutdown().await;
+}
+
+async fn reply_text(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+    content_type: &str,
+) {
+    let payload = body.as_bytes();
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nContent-Length: {}\r\n\r\n",
+        payload.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(payload).await;
+    let _ = stream.shutdown().await;
+}
+
+async fn reply_subscription(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    body: &str,
+    content_type: &str,
+    filename: &str,
+) {
+    let payload = body.as_bytes();
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Disposition: attachment; filename=\"{filename}\"\r\n\
+         Subscription-Userinfo: upload=0; download=0; total=1073741824000; expire=0\r\n\
+         Profile-Update-Interval: 24\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
+         Content-Length: {}\r\n\r\n",
+        payload.len()
+    );
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(payload).await;
+    let _ = stream.shutdown().await;
+}
+
+fn generate_base64_sub_from_text(cfg_text: &str, host_header: Option<&str>) -> String {
+    let clean_host = host_header
+        .and_then(|h| h.split(':').next())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "0.0.0.0" && *s != "127.0.0.1")
+        .unwrap_or("127.0.0.1");
+
+    let Ok(cfg) = vp_config::parse(cfg_text, vp_config::Format::Yaml) else {
+        return String::new();
+    };
+
+    let mut links = Vec::new();
+    for l in &cfg.listeners {
+        match l.kind.as_str() {
+            "mux" | "reality" => {
+                let uuid = l
+                    .users
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("00000000-0000-0000-0000-000000000000");
+                let reality = l.reality.as_ref();
+                let sid = reality
+                    .and_then(|r| r.short_ids.first().map(|s| s.as_str()))
+                    .unwrap_or("");
+                let sni = reality
+                    .and_then(|r| r.server_names.first().map(|s| s.as_str()))
+                    .unwrap_or("www.amazon.com");
+                links.push(format!(
+                    "vless://{uuid}@{clean_host}:{}?security=reality&encryption=none&pbk=&sid={sid}&sni={sni}&fp=chrome&type=tcp#vpcore-reality",
+                    l.port
+                ));
+            }
+            "hysteria2" => {
+                let pass = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                links.push(format!(
+                    "hysteria2://{pass}@{clean_host}:{}/?insecure=1&sni=hy2.vpcore.internal#vpcore-hy2",
+                    l.port
+                ));
+            }
+            "ss" => {
+                let cipher = l.cipher.as_deref().unwrap_or("2022-blake3-aes-128-gcm");
+                let key = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                let userinfo = BASE64_STANDARD.encode(format!("{cipher}:{key}"));
+                links.push(format!("ss://{userinfo}@{clean_host}:{}#vpcore-ss", l.port));
+            }
+            "trojan" => {
+                let pass = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                links.push(format!(
+                    "trojan://{pass}@{clean_host}:{}?security=tls&sni={clean_host}#vpcore-trojan",
+                    l.port
+                ));
+            }
+            "vless" => {
+                let uuid = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                links.push(format!(
+                    "vless://{uuid}@{clean_host}:{}?security=tls&sni={clean_host}#vpcore-vless",
+                    l.port
+                ));
+            }
+            _ => {}
+        }
+    }
+    let joined = links.join("\n");
+    BASE64_STANDARD.encode(joined.as_bytes())
+}
+
+fn generate_clash_sub_from_text(cfg_text: &str, host_header: Option<&str>) -> String {
+    let clean_host = host_header
+        .and_then(|h| h.split(':').next())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "0.0.0.0" && *s != "127.0.0.1")
+        .unwrap_or("127.0.0.1");
+
+    let Ok(cfg) = vp_config::parse(cfg_text, vp_config::Format::Yaml) else {
+        return String::new();
+    };
+
+    let mut proxies_yaml = String::new();
+    let mut names = Vec::new();
+
+    for l in &cfg.listeners {
+        match l.kind.as_str() {
+            "mux" | "reality" => {
+                let uuid = l
+                    .users
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("00000000-0000-0000-0000-000000000000");
+                let reality = l.reality.as_ref();
+                let sid = reality
+                    .and_then(|r| r.short_ids.first().map(|s| s.as_str()))
+                    .unwrap_or("");
+                let sni = reality
+                    .and_then(|r| r.server_names.first().map(|s| s.as_str()))
+                    .unwrap_or("www.amazon.com");
+                names.push("vpcore-reality".to_string());
+                proxies_yaml.push_str(&format!(
+                    "  - name: \"vpcore-reality\"\n    type: vless\n    server: \"{clean_host}\"\n    port: {}\n    uuid: \"{uuid}\"\n    cipher: auto\n    tls: true\n    udp: true\n    servername: \"{sni}\"\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: \"\"\n      short-id: \"{sid}\"\n",
+                    l.port
+                ));
+            }
+            "hysteria2" => {
+                let pass = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                names.push("vpcore-hy2".to_string());
+                proxies_yaml.push_str(&format!(
+                    "  - name: \"vpcore-hy2\"\n    type: hysteria2\n    server: \"{clean_host}\"\n    port: {}\n    password: \"{pass}\"\n    sni: hy2.vpcore.internal\n    skip-cert-verify: true\n",
+                    l.port
+                ));
+            }
+            "ss" => {
+                let cipher = l.cipher.as_deref().unwrap_or("2022-blake3-aes-128-gcm");
+                let key = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                names.push("vpcore-ss".to_string());
+                proxies_yaml.push_str(&format!(
+                    "  - name: \"vpcore-ss\"\n    type: ss\n    server: \"{clean_host}\"\n    port: {}\n    cipher: {cipher}\n    password: \"{key}\"\n    udp: true\n",
+                    l.port
+                ));
+            }
+            "trojan" => {
+                let pass = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                names.push("vpcore-trojan".to_string());
+                proxies_yaml.push_str(&format!(
+                    "  - name: \"vpcore-trojan\"\n    type: trojan\n    server: \"{clean_host}\"\n    port: {}\n    password: \"{pass}\"\n    udp: true\n    sni: \"{clean_host}\"\n    skip-cert-verify: true\n",
+                    l.port
+                ));
+            }
+            "vless" => {
+                let uuid = l.users.first().map(|s| s.as_str()).unwrap_or("");
+                names.push("vpcore-vless".to_string());
+                proxies_yaml.push_str(&format!(
+                    "  - name: \"vpcore-vless\"\n    type: vless\n    server: \"{clean_host}\"\n    port: {}\n    uuid: \"{uuid}\"\n    cipher: auto\n    tls: true\n    udp: true\n",
+                    l.port
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut out =
+        String::from("port: 7890\nsocks-port: 7891\nmode: rule\nlog-level: info\n\nproxies:\n");
+    out.push_str(&proxies_yaml);
+    out.push_str(
+        "\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n      - AUTO\n",
+    );
+    for n in &names {
+        out.push_str(&format!("      - \"{n}\"\n"));
+    }
+    out.push_str("  - name: AUTO\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies:\n");
+    for n in &names {
+        out.push_str(&format!("      - \"{n}\"\n"));
+    }
+    out.push_str("\nrules:\n  - MATCH,PROXY\n");
+    out
 }
 
 #[cfg(test)]
@@ -1295,6 +1806,14 @@ rules: ['MATCH,PROXY']
         let resp = http_get(&ctl_addr, "/configs", Some("s3cret")).await;
         assert_eq!(resp.0, 200);
         assert!(resp.1.contains("\"mode\":\"rule\"") || resp.1.contains("\"mode\": \"rule\""));
+
+        // 验证订阅端点 /sub (通用订阅与 Clash 订阅)
+        let resp = http_get(&ctl_addr, "/sub?token=s3cret", None).await;
+        assert_eq!(resp.0, 200);
+
+        let resp_clash = http_get(&ctl_addr, "/sub?token=s3cret&format=clash", None).await;
+        assert_eq!(resp_clash.0, 200);
+        assert!(resp_clash.1.contains("proxies:"));
 
         // PATCH /configs 免停热切至 global
         let resp = http_patch(
@@ -1411,6 +1930,103 @@ rules: ['MATCH,PROXY']
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await.unwrap();
         parse_http(&buf)
+    }
+
+    async fn http_post(addr: &str, path: &str, secret: Option<&str>, body: &str) -> (u16, String) {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = secret
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        parse_http(&buf)
+    }
+
+    #[tokio::test]
+    async fn test_user_management_and_metrics_api() {
+        async fn free_port() -> u16 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        }
+        let ctl_port = free_port().await;
+        let ctl_addr = format!("127.0.0.1:{ctl_port}");
+
+        let cfg = format!(
+            r#"
+external-controller: {ctl_addr}
+secret: "test_sec"
+proxies: []
+rules: ['MATCH,DIRECT']
+"#
+        );
+        let app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+            .await
+            .unwrap();
+
+        // 1. 测试 Prometheus 指标导出
+        let resp = http_get(&ctl_addr, "/metrics", Some("test_sec")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("vpcore_build_info"));
+        assert!(resp.1.contains("vpcore_traffic_upload_bytes_total"));
+        assert!(resp.1.contains("vpcore_bufpool_active_buffers"));
+
+        // 2. 初始用户列表为空
+        let resp = http_get(&ctl_addr, "/api/v1/users", Some("test_sec")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains(r#""users":[]"#) || resp.1.contains(r#""users": []"#));
+
+        // 3. 动态添加用户
+        let new_user_json = r#"{
+            "name": "alice_api",
+            "secret": "my_secret_key",
+            "quota_bytes": 5000000000,
+            "rate_limit_up": 1048576,
+            "rate_limit_down": 2097152
+        }"#;
+        let resp = http_post(&ctl_addr, "/api/v1/users", Some("test_sec"), new_user_json).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("alice_api"));
+
+        // 4. 获取用户列表
+        let resp = http_get(&ctl_addr, "/api/v1/users", Some("test_sec")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("alice_api"));
+
+        // 5. 获取单个用户
+        let resp = http_get(&ctl_addr, "/api/v1/users/alice_api", Some("test_sec")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("alice_api"));
+
+        // 6. 指标中包含了 alice_api
+        let resp = http_get(&ctl_addr, "/metrics", Some("test_sec")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains(r#"user="alice_api""#));
+
+        // 7. 重置流量
+        let resp = http_post(
+            &ctl_addr,
+            "/api/v1/users/alice_api/reset",
+            Some("test_sec"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.0, 200);
+
+        // 8. 删除用户
+        let resp = http_del(&ctl_addr, "/api/v1/users/alice_api", Some("test_sec")).await;
+        assert_eq!(resp.0, 200);
+        assert!(resp.1.contains("removed"));
+
+        // 9. 再次查询为 404
+        let resp = http_get(&ctl_addr, "/api/v1/users/alice_api", Some("test_sec")).await;
+        assert_eq!(resp.0, 404);
+
+        let _ = app;
     }
 
     fn parse_http(buf: &[u8]) -> (u16, String) {

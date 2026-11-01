@@ -199,11 +199,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             (name, r)
         }));
     }
+    let what = if std::env::var("NODE_PROBE_UDP").is_ok() {
+        "UDP DNS 往返"
+    } else {
+        "握手+HTTP"
+    };
     let mut results = Vec::new();
     for h in handles {
         let (name, r) = h.await?;
         match &r {
-            Ok(ms) => println!("✅ {name} — 握手+HTTP {ms} ms"),
+            Ok(ms) => println!("✅ {name} — {what} {ms} ms"),
             Err(e) => println!("❌ {name} — {e}"),
         }
         results.push((name, r));

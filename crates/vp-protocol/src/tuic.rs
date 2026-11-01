@@ -243,7 +243,20 @@ impl TuicOutbound {
 
     /// QUIC 连接 + Authenticate
     async fn dial(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
-        let addr = vp_transport::resolve_node_addrs(&self.server, self.port).await?[0];
+        let addrs = vp_transport::resolve_node_addrs(&self.server, self.port).await?;
+        let (conn, ep) =
+            vp_transport::race_addrs(&addrs, vp_transport::HAPPY_EYEBALLS_DELAY, |addr| {
+                self.connect_quic_addr(addr)
+            })
+            .await?;
+        self.authenticate(&conn).await?;
+        Ok((conn, ep))
+    }
+
+    async fn connect_quic_addr(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Result<(quinn::Connection, quinn::Endpoint)> {
         let bind: &'static str = if addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -265,13 +278,17 @@ impl TuicOutbound {
             .map_err(|e| Error::Addr(format!("tuic 连接参数: {e}")))?
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic QUIC 握手: {e}"))))?;
-        // Authenticate（uni 流）
+        Ok((conn, ep))
+    }
+
+    /// Authenticate（uni 流）
+    async fn authenticate(&self, conn: &quinn::Connection) -> Result<()> {
         let mut uni = conn
             .open_uni()
             .await
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic open_uni: {e}"))))?;
         let uuid16 = parse_uuid16(&self.uuid)?;
-        let tok = token(&conn, &uuid16, &self.password)?;
+        let tok = token(conn, &uuid16, &self.password)?;
         let mut auth = Vec::with_capacity(2 + 16 + 32);
         auth.push(VER);
         auth.push(T_AUTH);
@@ -282,7 +299,7 @@ impl TuicOutbound {
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic auth 写入: {e}"))))?;
         uni.finish()
             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic auth finish: {e}"))))?;
-        Ok((conn, ep))
+        Ok(())
     }
 }
 

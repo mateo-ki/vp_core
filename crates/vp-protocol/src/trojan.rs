@@ -12,11 +12,16 @@ use vp_config::TrojanCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::tunnel::{RelayHook, relay};
-use vp_core::{Inbound, Outbound, ProxyStream};
+use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
+
+use crate::uot::{PacketFraming, StreamPacketConn, UdpEgress};
 
 use crate::direct::DirectOutbound;
 use vp_dns::Resolver;
 use vp_transport as transport;
+
+const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
 fn password_hash(pw: &str) -> [u8; 28] {
     let d: [u8; 28] = sha2::Sha224::digest(pw.as_bytes()).into();
@@ -33,6 +38,7 @@ pub struct TrojanOutbound {
     port: u16,
     hash: [u8; 28],
     transport: transport::TransportConfig,
+    udp: bool,
 }
 
 impl TrojanOutbound {
@@ -64,15 +70,11 @@ impl TrojanOutbound {
             port: cfg.port,
             hash: password_hash(&cfg.password),
             transport: t,
+            udp: cfg.udp,
         })
     }
 
-    async fn handshake<S>(
-        &self,
-        mut io: S,
-        dst: &DstAddr,
-        initial: Option<&[u8]>,
-    ) -> Result<Box<dyn ProxyStream>>
+    async fn handshake<S>(&self, mut io: S, dst: &DstAddr, cmd: u8) -> Result<Box<dyn ProxyStream>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static + ProxyStream,
     {
@@ -86,12 +88,9 @@ impl TrojanOutbound {
                 .as_bytes(),
         );
         req.extend_from_slice(b"\r\n");
-        req.push(0x01); // CONNECT
+        req.push(cmd);
         encode_socks_addr(dst, &mut req);
         req.extend_from_slice(b"\r\n");
-        if let Some(init) = initial {
-            req.extend_from_slice(init);
-        }
         io.write_all(&req).await?;
         Ok(Box::new(io))
     }
@@ -105,7 +104,7 @@ impl Outbound for TrojanOutbound {
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         let io = transport::dial(&self.server, self.port, &self.transport).await?;
-        self.handshake(io, dst, None).await
+        self.handshake(io, dst, CMD_CONNECT).await
     }
 
     async fn connect_over(
@@ -115,7 +114,22 @@ impl Outbound for TrojanOutbound {
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
         let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
-        self.handshake(io, dst, None).await
+        self.handshake(io, dst, CMD_CONNECT).await
+    }
+
+    fn support_udp(&self) -> bool {
+        self.udp
+    }
+
+    /// 原生 UDP（UDP ASSOCIATE）：一条流承载多目标数据报，帧为 `[SOCKS 地址][len][CRLF][data]`
+    async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let stream = self.handshake(io, dst, CMD_UDP_ASSOCIATE).await?;
+        Ok(Box::new(StreamPacketConn::new(
+            stream,
+            dst,
+            PacketFraming::Trojan,
+        )))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -175,8 +189,11 @@ impl TrojanInbound {
         }
         let mut cmd = [0u8; 1];
         stream.read_exact(&mut cmd).await?;
-        if cmd[0] != 0x01 {
-            return Err(Error::Unsupported("trojan 入站仅支持 TCP".into()));
+        if cmd[0] != CMD_CONNECT && cmd[0] != CMD_UDP_ASSOCIATE {
+            return Err(Error::Unsupported(format!(
+                "trojan 入站: 不支持的命令 {}",
+                cmd[0]
+            )));
         }
         // SOCKS 地址增量读
         let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
@@ -201,6 +218,16 @@ impl TrojanInbound {
             return Err(Error::Proto("trojan: 缺少结尾 CRLF"));
         }
 
+        if cmd[0] == CMD_UDP_ASSOCIATE {
+            // 请求头里的地址只是占位，每个数据报自带目标地址
+            let sess = Session::new_udp(self.tag.clone(), Some(src), dst);
+            let egress = UdpEgress::Fixed(self.direct.clone());
+            tokio::spawn(async move {
+                let framing = PacketFraming::Trojan;
+                let _ = crate::uot::serve_packets(egress, sess, Box::new(stream), framing).await;
+            });
+            return Ok(());
+        }
         let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
         let remote = self.direct.connect_stream(&sess, &dst).await?;
         let meta = vp_core::conn_table::ConnMeta {
@@ -315,5 +342,49 @@ mod tests {
         let mut buf = [0u8; 11];
         s.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping-trojan");
+    }
+
+    /// UDP：出站 connect_packet（UDP ASSOCIATE）↔ 本地 trojan 入站 ↔ UDP echo
+    #[tokio::test]
+    async fn trojan_udp_roundtrip() {
+        let echo = crate::test_support::udp_echo().await;
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let server = TrojanInbound::new("127.0.0.1", 0, "tr-udp", &["pw123".to_string()]).unwrap();
+        let port = Arc::new(server).start(ctx).await.unwrap();
+        let out = TrojanOutbound::new(&TrojanCfg {
+            server: "127.0.0.1".into(),
+            port,
+            password: "pw123".into(),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            alpn: None,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            http_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            udp: true,
+        })
+        .unwrap();
+        assert!(out.support_udp());
+        let dst = DstAddr::ip(echo.ip(), echo.port());
+        let sess = Session::new_udp("t".into(), None, dst.clone());
+        let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
+        crate::test_support::assert_udp_roundtrip(&mut conn, echo).await;
+    }
+
+    /// 帧格式：[SOCKS 地址][len][CRLF][data]（trojan-gfw 规范）
+    #[test]
+    fn trojan_udp_frame_layout() {
+        let addr = DstAddr::ip("8.8.8.8".parse().unwrap(), 53);
+        let f = PacketFraming::Trojan.encode(&addr, b"ab").unwrap();
+        assert_eq!(f, b"\x01\x08\x08\x08\x08\x00\x35\x00\x02\r\nab".to_vec());
     }
 }

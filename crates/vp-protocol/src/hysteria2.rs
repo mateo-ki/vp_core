@@ -348,7 +348,17 @@ impl Hysteria2Outbound {
 
     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
         let target_port = self.pick_port();
-        let addr = vp_transport::resolve_node_addrs(&self.server, target_port).await?[0];
+        let addrs = vp_transport::resolve_node_addrs(&self.server, target_port).await?;
+        vp_transport::race_addrs(&addrs, vp_transport::HAPPY_EYEBALLS_DELAY, |addr| {
+            self.connect_quic_addr(addr)
+        })
+        .await
+    }
+
+    async fn connect_quic_addr(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(quinn::Connection, quinn::Endpoint)> {
         let bind: &'static str = if addr.is_ipv4() {
             "0.0.0.0:0"
         } else {

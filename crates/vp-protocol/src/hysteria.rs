@@ -199,16 +199,26 @@ impl Hysteria1Outbound {
     }
 
     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
-        let addr = vp_transport::resolve_node_addrs(&self.server, self.port).await?[0];
+        let addrs = vp_transport::resolve_node_addrs(&self.server, self.port).await?;
+        vp_transport::race_addrs(&addrs, vp_transport::HAPPY_EYEBALLS_DELAY, |addr| {
+            self.connect_quic_addr(addr)
+        })
+        .await
+    }
+
+    async fn connect_quic_addr(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Result<(quinn::Connection, quinn::Endpoint)> {
         tracing::debug!(target: "hy1", %addr, sni = %self.sni, alpn = ?self.alpn, "hy1: 开始 QUIC 握手");
+        let bind: &'static str = if addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
         let mut ep = match &self.obfs {
             Some(ob) => {
-                let bind: &'static str = if addr.is_ipv4() {
-                    "0.0.0.0:0"
-                } else {
-                    "[::]:0"
-                };
-                let sock = vp_transport::create_udp_socket(bind.parse().unwrap())?;
                 let wrapped = Arc::new(ObfsUdpSocket::new(sock, ob.clone()));
                 quinn::Endpoint::new_with_abstract_socket(
                     quinn::EndpointConfig::default(),
@@ -218,7 +228,13 @@ impl Hysteria1Outbound {
                 )
                 .map_err(|e| Error::Io(std::io::Error::other(format!("hy1 endpoint: {e}"))))?
             }
-            None => quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?,
+            None => quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                None,
+                sock.into_std().map_err(Error::Io)?,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(|e| Error::Io(std::io::Error::other(format!("hy1 endpoint: {e}"))))?,
         };
         ep.set_default_client_config(self.client_config());
         let conn = ep

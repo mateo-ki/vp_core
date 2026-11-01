@@ -628,4 +628,39 @@ pub(crate) mod test_support {
             unreachable!("noop router")
         }
     }
+
+    /// 本地 UDP echo（原样回发）
+    pub async fn udp_echo() -> std::net::SocketAddr {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 65535];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+        addr
+    }
+
+    /// 经 PacketConn 发几个数据报（含一个大包，验证分帧边界），逐个等回包核对
+    pub async fn assert_udp_roundtrip(
+        conn: &mut Box<dyn vp_core::PacketConn>,
+        echo: std::net::SocketAddr,
+    ) {
+        let big = vec![0x5au8; 8000];
+        for payload in [&b"first"[..], &big, b"third"] {
+            conn.send(&vp_core::stream::UdpPacket {
+                src: "0.0.0.0:0".parse().unwrap(),
+                dst: echo,
+                data: bytes::Bytes::copy_from_slice(payload),
+            })
+            .await
+            .unwrap();
+            let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv())
+                .await
+                .expect("UDP 回包超时")
+                .unwrap();
+            assert_eq!(&pkt.data[..], payload, "数据报内容 / 边界不一致");
+        }
+    }
 }

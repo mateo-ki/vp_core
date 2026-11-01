@@ -621,11 +621,11 @@ impl ProxyKind {
     pub fn support_udp(&self) -> bool {
         match self {
             ProxyKind::Ss(s) => s.udp,
-            // 以下协议的原生 UDP 尚未实现，只能经 udp-over-tcp（由 LazyOutbound 另行判断）
-            ProxyKind::Ssr(_)
-            | ProxyKind::Vmess(_)
-            | ProxyKind::Vless(_)
-            | ProxyKind::Trojan(_) => false,
+            ProxyKind::Vmess(v) => v.udp,
+            ProxyKind::Vless(v) => v.udp,
+            ProxyKind::Trojan(t) => t.udp,
+            // SSR 原生 UDP 尚未实现，只能经 udp-over-tcp（由 LazyOutbound 另行判断）
+            ProxyKind::Ssr(_) => false,
             ProxyKind::Snell(s) => s.udp,
             // anytls / naive 只在 udp: true 时才包装 UoT（见 vp-protocol build_anytls / build_naive）
             ProxyKind::Anytls(a) => a.udp,

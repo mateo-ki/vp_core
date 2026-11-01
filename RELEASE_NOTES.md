@@ -1,3 +1,22 @@
+# 🚀 VP_Core v1.4.1 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.4.1**！本版是 **原生 VLESS-WebSocket 服务端入站 + Cloudflare CDN 穿透拯救被墙 VPS + RFC 6455 握手加固** 关键版本：
+
+### ⚡ 原生 VLESS-WebSocket 服务端入站 (Zero-Panel VLESS-WS)
+- **原生接管 Web 路径代理**：在 `VlessInbound` 中实现自适应 WebSocket 服务端入站识别与握手升协议，无需在 VPS 上安装 3x-ui / xray 等外部重型第三方面板，VP_Core 单内核独立接管 Caddy / Nginx 443 反代路径（如 `/vpcore-tunnel`）；
+- **Cloudflare Anycast CDN 完美穿透**：针对物理 IP / 自定义端口遭 GFW 阻断的 VPS，借由 Cloudflare 443 免费 CDN 节点与 WebSocket 隧道实现免翻墙秒通复活；
+- **极端低常驻内存**：彻底淘汰第三方面板后，VPS 服务端常驻物理内存稳定在 **15MB**（仅占 1%~2%），512MB 玩具级低配 VPS 亦可全天候稳定运行。
+
+### 🛡️ RFC 6455 WebSocket 握手协议加固与回落优化
+- **Sec-WebSocket-Accept 签名修复**：实现不区分大小写的请求头提取算法，严格保留 Base64 原始 Key 字符大小写，解决 Cloudflare CDN 边缘节点与代理客户端因 SHA-1 签名不符导致的握手失败；
+- **精准流量分流探测**：强化入站流量预读识别，仅在明确探测到 `upgrade: websocket` 子串时触发 WebSocket 升级，普通 HTTP 探针与浏览器请求平滑回退至 fallback 伪装站点，互不干扰。
+
+### 🚀 CLI 开服与配置生成器联动升级 (`vpcore gen-server`)
+- **自动注入 CDN 穿透入站**：当传入 `--domain` 参数绑定域名时，自动生成 `vless-ws-in`（127.0.0.1:28289）本地监听，与 Web 服务器反代配置无缝衔接；
+- **全格式节点链接输出**：一键导出包含标准通用链接、Clash 规则配置与动态 `/sub` 订阅端点。
+
+---
+
 # 🚀 VP_Core v1.4.0 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.4.0**！本版是 **高性能服务端生产级矩阵 + CLI 一键开服 + 内核自我更新** 重大里程碑版本：

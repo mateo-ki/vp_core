@@ -783,6 +783,13 @@ pub struct VmessCfg {
     pub http_opts: Option<HttpOpts>,
     #[serde(default)]
     pub udp: bool,
+    /// UDP 编码：xudp / packetaddr；空为原始编码（mihomo 语义，优先于下面两个布尔开关）
+    #[serde(alias = "packet-encoding", alias = "packetEncoding", default)]
+    pub packet_encoding: Option<String>,
+    #[serde(default)]
+    pub xudp: bool,
+    #[serde(alias = "packet-addr", default)]
+    pub packet_addr: bool,
 }
 
 fn default_vmess_cipher() -> String {
@@ -835,6 +842,13 @@ pub struct VlessCfg {
     pub http_opts: Option<HttpOpts>,
     #[serde(default)]
     pub udp: bool,
+    /// UDP 编码：xudp / packetaddr；空为原始编码（mihomo 语义，优先于下面两个布尔开关）
+    #[serde(alias = "packet-encoding", alias = "packetEncoding", default)]
+    pub packet_encoding: Option<String>,
+    #[serde(default)]
+    pub xudp: bool,
+    #[serde(alias = "packet-addr", default)]
+    pub packet_addr: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

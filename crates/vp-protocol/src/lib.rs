@@ -663,4 +663,23 @@ pub(crate) mod test_support {
             assert_eq!(&pkt.data[..], payload, "数据报内容 / 边界不一致");
         }
     }
+
+    /// 同一个 PacketConn 发往第二个目标（full-cone：XUDP / packetaddr 单连接多目标），
+    /// 回包来源必须是第二个目标
+    pub async fn assert_udp_second_target(conn: &mut Box<dyn vp_core::PacketConn>) {
+        let echo2 = udp_echo().await;
+        conn.send(&vp_core::stream::UdpPacket {
+            src: "0.0.0.0:0".parse().unwrap(),
+            dst: echo2,
+            data: bytes::Bytes::from_static(b"to-second"),
+        })
+        .await
+        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv())
+            .await
+            .expect("第二目标回包超时")
+            .unwrap();
+        assert_eq!(&pkt.data[..], b"to-second");
+        assert_eq!(pkt.src, echo2, "回包来源应为第二个目标");
+    }
 }

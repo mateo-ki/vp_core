@@ -10,6 +10,7 @@
 //! - NODE_PROBE_HTTPS=1：改测 https://www.gstatic.com/generate_204（内层 TLS 1.3，
 //!   能覆盖 XTLS Vision 的 PaddingDirect 直拷路径）
 //! - NODE_PROBE_UDP=1：改测 UDP——经节点向 8.8.8.8:53 发 DNS 查询并校验应答
+//! - NODE_PROBE_UDP_ENC=xudp|packetaddr：覆写 VLESS / VMess 的 UDP 编码（配合 NODE_PROBE_UDP）
 //! - NODE_PROBE_IFACE=网卡名：节点连接绑定该网卡。本机已有别的 TUN（如 FlClash）时用它绕开，
 //!   测出节点自身的表现，而不是"被那个 TUN 再转一手"的结果
 
@@ -164,6 +165,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
     if let Ok(f) = std::env::var("NODE_PROBE_FILTER") {
         cfgs.retain(|c| c.name.contains(&f));
+    }
+    if let Ok(enc) = std::env::var("NODE_PROBE_UDP_ENC") {
+        // 覆写 VLESS / VMess 的 packet-encoding（xudp / packetaddr），验证各 UDP 编码
+        for c in &mut cfgs {
+            match &mut c.kind {
+                vp_config::ProxyKind::Vless(v) => v.packet_encoding = Some(enc.clone()),
+                vp_config::ProxyKind::Vmess(v) => v.packet_encoding = Some(enc.clone()),
+                _ => {}
+            }
+        }
     }
     if let Ok(iface) = std::env::var("NODE_PROBE_IFACE") {
         // 全局也绑：内置 DNS 的上游查询同样要绕开别的 TUN

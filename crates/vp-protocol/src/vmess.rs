@@ -10,17 +10,20 @@ use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tracing::warn;
 
-use vp_common::{DstAddr, Error, Host, Result};
+use vp_common::{DstAddr, Error, Result};
 use vp_config::VmessCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 
-use crate::uot::{PacketFraming, StreamPacketConn, UdpEgress};
+use crate::uot::{
+    PACKET_ADDR_MAGIC, PacketFraming, StreamPacketConn, UdpEgress, UdpEncoding, xudp_dst,
+};
 
 const CMD_TCP: u8 = 0x01;
 const CMD_UDP: u8 = 0x02;
+const CMD_MUX: u8 = 0x03;
 use vp_crypto::vmess_kdf as kdf;
 use vp_crypto::{AeadKind, AnyAead};
 
@@ -77,68 +80,7 @@ fn body_aead(security: Security, body_key: &[u8; 16]) -> Result<AnyAead> {
 // 地址编解码（port 2B → atyp → addr；atyp 1/2/3）
 // ---------------------------------------------------------------------------
 
-fn encode_v2ray_addr(dst: &DstAddr, out: &mut Vec<u8>) {
-    out.extend_from_slice(&dst.port.to_be_bytes());
-    match &dst.host {
-        Host::Ip(std::net::IpAddr::V4(v4)) => {
-            out.push(0x01);
-            out.extend_from_slice(&v4.octets());
-        }
-        Host::Ip(std::net::IpAddr::V6(v6)) => {
-            out.push(0x03);
-            out.extend_from_slice(&v6.octets());
-        }
-        Host::Domain(d) => {
-            out.push(0x02);
-            out.push(d.len() as u8);
-            out.extend_from_slice(d.as_bytes());
-        }
-    }
-}
-
-fn decode_v2ray_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
-    if buf.len() < 3 {
-        return Err(Error::Proto("vmess 地址截断"));
-    }
-    let port = u16::from_be_bytes([buf[0], buf[1]]);
-    let atyp = buf[2];
-    let (host, used) = match atyp {
-        0x01 => {
-            if buf.len() < 7 {
-                return Err(Error::Proto("vmess 地址截断"));
-            }
-            (
-                Host::Ip(std::net::IpAddr::V4(
-                    [buf[3], buf[4], buf[5], buf[6]].into(),
-                )),
-                7,
-            )
-        }
-        0x02 => {
-            if buf.len() < 4 {
-                return Err(Error::Proto("vmess 地址截断"));
-            }
-            let n = buf[3] as usize;
-            if buf.len() < 4 + n {
-                return Err(Error::Proto("vmess 地址截断"));
-            }
-            let d = std::str::from_utf8(&buf[4..4 + n])
-                .map_err(|_| Error::Proto("域名非 utf-8"))?
-                .to_ascii_lowercase();
-            (Host::Domain(d), 4 + n)
-        }
-        0x03 => {
-            if buf.len() < 19 {
-                return Err(Error::Proto("vmess 地址截断"));
-            }
-            let mut o = [0u8; 16];
-            o.copy_from_slice(&buf[3..19]);
-            (Host::Ip(std::net::IpAddr::V6(o.into())), 19)
-        }
-        _ => return Err(Error::Proto("vmess atyp 非法")),
-    };
-    Ok((DstAddr { host, port }, used))
-}
+use vp_common::addr::{decode_v2ray_addr, encode_v2ray_addr};
 
 // ---------------------------------------------------------------------------
 // 请求头构造/解析
@@ -165,7 +107,10 @@ fn build_request_plaintext(r: &VmessRequest) -> Vec<u8> {
     p.push(r.security.byte()); // (0 << 4) | security
     p.push(0); // reserved
     p.push(r.cmd);
-    encode_v2ray_addr(&r.dst, &mut p);
+    // Mux（XUDP）请求不带地址（同 Xray / sing-vmess）
+    if r.cmd != CMD_MUX {
+        encode_v2ray_addr(&r.dst, &mut p);
+    }
     let fnv = kdf::fnv1a32(&p).to_be_bytes();
     p.extend_from_slice(&fnv);
     p
@@ -207,8 +152,13 @@ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
     i += 1; // reserved
     let cmd = body[i];
     i += 1;
-    let (dst, used) = decode_v2ray_addr(&body[i..])?;
-    i += used;
+    let dst = if cmd == CMD_MUX {
+        xudp_dst()
+    } else {
+        let (dst, used) = decode_v2ray_addr(&body[i..])?;
+        i += used;
+        dst
+    };
     i += padding_len;
     if i != body.len() {
         return Err(Error::Proto("vmess 请求头长度异常"));
@@ -937,6 +887,7 @@ pub struct VmessOutbound {
     security: Security,
     transport: transport::TransportConfig,
     udp: bool,
+    udp_encoding: UdpEncoding,
 }
 
 impl VmessOutbound {
@@ -975,6 +926,11 @@ impl VmessOutbound {
             security,
             transport: t,
             udp: cfg.udp,
+            udp_encoding: UdpEncoding::from_cfg(
+                cfg.packet_encoding.as_deref(),
+                cfg.xudp,
+                cfg.packet_addr,
+            )?,
         })
     }
 
@@ -1062,16 +1018,23 @@ impl Outbound for VmessOutbound {
         self.udp
     }
 
-    /// 原生 UDP（命令 0x02）：每个目标一条流，一个 body 分块即一个数据报。
-    /// ponytail: 未实现 xudp / packetaddr；需要 full-cone 时再加
+    /// 原生 UDP，按 packet-encoding：
+    /// - 原始编码：命令 0x02，每个目标一条流，一个 body 分块即一个数据报
+    /// - xudp：命令 0x03（Mux.Cool，流模式分块），一条流承载多目标
+    /// - packetaddr：命令 0x02 发往魔法地址，每个分块 = IP 目标头 + 数据报
     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         let io = transport::dial(&self.server, self.port, &self.transport).await?;
-        let stream = self.handshake(io, dst, CMD_UDP).await?;
-        Ok(Box::new(StreamPacketConn::new(
-            stream,
-            dst,
-            PacketFraming::Vmess(dst.clone()),
-        )))
+        let (cmd, req_dst, framing) = match self.udp_encoding {
+            UdpEncoding::Raw => (CMD_UDP, dst.clone(), PacketFraming::Vmess(dst.clone())),
+            UdpEncoding::Xudp => (CMD_MUX, xudp_dst(), PacketFraming::xudp_client(dst)),
+            UdpEncoding::PacketAddr => (
+                CMD_UDP,
+                DstAddr::new(PACKET_ADDR_MAGIC, 0),
+                PacketFraming::PacketAddr { vmess: true },
+            ),
+        };
+        let stream = self.handshake(io, &req_dst, cmd).await?;
+        Ok(Box::new(StreamPacketConn::new(stream, dst, framing)))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -1140,9 +1103,9 @@ impl VmessInbound {
         let cmd_key = matched.ok_or(Error::Proto("vmess: 用户认证失败"))?;
         let plaintext = open_header(&cmd_key, &auth_id, &mut stream).await?;
         let req = parse_request_plaintext(&plaintext)?;
-        if req.cmd != CMD_TCP && req.cmd != CMD_UDP {
+        if !matches!(req.cmd, CMD_TCP | CMD_UDP | CMD_MUX) {
             return Err(Error::Unsupported(format!(
-                "vmess 入站: 不支持的命令 {}（Mux 未实现）",
+                "vmess 入站: 不支持的命令 {}",
                 req.cmd
             )));
         }
@@ -1168,11 +1131,18 @@ impl VmessInbound {
             resp_header: None,
             packet: req.cmd == CMD_UDP,
         };
-        if req.cmd == CMD_UDP {
-            let sess = Session::new_udp(self.tag.clone(), Some(src), req.dst.clone());
+        if req.cmd != CMD_TCP {
+            // Mux → XUDP（流模式分块）；发往 packetaddr 魔法地址 → packetaddr；否则一块一个数据报
+            let framing = if req.cmd == CMD_MUX {
+                PacketFraming::xudp_server()
+            } else if req.dst.host.as_domain() == Some(PACKET_ADDR_MAGIC) {
+                PacketFraming::PacketAddr { vmess: true }
+            } else {
+                PacketFraming::Vmess(req.dst.clone())
+            };
+            let sess = Session::new_udp(self.tag.clone(), Some(src), req.dst);
             let egress = UdpEgress::Fixed(self.direct.clone());
             tokio::spawn(async move {
-                let framing = PacketFraming::Vmess(req.dst);
                 let _ = crate::uot::serve_packets(egress, sess, Box::new(client), framing).await;
             });
             return Ok(());
@@ -1284,6 +1254,9 @@ mod tests {
             http_opts: None,
             udp: false,
             ech_opts: None,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), echo_addr.port());
@@ -1315,7 +1288,15 @@ mod tests {
         let server =
             VmessInbound::new("127.0.0.1", 0, "vm-udp", std::slice::from_ref(&uuid)).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
-        for security in ["auto", "chacha20-poly1305", "none"] {
+        let cases = [
+            ("auto", None),
+            ("chacha20-poly1305", None),
+            ("none", None),
+            ("auto", Some("xudp")),
+            ("none", Some("xudp")),
+            ("auto", Some("packetaddr")),
+        ];
+        for (security, enc) in cases {
             let out = VmessOutbound::new(&VmessCfg {
                 server: "127.0.0.1".into(),
                 port,
@@ -1333,6 +1314,9 @@ mod tests {
                 http_opts: None,
                 udp: true,
                 ech_opts: None,
+                packet_encoding: enc.map(Into::into),
+                xudp: false,
+                packet_addr: false,
             })
             .unwrap();
             assert!(out.support_udp());
@@ -1340,6 +1324,9 @@ mod tests {
             let sess = Session::new_udp("t".into(), None, dst.clone());
             let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
             crate::test_support::assert_udp_roundtrip(&mut conn, echo).await;
+            if enc.is_some() {
+                crate::test_support::assert_udp_second_target(&mut conn).await;
+            }
         }
     }
 
@@ -1371,6 +1358,9 @@ mod tests {
             http_opts: None,
             udp: false,
             ech_opts: None,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), 80);

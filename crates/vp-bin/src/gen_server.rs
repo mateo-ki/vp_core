@@ -654,10 +654,10 @@ fn pick_default_config_path() -> PathBuf {
         use std::path::Path;
         let etc_vpcore = Path::new("/etc/vpcore");
         // 尝试测试 /etc/vpcore 是否可写，或 /etc 是否可写
-        if etc_vpcore.exists() || Path::new("/etc").exists() {
-            if fs::create_dir_all(etc_vpcore).is_ok() {
-                return etc_vpcore.join("config.yaml");
-            }
+        if (etc_vpcore.exists() || Path::new("/etc").exists())
+            && fs::create_dir_all(etc_vpcore).is_ok()
+        {
+            return etc_vpcore.join("config.yaml");
         }
     }
 

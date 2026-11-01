@@ -120,7 +120,7 @@ rules:
 | **主动防御 (Security)** | UDP RRL 防反射限速与 Slip 采样、端口敲门 (Port Knocking) 隐身防御、GeoIP/ASN 前置拦截、Full-Cone NAT 高水位主动 GC |
 | **订阅引擎 (Subscription)** | 动态 HTTP 端点 `/sub`（自适应 Clash YAML 与 Base64 订阅文本）、Token 鉴权、`Subscription-Userinfo` 标头、CLI `gen-sub` 导出 |
 | **客户端出站 (Outbound)** | VLESS (Vision/REALITY)、VMess、Trojan、Shadowsocks (AEAD/2022)、Snell v1-v4、Hysteria 2、TUIC v5、ShadowsocksR、WireGuard、SSH、Direct、Reject |
-| **传输层 (Transport)** | TCP、TLS 1.3、WebSocket、gRPC、QUIC、uTLS ClientHello（REALITY）、XTLS-Vision 流控、smux 多路复用 |
+| **传输层 (Transport)** | TCP、TLS 1.3、WebSocket、gRPC、QUIC、uTLS ClientHello（仅 REALITY）、XTLS-Vision 流控、smux 多路复用 |
 | **分流与规则** | DOMAIN、DOMAIN-SUFFIX、IP-CIDR、GEOIP / GEOSITE (`.dat` 与 `.mmdb` 双格式)、RULE-SET (Classical / Domain / IPCIDR)、PROCESS-NAME、嵌套逻辑组合 (AND/OR/NOT) |
 | **策略组** | Select (手动选择)、Url-Test (自动优选)、Fallback (故障转移)、Load-Balance (负载均衡)、Relay (链式代理) |
 | **外部控制** | 兼容 Clash RESTful API（适配 Yacd / Metacubexd / Clash-Verge 面板），支持分流模式运行中免停热切换与平滑热重载 |

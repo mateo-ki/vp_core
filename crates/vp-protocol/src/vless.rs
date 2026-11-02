@@ -8,13 +8,17 @@ use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use vp_common::{DstAddr, Error, Host, Result};
+use vp_common::{DstAddr, Error, Result};
 use vp_config::VlessCfg;
 use vp_core::inbound::InboundCtx;
 use vp_core::session::Session;
 use vp_core::tunnel::{RelayHook, relay};
-use vp_core::{Inbound, Outbound, ProxyStream};
+use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::vmess_kdf::parse_uuid;
+
+use crate::uot::{
+    PACKET_ADDR_MAGIC, PacketFraming, StreamPacketConn, UdpEgress, UdpEncoding, xudp_dst,
+};
 
 use crate::direct::DirectOutbound;
 use crate::vless_vision::{VISION_FLOW_BYTES, VisionStream};
@@ -22,37 +26,28 @@ use vp_dns::Resolver;
 use vp_transport as transport;
 
 pub(crate) const VERSION: u8 = 0x00;
-const CMD_TCP: u8 = 0x01;
+pub(crate) const CMD_TCP: u8 = 0x01;
+const CMD_UDP: u8 = 0x02;
 
-fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
-    // [addons len][cmd][port][atyp][addr]（版本与 UUID 由调用方前置）
+const CMD_MUX: u8 = 0x03;
+
+fn encode_addr(dst: &DstAddr, cmd: u8, is_vision: bool, out: &mut Vec<u8>) {
+    // [addons len][cmd][port][atyp][addr]（版本与 UUID 由调用方前置；Mux 命令不带地址）
     if is_vision {
         out.push(VISION_FLOW_BYTES.len() as u8);
         out.extend_from_slice(VISION_FLOW_BYTES);
     } else {
         out.push(0); // addons len
     }
-    out.push(CMD_TCP);
-    out.extend_from_slice(&dst.port.to_be_bytes());
-    match &dst.host {
-        Host::Ip(std::net::IpAddr::V4(v4)) => {
-            out.push(0x01);
-            out.extend_from_slice(&v4.octets());
-        }
-        Host::Ip(std::net::IpAddr::V6(v6)) => {
-            out.push(0x03);
-            out.extend_from_slice(&v6.octets());
-        }
-        Host::Domain(d) => {
-            out.push(0x02);
-            out.push(d.len() as u8);
-            out.extend_from_slice(d.as_bytes());
-        }
+    out.push(cmd);
+    if cmd != CMD_MUX {
+        vp_common::addr::encode_v2ray_addr(dst, out);
     }
 }
 
-pub(crate) fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
-    if buf.len() < 3 + 16 + 1 + 1 + 2 + 1 {
+/// 解析请求头：(uuid, 目标, 是否 vision, 命令, 头长度)。Mux 命令（XUDP）不带地址
+pub(crate) fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, u8, usize)> {
+    if buf.len() < 1 + 16 + 1 + 1 {
         return Err(Error::Proto("vless 请求头过短"));
     }
     if buf[0] != VERSION {
@@ -62,64 +57,30 @@ pub(crate) fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usi
     uuid.copy_from_slice(&buf[1..17]);
     let addons_len = buf[17] as usize;
     let mut i = 18;
-    let mut is_vision = false;
-    if addons_len > 0 {
-        if buf.len() < i + addons_len {
-            return Err(Error::Proto("vless 请求头截断"));
-        }
-        if &buf[i..i + addons_len] == VISION_FLOW_BYTES {
-            is_vision = true;
-        }
-        i += addons_len;
-    }
-    if buf.len() < i + 4 {
+    if buf.len() < i + addons_len + 1 {
         return Err(Error::Proto("vless 请求头截断"));
     }
+    let is_vision = addons_len > 0 && &buf[i..i + addons_len] == VISION_FLOW_BYTES;
+    i += addons_len;
     let cmd = buf[i];
     i += 1;
-    if cmd != CMD_TCP {
-        return Err(Error::Unsupported("vless 入站仅支持 TCP".into()));
-    }
-    let port = u16::from_be_bytes([buf[i], buf[i + 1]]);
-    i += 2;
-    let atyp = buf[i];
-    i += 1;
-    let host = match atyp {
-        0x01 => {
-            if buf.len() < i + 4 {
-                return Err(Error::Proto("vless 地址截断"));
+    let dst = match cmd {
+        CMD_MUX => crate::uot::xudp_dst(),
+        CMD_TCP | CMD_UDP => match vp_common::addr::decode_v2ray_addr(&buf[i..]) {
+            Ok((dst, used)) => {
+                i += used;
+                dst
             }
-            let o: [u8; 4] = buf[i..i + 4].try_into().unwrap();
-            i += 4;
-            Host::Ip(std::net::IpAddr::V4(o.into()))
+            Err(Error::Proto("address truncated")) => return Err(Error::Proto("vless 地址截断")),
+            Err(_) => return Err(Error::Proto("vless atyp 非法")),
+        },
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "vless 入站: 不支持的命令 {cmd}"
+            )));
         }
-        0x02 => {
-            if buf.len() < i + 1 {
-                return Err(Error::Proto("vless 地址截断"));
-            }
-            let n = buf[i] as usize;
-            i += 1;
-            if buf.len() < i + n {
-                return Err(Error::Proto("vless 地址截断"));
-            }
-            let d = std::str::from_utf8(&buf[i..i + n])
-                .map_err(|_| Error::Proto("域名非 utf-8"))?
-                .to_ascii_lowercase();
-            i += n;
-            Host::Domain(d)
-        }
-        0x03 => {
-            if buf.len() < i + 16 {
-                return Err(Error::Proto("vless 地址截断"));
-            }
-            let mut o = [0u8; 16];
-            o.copy_from_slice(&buf[i..i + 16]);
-            i += 16;
-            Host::Ip(std::net::IpAddr::V6(o.into()))
-        }
-        _ => return Err(Error::Proto("vless atyp 非法")),
     };
-    Ok((uuid, DstAddr { host, port }, is_vision, i))
+    Ok((uuid, dst, is_vision, cmd, i))
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +94,8 @@ pub struct VlessOutbound {
     uuid: [u8; 16],
     flow: Option<String>,
     transport: transport::TransportConfig,
+    udp: bool,
+    udp_encoding: UdpEncoding,
 }
 
 impl VlessOutbound {
@@ -166,58 +129,57 @@ impl VlessOutbound {
             uuid,
             flow: cfg.flow.clone(),
             transport: t,
+            udp: cfg.udp,
+            udp_encoding: UdpEncoding::from_cfg(
+                cfg.packet_encoding.as_deref(),
+                cfg.xudp,
+                cfg.packet_addr,
+            )?,
         })
     }
 
-    async fn handshake<S>(&self, mut io: S, dst: &DstAddr) -> Result<Box<dyn ProxyStream>>
+    async fn handshake<S>(&self, io: S, dst: &DstAddr, cmd: u8) -> Result<Box<dyn ProxyStream>>
     where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        S: ProxyStream,
     {
-        let is_vision = self
-            .flow
-            .as_deref()
-            .map(|f| f.eq_ignore_ascii_case("xtls-rprx-vision"))
-            .unwrap_or(false);
+        // UDP / XUDP（Mux）不走 vision：Xray 服务端拒绝 vision + UDP 命令，但接受 flow 为空的
+        // UDP / Mux 请求，即使该用户配置了 vision（真实 Xray 节点实测 XUDP 可用）
+        let is_vision = cmd == CMD_TCP
+            && self
+                .flow
+                .as_deref()
+                .map(|f| f.eq_ignore_ascii_case("xtls-rprx-vision"))
+                .unwrap_or(false);
 
         let mut req = Vec::with_capacity(48);
-        encode_addr(dst, is_vision, &mut req);
+        encode_addr(dst, cmd, is_vision, &mut req);
         let mut full = Vec::with_capacity(1 + 16 + req.len());
         full.push(VERSION);
         full.extend_from_slice(&self.uuid);
         full.extend_from_slice(&req);
-        tracing::debug!(
-            "vless 请求 {} 字节: {}",
-            full.len(),
-            full.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
+        // 只记长度：请求里含 UUID（认证凭据），整段打印会在用户贴出的 debug 日志里泄露
+        tracing::debug!("vless 请求 {} 字节 -> {dst}", full.len());
 
-        if is_vision {
-            io.write_all(&full).await?;
-            // 响应头：[ver][addon_len]
-            let mut resp = [0u8; 2];
-            io.read_exact(&mut resp).await?;
-            if resp[0] != VERSION {
-                return Err(Error::Proto("vless 响应版本不匹配"));
-            }
-            let addon_len = resp[1] as usize;
-            if addon_len > 0 {
-                let mut skip = vec![0u8; addon_len];
-                io.read_exact(&mut skip).await?;
-            }
-            Ok(Box::new(VisionStream::new(io)))
+        // 懒握手：vless 请求不单独成帧、也不阻塞等响应头，而是与消费方的首个载荷
+        // （vision 时即首个填充帧）合并同一帧写出；响应侧的 [ver][addon_len][addon]
+        // 头由 VlessStream 读取时透明剥离。
+        // - Xray 服务端只在目标首包回来时才连同响应头一起发出：先等响应头，HTTP 这类
+        //   "客户端先说话"的协议就会互等到超时
+        // - Cloudflare Worker 型服务端只在首条消息里同时拿到 vless 头+初始载荷才建立
+        //   上游；空的 vless 首帧会让其对端静默等待（mihomo 的中继同样把早数据并入首帧）
+        let stream = VlessStream {
+            inner: io,
+            request: Some(full),
+            out: BytesMut::new(),
+            strip: RespStrip::default(),
+            decoded: BytesMut::new(),
+        };
+        let out: Box<dyn ProxyStream> = if is_vision {
+            Box::new(VisionStream::new(stream, self.uuid))
         } else {
-            // 懒握手：vless 请求不单独成帧、也不阻塞等响应头，而是与消费方的
-            // 首个载荷合并同一帧写出。Cloudflare Worker 型服务端只在首条消息里
-            // 同时拿到 vless 头+初始载荷才建立上游；空的 vless 首帧会让其对端
-            // 静默等待（mihomo 的中继同样把早数据并入首帧）。响应侧的
-            // [ver][addon_len][addon] 头由 VlessStream 读取时透明剥离。
-            Ok(Box::new(VlessStream {
-                inner: io,
-                request: Some(full),
-                strip: RespStrip::default(),
-                decoded: BytesMut::new(),
-            }))
-        }
+            Box::new(stream)
+        };
+        Ok(out)
     }
 }
 
@@ -268,14 +230,19 @@ pub struct VlessStream<S> {
     inner: S,
     /// 待发送的 vless 请求（与首个载荷合并同帧）
     request: Option<Vec<u8>>,
+    /// 已合并（请求头 + 首个载荷）但底层尚未写完的字节：底层返回 Pending 或只写一部分时，
+    /// 不能丢（否则请求头没发出去，整条连接作废）
+    out: BytesMut,
     strip: RespStrip,
     /// 剥离后待交付的明文余量
     decoded: BytesMut,
 }
 
-impl<S> vp_core::ProxyStream for VlessStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
-{
+impl<S: vp_core::ProxyStream> vp_core::ProxyStream for VlessStream<S> {
+    /// decoded 里已读出的余量照常先交付（poll_read 先吐 decoded），切换只影响其后的 inner 读取
+    fn switch_to_raw_read(&mut self) -> bool {
+        self.inner.switch_to_raw_read()
+    }
 }
 
 impl<S> VlessStream<S> {
@@ -286,9 +253,23 @@ impl<S> VlessStream<S> {
         S: AsyncWrite + Unpin,
     {
         if let Some(req) = self.request.take() {
-            let mut inner = Pin::new(&mut self.inner);
-            std::task::ready!(inner.as_mut().poll_write(cx, &req))?;
-            std::task::ready!(inner.as_mut().poll_flush(cx))?;
+            self.out.extend_from_slice(&req);
+        }
+        std::task::ready!(self.poll_drain(cx))?;
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    /// 把 out 里积压的字节写进底层
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        while !self.out.is_empty() {
+            let n = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, &self.out))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.out.advance(n);
         }
         Poll::Ready(Ok(()))
     }
@@ -301,22 +282,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if this.request.is_some() {
+        if this.request.is_some() || !this.out.is_empty() {
             std::task::ready!(this.ensure_request_sent(cx))?;
         }
-        if this.strip.phase < 2 {
-            // 头未剥离完：经内部缓冲
-            while this.decoded.is_empty() {
-                let mut tmp = [0u8; 16 * 1024];
-                let mut rb = ReadBuf::new(&mut tmp);
-                std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
-                let filled = rb.filled();
-                if filled.is_empty() {
-                    return Poll::Ready(Ok(())); // EOF
-                }
-                let rest = this.strip.strip(filled);
-                this.decoded.extend_from_slice(rest);
+        // 头未剥离完：经内部缓冲剥离（可能连带读入其后的载荷）
+        while this.strip.phase < 2 && this.decoded.is_empty() {
+            let mut tmp = [0u8; 16 * 1024];
+            let mut rb = ReadBuf::new(&mut tmp);
+            std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+            let filled = rb.filled();
+            if filled.is_empty() {
+                return Poll::Ready(Ok(())); // EOF
             }
+            let rest = this.strip.strip(filled);
+            this.decoded.extend_from_slice(rest);
+        }
+        // 剥离时连带读入的载荷必须先交付完：调用方读缓冲小于余量时（如 vision 逐 5 字节读帧头），
+        // 若此处只看"头已剥完"就转去直读 inner，余量会被静默丢弃
+        if !this.decoded.is_empty() {
             let n = this.decoded.len().min(buf.remaining());
             buf.put_slice(&this.decoded[..n]);
             this.decoded.advance(n);
@@ -333,23 +316,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VlessStream<S> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        if let Some(mut req) = this.request.take() {
-            // 首写：vless 请求 + 载荷同帧
-            req.extend_from_slice(buf);
-            Pin::new(&mut this.inner)
-                .poll_write(cx, &req)
-                .map(|p| p.map(|_| buf.len()))
-        } else {
-            Pin::new(&mut this.inner).poll_write(cx, buf)
+        std::task::ready!(this.poll_drain(cx))?;
+        if let Some(req) = this.request.take() {
+            // 首写：vless 请求 + 载荷同帧；写不完的留在 out，由后续 write / flush 续写
+            this.out.extend_from_slice(&req);
+            this.out.extend_from_slice(buf);
+            if let Poll::Ready(Err(e)) = this.poll_drain(cx) {
+                return Poll::Ready(Err(e));
+            }
+            return Poll::Ready(Ok(buf.len()));
         }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_drain(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_drain(cx))?;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -361,7 +350,7 @@ impl Outbound for VlessOutbound {
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         let io = transport::dial(&self.server, self.port, &self.transport).await?;
-        self.handshake(io, dst).await
+        self.handshake(io, dst, CMD_TCP).await
     }
 
     async fn connect_over(
@@ -371,7 +360,30 @@ impl Outbound for VlessOutbound {
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
         let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
-        self.handshake(io, dst).await
+        self.handshake(io, dst, CMD_TCP).await
+    }
+
+    fn support_udp(&self) -> bool {
+        self.udp
+    }
+
+    /// 原生 UDP，按 packet-encoding：
+    /// - 原始编码：命令 0x02，每个目标一条流，帧为 `[len][data]`
+    /// - xudp：命令 0x03（Mux.Cool，不带地址），一条流承载多目标（Xray full-cone）
+    /// - packetaddr：命令 0x02 发往魔法地址，每个数据报自带 IP 目标（v2ray 5+）
+    async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let (cmd, req_dst, framing) = match self.udp_encoding {
+            UdpEncoding::Raw => (CMD_UDP, dst.clone(), PacketFraming::Len(dst.clone())),
+            UdpEncoding::Xudp => (CMD_MUX, xudp_dst(), PacketFraming::xudp_client(dst)),
+            UdpEncoding::PacketAddr => (
+                CMD_UDP,
+                DstAddr::new(PACKET_ADDR_MAGIC, 0),
+                PacketFraming::PacketAddr { vmess: false },
+            ),
+        };
+        let stream = self.handshake(io, &req_dst, cmd).await?;
+        Ok(Box::new(StreamPacketConn::new(stream, dst, framing)))
     }
 
     fn remote_addr(&self) -> Option<(String, u16)> {
@@ -533,7 +545,7 @@ impl VlessInbound {
             }
             filled += n;
             match decode_request(&buf[..filled]) {
-                Ok((uuid, dst, is_vision, used)) => {
+                Ok((uuid, dst, is_vision, cmd, used)) => {
                     let (matched, user) = if let Some(mgr) = &self.user_mgr {
                         if let Some(u) = mgr.get_user_by_uuid(&uuid) {
                             if u.is_quota_exceeded() {
@@ -579,9 +591,34 @@ impl VlessInbound {
                     if let Some(ref g) = self.gate {
                         g.mark_authenticated(src.ip());
                     }
-                    let extra = filled - used;
+                    if cmd != CMD_TCP {
+                        // UDP：回响应头后流上是数据报帧（请求头后的早数据即首帧）。
+                        // 帧格式：Mux → XUDP；发往 packetaddr 魔法地址 → packetaddr；否则 [len][data]
+                        stream.write_all(&[VERSION, 0]).await?;
+                        let stream = vp_core::PeekedStream::new(stream, buf[used..filled].to_vec());
+                        // Xray 客户端 vision + XUDP 时 Mux 流也走 vision 填充
+                        let client: Box<dyn ProxyStream> = if is_vision {
+                            Box::new(VisionStream::new(stream, uuid))
+                        } else {
+                            Box::new(stream)
+                        };
+                        let framing = if cmd == CMD_MUX {
+                            PacketFraming::xudp_server()
+                        } else if dst.host.as_domain() == Some(PACKET_ADDR_MAGIC) {
+                            PacketFraming::PacketAddr { vmess: false }
+                        } else {
+                            PacketFraming::Len(dst.clone())
+                        };
+                        let sess = Session::new_udp(self.tag.clone(), Some(src), dst);
+                        let egress = UdpEgress::Fixed(self.direct.clone());
+                        tokio::spawn(async move {
+                            let _ = crate::uot::serve_packets(egress, sess, client, framing, user)
+                                .await;
+                        });
+                        return Ok(());
+                    }
                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
-                    let mut remote = self.direct.connect_stream(&sess, &dst).await?;
+                    let remote = self.direct.connect_stream(&sess, &dst).await?;
                     // 响应：如果启用了 vision，回送 [VERSION, 18, VISION_FLOW_BYTES]
                     if is_vision {
                         stream
@@ -591,9 +628,9 @@ impl VlessInbound {
                     } else {
                         stream.write_all(&[VERSION, 0]).await?;
                     }
-                    if extra > 0 {
-                        remote.write_all(&buf[used..filled]).await?;
-                    }
+                    // 请求头之后已读入的早数据属于上行载荷（Xray / mihomo 客户端会把它与
+                    // 请求头合并发出），放回读取侧随后续数据一起转发——不能回写给客户端
+                    let stream = vp_core::PeekedStream::new(stream, buf[used..filled].to_vec());
                     let meta = vp_core::conn_table::ConnMeta {
                         id: sess.id,
                         inbound: self.tag.clone(),
@@ -616,9 +653,9 @@ impl VlessInbound {
                         brutal: None,
                     };
                     let client: Box<dyn ProxyStream> = if is_vision {
-                        Box::new(VisionStream::new_server(stream))
+                        Box::new(VisionStream::new(stream, uuid))
                     } else {
-                        stream
+                        Box::new(stream)
                     };
                     tokio::spawn(async move {
                         let _ = relay(client, remote, hook).await;
@@ -695,6 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn vless_loopback() {
+        // 目标服务回 "echo:" + 收到的数据：区分"真正经目标往返"与"服务端把早数据回写给客户端"
         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_addr = echo.local_addr().unwrap();
         tokio::spawn(async move {
@@ -705,6 +743,7 @@ mod tests {
                 if n == 0 {
                     break;
                 }
+                s.write_all(b"echo:").await.unwrap();
                 s.write_all(&b[..n]).await.unwrap();
             }
         });
@@ -735,15 +774,70 @@ mod tests {
             reality_opts: None,
             ech_opts: None,
             udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = DstAddr::new("127.0.0.1", echo_addr.port());
         let sess = Session::new_tcp("t".into(), None, dst.clone());
         let mut s = out.connect_stream(&sess, &dst).await.unwrap();
         s.write_all(b"ping-vless").await.unwrap();
-        let mut buf = [0u8; 10];
+        let mut buf = [0u8; 15];
         s.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping-vless");
+        assert_eq!(&buf, b"echo:ping-vless", "请求头后的早数据必须转发给目标");
+    }
+
+    /// UDP：出站 connect_packet ↔ 本地 vless 入站 ↔ UDP echo，三种编码。
+    /// 配了 vision 也要能走 UDP（UDP 请求不带 flow，同 Xray）；xudp / packetaddr 单连接多目标
+    #[tokio::test]
+    async fn vless_udp_roundtrip() {
+        for enc in [None, Some("xudp"), Some("packetaddr")] {
+            vless_udp_roundtrip_with(enc).await;
+        }
+    }
+
+    async fn vless_udp_roundtrip_with(enc: Option<&str>) {
+        let echo = crate::test_support::udp_echo().await;
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let server =
+            VlessInbound::new("127.0.0.1", 0, "vl-udp", std::slice::from_ref(&uuid)).unwrap();
+        let port = Arc::new(server).start(ctx).await.unwrap();
+        let out = VlessOutbound::new(&VlessCfg {
+            server: "127.0.0.1".into(),
+            port,
+            uuid,
+            flow: Some("xtls-rprx-vision".into()),
+            tls: false,
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            alpn: None,
+            network: None,
+            ws_opts: None,
+            grpc_opts: None,
+            http_opts: None,
+            reality_opts: None,
+            ech_opts: None,
+            udp: true,
+            packet_encoding: enc.map(Into::into),
+            xudp: false,
+            packet_addr: false,
+        })
+        .unwrap();
+        assert!(out.support_udp());
+        let dst = DstAddr::ip(echo.ip(), echo.port());
+        let sess = Session::new_udp("t".into(), None, dst.clone());
+        let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
+        crate::test_support::assert_udp_roundtrip(&mut conn, echo).await;
+        if enc.is_some() {
+            crate::test_support::assert_udp_second_target(&mut conn).await;
+        }
     }
 
     #[tokio::test]
@@ -794,6 +888,9 @@ mod tests {
             reality_opts: None,
             ech_opts: None,
             udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = DstAddr::new("127.0.0.1", echo_addr.port());
@@ -851,6 +948,9 @@ mod tests {
             reality_opts: None,
             ech_opts: None,
             udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
 

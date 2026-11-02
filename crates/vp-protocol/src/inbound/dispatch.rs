@@ -50,9 +50,9 @@ pub async fn dispatch_stream(
         }
     };
 
-    // UDP over TCP（UoT）：魔法地址目标交由 UoT 中继处理
+    // UDP over TCP（UoT）：魔法地址目标交由 UoT 中继处理（每个数据报目标按路由选出站）
     if crate::uot::is_magic(&sess.dst) {
-        let _ = crate::uot::serve_client(ctx, sess, client).await;
+        let _ = crate::uot::serve_client(crate::uot::UdpEgress::Route(ctx), sess, client).await;
         return;
     }
 

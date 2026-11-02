@@ -8,6 +8,7 @@ use vp_common::{DstAddr, Error, Host, Result};
 use vp_core::{Outbound, PacketConn, ProxyStream, Session, UdpPacket};
 use vp_dns::Resolver;
 
+#[derive(Clone)]
 pub struct DirectOutbound {
     dns: Arc<Resolver>,
     ipv6: bool,
@@ -39,6 +40,21 @@ impl Outbound for DirectOutbound {
     }
 
     async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
+        // UoT 魔法地址不是真域名：在本地承接，数据报经直连 UDP 收发。
+        // 协议服务端监听器（ss / vless / trojan / anytls / naive …）都经此拨号目标，
+        // 在这一处处理即可让它们全部支持客户端的 udp-over-tcp
+        if crate::uot::is_magic(dst) {
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let mut sess = sess.clone();
+            sess.dst = dst.clone();
+            let egress = crate::uot::UdpEgress::Fixed(Arc::new(self.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = crate::uot::serve_client(egress, sess, Box::new(far)).await {
+                    tracing::debug!("uot 服务侧中继结束: {e}");
+                }
+            });
+            return Ok(Box::new(near));
+        }
         // 防止意外将流量直连回环到自身入站端口形成死循环
         if let Some(in_port) = sess.inbound_port {
             if dst.port == in_port {

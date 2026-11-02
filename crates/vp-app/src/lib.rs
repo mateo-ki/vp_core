@@ -2155,6 +2155,9 @@ rules:
             reality_opts: None,
             ech_opts: None,
             udp: false,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -2256,6 +2259,9 @@ rules:
             http_opts: None,
             udp: false,
             ech_opts: None,
+            packet_encoding: None,
+            xudp: false,
+            packet_addr: false,
         })
         .unwrap();
         let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -2495,9 +2501,10 @@ listeners:
     port: {ss_port}
     users: [pw]
     cipher: aes-128-gcm
-rules: ['MATCH,ss-uot']
+rules: ['IN-NAME,uot-srv,DIRECT', 'MATCH,ss-uot']
 "
         );
+        // listener 流量也走规则（v1.4.0）：服务端侧必须出 DIRECT，否则 MATCH 把它再送回 ss-uot 自环
         let _app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
             .await
             .unwrap();

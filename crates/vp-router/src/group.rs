@@ -575,15 +575,58 @@ impl Outbound for Group {
     }
 
     fn support_udp(&self) -> bool {
-        if self.ty == GroupType::Relay {
-            self.members.iter().all(|m| m.support_udp())
-        } else {
-            self.members.iter().any(|m| m.support_udp())
+        match self.ty {
+            GroupType::Relay => self.members.iter().all(|m| m.support_udp()),
+            // 手动选择尊重用户的选择：选中成员不支持 UDP 就是不支持（同 mihomo / sing-box）
+            GroupType::Select => self.selected_member().support_udp(),
+            _ => self.members.iter().any(|m| m.support_udp()),
         }
     }
 
     async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        self.pick(sess).connect_packet(sess, dst).await
+        self.pick_udp(sess).connect_packet(sess, dst).await
+    }
+}
+
+impl Group {
+    /// select 组当前选中的成员
+    fn selected_member(&self) -> &Arc<dyn Outbound> {
+        let i = *self.select_now.read().unwrap();
+        &self.members[i.min(self.members.len().saturating_sub(1))]
+    }
+
+    /// 按会话网络类型取实际生效的成员（TCP 走 pick，UDP 走 pick_udp）；连接表 / 日志展示用
+    pub fn pick_for(&self, sess: &Session) -> Arc<dyn Outbound> {
+        match sess.network {
+            vp_core::Network::Udp => self.pick_udp(sess),
+            vp_core::Network::Tcp => self.pick(sess),
+        }
+    }
+
+    /// UDP 选成员：url-test / fallback / load-balance 当前成员不支持 UDP（如 http 节点）时，
+    /// 改用支持 UDP 的成员——存活的优先；url-test 取延迟最低，其余按配置顺序。
+    /// 同 sing-box urltest 按网络类型分别择优；否则"首个成员是 http 节点"的常见分组里 UDP 永远失败。
+    fn pick_udp(&self, sess: &Session) -> Arc<dyn Outbound> {
+        let picked = self.pick(sess);
+        if picked.support_udp() || matches!(self.ty, GroupType::Select | GroupType::Relay) {
+            return picked;
+        }
+        let alive = self.alive.lock().unwrap().clone();
+        let delay = self.delay_ms.lock().unwrap().clone();
+        self.members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.support_udp())
+            .min_by_key(|&(i, _)| {
+                let is_alive = alive.get(i).copied().unwrap_or(false);
+                let ms = match self.ty {
+                    GroupType::UrlTest => delay.get(i).copied().flatten().unwrap_or(u32::MAX),
+                    _ => 0,
+                };
+                (!is_alive, ms)
+            })
+            .map(|(_, m)| m.clone())
+            .unwrap_or(picked)
     }
 }
 
@@ -597,15 +640,23 @@ mod tests {
         remote: Option<(String, u16)>,
         connects: AtomicUsize,
         overs: AtomicUsize,
+        udp: bool,
+        packets: AtomicUsize,
     }
 
     impl MockOutbound {
         fn new(name: &str) -> Arc<Self> {
+            Self::with_udp(name, false)
+        }
+
+        fn with_udp(name: &str, udp: bool) -> Arc<Self> {
             Arc::new(MockOutbound {
                 name: name.into(),
                 remote: Some((format!("{}.mock", name), 1080)),
                 connects: AtomicUsize::new(0),
                 overs: AtomicUsize::new(0),
+                udp,
+                packets: AtomicUsize::new(0),
             })
         }
     }
@@ -636,9 +687,76 @@ mod tests {
             Ok(underlying)
         }
 
+        fn support_udp(&self) -> bool {
+            self.udp
+        }
+
+        async fn connect_packet(
+            &self,
+            _sess: &Session,
+            _dst: &DstAddr,
+        ) -> Result<Box<dyn PacketConn>> {
+            self.packets.fetch_add(1, Ordering::Relaxed);
+            Err(Error::Unsupported("mock".into()))
+        }
+
         fn remote_addr(&self) -> Option<(String, u16)> {
             self.remote.clone()
         }
+    }
+
+    fn group(ty: GroupType, members: &[Arc<MockOutbound>]) -> Arc<Group> {
+        Group::new(
+            GroupSpec {
+                name: "G".into(),
+                ty,
+                members: members.iter().map(|m| m.name.to_string()).collect(),
+                test_url: None,
+                interval: 300,
+                tolerance: 0,
+                lazy: true,
+                lb_strategy: LbStrategy::RoundRobin,
+            },
+            members
+                .iter()
+                .map(|m| m.clone() as Arc<dyn Outbound>)
+                .collect(),
+        )
+    }
+
+    /// 回归：分组首个成员不支持 UDP（如 http 节点）时，url-test / fallback 的 UDP 不能跟着失败
+    #[tokio::test]
+    async fn udp_skips_members_without_udp() {
+        let http = MockOutbound::with_udp("http", false);
+        let hy2 = MockOutbound::with_udp("hy2", true);
+        let naive = MockOutbound::with_udp("naive", true);
+        let members = [http.clone(), hy2.clone(), naive.clone()];
+        let udp_sess = Session::new_udp("t".into(), None, dst());
+
+        // fallback：无探活结果 → 按顺序取第一个支持 UDP 的
+        let fb = group(GroupType::Fallback, &members);
+        assert!(fb.support_udp());
+        let _ = fb.connect_packet(&udp_sess, &dst()).await;
+        assert_eq!(hy2.packets.load(Ordering::Relaxed), 1);
+        assert_eq!(http.packets.load(Ordering::Relaxed), 0);
+        // 有探活结果 → 存活优先
+        fb.apply_probe_results(&[Some(10), None, Some(30)]);
+        let _ = fb.connect_packet(&udp_sess, &dst()).await;
+        assert_eq!(naive.packets.load(Ordering::Relaxed), 1);
+
+        // url-test：存活成员里取延迟最低的
+        let ut = group(GroupType::UrlTest, &members);
+        ut.apply_probe_results(&[Some(5), Some(80), Some(40)]);
+        let _ = ut.connect_packet(&udp_sess, &dst()).await;
+        assert_eq!(naive.packets.load(Ordering::Relaxed), 2);
+
+        // select：尊重手动选择，不偷换成员
+        let sel = group(GroupType::Select, &members);
+        assert!(!sel.support_udp(), "选中的 http 节点不支持 UDP");
+        let _ = sel.connect_packet(&udp_sess, &dst()).await;
+        assert_eq!(http.packets.load(Ordering::Relaxed), 1);
+        assert!(sel.set_selected("hy2"));
+        assert!(sel.support_udp());
     }
 
     fn dst() -> DstAddr {

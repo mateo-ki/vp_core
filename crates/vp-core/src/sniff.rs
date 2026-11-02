@@ -43,6 +43,11 @@ impl<S: ProxyStream> ProxyStream for PeekedStream<S> {
             self.inner.consume_peek(len);
         }
     }
+
+    /// 预读缓冲在本层之上照常先交付，切换只影响其后从 inner 读取的部分
+    fn switch_to_raw_read(&mut self) -> bool {
+        self.inner.switch_to_raw_read()
+    }
 }
 
 impl<S> PeekedStream<S> {

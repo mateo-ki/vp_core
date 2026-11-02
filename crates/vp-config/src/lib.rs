@@ -42,6 +42,7 @@ pub fn parse(text: &str, fmt: Format) -> Result<Config> {
         }
     };
     sanitize_proxy_aliases(&mut json_value);
+    coerce_numeric_strings(&mut json_value);
     use serde::de::IntoDeserializer;
     let deserializer = json_value.into_deserializer();
     let cfg: Config = serde_path_to_error::deserialize(deserializer)
@@ -124,6 +125,57 @@ fn sanitize_proxy_aliases(val: &mut serde_json::Value) {
     }
 }
 
+/// mihomo 解析配置是弱类型的：字符串字段写成纯数字也照样接受，机场导出的配置里很常见
+/// （`username: 416479`、`password: 123456`、纯数字节点名）。serde 是强类型，遇到就整份
+/// 配置报错，所以这里先把"语义上是字符串、却常被写成数字"的字段转成字符串。
+/// 端口、带宽等真正的数字字段不在名单里，保持原样。
+fn coerce_numeric_strings(val: &mut serde_json::Value) {
+    use serde_json::Value;
+    fn stringify(obj: &mut serde_json::Map<String, Value>, keys: &[&str]) {
+        for key in keys {
+            match obj.get_mut(*key) {
+                Some(v @ Value::Number(_)) => *v = Value::String(v.to_string()),
+                Some(Value::Array(items)) => {
+                    for it in items.iter_mut().filter(|it| it.is_number()) {
+                        *it = Value::String(it.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(proxies) = val.get_mut("proxies").and_then(|p| p.as_array_mut()) {
+        for obj in proxies.iter_mut().filter_map(|p| p.as_object_mut()) {
+            stringify(
+                obj,
+                &[
+                    "name",
+                    "username",
+                    "password",
+                    "psk",
+                    "auth",
+                    "auth-str",
+                    "auth_str",
+                    "obfs-password",
+                    "obfs_password",
+                ],
+            );
+            for key in ["reality-opts", "reality_opts"] {
+                if let Some(r) = obj.get_mut(key).and_then(|r| r.as_object_mut()) {
+                    stringify(r, &["short-id", "short_id", "shortId", "sid"]);
+                }
+            }
+        }
+    }
+    for key in ["proxy-groups", "proxy_groups"] {
+        if let Some(groups) = val.get_mut(key).and_then(|g| g.as_array_mut()) {
+            for obj in groups.iter_mut().filter_map(|g| g.as_object_mut()) {
+                stringify(obj, &["name", "proxies", "use"]);
+            }
+        }
+    }
+}
+
 /// 从文件加载（扩展名决定格式）
 pub async fn load(path: &std::path::Path) -> Result<Config> {
     let text = tokio::fs::read_to_string(path)
@@ -144,6 +196,57 @@ pub fn parse_and_validate(text: &str, fmt: Format) -> std::result::Result<Config
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udp_over_tcp_mihomo_spelling() {
+        let cfg = parse(
+            "proxies:\n  - { name: a, type: ss, server: s, port: 1, cipher: aes-128-gcm, password: x, udp-over-tcp: true, udp-over-tcp-version: 2 }\n  - { name: b, type: ss, server: s, port: 1, cipher: aes-128-gcm, password: x }\n",
+            Format::Yaml,
+        )
+        .unwrap();
+        assert!(
+            cfg.proxies[0].udp_over_tcp,
+            "mihomo 写法 udp-over-tcp 不能被静默忽略"
+        );
+        assert_eq!(cfg.proxies[0].udp_over_tcp_version, Some(2));
+        assert!(!cfg.proxies[1].udp_over_tcp);
+        assert_eq!(cfg.proxies[1].udp_over_tcp_version, None);
+    }
+
+    #[test]
+    fn numeric_string_fields_accepted_like_mihomo() {
+        let cfg = parse(
+            r#"
+proxies:
+  - { name: 1, type: http, server: a.com, port: 995, username: 416479, password: 123456, tls: true }
+  - { name: "r", type: vless, server: b.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811,
+      tls: true, reality-opts: { public-key: "k", short-id: 12345678 } }
+proxy-groups:
+  - { name: 2, type: select, proxies: [1, r] }
+rules:
+  - MATCH,2
+"#,
+            Format::Yaml,
+        )
+        .expect("纯数字的字符串字段应当被接受");
+        assert_eq!(cfg.proxies[0].name, "1");
+        match &cfg.proxies[0].kind {
+            ProxyKind::Http(h) => {
+                assert_eq!(h.username.as_deref(), Some("416479"));
+                assert_eq!(h.password.as_deref(), Some("123456"));
+            }
+            other => panic!("应解析为 http，实际 {other:?}"),
+        }
+        match &cfg.proxies[1].kind {
+            ProxyKind::Vless(v) => assert_eq!(
+                v.reality_opts.as_ref().unwrap().short_id.as_deref(),
+                Some("12345678")
+            ),
+            other => panic!("应解析为 vless，实际 {other:?}"),
+        }
+        assert_eq!(cfg.proxy_groups[0].name, "2");
+        assert_eq!(cfg.proxy_groups[0].proxies, vec!["1", "r"]);
+    }
 
     const SAMPLE_YAML: &str = r#"
 mixed-port: 7890

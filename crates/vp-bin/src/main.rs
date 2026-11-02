@@ -637,8 +637,19 @@ async fn main() {
                     }
                 }
             }
-            // 正常退出清理：确保所有动态添加的 TUN 路由被完整移除，防止机器断网
-            let _ = vp_tun::auto_route::clean_all_routes();
+            // 正常退出清理：确保本进程动态添加的 TUN 路由被完整移除，防止机器断网。
+            // 只在本进程装过 auto-route 路由时执行：clean_all_routes 删的是通用的 /1 分半默认路由，
+            // 没开 TUN 也执行会误删其他 VPN（如 OpenVPN redirect-gateway def1）装的同名路由，
+            // 让其流量绕过 VPN 或直接断网
+            let installed_routes = app
+                .tun_runtime
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|rt| rt.route_guard.is_some());
+            if installed_routes {
+                let _ = vp_tun::auto_route::clean_all_routes();
+            }
             println!("bye");
         }
         Cmd::CleanRoutes => match vp_tun::auto_route::clean_all_routes() {

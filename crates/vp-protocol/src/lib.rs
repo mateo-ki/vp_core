@@ -424,7 +424,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
         | ProxyKind::Brook(_)
         | ProxyKind::Direct
         | ProxyKind::Reject => o,
-        _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o)),
+        _ if cfg.udp_over_tcp => Arc::new(uot::UotOutbound::new(o, uot_version(cfg))),
         _ => o,
     };
     // smux 多路复用包装（仅流型协议出站生效）
@@ -585,12 +585,21 @@ fn build_trojan(_name: &str, _tr_cfg: &TrojanCfg) -> Result<Arc<dyn Outbound>> {
     Err(Error::Unsupported("此构建未启用 trojan".into()))
 }
 
+/// UoT 版本：显式配置优先；naive / anytls 缺省 2（sing-box 与 anytls 规范：anytls-go 服务端
+/// 不论魔法地址都按 v2 读请求头），其余缺省 1（同 mihomo 文档）
+fn uot_version(cfg: &ProxyCfg) -> u8 {
+    cfg.udp_over_tcp_version.unwrap_or(match cfg.kind {
+        ProxyKind::Naive(_) | ProxyKind::Anytls(_) => 2,
+        _ => 1,
+    })
+}
+
 fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
     let base: Arc<dyn Outbound> =
         Arc::new(anytls::AnytlsOutbound::new_named(cfg.name.as_str(), a)?);
     // anytls 无原生 UDP：udp: true 时经 UoT 提供（显式 udp-over-tcp 标志避免双包装）
     if a.udp && !cfg.udp_over_tcp {
-        Ok(Arc::new(uot::UotOutbound::new(base)))
+        Ok(Arc::new(uot::UotOutbound::new(base, uot_version(cfg))))
     } else {
         Ok(base)
     }
@@ -599,7 +608,7 @@ fn build_anytls(cfg: &ProxyCfg, a: &AnytlsCfg) -> Result<Arc<dyn Outbound>> {
 fn build_naive(cfg: &ProxyCfg, n: &NaiveCfg) -> Result<Arc<dyn Outbound>> {
     let base: Arc<dyn Outbound> = Arc::new(naive::NaiveOutbound::new_named(cfg.name.as_str(), n)?);
     if n.udp && !cfg.udp_over_tcp {
-        Ok(Arc::new(uot::UotOutbound::new(base)))
+        Ok(Arc::new(uot::UotOutbound::new(base, uot_version(cfg))))
     } else {
         Ok(base)
     }
@@ -627,5 +636,59 @@ pub(crate) mod test_support {
                 rule: None,
             }
         }
+    }
+
+    /// 本地 UDP echo（原样回发）
+    pub async fn udp_echo() -> std::net::SocketAddr {
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 65535];
+            while let Ok((n, from)) = echo.recv_from(&mut b).await {
+                let _ = echo.send_to(&b[..n], from).await;
+            }
+        });
+        addr
+    }
+
+    /// 经 PacketConn 发几个数据报（含一个大包，验证分帧边界），逐个等回包核对
+    pub async fn assert_udp_roundtrip(
+        conn: &mut Box<dyn vp_core::PacketConn>,
+        echo: std::net::SocketAddr,
+    ) {
+        let big = vec![0x5au8; 8000];
+        for payload in [&b"first"[..], &big, b"third"] {
+            conn.send(&vp_core::stream::UdpPacket {
+                src: "0.0.0.0:0".parse().unwrap(),
+                dst: echo,
+                data: bytes::Bytes::copy_from_slice(payload),
+            })
+            .await
+            .unwrap();
+            let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv())
+                .await
+                .expect("UDP 回包超时")
+                .unwrap();
+            assert_eq!(&pkt.data[..], payload, "数据报内容 / 边界不一致");
+        }
+    }
+
+    /// 同一个 PacketConn 发往第二个目标（full-cone：XUDP / packetaddr 单连接多目标），
+    /// 回包来源必须是第二个目标
+    pub async fn assert_udp_second_target(conn: &mut Box<dyn vp_core::PacketConn>) {
+        let echo2 = udp_echo().await;
+        conn.send(&vp_core::stream::UdpPacket {
+            src: "0.0.0.0:0".parse().unwrap(),
+            dst: echo2,
+            data: bytes::Bytes::from_static(b"to-second"),
+        })
+        .await
+        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_secs(5), conn.recv())
+            .await
+            .expect("第二目标回包超时")
+            .unwrap();
+        assert_eq!(&pkt.data[..], b"to-second");
+        assert_eq!(pkt.src, echo2, "回包来源应为第二个目标");
     }
 }

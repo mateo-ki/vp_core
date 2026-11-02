@@ -1,3 +1,31 @@
+# 🚀 VP_Core v1.5.0 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.5.0**！本版是 **全协议原生 UDP 矩阵 + XUDP / packetaddr 编码 + XTLS Vision / REALITY / TUIC 互通互联重构 + QUIC Happy Eyeballs 竞速** 重大里程碑版本：
+
+### 🌐 全协议原生 UDP 与 XUDP 矩阵 (Full-Cone UDP)
+- **主流协议原生 UDP 全面覆盖**：VLESS、VMess、Trojan 原生 UDP 全面落地（出站与服务端入站双向支持）；
+- **Xray XUDP (Mux.Cool) & packetaddr 编码支持**：支持 `packet-encoding: xudp | packetaddr`（与 mihomo 语义对齐），实现一条代理连接承载多个远端目标（Full-Cone）；服务端自适应 Mux 与 packetaddr 命令；
+- **通用流式数据报框架**：抽象出通用的 `PacketFraming` 与 `StreamPacketConn`，统一承载 UoT、VLESS、VMess 与 Trojan 的数据报传输；
+- **Cancel-Safe 帧读取引擎**：重构 `FrameReader`，单次 await 仅触发一次缓冲读取，杜绝在 `tokio::select!` 分支打断时丢失帧片断导致流解析错位。
+
+### 🛡️ 真实节点互通重大修复与握手加固 (Interop Fixes)
+- **XTLS Vision 架构重构**：完全对齐 Xray 规范，首帧携带 16 字节 UUID 前缀；实现完整的 `PaddingContinue` / `PaddingEnd` / `PaddingDirect` 状态机；收到 `PaddingDirect` 时通过 `ProxyStream::switch_to_raw_read` 绕过外层 TLS 切换到底层 TCP 直拷，彻底解决与 Xray Vision 节点死锁卡死的问题；
+- **uTLS / REALITY 记录零填充规范对齐**：严格遵循 RFC 8446 §5.2 规范，从末尾反向寻找 Inner Content Type，防止 REALITY 服务端握手填充及末尾为 0 的合法数据被误截断；
+- **VLESS 懒握手 (Lazy Handshake)**：请求头与客户端首个载荷合并发送，避免在 HTTP 类先发数据协议下与 Xray 服务端互等响应头超时；修复底层写操作 Pending 时丢失请求头的隐患；修复入站早数据误回写给客户端的 Bug；
+- **TUIC v5 规范对齐与双模式支持**：修复 TUIC v5 中 `SIZE` 字段错误包含地址长度导致与真实服务端不互通的致命 Bug；支持 `udp-relay-mode`（native / quic）；关闭连接时主动发送 `Dissociate` 让服务端释放关联套接字。
+
+### ⚡ QUIC Happy Eyeballs 错峰竞速与 Hysteria2 分片重组
+- **Happy Eyeballs 错峰竞速**：Hysteria / Hysteria2 / TUIC 解析出多 IP 时按 250ms（RFC 8305）错峰并发拨号，任一成功即用，彻底解决首个 IP 丢包时整节点卡死的问题；
+- **Hysteria2 官方 frag.go 分片重组**：超过单包上限时规范切片，超限或异常时优雅丢包，消除 panic 崩溃隐患（防范 GHSA-qh5x-rfwf-rvfv）；
+- **服务端 UDP 会话独立转发**：服务端单会话维护独立套接字，按数据报各自目标进行真实转发，回包携带真实源地址并支持 60s 空闲自动回收；释放连接时主动中止 demux 任务，防止旧 QUIC 连接泄露。
+
+### 🔀 智能路由与系统级兼容加固
+- **策略组 UDP 智能避让**：在 `url-test` / `fallback` 等策略组中，UDP 会话会自动避开不支持 UDP 的纯 TCP 节点（如纯 HTTP 节点），避免 UDP 连接中断；
+- **配置弱类型宽容兼容**：预处理纯数字字段（如纯数字用户名、密码、节点名等），兼容各类机场订阅导出的弱类型配置，支持 `udp-over-tcp` kebab-case 格式；
+- **Windows 出站与路由防护**：出站网卡绑定支持“以太网”、“WLAN”等网卡别名；退出时仅在自身安装过 auto-route 时执行清理，避免误删第三方 VPN 路由。
+
+---
+
 # 🚀 VP_Core v1.4.1 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.4.1**！本版是 **原生 VLESS-WebSocket 服务端入站 + Cloudflare CDN 穿透拯救被墙 VPS + RFC 6455 握手加固** 关键版本：

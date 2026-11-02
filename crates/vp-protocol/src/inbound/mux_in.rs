@@ -29,7 +29,7 @@ use vp_transport::tls::tls_acceptor;
 
 use crate::direct::DirectOutbound;
 use crate::trojan::password_hash;
-use crate::vless::{VERSION as VLESS_VERSION, decode_request};
+use crate::vless::{CMD_TCP, VERSION as VLESS_VERSION, decode_request};
 use crate::vless_vision::{VISION_FLOW_BYTES, VisionStream};
 
 /// TlsMuxInbound 配置选项
@@ -225,7 +225,19 @@ impl TlsMuxInbound {
                     // 循环读取完整 VLESS 请求头
                     let (dst, is_vision, used) = loop {
                         match decode_request(&peek_buf) {
-                            Ok((_, dst, is_vision, used)) => break (dst, is_vision, used),
+                            Ok((_, dst, is_vision, CMD_TCP, used)) => {
+                                break (dst, is_vision, used);
+                            }
+                            // ponytail: tls-mux 的 VLESS 只转 TCP；UDP / XUDP 走独立 vless 入站
+                            Ok(_) => {
+                                return self
+                                    .handle_fallback_or_err(
+                                        plain_stream,
+                                        peek_buf,
+                                        Error::Unsupported("tls-mux: vless 仅支持 TCP".into()),
+                                    )
+                                    .await;
+                            }
                             Err(Error::Proto(
                                 "vless 请求头过短" | "vless 请求头截断" | "vless 地址截断",
                             )) => {
@@ -272,11 +284,7 @@ impl TlsMuxInbound {
                         g.mark_authenticated(src.ip());
                     }
                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
-                    let mut remote = self.direct.connect_stream(&sess, &dst).await?;
-                    let extra = peek_buf.len() - used;
-                    if extra > 0 {
-                        remote.write_all(&peek_buf[used..]).await?;
-                    }
+                    let remote = self.direct.connect_stream(&sess, &dst).await?;
 
                     let meta = ConnMeta {
                         id: sess.id,
@@ -299,10 +307,13 @@ impl TlsMuxInbound {
                         limiter: None,
                         brutal: None,
                     };
+                    // 请求头后的早数据属于上行载荷，放回读取侧（vision 时是填充帧，必须经 VisionStream 解码）
+                    let plain_stream =
+                        vp_core::PeekedStream::new(plain_stream, peek_buf[used..].to_vec());
                     let client: Box<dyn ProxyStream> = if is_vision {
-                        Box::new(VisionStream::new_server(plain_stream))
+                        Box::new(VisionStream::new(plain_stream, uuid))
                     } else {
-                        plain_stream
+                        Box::new(plain_stream)
                     };
                     tokio::spawn(async move {
                         let _ = relay(client, remote, hook).await;
@@ -757,6 +768,9 @@ mod tests {
                 ech_opts: None,
                 http_opts: None,
                 udp: false,
+                packet_encoding: None,
+                xudp: false,
+                packet_addr: false,
             })
             .unwrap();
 

@@ -393,7 +393,8 @@ pub async fn wrap_transport(
                 },
             )
             .await?;
-            Box::new(vp_core::stream::Opaque(s))
+            // 直接装箱（不经 Opaque）：XTLS Vision 需要经 ProxyStream::switch_to_raw_read 触达 UtlsStream
+            Box::new(s)
         } else {
             let alpn = explicit_or_derived_alpn(cfg, &["h2".into()], &["http/1.1".into()]);
             let s = tls::tls_connect(
@@ -649,6 +650,30 @@ pub async fn dial_tcp_multi_with_opts(
         tune(&tcp);
         return Ok(tcp);
     }
+    let addrs = resolve_node_addrs(host, port).await?;
+    if addrs.len() == 1 {
+        let tcp = tokio::time::timeout(budget, connect_tcp_stream_with_opts(addrs[0], opts))
+            .await
+            .map_err(|_| {
+                vp_common::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("连接 {host}:{port} 超时"),
+                ))
+            })??;
+        tune(&tcp);
+        return Ok(tcp);
+    }
+    dial_addrs_multi_with_opts(&addrs, host, port, budget, opts).await
+}
+
+/// 节点服务器域名 → 地址列表（内置 DNS 的答案排在前面）。
+/// TCP 拨号与 QUIC / UDP 类出站（hysteria / tuic / ss UDP）共用：只走系统解析的话，
+/// 开着 TUN + Fake-IP 时（本内核或别的客户端）拿到的是 198.18.x.x 这类假地址，绑定物理网卡后发出去就是黑洞。
+pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
     let mut addrs: Vec<SocketAddr> = Vec::new();
     // 1) 内置 DNS（多上游并发 + 缓存 + 污染过滤）：节点域名优先走它
     if let Some((resolver, ipv6)) = global_node_resolver() {
@@ -669,23 +694,67 @@ pub async fn dial_tcp_multi_with_opts(
         }
         Err(_) => {}
     }
-    addrs.dedup();
+    // 两路答案交错，dedup 只去相邻重复不够
+    let mut seen = std::collections::HashSet::new();
+    addrs.retain(|a| seen.insert(*a));
     if addrs.is_empty() {
         return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
     }
-    if addrs.len() == 1 {
-        let tcp = tokio::time::timeout(budget, connect_tcp_stream_with_opts(addrs[0], opts))
-            .await
-            .map_err(|_| {
-                vp_common::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("连接 {host}:{port} 超时"),
-                ))
-            })??;
-        tune(&tcp);
-        return Ok(tcp);
-    }
-    dial_addrs_multi_with_opts(&addrs, host, port, budget, opts).await
+    Ok(addrs)
+}
+
+/// Happy Eyeballs 式错峰间隔（RFC 8305 建议 250ms）
+pub const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+/// 多地址错峰竞速：第 i 个地址晚 i×stagger（最多 4 档）启动，先成功者胜、其余随之丢弃；
+/// 全部失败返回最后一个错误。QUIC 类出站（hysteria / hysteria2 / tuic）用它，避免只试第一个
+/// 解析结果——那个地址的 UDP 不通时整个节点就不可用，而 TCP 拨号早已多地址竞速。
+/// 在调用方任务内并发轮询、不 spawn：task-local 的出站套接字选项（interface-name 等）照常生效。
+pub async fn race_addrs<T, F, Fut>(
+    addrs: &[std::net::SocketAddr],
+    stagger: Duration,
+    connect: F,
+) -> Result<T>
+where
+    F: Fn(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use std::task::Poll;
+    let mut futs: Vec<_> = addrs
+        .iter()
+        .enumerate()
+        .map(|(i, &addr)| {
+            let fut = connect(addr);
+            let delay = stagger * (i as u32).min(4);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                fut.await
+            })
+        })
+        .collect();
+    let mut last_err = None;
+    std::future::poll_fn(|cx| {
+        let mut i = 0;
+        while i < futs.len() {
+            match futs[i].as_mut().poll(cx) {
+                Poll::Ready(Ok(v)) => return Poll::Ready(Ok(v)),
+                Poll::Ready(Err(e)) => {
+                    tracing::debug!("多地址竞速: 一个地址失败: {e}");
+                    last_err = Some(e);
+                    drop(futs.swap_remove(i));
+                }
+                Poll::Pending => i += 1,
+            }
+        }
+        if futs.is_empty() {
+            Poll::Ready(Err(last_err.take().unwrap_or_else(|| {
+                vp_common::Error::Addr("没有可连接的地址".into())
+            })))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// 对既定地址列表竞速拨号（[`dial_tcp_multi`] 的核心，独立出来便于测试）。
@@ -816,6 +885,34 @@ pub async fn dial(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 第一个地址一直不通（UDP 被丢弃时 QUIC 握手就是这样挂着）时，后面的地址要能顶上
+    #[tokio::test]
+    async fn race_addrs_falls_back_to_later_address() {
+        use std::net::SocketAddr;
+        let a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let won = tokio::time::timeout(
+            Duration::from_secs(2),
+            race_addrs(&[a, b], Duration::from_millis(10), |addr| async move {
+                if addr == a {
+                    std::future::pending::<Result<SocketAddr>>().await
+                } else {
+                    Ok(addr)
+                }
+            }),
+        )
+        .await
+        .expect("不应等第一个地址")
+        .unwrap();
+        assert_eq!(won, b);
+
+        let all_fail = race_addrs(&[a, b], Duration::from_millis(10), |addr| async move {
+            Err::<(), _>(vp_common::Error::Addr(format!("{addr} 不可达")))
+        })
+        .await;
+        assert!(all_fail.is_err());
+    }
 
     #[tokio::test]
     async fn dial_plain_tcp() {

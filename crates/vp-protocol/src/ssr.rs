@@ -202,7 +202,6 @@ pub struct SsrOutbound {
     obfs: String,
     obfs_param: Option<String>,
     direct: Arc<DirectOutbound>,
-    udp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +481,6 @@ impl SsrOutbound {
             obfs: cfg.obfs.to_ascii_lowercase(),
             obfs_param: cfg.obfs_param.clone(),
             direct: Arc::new(DirectOutbound::new(resolver, false)),
-            udp: cfg.udp,
         })
     }
 
@@ -593,8 +591,9 @@ impl Outbound for SsrOutbound {
         }))
     }
 
+    /// 原生 UDP 未实现（connect_packet 恒报错）：如实声明，UDP 需开 udp-over-tcp
     fn support_udp(&self) -> bool {
-        self.udp
+        false
     }
 
     async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {

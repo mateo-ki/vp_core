@@ -5,15 +5,17 @@
 //!   服务端 TCPResponse `[u8 status][varint |msg|][msg]`
 //! - UDP：QUIC unreliable datagram，UDPMessage
 //!   `[u32 BE session][u16 BE pkt][u8 frag][u8 frag_total][varint |addr|][addr][payload]`
+//!   超过 datagram 上限的包按 apernet/hysteria `frag.go` 分片（每片都带地址），收端按会话重组
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use blake2::digest::{Digest, consts::U32};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
@@ -111,6 +113,197 @@ fn addr_text(dst: &DstAddr) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// UDP 分片 / 重组 / 服务端会话（TUIC 复用 split_frags、Defragger、udp_session）
+// ---------------------------------------------------------------------------
+
+/// 切分载荷：返回 `(frag_id, frag_total, 片段)`。`head` 为每片头部开销，`max` 为单片上限。
+/// 整包放得下时只有一片；头部都放不下或超过 255 片时返回空，即丢包而不是 panic
+/// （GHSA-qh5x-rfwf-rvfv）
+pub(crate) fn split_frags(data: &[u8], head: usize, max: usize) -> Vec<(u8, u8, &[u8])> {
+    let chunk = if head + data.len() <= max {
+        data.len().max(1)
+    } else {
+        match max.checked_sub(head) {
+            Some(c) if c > 0 => c,
+            _ => return Vec::new(),
+        }
+    };
+    let n = data.len().div_ceil(chunk).max(1);
+    let Ok(total) = u8::try_from(n) else {
+        return Vec::new();
+    };
+    (0..n)
+        .map(|i| {
+            let part = &data[i * chunk..((i + 1) * chunk).min(data.len())];
+            (i as u8, total, part)
+        })
+        .collect()
+}
+
+/// 编码 UDPMessage，超过 `max` 时分片（每片都带地址）
+fn frag_udp_message(session: u32, pkt_id: u16, addr: &str, data: &[u8], max: usize) -> Vec<Bytes> {
+    let mut head = Vec::with_capacity(16 + addr.len());
+    head.extend_from_slice(&session.to_be_bytes());
+    head.extend_from_slice(&pkt_id.to_be_bytes());
+    head.extend_from_slice(&[0, 1]);
+    write_varint(&mut head, addr.len() as u64);
+    head.extend_from_slice(addr.as_bytes());
+    split_frags(data, head.len(), max)
+        .into_iter()
+        .map(|(id, total, part)| {
+            let mut m = Vec::with_capacity(head.len() + part.len());
+            m.extend_from_slice(&head);
+            m[6] = id;
+            m[7] = total;
+            m.extend_from_slice(part);
+            Bytes::from(m)
+        })
+        .collect()
+}
+
+/// 分片重组（同 hysteria `Defragger` / mihomo tuic `deFragger`）：只跟踪当前一个 pkt id，
+/// 新 pkt id 到来即丢弃未凑齐的旧包。地址取自带地址的分片（TUIC 只有首片带）
+pub(crate) struct Defragger<A> {
+    pkt_id: u16,
+    frags: Vec<Option<Bytes>>,
+    count: usize,
+    addr: Option<A>,
+}
+
+impl<A> Default for Defragger<A> {
+    fn default() -> Self {
+        Self {
+            pkt_id: 0,
+            frags: Vec::new(),
+            count: 0,
+            addr: None,
+        }
+    }
+}
+
+impl<A: Clone> Defragger<A> {
+    /// 喂入一片；凑齐整包时返回 `(地址, 载荷)`
+    pub(crate) fn feed(
+        &mut self,
+        pkt_id: u16,
+        frag_id: u8,
+        frag_total: u8,
+        addr: Option<A>,
+        data: Bytes,
+    ) -> Option<(A, Bytes)> {
+        if frag_total <= 1 {
+            return Some((addr?, data));
+        }
+        if frag_id >= frag_total {
+            return None;
+        }
+        let (id, total) = (frag_id as usize, frag_total as usize);
+        if pkt_id != self.pkt_id || total != self.frags.len() {
+            self.pkt_id = pkt_id;
+            self.frags = vec![None; total];
+            self.count = 0;
+            self.addr = None;
+        }
+        if self.frags[id].is_some() {
+            return None; // 重复分片
+        }
+        self.frags[id] = Some(data);
+        self.count += 1;
+        if addr.is_some() {
+            self.addr = addr;
+        }
+        if self.count < total {
+            return None;
+        }
+        // 分片留到下个包再清：迟到的重复分片落进已占用的槽位，被忽略
+        let len = self.frags.iter().flatten().map(Bytes::len).sum();
+        let mut out = BytesMut::with_capacity(len);
+        for f in self.frags.iter().flatten() {
+            out.extend_from_slice(f);
+        }
+        Some((self.addr.clone()?, out.freeze()))
+    }
+}
+
+/// 服务端 UDP 会话空闲回收时间（同 hysteria 默认 udpIdleTimeout）
+const UDP_SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 服务端 UDP 会话表：会话 id → (发往会话任务的通道, 该会话的重组器)
+pub(crate) type UdpSessions<K, A> = HashMap<K, (mpsc::Sender<(DstAddr, Bytes)>, Defragger<A>)>;
+
+/// 取会话；不存在或已空闲回收时新建（顺带清掉其它已结束的会话）。`reply` 构造新会话的回包函数
+pub(crate) fn udp_session<K, A, F>(
+    sessions: &mut UdpSessions<K, A>,
+    key: K,
+    reply: impl FnOnce() -> F,
+) -> &mut (mpsc::Sender<(DstAddr, Bytes)>, Defragger<A>)
+where
+    K: Eq + Hash,
+    F: FnMut(SocketAddr, &[u8]) -> bool + Send + 'static,
+{
+    if sessions.get(&key).is_none_or(|(tx, _)| tx.is_closed()) {
+        sessions.retain(|_, (tx, _)| !tx.is_closed());
+    }
+    sessions.entry(key).or_insert_with(|| {
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(serve_udp_session(rx, reply()));
+        (tx, Defragger::default())
+    })
+}
+
+/// 一个会话一个未 connect 的套接字：每包按各自目标 send_to（域名在此解析），
+/// 回包连同来源地址交给 `reply`（返回 false 结束会话）；双向都空闲超时后退出
+async fn serve_udp_session(
+    mut rx: mpsc::Receiver<(DstAddr, Bytes)>,
+    mut reply: impl FnMut(SocketAddr, &[u8]) -> bool,
+) {
+    // ponytail: 只绑 IPv4，IPv6 目标 send_to 失败即丢包；要支持再按地址族补一个套接字
+    let Ok(sock) = vp_transport::create_udp_socket(SocketAddr::from(([0, 0, 0, 0], 0))) else {
+        return;
+    };
+    let mut buf = vec![0u8; 65535];
+    // 同一会话通常只发往一个目标：缓存最近一次解析结果
+    let mut last: Option<(DstAddr, SocketAddr)> = None;
+    loop {
+        tokio::select! {
+            m = rx.recv() => {
+                let Some((dst, data)) = m else { break };
+                let target = match &last {
+                    Some((d, a)) if *d == dst => *a,
+                    _ => {
+                        let Some(a) = resolve_udp_target(&dst).await else { continue };
+                        last = Some((dst, a));
+                        a
+                    }
+                };
+                let _ = sock.send_to(&data, target).await;
+            }
+            r = sock.recv_from(&mut buf) => match r {
+                Ok((n, from)) => {
+                    if !reply(from, &buf[..n]) {
+                        break;
+                    }
+                }
+                // Windows：先前目标端口不可达（ICMP）会让下一次 recv_from 报 WSAECONNRESET，会话仍可用
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(_) => break,
+            },
+            _ = tokio::time::sleep(UDP_SESSION_IDLE) => break,
+        }
+    }
+}
+
+async fn resolve_udp_target(dst: &DstAddr) -> Option<SocketAddr> {
+    match &dst.host {
+        vp_common::Host::Ip(ip) => Some(SocketAddr::new(*ip, dst.port)),
+        vp_common::Host::Domain(d) => tokio::net::lookup_host((d.as_str(), dst.port))
+            .await
+            .ok()?
+            .find(SocketAddr::is_ipv4),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 出站
 // ---------------------------------------------------------------------------
 
@@ -190,35 +383,36 @@ impl Hysteria2UdpDemuxer {
             Arc::new(RwLock::new(HashMap::new()));
         let listeners_cloned = listeners.clone();
         let task = tokio::spawn(async move {
+            let mut defrag: HashMap<u32, Defragger<SocketAddr>> = HashMap::new();
             while let Ok(dgram) = conn.read_datagram().await {
-                if dgram.len() < 8 {
-                    continue;
-                }
-                let session = u32::from_be_bytes([dgram[0], dgram[1], dgram[2], dgram[3]]);
-                // frag id/total：未分片实现——分片包直接丢弃
-                if dgram[7] != 1 {
-                    continue;
-                }
-                let Some((alen, used)) = read_varint(&dgram[8..]) else {
+                let Some(m) = parse_udp_message(dgram) else {
                     continue;
                 };
-                let start = 8 + used;
-                let end = start + alen as usize;
-                if dgram.len() < end {
+                // 服务端回包地址恒为 "ip:port"
+                let Ok(src) = m.addr.parse::<SocketAddr>() else {
                     continue;
-                }
-                let addr = std::str::from_utf8(&dgram[start..end])
-                    .ok()
-                    .and_then(|s| s.parse::<SocketAddr>().ok());
-                let Some(src) = addr else { continue };
-                let pkt = UdpPacket {
-                    src,
-                    dst: src,
-                    data: dgram.slice(end..),
                 };
                 let guard = listeners_cloned.read().await;
-                if let Some(sender) = guard.get(&session) {
-                    let _ = sender.try_send(pkt);
+                let Some(sender) = guard.get(&m.session) else {
+                    continue;
+                };
+                // 已注销会话的重组状态批量清掉（会话 id 只增不复用）
+                if defrag.len() > guard.len() + 64 {
+                    defrag.retain(|k, _| guard.contains_key(k));
+                }
+                let whole = defrag.entry(m.session).or_default().feed(
+                    m.pkt_id,
+                    m.frag_id,
+                    m.frag_total,
+                    Some(src),
+                    m.payload,
+                );
+                if let Some((src, data)) = whole {
+                    let _ = sender.try_send(UdpPacket {
+                        src,
+                        dst: src,
+                        data,
+                    });
                 }
             }
         });
@@ -234,6 +428,13 @@ impl Hysteria2UdpDemuxer {
 
     pub async fn unregister(&self, session_id: u32) {
         self.listeners.write().await.remove(&session_id);
+    }
+}
+
+impl Drop for Hysteria2UdpDemuxer {
+    /// 接收任务持有连接副本：不停掉它，被替换的旧会话（端口跳跃等）会靠 keepalive 一直活着
+    fn drop(&mut self) {
+        self._task.abort();
     }
 }
 
@@ -348,17 +549,30 @@ impl Hysteria2Outbound {
 
     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
         let target_port = self.pick_port();
-        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), target_port))
-            .await
-            .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
-            .next()
-            .ok_or(Error::Addr("无地址".into()))?;
+        let addrs = vp_transport::resolve_node_addrs(&self.server, target_port).await?;
+        vp_transport::race_addrs(&addrs, vp_transport::HAPPY_EYEBALLS_DELAY, |addr| {
+            self.connect_quic_addr(addr)
+        })
+        .await
+    }
 
+    async fn connect_quic_addr(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(quinn::Connection, quinn::Endpoint)> {
         if let Some(ref obfs) = self.obfs {
             let local_proxy_sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
             let local_proxy_addr = local_proxy_sock.local_addr()?;
 
-            let remote_sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+            // 走 create_udp_socket：按地址族绑定，并带上出站网卡绑定（同非混淆路径）
+            let remote_bind = if addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let remote_sock = Arc::new(vp_transport::create_udp_socket(
+                remote_bind.parse().unwrap(),
+            )?);
             remote_sock.connect(addr).await?;
 
             let quinn_tokio_sock = vp_transport::create_udp_socket("127.0.0.1:0".parse().unwrap())?;
@@ -660,19 +874,17 @@ impl PacketConn for Hy2UdpConn {
         {
             self.target.to_string()
         } else {
-            format!("{}:{}", pkt.dst.ip(), pkt.dst.port())
+            pkt.dst.to_string() // IPv6 带方括号，对端按 host:port 拆分
         };
-        let mut msg = Vec::with_capacity(pkt.data.len() + addr.len() + 16);
-        msg.extend_from_slice(&self.session.to_be_bytes());
-        msg.extend_from_slice(&pkt_id.to_be_bytes());
-        msg.push(0); // frag id
-        msg.push(1); // frag total
-        write_varint(&mut msg, addr.len() as u64);
-        msg.extend_from_slice(addr.as_bytes());
-        msg.extend_from_slice(&pkt.data);
-        self.conn
-            .send_datagram(Bytes::from(msg))
-            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 datagram: {e}"))))?;
+        let max = self
+            .conn
+            .max_datagram_size()
+            .ok_or(Error::Proto("hy2: 对端未启用 QUIC datagram"))?;
+        for m in frag_udp_message(self.session, pkt_id, &addr, &pkt.data, max) {
+            self.conn
+                .send_datagram(m)
+                .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 datagram: {e}"))))?;
+        }
         Ok(())
     }
 
@@ -1086,11 +1298,7 @@ impl Hysteria2Inbound {
     async fn serve_conn(self: Arc<Self>, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
         let authenticated_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>> =
             Arc::new(tokio::sync::RwLock::new(None));
-        let mut udp_sessions: std::collections::HashMap<
-            u32,
-            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
-        > = std::collections::HashMap::new();
-
+        let mut udp_sessions: UdpSessions<u32, DstAddr> = HashMap::new();
         loop {
             tokio::select! {
                 uni = conn.accept_uni() => {
@@ -1155,64 +1363,38 @@ impl Hysteria2Inbound {
                 }
                 dg = conn.read_datagram() => {
                     let Ok(dg) = dg else { break };
-                    let Some(pkt) = parse_udp_message(&dg) else { continue };
-
-                    // 检查用户配额
+                    let Some(m) = parse_udp_message(dg) else { continue };
+                    let Ok(dst) = DstAddr::parse(&m.addr) else { continue };
+                    // 用户配额：超限断开连接；上行按载荷计量
                     let cur_user = authenticated_user.read().await.clone();
                     if let Some(ref u) = cur_user {
                         if u.is_quota_exceeded() {
                             break;
                         }
-                        u.add_up(pkt.payload.len() as u64);
+                        u.add_up(m.payload.len() as u64);
                     }
-
-                    let sess = udp_sessions
-                        .entry(pkt.session)
-                        .or_insert_with(|| {
-                            std::sync::Arc::new(tokio::sync::Mutex::new(
-                                "127.0.0.1:0".parse().unwrap(),
-                            ))
-                        })
-                        .clone();
-                    let mut g = sess.lock().await;
-                    if g.port() == 0 {
-                        *g = pkt.src;
-                    }
-                    let target = *g;
-                    drop(g);
-                    if target.port() == 0 {
-                        continue;
-                    }
-                    let sock = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
-                    sock.connect(target).await?;
-                    let _ = sock.send(&pkt.payload).await;
-                    let conn2 = conn.clone();
-                    let session = pkt.session;
-                    let return_user = cur_user.clone();
-                    tokio::spawn(async move {
-                        let mut rbuf = [0u8; 65535];
-                        loop {
-                            let Ok(Ok((n, from))) = tokio::time::timeout(
-                                std::time::Duration::from_secs(180),
-                                sock.recv_from(&mut rbuf),
-                            ).await else { break };
-                            if let Some(ref u) = return_user {
-                                u.add_down(n as u64);
+                    let session = m.session;
+                    let (tx, defrag) = udp_session(&mut udp_sessions, session, || {
+                        let conn = conn.clone();
+                        let user = cur_user.clone();
+                        let mut pkt_id = 0u16;
+                        move |from: SocketAddr, data: &[u8]| {
+                            if let Some(ref u) = user {
+                                u.add_down(data.len() as u64);
                             }
-                            let addr = format!("{}:{}", from.ip(), from.port());
-                            let mut msg = Vec::with_capacity(n + addr.len() + 16);
-                            msg.extend_from_slice(&session.to_be_bytes());
-                            msg.extend_from_slice(&0u16.to_be_bytes());
-                            msg.push(0);
-                            msg.push(1);
-                            write_varint(&mut msg, addr.len() as u64);
-                            msg.extend_from_slice(addr.as_bytes());
-                            msg.extend_from_slice(&rbuf[..n]);
-                            if conn2.send_datagram(Bytes::from(msg)).is_err() {
-                                break;
+                            pkt_id = pkt_id.wrapping_add(1);
+                            let max = conn.max_datagram_size().unwrap_or(0);
+                            for f in frag_udp_message(session, pkt_id, &from.to_string(), data, max) {
+                                let _ = conn.send_datagram(f);
                             }
+                            conn.close_reason().is_none()
                         }
                     });
+                    if let Some(whole) =
+                        defrag.feed(m.pkt_id, m.frag_id, m.frag_total, Some(dst), m.payload)
+                    {
+                        let _ = tx.try_send(whole);
+                    }
                 }
             }
         }
@@ -1313,10 +1495,6 @@ impl Hysteria2Inbound {
                 Some((alen, used)) if addr_buf.len() >= used + alen as usize => {
                     let s = std::str::from_utf8(&addr_buf[used..used + alen as usize])
                         .unwrap_or("127.0.0.1:0");
-                    let s = s
-                        .strip_prefix('[')
-                        .map(|x| x.trim_end_matches(']'))
-                        .unwrap_or(s);
                     break DstAddr::parse(s)
                         .unwrap_or_else(|_| DstAddr::ip([127, 0, 0, 1].into(), 0));
                 }
@@ -1411,30 +1589,30 @@ impl Hysteria2Inbound {
 
 struct Hy2Packet {
     session: u32,
-    src: SocketAddr,
+    pkt_id: u16,
+    frag_id: u8,
+    frag_total: u8,
+    addr: String,
     payload: Bytes,
 }
 
-fn parse_udp_message(dg: &[u8]) -> Option<Hy2Packet> {
-    if dg.len() < 10 {
-        return None;
-    }
-    let session = u32::from_be_bytes([dg[0], dg[1], dg[2], dg[3]]);
-    let _pkt = u16::from_be_bytes([dg[4], dg[5]]);
-    if dg[7] != 1 {
+fn parse_udp_message(dg: Bytes) -> Option<Hy2Packet> {
+    if dg.len() < 9 {
         return None;
     }
     let (alen, used) = read_varint(&dg[8..])?;
     let start = 8 + used;
-    let end = start + alen as usize;
+    let end = start.checked_add(usize::try_from(alen).ok()?)?;
     if dg.len() < end {
         return None;
     }
-    let src = std::str::from_utf8(&dg[start..end]).ok()?.parse().ok()?;
     Some(Hy2Packet {
-        session,
-        src,
-        payload: Bytes::copy_from_slice(&dg[end..]),
+        session: u32::from_be_bytes([dg[0], dg[1], dg[2], dg[3]]),
+        pkt_id: u16::from_be_bytes([dg[4], dg[5]]),
+        frag_id: dg[6],
+        frag_total: dg[7],
+        addr: std::str::from_utf8(&dg[start..end]).ok()?.to_string(),
+        payload: dg.slice(end..),
     })
 }
 
@@ -1819,6 +1997,90 @@ mod tests {
         )
         .await;
         assert!(res.is_err() || res.unwrap().is_err());
+    }
+
+    #[test]
+    fn udp_frag_defrag() {
+        let big: Vec<u8> = (0..8000u32).map(|i| i as u8).collect();
+        let feed = |d: &mut Defragger<String>, f: &Bytes| {
+            let m = parse_udp_message(f.clone()).unwrap();
+            assert_eq!((m.session, m.addr.as_str()), (7, "1.2.3.4:53"));
+            d.feed(m.pkt_id, m.frag_id, m.frag_total, Some(m.addr), m.payload)
+        };
+
+        // 分片都不超上限、每片带地址；乱序到达照样重组
+        let frags = frag_udp_message(7, 3, "1.2.3.4:53", &big, 1200);
+        assert!(frags.len() > 1 && frags.iter().all(|f| f.len() <= 1200));
+        let mut d = Defragger::default();
+        let mut out = None;
+        for f in frags.iter().rev() {
+            out = feed(&mut d, f);
+        }
+        assert_eq!(out, Some(("1.2.3.4:53".into(), Bytes::from(big.clone()))));
+
+        // 丢了一片的旧包被新包顶掉：新包完整拼出，旧包迟到的那片不会拼出残缺包
+        let old = frag_udp_message(7, 4, "1.2.3.4:53", &big, 1200);
+        let new = frag_udp_message(7, 5, "1.2.3.4:53", &big[..3000], 1200);
+        let mut d = Defragger::default();
+        for f in &old[1..] {
+            assert!(feed(&mut d, f).is_none());
+        }
+        let got = new
+            .iter()
+            .filter_map(|f| feed(&mut d, f))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [("1.2.3.4:53".into(), Bytes::copy_from_slice(&big[..3000]))]
+        );
+        // 重复分片不重复交付
+        assert!(feed(&mut d, &new[0]).is_none());
+        assert!(feed(&mut d, &old[0]).is_none());
+
+        // 放得下就不分片；头部超过上限 / 超过 255 片时丢包而不是 panic
+        assert_eq!(frag_udp_message(1, 1, "1.2.3.4:53", b"", 1200).len(), 1);
+        assert_eq!(frag_udp_message(1, 1, "1.2.3.4:53", b"hi", 1200).len(), 1);
+        assert!(frag_udp_message(1, 1, &"a".repeat(2000), b"hi", 1200).is_empty());
+        assert!(frag_udp_message(1, 1, "1.2.3.4:53", &[0; 400_000], 1200).is_empty());
+    }
+
+    /// 超过 datagram 上限的 UDP 包：客户端分片 → 服务端重组转发 → 回包分片 → 客户端重组
+    #[tokio::test]
+    async fn hysteria2_udp_large_packets() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let ctx = InboundCtx {
+            router: Arc::new(crate::test_support::NoopRouter()),
+            stats: Arc::new(vp_common::Stats::default()),
+            conns: Arc::new(vp_core::ConnTable::new()),
+        };
+        let server = Hysteria2Inbound::new(
+            "127.0.0.1",
+            0,
+            "hy2-srv",
+            &["s3cret".to_string()],
+            cert.cert.pem().into_bytes(),
+            cert.key_pair.serialize_pem().into_bytes(),
+        );
+        let port = Arc::new(server).start(ctx).await.unwrap();
+        let out = Hysteria2Outbound::new(&vp_config::Hysteria2Cfg {
+            server: "127.0.0.1".into(),
+            port,
+            password: "s3cret".into(),
+            sni: None,
+            skip_cert_verify: true,
+            up: None,
+            down: None,
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            hop_interval: None,
+        })
+        .unwrap();
+        let echo = crate::test_support::udp_echo().await;
+        let dst = DstAddr::ip(echo.ip(), echo.port());
+        let sess = Session::new_udp("t".into(), None, dst.clone());
+        let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
+        crate::test_support::assert_udp_roundtrip(&mut conn, echo).await;
     }
 
     #[test]

@@ -169,11 +169,7 @@ impl SsUdpConn {
         cipher: vp_crypto::ss::Cipher,
         key: Vec<u8>,
     ) -> Result<Self> {
-        let server = tokio::net::lookup_host((server_host, server_port))
-            .await
-            .map_err(|e| Error::Addr(format!("解析 {server_host} 失败: {e}")))?
-            .next()
-            .ok_or(Error::Addr("无地址".into()))?;
+        let server = vp_transport::resolve_node_addrs(server_host, server_port).await?[0];
         let sock = vp_transport::create_udp_socket("0.0.0.0:0".parse().unwrap())?;
         Ok(SsUdpConn {
             sock: Arc::new(sock),

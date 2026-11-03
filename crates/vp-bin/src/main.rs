@@ -1,5 +1,6 @@
 //! vpcore CLI。
 
+#[cfg(windows)]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -239,11 +240,38 @@ fn trim_working_set() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_working_set() {
+    unsafe {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", target_env = "gnu"))))]
 fn trim_working_set() {}
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2);
+            cpus.clamp(2, 4)
+        });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .enable_all()
+        .build()
+        .expect("初始化 tokio 运行时失败")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::GenServer {

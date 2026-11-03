@@ -100,22 +100,24 @@ pub async fn serve_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static + vp_core::ProxyStream,
 {
-    // 读请求头
+    // 读请求头：大块批量读取，避免逐字节 read 引发的 Windows IOCP 线程风暴与高 CPU 消耗
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await?;
+    let mut temp = [0u8; 2048];
+    let header_len = loop {
+        let n = stream.read(&mut temp).await?;
         if n == 0 {
             return Err(vp_common::Error::Proto("http 入站: 请求中断"));
         }
-        buf.push(byte[0]);
+        buf.extend_from_slice(&temp[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
         if buf.len() > 32 * 1024 {
             return Err(vp_common::Error::Proto("http 入站: 请求头过长"));
         }
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
-        }
-    }
+    };
+    let body_prefix = buf.split_off(header_len);
+
     let text = String::from_utf8_lossy(&buf);
     let mut lines = text.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
@@ -160,39 +162,59 @@ where
         return Ok(());
     }
 
-    // absolute-form: GET http://host/path → 转发时改写为相对路径
-    let (host, rewritten) = match target
+    // absolute-form: GET http://host[:port]/path → 转发时改写为相对路径
+    let (target_host, target_port, rewritten) = match target
         .strip_prefix("http://")
         .or_else(|| target.strip_prefix("https://"))
     {
         Some(rest) => {
-            let (h, path) = match rest.find('/') {
+            let is_https = target.starts_with("https://");
+            let default_port = if is_https { 443 } else { 80 };
+            let (hp, path) = match rest.find('/') {
                 Some(i) => (&rest[..i], &rest[i..]),
                 None => (rest, "/"),
             };
-            (h.to_string(), path.to_string())
+            let (h, p) = match hp.rsplit_once(':') {
+                Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                    (h, p.parse().unwrap_or(default_port))
+                }
+                _ => (hp, default_port),
+            };
+            (h.to_string(), p, path.to_string())
         }
         None => {
             // origin-form：从 Host 头取目标
-            let host = lines
+            let host_header = lines
                 .find_map(|l| {
                     let (k, v) = l.split_once(':')?;
                     if k.trim().eq_ignore_ascii_case("host") {
-                        Some(v.trim().to_string())
+                        Some(v.trim())
                     } else {
                         None
                     }
                 })
                 .ok_or(vp_common::Error::Proto("http 入站: 缺少 Host"))?;
-            (host, target.to_string())
+            let (h, p) = match host_header.rsplit_once(':') {
+                Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                    (h.to_string(), p.parse().unwrap_or(80))
+                }
+                _ => (host_header.to_string(), 80),
+            };
+            (h, p, target.to_string())
         }
     };
-    let dst = DstAddr::new(host.clone(), 80);
+    let dst = match target_host.parse::<std::net::IpAddr>() {
+        Ok(ip) => DstAddr::ip(ip, target_port),
+        Err(_) => DstAddr::new(target_host, target_port),
+    };
     // 改写请求行（absolute-form → origin-form），保留首个 \r\n 与后续头
     let new_first_line = format!("{method} {rewritten} HTTP/1.1");
     let mut new_req = new_first_line.into_bytes();
     if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
         new_req.extend_from_slice(&buf[pos..]);
+    }
+    if !body_prefix.is_empty() {
+        new_req.extend_from_slice(&body_prefix);
     }
 
     // absolute-form：响应由远端直接透传，不做本地应答

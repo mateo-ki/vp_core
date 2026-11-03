@@ -178,6 +178,36 @@ pub async fn relay(
         ),
     };
 
+    // 无 QoS 限速 / Brutal / 用户配额时，走单任务双向直通快速路径：
+    // 消除 2 次 tokio::spawn 与 BiLock 互斥锁开销，CPU 占用与调度损耗降至极致
+    let has_qos = hook.limiter.is_some() || hook.user.is_some() || hook.brutal.is_some();
+    if !has_qos {
+        let guard = RelayGuard {
+            table: hook.table.clone(),
+            id,
+            stats: if registered.is_some() {
+                hook.stats.clone()
+            } else {
+                None
+            },
+            user: None,
+            t1: None,
+            t2: None,
+        };
+        let (up_bytes, down_bytes) = match tokio::io::copy_bidirectional(&mut left, &mut right).await {
+            Ok((u, d)) => (u, d),
+            Err(_) => (0, 0),
+        };
+        up.store(up_bytes, Ordering::Relaxed);
+        down.store(down_bytes, Ordering::Relaxed);
+        if let Some(s) = &hook.stats {
+            s.add_up(up_bytes);
+            s.add_down(down_bytes);
+        }
+        drop(guard);
+        return (up_bytes, down_bytes);
+    }
+
     let (lr, lw) = tokio::io::split(left);
     let (rr, rw) = tokio::io::split(right);
 

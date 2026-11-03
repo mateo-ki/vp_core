@@ -819,6 +819,53 @@ impl Resolver {
         Ok(ips)
     }
 
+    /// 专供代理节点域名直连解析：优先静态 hosts、内存缓存与快速纯 UDP bootstrap DNS（default-nameserver），
+    /// 绝不走外层 DoH / TLS 握手，消除单节点测速与拨号中的 TLS 加解密风暴与延迟
+    pub async fn resolve_node_domain(&self, domain: &str, ipv6: bool) -> Result<Arc<Vec<IpAddr>>> {
+        if let Some(ips) = self.lookup_hosts(domain, ipv6) {
+            return Ok(ips);
+        }
+        let key = (domain.to_ascii_lowercase(), ipv6);
+        {
+            let c = self.cache.lock().unwrap();
+            if let Some(e) = c.map.get(&key) {
+                if e.at.elapsed() < Duration::from_secs(e.ttl.max(MIN_TTL) as u64) {
+                    return Ok(e.ips.clone());
+                }
+            }
+        }
+        let qtype = if ipv6 { QType::Aaaa } else { QType::A };
+        // 优先使用纯 UDP bootstrap_servers (default-nameserver: 223.5.5.5 / 119.29.29.29 等)
+        if !self.bootstrap_servers.is_empty() {
+            let udp_servers: Vec<ServerAddr> = self
+                .bootstrap_servers
+                .iter()
+                .map(|&sa| ServerAddr {
+                    host: sa.ip().to_string(),
+                    addr: Some(sa),
+                    port: sa.port(),
+                    proto: Proto::Udp,
+                    path: String::new(),
+                    skip_verify: false,
+                })
+                .collect();
+            if let Ok(ips) = Self::query_servers(&udp_servers, domain, qtype, &[]).await {
+                if !ips.is_empty() {
+                    let ips = Arc::new(ips);
+                    self.cache_store(key, ips.clone());
+                    return Ok(ips);
+                }
+            }
+        }
+        // 降级使用系统快速并发解析
+        let ips = self.system_lookup(domain).await?;
+        if !ips.is_empty() {
+            self.cache_store(key, ips.clone());
+            return Ok(ips);
+        }
+        Err(Error::Dns(format!("节点域名 {domain} 未解析到有效 IP")))
+    }
+
     fn cache_store(&self, key: (String, bool), ips: Arc<Vec<IpAddr>>) {
         let mut c = self.cache.lock().unwrap();
         if c.map.len() >= CACHE_CAP {

@@ -138,26 +138,6 @@ impl<S> vp_core::ProxyStream for PrefixedStream<S> where
 {
 }
 
-impl<S> PrefixedStream<S> {
-    #[allow(dead_code)]
-    pub fn new(inner: S, prefix: u8) -> Self {
-        PrefixedStream {
-            inner,
-            prefix: vec![prefix],
-            pos: 0,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn with_bytes(inner: S, prefix: Vec<u8>) -> Self {
-        PrefixedStream {
-            inner,
-            prefix,
-            pos: 0,
-        }
-    }
-}
-
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,

@@ -7,7 +7,6 @@ pub mod conn_table;
 pub mod gate;
 pub mod inbound;
 pub mod outbound;
-pub mod process;
 pub mod rate_limit;
 pub mod router;
 pub mod session;

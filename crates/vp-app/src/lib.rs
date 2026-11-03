@@ -14,8 +14,8 @@ use vp_common::{Error, Result, Stats};
 use vp_config::Format;
 use vp_core::{ConnTable, InboundCtx, Outbound, Resolution, Router, Session};
 use vp_dns::Resolver;
-use vp_protocol::{InboundKind, OutboundDeps, build_inbound_with_gate, build_outbound, group_spec};
-use vp_router::{Router as InnerRouter, RouterSpec};
+use vp_protocol::{InboundKind, OutboundDeps, build_inbound_with_gate, build_outbound};
+use vp_router::{Router as InnerRouter, RouterSpec, group_spec};
 use vp_rule::{CompileEnv, geosite::GeoSiteDb};
 
 /// 热替换路由句柄：入站持有它，重载时替换内部 Router

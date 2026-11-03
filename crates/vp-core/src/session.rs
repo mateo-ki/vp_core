@@ -45,31 +45,34 @@ pub struct Session {
 
 impl Session {
     pub fn new_tcp(inbound: Arc<str>, src: Option<SocketAddr>, dst: DstAddr) -> Self {
-        let process = crate::process::resolve_process("tcp", src);
         Session {
             id: next_id(),
             inbound,
             network: Network::Tcp,
             src,
             dst,
-            process,
+            process: None,
             inbound_port: None,
             inbound_user: None,
         }
     }
 
     pub fn new_udp(inbound: Arc<str>, src: Option<SocketAddr>, dst: DstAddr) -> Self {
-        let process = crate::process::resolve_process("udp", src);
         Session {
             id: next_id(),
             inbound,
             network: Network::Udp,
             src,
             dst,
-            process,
+            process: None,
             inbound_port: None,
             inbound_user: None,
         }
+    }
+
+    pub fn with_process(mut self, process: impl Into<Arc<str>>) -> Self {
+        self.process = Some(process.into());
+        self
     }
 
     pub fn with_inbound_port(mut self, port: u16) -> Self {

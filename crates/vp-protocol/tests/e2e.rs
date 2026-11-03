@@ -89,6 +89,7 @@ async fn build_core() -> (u16 /*mixed port*/, Arc<Router>, u16 /*echo port*/) {
         mode: Mode::Rule,
         dns: Arc::new(Resolver::system()),
         ipv6: false,
+        start_health_checks: false,
     })
     .unwrap();
 

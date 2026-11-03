@@ -26,6 +26,8 @@ pub struct RouterSpec {
     pub mode: Mode,
     pub dns: Arc<Resolver>,
     pub ipv6: bool,
+    /// 是否启动后台自动定时健康检查任务（纯测速模式或无入站时不启动，避免任务惊群与重复探测）
+    pub start_health_checks: bool,
 }
 
 pub struct Router {
@@ -132,10 +134,13 @@ impl Router {
 
         // 健康检查句柄在构造 Router 前收集：热替换旧 Router 时统一 abort，
         // 否则旧组任务持有 Arc<Group> 永久滞留（热更新泄漏）。
+        // 仅在明确启用后台健康检查时启动，避免测速模式与构造阶段并发惊群重复探活。
         let mut background_tasks = Vec::new();
-        for (idx, g) in groups.values().enumerate() {
-            if let Some(h) = g.start_health_checks(idx) {
-                background_tasks.push(h);
+        if spec.start_health_checks {
+            for (idx, g) in groups.values().enumerate() {
+                if let Some(h) = g.start_health_checks(idx) {
+                    background_tasks.push(h);
+                }
             }
         }
         let router = Arc::new(Router {
@@ -448,6 +453,7 @@ mod tests {
             mode,
             dns: Arc::new(Resolver::system()),
             ipv6: false,
+            start_health_checks: false,
         })
         .unwrap()
     }
@@ -520,6 +526,7 @@ mod tests {
             mode: Mode::Rule,
             dns: Arc::new(Resolver::system()),
             ipv6: false,
+            start_health_checks: false,
         })
         .unwrap();
 

@@ -80,6 +80,7 @@ async fn build_udp_router_with(
         mode: vp_config::Mode::Rule,
         dns: Arc::new(Resolver::system()),
         ipv6: false,
+        start_health_checks: false,
     })
     .unwrap();
     let ctx = InboundCtx {

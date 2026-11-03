@@ -660,16 +660,27 @@ fn parse_snell(rest: &str) -> Result<SubNode> {
 
 pub(crate) fn decode_base64_flexible(s: &str) -> Option<Vec<u8>> {
     use base64::Engine;
-    let clean = s.trim().replace('-', "+").replace('_', "/");
-    let pad = match clean.len() % 4 {
-        2 => "==",
-        3 => "=",
-        _ => "",
-    };
-    let with_pad = format!("{clean}{pad}");
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    // 先尝试直接解码（避免任何内存分配与字符串拷贝）
     base64::engine::general_purpose::STANDARD
-        .decode(&with_pad)
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s.trim()))
+        .decode(s)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
+        .or_else(|_| {
+            // 兼容可能混用了 URL_SAFE 符号但尾部未补齐 pad 的非标情况
+            let clean = s.replace('-', "+").replace('_', "/");
+            let pad = match clean.len() % 4 {
+                2 => "==",
+                3 => "=",
+                _ => "",
+            };
+            let with_pad = format!("{clean}{pad}");
+            base64::engine::general_purpose::STANDARD.decode(&with_pad)
+        })
         .ok()
 }
 
@@ -874,19 +885,30 @@ fn parse_ss(rest: &str) -> Result<SubNode> {
     Ok(SubNode { fields })
 }
 
+#[inline]
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn urldecode(s: &str) -> String {
     let bytes = s.as_bytes();
+    if !bytes.iter().any(|&b| b == b'%' || b == b'+') {
+        return s.to_string();
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() + 1 => {
-                if i + 2 < bytes.len() {
-                    if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                        out.push(b);
-                        i += 3;
-                        continue;
-                    }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(h1), Some(h2)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push((h1 << 4) | h2);
+                    i += 3;
+                    continue;
                 }
                 out.push(b'%');
                 i += 1;
@@ -907,20 +929,22 @@ fn urldecode(s: &str) -> String {
 /// 订阅内容 → 节点列表（自动识别 base64 包装）
 pub fn parse_subscription(text: &str) -> Vec<SubNode> {
     let body = text.trim();
-    // 尝试 base64 解包
+    if body.is_empty() {
+        return Vec::new();
+    }
+    // 尝试识别是否为明文链接或 base64
     let lines: Vec<String> = if body.contains("://") {
         body.lines().map(|l| l.trim().to_string()).collect()
     } else {
-        use base64::Engine;
-        let cleaned: String = body.chars().filter(|c| !c.is_whitespace()).collect();
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&cleaned)
-            .or_else(|_| base64::engine::general_purpose::STANDARD.decode(&cleaned))
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_default();
-        decoded.lines().map(|l| l.trim().to_string()).collect()
+        match decode_base64_flexible(body) {
+            Some(bytes) => {
+                let s = String::from_utf8_lossy(&bytes);
+                s.lines().map(|l| l.trim().to_string()).collect()
+            }
+            None => Vec::new(),
+        }
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(lines.len());
     let mut skipped = 0usize;
     for l in lines.into_iter().filter(|l| l.contains("://")) {
         match parse_uri(&l) {
@@ -940,7 +964,7 @@ pub fn parse_subscription(text: &str) -> Vec<SubNode> {
         }
     }
     if skipped > 0 {
-        eprintln!("订阅：跳过 {skipped} 个不支持的节点/传输");
+        tracing::debug!("订阅：跳过 {skipped} 个不支持的节点/传输");
     }
     out
 }
@@ -975,6 +999,12 @@ pub fn build_config(nodes: &[SubNode], port: u16) -> String {
     out
 }
 
+#[derive(serde::Deserialize)]
+struct ProviderContainer {
+    proxies: Option<Vec<vp_config::ProxyCfg>>,
+    payload: Option<Vec<vp_config::ProxyCfg>>,
+}
+
 /// 解析 proxy-provider 载荷（支持 Clash YAML proxies 段，或 Base64 / URI 列表）
 pub fn parse_provider_proxies(
     text: &str,
@@ -985,58 +1015,63 @@ pub fn parse_provider_proxies(
         return Ok(Vec::new());
     }
 
-    // 1. 尝试直接作为 YAML 反序列化（支持 proxies 块、payload 块、或顶层列表）
+    // 1. 快速路径：直接尝试强类型反序列化带有 proxies/payload 的 YAML 对象或顶层数组
     let mut proxies: Vec<vp_config::ProxyCfg> =
+        if let Ok(c) = serde_yaml::from_str::<ProviderContainer>(text) {
+            c.proxies.or(c.payload).unwrap_or_default()
+        } else {
+            serde_yaml::from_str::<Vec<vp_config::ProxyCfg>>(text).unwrap_or_default()
+        };
+
+    // 容错兜底：若强类型直接反序列化因部分非标/未知字段报错，降级为逐项宽容解析
+    if proxies.is_empty() {
         if let Ok(val) = serde_yaml::from_str::<serde_yaml::Value>(text) {
             if let Some(map) = val.as_mapping() {
                 let list_val = map.get("proxies").or_else(|| map.get("payload"));
                 if let Some(lv) = list_val {
                     if let Some(seq) = lv.as_sequence() {
-                        let mut list = Vec::new();
                         for item in seq {
                             match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
-                                Ok(p) => list.push(p),
+                                Ok(p) => proxies.push(p),
                                 Err(e) => tracing::warn!("proxy-provider 跳过无法识别的节点: {e}"),
                             }
                         }
-                        list
-                    } else {
-                        Vec::new()
                     }
-                } else {
-                    Vec::new()
                 }
             } else if let Some(seq) = val.as_sequence() {
-                let mut list = Vec::new();
                 for item in seq {
                     match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
-                        Ok(p) => list.push(p),
+                        Ok(p) => proxies.push(p),
                         Err(e) => tracing::warn!("proxy-provider 跳过无法识别的节点: {e}"),
                     }
                 }
-                list
-            } else {
-                Vec::new()
             }
-        } else {
-            Vec::new()
-        };
+        }
+    }
 
     // 2. 如果 YAML 未解析出节点，尝试作为订阅节点链接（Base64 或 raw URI 列表）解析
     if proxies.is_empty() {
         let nodes = parse_subscription(text);
         if !nodes.is_empty() {
-            let mut y = String::from("proxies:\n");
+            let mut y = String::with_capacity(nodes.len() * 256);
+            y.push_str("proxies:\n");
             for n in &nodes {
                 y.push_str(&n.to_yaml());
                 y.push('\n');
             }
-            if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&y) {
-                if let Some(seq) = doc.get("proxies").and_then(|v| v.as_sequence()) {
-                    for item in seq {
-                        match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
-                            Ok(p) => proxies.push(p),
-                            Err(e) => tracing::warn!("订阅节点转换配置跳过: {e}"),
+            if let Ok(c) = serde_yaml::from_str::<ProviderContainer>(&y) {
+                if let Some(list) = c.proxies {
+                    proxies = list;
+                }
+            }
+            if proxies.is_empty() {
+                if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&y) {
+                    if let Some(seq) = doc.get("proxies").and_then(|v| v.as_sequence()) {
+                        for item in seq {
+                            match serde_yaml::from_value::<vp_config::ProxyCfg>(item.clone()) {
+                                Ok(p) => proxies.push(p),
+                                Err(e) => tracing::warn!("订阅节点转换配置跳过: {e}"),
+                            }
                         }
                     }
                 }

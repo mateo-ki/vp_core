@@ -126,7 +126,12 @@ impl IptablesPortRedirectGuard {
 
         #[cfg(target_os = "linux")]
         {
-            guard.enable_linux()?;
+            if let Err(e) = guard.enable_linux() {
+                warn!(
+                    "listener [{}] 注入 iptables 端口重定向失败（无 root 或 CAP_NET_ADMIN 权限，将安全降级）: {e}",
+                    listener_name
+                );
+            }
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -188,6 +193,11 @@ impl IptablesPortRedirectGuard {
         }
 
         self.active = false;
+    }
+
+    /// 查询当前守卫是否成功在内核中激活了规则
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 }
 
@@ -380,10 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn test_guard_noop_on_non_linux() {
+    fn test_guard_lifecycle() {
         let mut guard =
             IptablesPortRedirectGuard::setup("test-listener", "20000-20010", 443, false).unwrap();
         assert_eq!(guard.port_ranges, vec![(20000, 20010)]);
         guard.disable();
+        assert!(!guard.is_active());
     }
 }

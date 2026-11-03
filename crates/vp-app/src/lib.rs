@@ -313,13 +313,13 @@ pub struct App {
 }
 
 impl App {
-    /// 是否存在已激活的 iptables 端口重定向守卫
+    /// 是否存在已在内核中激活生效的 iptables 端口重定向守卫
     pub fn has_port_redirects(&self) -> bool {
         let guards = self
             .port_redirect_guards
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        !guards.is_empty()
+        guards.iter().any(|g| g.is_active())
     }
     /// 从配置文本构建并启动（入站开始监听）
     pub async fn start(
@@ -3950,8 +3950,9 @@ rules: ['MATCH,DIRECT']
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].listener_name, "hy2-mport-test");
         assert_eq!(guards[0].port_ranges, vec![(25000, 25050)]);
+        let is_active = guards[0].is_active();
         drop(guards);
-        assert!(app.has_port_redirects());
+        assert_eq!(app.has_port_redirects(), is_active);
 
         let _ = std::fs::remove_file(cert_path);
         let _ = std::fs::remove_file(key_path);

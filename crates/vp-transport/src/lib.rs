@@ -145,13 +145,15 @@ pub fn tune(stream: &tokio::net::TcpStream) {
         let _ = sock.set_send_buffer_size(t.sndbuf);
     }
 
-    let keepalive_secs = t.keepalive_secs;
-    let ka = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(keepalive_secs))
-        .with_interval(Duration::from_secs(15));
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    let ka = ka.with_retries(3);
-    let _ = sock.set_tcp_keepalive(&ka);
+    let is_loopback = stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
+    if !is_loopback && t.keepalive_secs > 0 {
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(t.keepalive_secs))
+            .with_interval(Duration::from_secs(15));
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let ka = ka.with_retries(3);
+        let _ = sock.set_tcp_keepalive(&ka);
+    }
 
     #[cfg(target_os = "linux")]
     if t.tcp_bbr {
@@ -167,6 +169,41 @@ pub fn tune(stream: &tokio::net::TcpStream) {
             );
         }
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            let one: libc::c_int = 1;
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+        }
+    }
+}
+
+/// 针对 Linux 内核重置 quickack 的特性，在关键交互前强制快速确认（消除 40ms Delayed ACK 停顿）
+pub fn tune_quickack(stream: &tokio::net::TcpStream) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            let one: libc::c_int = 1;
+            let _ = libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = stream;
 }
 
 /// REALITY 扩展配置（VLESS / Trojan 专有，对标 Xray-core / sing-box）

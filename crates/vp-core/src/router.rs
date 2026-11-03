@@ -28,4 +28,9 @@ pub trait Router: Send + Sync {
     /// 规则匹配 + 策略组决策，返回出站。
     /// 内部可能触发 DNS 解析（IP 类规则 + 域名目标时）。
     async fn pick(&self, sess: &Session) -> Resolution;
+
+    /// 路由规则是否需要匹配进程名/路径（未配置时可跳过系统级进程扫描，避免高并发测速下产生无谓系统调用）
+    fn needs_process(&self) -> bool {
+        false
+    }
 }

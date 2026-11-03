@@ -82,30 +82,40 @@ impl Socks5Outbound {
             return Err(Error::Proto("socks5 出站: 不支持的认证方式"));
         }
         // CONNECT
-        let mut req = vec![0x05, 0x01, 0x00];
+        let mut req = Vec::with_capacity(32);
+        req.extend_from_slice(&[0x05, 0x01, 0x00]);
         encode_socks_addr(dst, &mut req);
         io.write_all(&req).await?;
-        // 响应: ver rep rsv atyp addr port
+        // 响应: ver rep rsv atyp
         let mut head = [0u8; 4];
         io.read_exact(&mut head).await?;
+        if head[0] != 0x05 {
+            return Err(Error::Proto("socks5 出站: 版本错误"));
+        }
         if head[1] != 0x00 {
             return Err(Error::ProtoMsg(format!(
                 "socks5 出站: 服务器拒绝 (rep={})",
                 head[1]
             )));
         }
-        let skip = match head[3] {
-            0x01 => 4 + 2,
-            0x03 => {
-                let mut l = [0u8; 1];
-                io.read_exact(&mut l).await?;
-                l[0] as usize + 2
+        // 读取并丢弃 BND.ADDR 与 BND.PORT（精确读取对应长度，绝不过读损坏应用层后续载荷）
+        match head[3] {
+            0x01 => {
+                let mut bnd = [0u8; 6];
+                io.read_exact(&mut bnd).await?;
             }
-            0x04 => 16 + 2,
+            0x04 => {
+                let mut bnd = [0u8; 18];
+                io.read_exact(&mut bnd).await?;
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                io.read_exact(&mut len).await?;
+                let mut bnd = vec![0u8; len[0] as usize + 2];
+                io.read_exact(&mut bnd).await?;
+            }
             _ => return Err(Error::Proto("socks5 出站: atyp 非法")),
-        };
-        let mut rest = vec![0u8; skip];
-        io.read_exact(&mut rest).await?;
+        }
         Ok(io)
     }
 }
@@ -118,6 +128,7 @@ impl Outbound for Socks5Outbound {
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         let io = connect_node(&self.server, self.port).await?;
+        vp_transport::tune_quickack(&io);
         let hs = tokio::time::timeout(std::time::Duration::from_secs(10), self.handshake(io, dst))
             .await
             .map_err(|_| {
@@ -126,6 +137,7 @@ impl Outbound for Socks5Outbound {
                     "socks5 出站握手超时",
                 ))
             })??;
+        vp_transport::tune_quickack(&hs);
         Ok(Box::new(hs))
     }
 

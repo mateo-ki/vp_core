@@ -180,7 +180,7 @@ where
                 }
                 _ => (hp, default_port),
             };
-            (h.to_string(), p, path.to_string())
+            (h, p, path)
         }
         None => {
             // origin-form：从 Host 头取目标
@@ -196,20 +196,23 @@ where
                 .ok_or(vp_common::Error::Proto("http 入站: 缺少 Host"))?;
             let (h, p) = match host_header.rsplit_once(':') {
                 Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                    (h.to_string(), p.parse().unwrap_or(80))
+                    (h, p.parse().unwrap_or(80))
                 }
-                _ => (host_header.to_string(), 80),
+                _ => (host_header, 80),
             };
-            (h, p, target.to_string())
+            (h, p, target)
         }
     };
     let dst = match target_host.parse::<std::net::IpAddr>() {
         Ok(ip) => DstAddr::ip(ip, target_port),
         Err(_) => DstAddr::new(target_host, target_port),
     };
-    // 改写请求行（absolute-form → origin-form），保留首个 \r\n 与后续头
-    let new_first_line = format!("{method} {rewritten} HTTP/1.1");
-    let mut new_req = new_first_line.into_bytes();
+    // 改写请求行（absolute-form → origin-form），保留首个 \r\n 与后续头（零拷贝拼接）
+    let mut new_req = Vec::with_capacity(method.len() + rewritten.len() + buf.len() + 16);
+    new_req.extend_from_slice(method.as_bytes());
+    new_req.push(b' ');
+    new_req.extend_from_slice(rewritten.as_bytes());
+    new_req.extend_from_slice(b" HTTP/1.1");
     if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
         new_req.extend_from_slice(&buf[pos..]);
     }

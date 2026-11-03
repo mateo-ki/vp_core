@@ -159,6 +159,9 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S>
             }
             buf.put_slice(&[self.prefix]);
             self.consumed = true;
+            if buf.remaining() > 0 {
+                let _ = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)

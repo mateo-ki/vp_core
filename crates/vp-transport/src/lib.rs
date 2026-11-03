@@ -675,9 +675,9 @@ pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::S
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let mut addrs: Vec<SocketAddr> = Vec::new();
-    // 1) 优先内置 DNS（多上游并发 + 内存缓存 + 污染过滤）：无阻塞系统调用，微秒级完成
+    // 1) 优先内置纯 UDP DNS（default-nameserver + 内存缓存）：微秒级并发，绝不走 DoH TLS 握手
     if let Some((resolver, ipv6)) = global_node_resolver() {
-        match resolver.resolve_domain(host, ipv6).await {
+        match resolver.resolve_node_domain(host, ipv6).await {
             Ok(ips) if !ips.is_empty() => {
                 let mut seen = std::collections::HashSet::new();
                 for &ip in ips.iter() {
@@ -692,7 +692,7 @@ pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::S
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::debug!("节点域名 {host} 内置 DNS 解析未命中，回退系统解析: {e}");
+                tracing::debug!("节点域名 {host} 内置 UDP DNS 未命中，回退系统解析: {e}");
             }
         }
     }

@@ -92,9 +92,17 @@ jobs:
           cd dist
           if [ "${{ matrix.archive_format }}" = "zip" ]; then
             7z a "${PKG_NAME}.zip" "${PKG_NAME}"
+            cp "${PKG_NAME}.zip" "vpcore-${{ matrix.target }}.zip"
             echo "archive=${PKG_NAME}.zip" >> $GITHUB_OUTPUT
           else
             tar -czvf "${PKG_NAME}.tar.gz" "${PKG_NAME}"
+            cp "${PKG_NAME}.tar.gz" "vpcore-${{ matrix.target }}.tar.gz"
+            if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+              cp "${PKG_NAME}.tar.gz" "vpcore-x86_64-unknown-linux-gnu.tar.gz"
+            fi
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+              cp "${PKG_NAME}.tar.gz" "vpcore-aarch64-unknown-linux-gnu.tar.gz"
+            fi
             echo "archive=${PKG_NAME}.tar.gz" >> $GITHUB_OUTPUT
           fi
 
@@ -102,7 +110,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.target }}
-          path: dist/${{ steps.package.outputs.archive }}
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/vpcore-${{ matrix.target }}.*
+            dist/vpcore-*-unknown-linux-gnu.tar.gz
 
   build-mobile-ffi:
     name: Build Mobile FFI (${{ matrix.platform }})

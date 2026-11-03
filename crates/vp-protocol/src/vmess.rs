@@ -399,13 +399,6 @@ impl VmessBodyCodec {
         out.extend_from_slice(&tag);
     }
 
-    #[allow(dead_code)]
-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
-        let mut out = BytesMut::new();
-        self.seal_chunk_into_bytes(payload, &mut out);
-        out.to_vec()
-    }
-
     /// 尝试从 buf 解出一条 payload；数据不足返回 None。
     /// 必须缓存已解出的分块长度，不能在分片到达时反复消费 SizeMask XOF 流，
     /// 否则会导致掩码失步与后续所有分块解密失败。
@@ -470,14 +463,6 @@ impl BodyCodec {
         }
     }
 
-    #[allow(dead_code)]
-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
-        match self {
-            BodyCodec::Aead(c) => c.seal_chunk(payload),
-            BodyCodec::Plain(c) => c.seal_chunk(payload),
-        }
-    }
-
     fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
         match self {
             BodyCodec::Aead(c) => c.try_open_chunk(buf),
@@ -509,13 +494,6 @@ impl PlainCodec {
         out.extend_from_slice(&len_field.to_be_bytes());
         out.extend_from_slice(&kdf::fnv1a32(payload).to_be_bytes());
         out.extend_from_slice(payload);
-    }
-
-    #[allow(dead_code)]
-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
-        let mut out = BytesMut::new();
-        self.seal_chunk_into_bytes(payload, &mut out);
-        out.to_vec()
     }
 
     fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
@@ -1404,8 +1382,10 @@ mod tests {
         let mut enc = BodyCodec::new(Security::Aes128Gcm, &key, &iv, true).unwrap();
         let mut dec = BodyCodec::new(Security::Aes128Gcm, &key, &iv, true).unwrap();
 
-        let chunk1 = enc.seal_chunk(b"hello vmess chunk 1");
-        let chunk2 = enc.seal_chunk(b"second chunk with more data here");
+        let mut chunk1 = bytes::BytesMut::new();
+        enc.seal_chunk_into_bytes(b"hello vmess chunk 1", &mut chunk1);
+        let mut chunk2 = bytes::BytesMut::new();
+        enc.seal_chunk_into_bytes(b"second chunk with more data here", &mut chunk2);
 
         let mut stream_bytes = Vec::new();
         stream_bytes.extend_from_slice(&chunk1);

@@ -336,8 +336,8 @@ async fn dispatch_tcp(
     mut sess: Session,
     mut client: Box<dyn vp_core::ProxyStream>,
 ) {
-    // 进程归属反查
-    if sess.process.is_none() {
+    // 进程归属反查（仅当规则集包含进程匹配规则时才触发系统查询）
+    if sess.process.is_none() && ctx.router.needs_process() {
         if let Some(src) = sess.src {
             let p = tokio::task::spawn_blocking(move || vp_rule::process::find_process_name(src))
                 .await

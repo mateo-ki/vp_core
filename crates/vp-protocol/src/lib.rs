@@ -44,12 +44,11 @@ use std::sync::Arc;
 use vp_common::DstAddr;
 use vp_common::{Error, Result};
 use vp_config::{
-    AnytlsCfg, GroupCfg, GroupKind, HttpCfg, NaiveCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg,
-    TrojanCfg, VlessCfg, VmessCfg, WsOpts,
+    AnytlsCfg, HttpCfg, NaiveCfg, ProxyCfg, ProxyKind, SocksCfg, SsCfg, TrojanCfg, VlessCfg,
+    VmessCfg, WsOpts,
 };
 use vp_core::{Outbound, PacketConn, ProxyStream, Session};
 use vp_dns::Resolver;
-use vp_router::{GroupSpec, GroupType, LbStrategy};
 use vp_transport::{TransportConfig, WsConfig};
 
 pub use basic_out::{HttpOutbound, RejectOutbound, Socks5Outbound};
@@ -510,30 +509,6 @@ impl Outbound for BoundOutbound {
 
     fn remote_addr(&self) -> Option<(String, u16)> {
         self.inner.remote_addr()
-    }
-}
-
-/// 组定义转换
-pub fn group_spec(g: &GroupCfg) -> GroupSpec {
-    let ty = match g.kind {
-        GroupKind::Select => GroupType::Select,
-        GroupKind::UrlTest => GroupType::UrlTest,
-        GroupKind::Fallback => GroupType::Fallback,
-        GroupKind::LoadBalance => GroupType::LoadBalance,
-        GroupKind::Relay => GroupType::Relay,
-    };
-    GroupSpec {
-        name: g.name.clone(),
-        ty,
-        members: g.proxies.clone(),
-        test_url: g.url.clone(),
-        interval: g.interval.unwrap_or(300),
-        tolerance: g.tolerance.unwrap_or(0),
-        lazy: g.lazy.unwrap_or(true),
-        lb_strategy: match g.strategy.as_deref() {
-            Some("consistent-hashing") => LbStrategy::ConsistentHash,
-            _ => LbStrategy::RoundRobin,
-        },
     }
 }
 

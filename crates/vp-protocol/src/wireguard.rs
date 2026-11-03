@@ -41,10 +41,6 @@ const SESSION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(120)
 /// 应用→栈 与 栈→应用 通道容量
 const CHAN_CAP: usize = 256;
 
-/// WG 包类型字节（boringtun wire 格式首 4 字节前缀）
-#[allow(dead_code)]
-const WG_TYPE_DATA: u32 = 4;
-
 static WG_INDEX_SEQ: AtomicU32 = AtomicU32::new(1);
 static LOCAL_PORT_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -814,8 +810,6 @@ impl AsyncWrite for WgTcpStream {
 pub struct WgOutbound {
     name: Arc<str>,
     core: Arc<WgCore>,
-    #[allow(dead_code)]
-    resolver: Arc<Resolver>,
     direct: Arc<DirectOutbound>,
     udp: bool,
 }
@@ -838,8 +832,7 @@ impl WgOutbound {
         Ok(WgOutbound {
             name: name.into(),
             core,
-            direct: Arc::new(DirectOutbound::new(resolver.clone(), false)),
-            resolver,
+            direct: Arc::new(DirectOutbound::new(resolver, false)),
             udp: cfg.udp,
         })
     }

@@ -487,11 +487,10 @@ pub fn global_node_resolver() -> Option<(std::sync::Arc<vp_dns::Resolver>, bool)
     NODE_RESOLVER.read().ok().and_then(|slot| slot.clone())
 }
 
-static BIND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 pub use vp_dns::{
-    connect_tcp_bound_with_opts, create_udp_socket_with_opts, get_bind_interface_name,
-    get_routing_mark, set_bind_interface_name, set_routing_mark,
+    connect_tcp_bound_with_opts, create_udp_socket_with_opts, get_bind_interface_index,
+    get_bind_interface_name, get_routing_mark, set_bind_interface_index, set_bind_interface_name,
+    set_routing_mark,
 };
 
 /// 节点专属网络出站选项（优先于全局默认配置）
@@ -508,18 +507,6 @@ tokio::task_local! {
 /// 获取当前 task-local 作用域内注入的节点网络出站选项
 pub fn current_socket_opts() -> Option<SocketOpts> {
     CURRENT_SOCKET_OPTS.try_with(|o| o.clone()).ok().flatten()
-}
-
-/// 设置出站套接字强制绑定的物理网卡索引（TUN 模式防环路）
-pub fn set_bind_interface_index(if_idx: u32) {
-    BIND_INTERFACE_INDEX.store(if_idx, std::sync::atomic::Ordering::Relaxed);
-    vp_dns::set_bind_interface_index(if_idx);
-}
-
-/// 获取当前设置的物理网卡索引
-pub fn get_bind_interface_index() -> Option<u32> {
-    let idx = BIND_INTERFACE_INDEX.load(std::sync::atomic::Ordering::Relaxed);
-    if idx > 0 { Some(idx) } else { None }
 }
 
 /// 创建 UDP 套接字，若配置了物理网卡索引/名称或 routing-mark 则绑定防止路由环路

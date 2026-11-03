@@ -285,53 +285,6 @@ pub async fn relay(
     (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed))
 }
 
-/// 把若干段内存按顺序写尽。优先一次 vectored 写（Windows = WSASend 多缓冲，一次
-/// syscall 落全部块）；`write_vectored` 允许部分写，循环推进剩余部分直到写完。
-/// 只剩一段时退回 `write_all`（单块场景 vector 无收益）。
-#[allow(dead_code)]
-async fn write_chain_vectored<'a, W: AsyncWrite + Unpin>(
-    w: &mut W,
-    bufs: &'a [vp_common::bufpool::PooledBuf],
-) -> bool {
-    use std::io::IoSlice;
-    // 各块可写视图（'a 直接指向池块，推进时不产生对自身的借用冲突）
-    let mut parts: Vec<&'a [u8]> = bufs.iter().map(|b| b.as_slice()).collect();
-    loop {
-        while !parts.is_empty() && parts[0].is_empty() {
-            parts.remove(0);
-        }
-        if parts.is_empty() {
-            return true;
-        }
-        let written = if parts.len() == 1 {
-            match w.write_all(parts[0]).await {
-                Ok(()) => parts[0].len(),
-                Err(_) => return false,
-            }
-        } else {
-            let iov: Vec<IoSlice<'a>> = parts.iter().map(|p| IoSlice::new(p)).collect();
-            match w.write_vectored(&iov).await {
-                Ok(n) => n,
-                Err(_) => return false,
-            }
-        };
-        if written == 0 {
-            return false;
-        }
-        let mut rem = written;
-        let mut next: Vec<&'a [u8]> = Vec::with_capacity(parts.len());
-        for p in parts.iter() {
-            if rem >= p.len() {
-                rem -= p.len();
-            } else {
-                next.push(&p[rem..]);
-                rem = 0;
-            }
-        }
-        parts = next;
-    }
-}
-
 /// 链读用的"探一眼"读：只 poll 一次。有数据带回 Data/EOF；
 /// 没数据（Pending）转成 Empty 立即返回。绝不在手里攒着未送达数据时阻塞
 /// 等下一块 —— 请求-响应式对端（发完 2 整块就停下来等回包）会因此死锁：

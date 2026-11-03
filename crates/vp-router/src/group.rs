@@ -50,6 +50,30 @@ pub struct GroupSpec {
     pub lb_strategy: LbStrategy,
 }
 
+/// 将配置中的组定义转为 GroupSpec
+pub fn group_spec(g: &vp_config::GroupCfg) -> GroupSpec {
+    let ty = match g.kind {
+        vp_config::GroupKind::Select => GroupType::Select,
+        vp_config::GroupKind::UrlTest => GroupType::UrlTest,
+        vp_config::GroupKind::Fallback => GroupType::Fallback,
+        vp_config::GroupKind::LoadBalance => GroupType::LoadBalance,
+        vp_config::GroupKind::Relay => GroupType::Relay,
+    };
+    GroupSpec {
+        name: g.name.clone(),
+        ty,
+        members: g.proxies.clone(),
+        test_url: g.url.clone(),
+        interval: g.interval.unwrap_or(300),
+        tolerance: g.tolerance.unwrap_or(0),
+        lazy: g.lazy.unwrap_or(true),
+        lb_strategy: match g.strategy.as_deref() {
+            Some("consistent-hashing") => LbStrategy::ConsistentHash,
+            _ => LbStrategy::RoundRobin,
+        },
+    }
+}
+
 pub struct Group {
     name: Arc<str>,
     ty: GroupType,
@@ -467,13 +491,6 @@ pub async fn url_test_outbound(o: &Arc<dyn Outbound>, url: &str) -> Result<u32> 
     let _permit = sem.acquire().await.ok();
     let d = probe_target(o, &target).await?;
     Ok((d.as_millis() as u32).max(1))
-}
-
-/// 通过指定出站探测测试 URL，返回耗时
-#[allow(dead_code)]
-async fn probe(o: &Arc<dyn Outbound>, url: &str) -> Result<Duration> {
-    let target = ProbeTarget::build(url)?;
-    probe_target(o, &target).await
 }
 
 /// 通过预编译的目标与静态字节高效探测指定出站（零格式化开销，精准计时）

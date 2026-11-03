@@ -14,7 +14,7 @@ use vp_core::{Outbound, Resolution, Router as RouterTrait, RuleHit, Session};
 use vp_dns::Resolver;
 use vp_rule::{MatchCtx, Net, RuleEngine};
 
-pub use group::{Group, GroupSpec, GroupType, LbStrategy};
+pub use group::{Group, GroupSpec, GroupType, LbStrategy, group_spec};
 
 pub struct RouterSpec {
     /// 具名出站（含 DIRECT/REJECT 内置与所有协议节点）

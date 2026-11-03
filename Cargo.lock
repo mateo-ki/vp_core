@@ -2706,6 +2706,7 @@ dependencies = [
  "clap",
  "mimalloc",
  "rcgen",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",

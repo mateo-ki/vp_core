@@ -20,9 +20,9 @@ pub struct UpdateArgs {
 /// 获取当前构建的目标架构三元组
 pub fn get_target_triple() -> &'static str {
     if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        "x86_64-unknown-linux-gnu"
+        "x86_64-unknown-linux-musl"
     } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "aarch64-unknown-linux-gnu"
+        "aarch64-unknown-linux-musl"
     } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
         "x86_64-pc-windows-msvc"
     } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
@@ -32,6 +32,68 @@ pub fn get_target_triple() -> &'static str {
     } else {
         "unknown"
     }
+}
+
+/// 解析或探测最新 Release 下载链接
+pub fn resolve_download_url(target: &str) -> String {
+    let ext = if target.contains("windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+
+    // 优先尝试通过 GitHub API 动态匹配最新的 Release Asset 真实名称与直链
+    let api_url = "https://api.github.com/repos/mateo-ki/vp_core/releases/latest";
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(4))
+        .timeout_read(Duration::from_secs(6))
+        .build();
+
+    if let Ok(resp) = agent
+        .get(api_url)
+        .set("User-Agent", "vpcore-updater")
+        .call()
+    {
+        if let Ok(val) = serde_json::from_reader::<_, serde_json::Value>(resp.into_reader()) {
+            if let Some(assets) = val.get("assets").and_then(|a| a.as_array()) {
+                // 1. 精确匹配包含目标架构三元组的资源文件
+                for asset in assets {
+                    if let (Some(name), Some(url)) = (
+                        asset.get("name").and_then(|n| n.as_str()),
+                        asset.get("browser_download_url").and_then(|u| u.as_str()),
+                    ) {
+                        if name.contains(target) {
+                            return url.to_string();
+                        }
+                    }
+                }
+                // 2. 跨 glibc / musl 模糊匹配（Linux 通用可执行文件）
+                if target.contains("linux") {
+                    let arch_key = if target.contains("aarch64") {
+                        "aarch64"
+                    } else {
+                        "x86_64"
+                    };
+                    for asset in assets {
+                        if let (Some(name), Some(url)) = (
+                            asset.get("name").and_then(|n| n.as_str()),
+                            asset.get("browser_download_url").and_then(|u| u.as_str()),
+                        ) {
+                            if name.contains("linux")
+                                && name.contains(arch_key)
+                                && name.ends_with(".tar.gz")
+                            {
+                                return url.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // API 降级后直接使用最新下载重定向
+    format!("https://github.com/mateo-ki/vp_core/releases/latest/download/vpcore-{target}.{ext}")
 }
 
 /// 执行自我更新主逻辑
@@ -67,9 +129,7 @@ pub fn run(args: UpdateArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else if let Ok(env_url) = std::env::var("VPCORE_UPDATE_URL") {
         env_url
     } else {
-        format!(
-            "https://github.com/mateo-ki/vp_core/releases/latest/download/vpcore-{target}.tar.gz"
-        )
+        resolve_download_url(target)
     };
 
     if args.check {
@@ -182,7 +242,7 @@ fn download_to_file(url: &str, output: &Path) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// 提取解压二进制：支持 tar.gz、直接的可执行二进制文件
+/// 提取解压二进制：支持 tar.gz、zip、以及直接的可执行二进制文件
 fn extract_binary(
     archive_path: &Path,
     extract_to: &Path,
@@ -194,36 +254,50 @@ fn extract_binary(
     };
     let target_bin = extract_to.join(bin_name);
 
-    // 检查是否为 tar.gz
-    let is_tar = (|| -> Option<bool> {
+    // 检查是否为 tar.gz 或 zip
+    let (is_tar, is_zip) = (|| -> Option<(bool, bool)> {
         let mut f = fs::File::open(archive_path).ok()?;
         let mut magic = [0u8; 2];
         use std::io::Read;
         f.read_exact(&mut magic).ok()?;
-        // Gzip magic number 0x1f, 0x8b
-        Some(magic == [0x1f, 0x8b])
+        // Gzip magic number 0x1f, 0x8b; Zip magic 0x50, 0x4b ('PK')
+        Some((magic == [0x1f, 0x8b], magic == [0x50, 0x4b]))
     })()
-    .unwrap_or(false);
+    .unwrap_or((false, false));
 
-    if is_tar {
+    if is_tar || is_zip {
         #[cfg(unix)]
         {
-            let status = Command::new("tar")
-                .arg("-xzf")
-                .arg(archive_path)
-                .arg("-C")
-                .arg(extract_to)
-                .status()
-                .map_err(|e| format!("调用系统 tar 解压失败: {e}"))?;
-            if !status.success() {
-                return Err("系统 tar 解压返回失败代码".into());
+            if is_tar {
+                let status = Command::new("tar")
+                    .arg("-xzf")
+                    .arg(archive_path)
+                    .arg("-C")
+                    .arg(extract_to)
+                    .status()
+                    .map_err(|e| format!("调用系统 tar 解压失败: {e}"))?;
+                if !status.success() {
+                    return Err("系统 tar 解压返回失败代码".into());
+                }
+            } else if is_zip {
+                let status = Command::new("unzip")
+                    .arg("-q")
+                    .arg("-o")
+                    .arg(archive_path)
+                    .arg("-d")
+                    .arg(extract_to)
+                    .status()
+                    .map_err(|e| format!("调用系统 unzip 解压失败: {e}"))?;
+                if !status.success() {
+                    return Err("系统 unzip 解压返回失败代码".into());
+                }
             }
         }
         #[cfg(windows)]
         {
-            // Windows 10/11 内置 bsdtar (tar.exe)
+            // Windows 10/11 内置 bsdtar (tar.exe)，支持 .zip 与 .tar.gz
             let status = Command::new("tar")
-                .arg("-xzf")
+                .arg("-xf")
                 .arg(archive_path)
                 .arg("-C")
                 .arg(extract_to)
@@ -236,9 +310,21 @@ fn extract_binary(
         if target_bin.exists() {
             return Ok(target_bin);
         }
+        // 若压缩包内包含一级子目录（如 vpcore-v1.5.3-.../vpcore），递归扫描匹配
+        if let Ok(entries) = fs::read_dir(extract_to) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    let sub_bin = p.join(bin_name);
+                    if sub_bin.exists() {
+                        return Ok(sub_bin);
+                    }
+                }
+            }
+        }
     }
 
-    // 若不是 tar.gz 或解压后未在顶层找到，则将下载的文件直接视作二进制
+    // 若不是压缩包或解压后未在目录找到，则将下载的文件直接视作二进制
     Ok(archive_path.to_path_buf())
 }
 
@@ -289,6 +375,13 @@ mod tests {
     fn test_target_triple_not_unknown() {
         let triple = get_target_triple();
         assert_ne!(triple, "unknown");
+    }
+
+    #[test]
+    fn test_resolve_download_url() {
+        let url = resolve_download_url("x86_64-unknown-linux-musl");
+        assert!(url.contains("vpcore"));
+        assert!(url.contains("x86_64"));
     }
 
     #[test]

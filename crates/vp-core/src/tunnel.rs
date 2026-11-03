@@ -194,10 +194,11 @@ pub async fn relay(
             t1: None,
             t2: None,
         };
-        let (up_bytes, down_bytes) = match tokio::io::copy_bidirectional(&mut left, &mut right).await {
-            Ok((u, d)) => (u, d),
-            Err(_) => (0, 0),
-        };
+        let (up_bytes, down_bytes) =
+            match tokio::io::copy_bidirectional(&mut left, &mut right).await {
+                Ok((u, d)) => (u, d),
+                Err(_) => (0, 0),
+            };
         up.store(up_bytes, Ordering::Relaxed);
         down.store(down_bytes, Ordering::Relaxed);
         if let Some(s) = &hook.stats {

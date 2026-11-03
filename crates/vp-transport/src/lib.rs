@@ -145,7 +145,10 @@ pub fn tune(stream: &tokio::net::TcpStream) {
         let _ = sock.set_send_buffer_size(t.sndbuf);
     }
 
-    let is_loopback = stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
+    let is_loopback = stream
+        .peer_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
     if !is_loopback && t.keepalive_secs > 0 {
         let ka = socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(t.keepalive_secs))

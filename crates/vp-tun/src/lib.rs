@@ -22,6 +22,7 @@ use vp_core::stream::UdpPacket;
 use vp_dns::{FakeIpPool, Resolver};
 
 pub mod auto_route;
+pub mod port_redirect;
 pub mod wintun_installer;
 
 #[derive(Clone)]

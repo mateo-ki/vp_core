@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+#[allow(unused_imports)]
+use tracing::{debug, info, warn};
 
 use vp_common::{Error, Result, Stats};
 use vp_config::Format;
@@ -307,9 +308,19 @@ pub struct App {
     pub dns: Arc<Resolver>,
     /// 多用户管理器（控制面动态管理 + 认证配额限速）
     pub user_manager: Arc<vp_core::UserManager>,
+    /// 内核级 UDP 端口重定向守卫（RAII 自动管理 iptables/ip6tables 规则）
+    pub port_redirect_guards: Arc<RwLock<Vec<vp_tun::port_redirect::IptablesPortRedirectGuard>>>,
 }
 
 impl App {
+    /// 是否存在已激活的 iptables 端口重定向守卫
+    pub fn has_port_redirects(&self) -> bool {
+        let guards = self
+            .port_redirect_guards
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        !guards.is_empty()
+    }
     /// 从配置文本构建并启动（入站开始监听）
     pub async fn start(
         text: &str,
@@ -838,6 +849,7 @@ impl App {
 
         // 入站
         let mut listen_ports = Vec::new();
+        let mut port_redirect_guards = Vec::new();
         let mut tun_runtime_opt: Option<TunRuntime> = None;
         let tun_status: Arc<RwLock<TunStatus>>;
         let dns_status: Arc<RwLock<DnsStatus>>;
@@ -1003,6 +1015,21 @@ impl App {
                     Ok(bound) => {
                         info!("listener {} [{}] 监听 {bind}:{bound}", l.name, l.kind);
                         listen_ports.push((l.name.clone(), bound));
+                        if let Some(port_spec) = l.ports.as_deref() {
+                            match vp_tun::port_redirect::IptablesPortRedirectGuard::setup(
+                                &l.name, port_spec, bound, cfg.ipv6,
+                            ) {
+                                Ok(guard) => {
+                                    port_redirect_guards.push(guard);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "listener [{}] 配置 iptables 端口重定向失败: {e}",
+                                        l.name
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(e) => warn!("listener {:?} 启动失败: {e}", l.name),
                 }
@@ -1146,6 +1173,7 @@ impl App {
             dns_status,
             dns,
             user_manager,
+            port_redirect_guards: Arc::new(RwLock::new(port_redirect_guards)),
         };
         Ok(Arc::new(app))
     }
@@ -1672,7 +1700,33 @@ fn build_listener(
             } else {
                 l.obfs_password.as_deref()
             };
-            let ports = l.ports.as_deref().map(parse_ports_list);
+            let ports = l.ports.as_deref().and_then(|spec| {
+                let list = parse_ports_list(spec);
+                if list.len() > 64 {
+                    #[cfg(target_os = "linux")]
+                    {
+                        debug!(
+                            "listener [{}] ports 包含 {} 个端口，将由内核级 iptables REDIRECT 接管，避免用户态海量 socket 绑定",
+                            l.name,
+                            list.len()
+                        );
+                        None
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        warn!(
+                            "listener [{}] ports 包含 {} 个端口，非 Linux 环境用户态最多绑定前 64 个端口以防文件描述符耗尽",
+                            l.name,
+                            list.len()
+                        );
+                        Some(list[..64].to_vec())
+                    }
+                } else if list.is_empty() {
+                    None
+                } else {
+                    Some(list)
+                }
+            });
             Ok(Arc::new(
                 vp_protocol::hysteria2::Hysteria2Inbound::with_gate(
                     bind,
@@ -3856,5 +3910,50 @@ rules: ['MATCH,DIRECT']
         let mut ok_buf = [0u8; 8];
         s.read_exact(&mut ok_buf).await.unwrap();
         assert_eq!(&ok_buf, b"knock-ok");
+    }
+
+    /// listeners 段端到端：UDP 端口跳跃 iptables 守卫生命周期与状态测试
+    #[tokio::test]
+    async fn test_listener_port_redirect_guard_lifecycle() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let temp_dir = std::env::temp_dir();
+        let cert_path = temp_dir.join(format!("test_hy2_cert_{}.pem", std::process::id()));
+        let key_path = temp_dir.join(format!("test_hy2_key_{}.pem", std::process::id()));
+        std::fs::write(&cert_path, cert_pem).unwrap();
+        std::fs::write(&key_path, key_pem).unwrap();
+
+        let cfg = format!(
+            r#"
+mode: direct
+listeners:
+  - name: hy2-mport-test
+    type: hysteria2
+    port: 0
+    listen: 127.0.0.1
+    users: ["secret123"]
+    cert: "{cert_file}"
+    key: "{key_file}"
+    ports: "25000-25050"
+rules: ['MATCH,DIRECT']
+"#,
+            cert_file = cert_path.to_str().unwrap().replace('\\', "/"),
+            key_file = key_path.to_str().unwrap().replace('\\', "/"),
+        );
+
+        let app = App::start(&cfg, Format::Yaml, &temp_dir, true)
+            .await
+            .unwrap();
+        // 验证 Guard 已建立且状态一致
+        let guards = app.port_redirect_guards.read().unwrap();
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].listener_name, "hy2-mport-test");
+        assert_eq!(guards[0].port_ranges, vec![(25000, 25050)]);
+        drop(guards);
+        assert!(app.has_port_redirects());
+
+        let _ = std::fs::remove_file(cert_path);
+        let _ = std::fs::remove_file(key_path);
     }
 }

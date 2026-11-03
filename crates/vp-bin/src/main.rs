@@ -76,7 +76,7 @@ enum Cmd {
         #[arg(long)]
         user_agent: Option<String>,
     },
-    /// 应急清理所有系统 TUN 历史残留路由（恢复网络）
+    /// 应急清理所有系统 TUN 历史残留路由与 iptables 端口重定向（恢复网络）
     CleanRoutes,
     /// 一键生成服务端配置及客户端分享链接
     #[command(name = "gen-server", alias = "init-server")]
@@ -650,11 +650,23 @@ async fn main() {
             if installed_routes {
                 let _ = vp_tun::auto_route::clean_all_routes();
             }
+            if app.has_port_redirects() {
+                let _ = vp_tun::port_redirect::clean_all_port_redirects();
+            }
             println!("bye");
         }
-        Cmd::CleanRoutes => match vp_tun::auto_route::clean_all_routes() {
-            Ok(()) => println!("✓ 已清理所有系统 TUN 历史残留路由，网络已自愈恢复"),
-            Err(e) => eprintln!("✗ 清理路由失败: {e}"),
-        },
+        Cmd::CleanRoutes => {
+            let r1 = vp_tun::auto_route::clean_all_routes();
+            let r2 = vp_tun::port_redirect::clean_all_port_redirects();
+            match (r1, r2) {
+                (Ok(()), Ok(())) => {
+                    println!(
+                        "✓ 已清理所有系统 TUN 历史残留路由与 iptables 端口重定向，网络已自愈恢复"
+                    );
+                }
+                (Err(e), _) => eprintln!("✗ 清理路由失败: {e}"),
+                (_, Err(e)) => eprintln!("✗ 清理 iptables 端口重定向失败: {e}"),
+            }
+        }
     }
 }

@@ -207,6 +207,15 @@ impl Matcher {
         }
     }
 
+    pub fn needs_process(&self) -> bool {
+        match self {
+            Matcher::ProcessName(_) | Matcher::ProcessPath(_) => true,
+            Matcher::Logic { subs, .. } => subs.iter().any(|m| m.needs_process()),
+            Matcher::SubRules(list) => list.iter().any(|r| r.matcher.needs_process()),
+            _ => false,
+        }
+    }
+
     /// 是否含降级占位（NeverMatch：缺数据库 / 未知类型 / 嵌套过深）
     fn is_degraded(&self) -> bool {
         match self {
@@ -275,6 +284,7 @@ pub struct MatchResult<'a> {
 pub struct RuleEngine {
     rules: Vec<CompiledRule>,
     needs_ip: bool,
+    needs_process: bool,
 }
 
 impl RuleEngine {
@@ -288,6 +298,10 @@ impl RuleEngine {
 
     pub fn needs_dst_ip(&self) -> bool {
         self.needs_ip
+    }
+
+    pub fn needs_process(&self) -> bool {
+        self.needs_process
     }
 
     pub fn rules(&self) -> &[CompiledRule] {
@@ -476,9 +490,11 @@ pub fn compile(rules: &[String], env: &CompileEnv<'_>) -> Result<RuleEngine, Vec
 
     if errs.is_empty() {
         let needs_ip = compiled.iter().any(|r| r.needs_dst_ip());
+        let needs_process = compiled.iter().any(|r| r.matcher.needs_process());
         Ok(RuleEngine {
             rules: compiled,
             needs_ip,
+            needs_process,
         })
     } else {
         Err(errs)

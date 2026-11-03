@@ -101,21 +101,23 @@ async fn serve_mixed(
     tag: Arc<str>,
     ctx: &InboundCtx,
 ) -> Result<()> {
-    // 预读首字节判断协议
-    let mut first = [0u8; 1];
-    stream.read_exact(&mut first).await?;
-    // 回填：包装流
+    // 预读大块缓冲（彻底消除单字节 read 系统调用与 IOCP/epoll 线程唤醒风暴）
+    let mut temp = [0u8; 1024];
+    let n = stream.read(&mut temp).await?;
+    if n == 0 {
+        return Ok(());
+    }
+    let first = temp[0];
     let stream = PrefixedStream {
         inner: stream,
-        prefix: first[0],
-        consumed: false,
+        prefix: temp[..n].to_vec(),
+        pos: 0,
     };
 
-    if first[0] == 0x05 {
+    if first == 0x05 {
         serve_socks5(stream, src, tag, ctx).await
     } else {
-        let c = first[0];
-        let looks_http = HTTP_METHODS.iter().any(|m| m[0] == c);
+        let looks_http = HTTP_METHODS.iter().any(|m| m[0] == first);
         if looks_http {
             serve_http(stream, src, tag, ctx).await
         } else {
@@ -124,11 +126,11 @@ async fn serve_mixed(
     }
 }
 
-/// 把预读的一个字节注回流的包装器
+/// 把预读的多字节缓冲注回流的高性能包装器
 pub struct PrefixedStream<S> {
     inner: S,
-    prefix: u8,
-    consumed: bool,
+    prefix: Vec<u8>,
+    pos: usize,
 }
 
 impl<S> vp_core::ProxyStream for PrefixedStream<S> where
@@ -141,8 +143,17 @@ impl<S> PrefixedStream<S> {
     pub fn new(inner: S, prefix: u8) -> Self {
         PrefixedStream {
             inner,
+            prefix: vec![prefix],
+            pos: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_bytes(inner: S, prefix: Vec<u8>) -> Self {
+        PrefixedStream {
+            inner,
             prefix,
-            consumed: false,
+            pos: 0,
         }
     }
 }
@@ -153,15 +164,11 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S>
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        if !self.consumed {
-            if buf.remaining() == 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            buf.put_slice(&[self.prefix]);
-            self.consumed = true;
-            if buf.remaining() > 0 {
-                let _ = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
-            }
+        if self.pos < self.prefix.len() {
+            let available = self.prefix.len() - self.pos;
+            let to_copy = available.min(buf.remaining());
+            buf.put_slice(&self.prefix[self.pos..self.pos + to_copy]);
+            self.pos += to_copy;
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)

@@ -199,6 +199,10 @@ impl Router {
         &self.dns
     }
 
+    pub fn needs_process(&self) -> bool {
+        self.rules.needs_process()
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
@@ -363,6 +367,10 @@ impl RouterTrait for Router {
             via,
             rule,
         }
+    }
+
+    fn needs_process(&self) -> bool {
+        self.rules.needs_process()
     }
 }
 

@@ -2,7 +2,7 @@
 //! 组本身实现 Outbound，天然支持嵌套（构建期保证无环）。
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -55,7 +55,7 @@ pub struct Group {
     ty: GroupType,
     members: Vec<Arc<dyn Outbound>>,
     member_names: Vec<Arc<str>>,
-    select_now: RwLock<usize>,
+    select_now: AtomicUsize,
     rr_counter: AtomicU32,
     /// url-test/fallback 当前选择
     selected: AtomicUsize,
@@ -78,7 +78,7 @@ impl Group {
             ty: spec.ty,
             members,
             member_names,
-            select_now: RwLock::new(0),
+            select_now: AtomicUsize::new(0),
             rr_counter: AtomicU32::new(0),
             selected: AtomicUsize::new(0),
             alive: Mutex::new(vec![false; n]),
@@ -113,7 +113,7 @@ impl Group {
         }
         match self.ty {
             GroupType::Select => {
-                let i = *self.select_now.read().unwrap();
+                let i = self.select_now.load(Ordering::Relaxed);
                 i.min(n - 1)
             }
             GroupType::UrlTest | GroupType::Fallback => {
@@ -160,7 +160,7 @@ impl Group {
             return false;
         }
         if let Some(i) = self.member_names.iter().position(|n| &**n == member) {
-            *self.select_now.write().unwrap() = i;
+            self.select_now.store(i, Ordering::Relaxed);
             true
         } else {
             false
@@ -171,7 +171,7 @@ impl Group {
     pub fn unfix_selected(&self) -> bool {
         match self.ty {
             GroupType::Select => {
-                *self.select_now.write().unwrap() = 0;
+                self.select_now.store(0, Ordering::Relaxed);
                 true
             }
             GroupType::UrlTest | GroupType::Fallback => {
@@ -189,7 +189,7 @@ impl Group {
     pub fn selected_name(&self) -> Arc<str> {
         match self.ty {
             GroupType::Select => {
-                let i = *self.select_now.read().unwrap();
+                let i = self.select_now.load(Ordering::Relaxed);
                 self.member_names[i.min(self.member_names.len() - 1)].clone()
             }
             _ => {
@@ -640,7 +640,7 @@ impl Outbound for Group {
 impl Group {
     /// select 组当前选中的成员
     fn selected_member(&self) -> &Arc<dyn Outbound> {
-        let i = *self.select_now.read().unwrap();
+        let i = self.select_now.load(Ordering::Relaxed);
         &self.members[i.min(self.members.len().saturating_sub(1))]
     }
 

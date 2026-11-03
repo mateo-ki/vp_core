@@ -56,8 +56,8 @@ pub async fn dispatch_stream(
         return;
     }
 
-    // 进程归属（Windows 查表 + 缓存；其它平台 None）
-    if sess.process.is_none() {
+    // 进程归属（仅在路由规则显式包含进程规则时才触发查询，避免无谓的系统级全盘与 TCP 表扫描消耗）：
+    if sess.process.is_none() && ctx.router.needs_process() {
         if let Some(src) = sess.src {
             let p = tokio::task::spawn_blocking(move || vp_rule::process::find_process_name(src))
                 .await

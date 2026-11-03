@@ -1,3 +1,24 @@
+# 🚀 VP_Core v1.5.1 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.5.1**！本版引入 **Linux 内核级 iptables / ip6tables UDP 多端口跳跃重定向守卫 (IptablesPortRedirectGuard) + 零脚本开箱即用 + 孤儿规则自愈 + 双栈抗 QoS 丢包** 专项加固：
+
+### 🛡️ Linux 内核级 UDP 多端口跳跃重定向 (Port Hopping Netfilter REDIRECT)
+- **原生内核级重定向**：针对运营商对单端口 UDP 施加的 QoS 恶劣限速与丢包，当服务端 Listener 配置宽范围端口跳跃（如 `ports: "20000-40000"` 共 20,001 个端口）时，自动注入 Linux 内核 Netfilter `REDIRECT` 规则，由内核网络层瞬时转发至主监听端口；
+- **杜绝文件描述符耗尽 (`EMFILE`)**：免去在用户态逐一绑定成千上万个 UDP 套接字的系统开销，显著降低内存占用与调度损耗，小内存 VPS 也能稳定运行超大范围端口跳跃。
+
+### 🔄 RAII 生命周期守护与零脚本无感开箱即用 (IptablesPortRedirectGuard)
+- **全自动注入与清理**：告别繁琐的手动编写 iptables 脚本与开机自启配置；服务启动时由内核自动检查并注入缺失规则，服务终止或接收终止信号时通过 Rust `Drop` 机制全自动撤销还原；
+- **跨平台平滑降级**：非 Linux 平台自动编译为安全 no-op 并对用户态套接字数量进行上限保护（最多 64 端口）；在无 root 权限或缺省工具环境下输出友好提示并优雅回退，绝不 panic。
+
+### 🧹 孤儿规则深度自愈与应急网络恢复 (Sweep & clean-routes)
+- **唯一注释标签索引**：所有由 VP_Core 注入的重定向规则均自动标记 `-m comment --comment "vpcore-mport-<listener>"`；
+- **自愈清理与应急工具联动**：针对断电、意外崩溃或被 `kill -9` 强杀遗留的孤儿规则，联动 `vpcore clean-routes` 应急自愈命令，执行 `iptables -t nat -S PREROUTING` 逆向解析，一键批处理清理所有残留重定向规则。
+
+### 🌐 IPv4 + IPv6 全双栈协同支持
+- **同步管理双栈防火墙**：当配置开启 `ipv6: true` 时，自动同步向 `ip6tables` 注入并管理对应端口重定向规则，保证 IPv6 与 IPv4 客户端获得完全一致的抗 QoS 跳跃体验。
+
+---
+
 # 🚀 VP_Core v1.5.0 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.5.0**！本版是 **全协议原生 UDP 矩阵 + XUDP / packetaddr 编码 + XTLS Vision / REALITY / TUIC 互通互联重构 + QUIC Happy Eyeballs 竞速** 重大里程碑版本：

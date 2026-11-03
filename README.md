@@ -10,7 +10,7 @@
 
 - ⚡ **极致轻量**：Linux Musl 单文件仅 **4.3 MB**，空载常驻内存 (RSS) 仅 **10~20 MB**（零 GC 停顿），512MB 低配 VPS 轻松拉满。
 - 🚀 **极高吞吐**：基于 Rust + Tokio 异步运行时，全链路池化零拷贝，千兆线速轻松跑满。
-- 🛡️ **生产级服务端**：原生支持 VLESS (REALITY/WS CDN穿透)、SS-2022、Hysteria 2、Trojan、TUIC v5，内置 UDP RRL 防反射与端口敲门隐身防御。
+- 🛡️ **生产级服务端**：原生支持 VLESS (REALITY/WS CDN穿透)、SS-2022、Hysteria 2、Trojan、TUIC v5，内置内核级 iptables 端口跳跃重定向、UDP RRL 防反射与端口敲门隐身防御。
 - 🌐 **一键开服与订阅**：内置开服引擎与动态 HTTP 订阅端点（`/sub`），自动输出 Clash 规则配置与通用节点链接。
 - 🔌 **全协议原生 UDP**：原生支持 VLESS/VMess/Trojan UDP、XUDP (Mux.Cool) 及 packetaddr 编码，支持单连接多目标 (Full-Cone)。
 - 📱 **全平台覆盖**：Windows (Wintun)、Linux (Musl/OpenWrt)、macOS、Android 与 iOS。
@@ -44,6 +44,7 @@ vpcore sub "<URL>" -o config.yaml   # 拉取远程订阅生成客户端配置
 vpcore validate -c config.yaml      # 校验配置文件语法与端口
 vpcore run -c config.yaml           # 启动代理 / VPN 服务
 vpcore test -c config.yaml          # 全节点延迟并发测速
+vpcore clean-routes                 # 应急清理残留路由与 iptables 端口重定向
 ```
 
 ### 3. 极简配置示例 (`config.yaml`)

@@ -722,6 +722,7 @@ impl App {
             mode: cfg.mode,
             dns: dns.clone(),
             ipv6: cfg.ipv6,
+            start_health_checks: start_listeners,
         })?;
 
         let router_handle = Arc::new(RouterHandle::new(router));
@@ -1180,9 +1181,43 @@ impl App {
 
     /// 全组测速（CLI test 用）
     pub async fn url_test_all_groups(&self) {
-        for (name, g) in self.router.current().groups() {
+        let router = self.router.current();
+        let groups = router.groups();
+        if groups.is_empty() {
+            println!("没有可测速的策略组");
+            return;
+        }
+
+        // 收集所有策略组中所有唯一的底层节点名称，避免多组重叠导致同一节点被重复连接测速数次
+        let mut unique_members: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for g in groups.values() {
+            for m in g.member_names() {
+                if router.outbound(m).is_some() && seen.insert(m.to_string()) {
+                    unique_members.push(m.to_string());
+                }
+            }
+        }
+
+        let test_url = groups
+            .values()
+            .next()
+            .map(|g| g.test_url())
+            .unwrap_or("http://www.gstatic.com/generate_204");
+
+        // 一次性高并发（128 并发通道）批量探测所有唯一节点，结果自动同步回填至所有策略组
+        let mut set = tokio::task::JoinSet::new();
+        for member in unique_members {
+            let r_clone = router.clone();
+            let url = test_url.to_string();
+            set.spawn(async move {
+                let _ = r_clone.url_test_node(&member, &url).await;
+            });
+        }
+        while set.join_next().await.is_some() {}
+
+        for (name, g) in groups {
             println!("组 {name} [{}]:", g.ty().as_str());
-            g.url_test_all().await;
             for (member, delay, alive) in g.member_states() {
                 match delay {
                     Some(ms) if alive => println!("  {member:<24} {ms:>5} ms"),

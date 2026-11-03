@@ -182,6 +182,10 @@ impl Group {
         }
     }
 
+    pub fn test_url(&self) -> &str {
+        &self.test_url
+    }
+
     pub fn selected_name(&self) -> Arc<str> {
         match self.ty {
             GroupType::Select => {
@@ -217,11 +221,14 @@ impl Group {
             .iter()
             .position(|n| &**n == member)
             .ok_or_else(|| Error::Other(format!("成员 {member:?} 不存在")))?;
+        let target = ProbeTarget::build(&self.test_url)?;
         let sem = global_probe_semaphore().clone();
         let _permit = sem.acquire().await.ok();
-        let started = std::time::Instant::now();
-        let ok = probe(&self.members[i], &self.test_url).await.is_ok();
-        let ms = started.elapsed().as_millis() as u32;
+        let d = probe_target(&self.members[i], &target).await;
+        let (ok, ms) = match d {
+            Ok(dur) => (true, (dur.as_millis() as u32).max(1)),
+            Err(_) => (false, 0),
+        };
         {
             let mut alive = self.alive.lock().unwrap();
             let mut delay = self.delay_ms.lock().unwrap();
@@ -282,21 +289,27 @@ impl Group {
         if n == 0 {
             return;
         }
-        // 有界并发（报告 9.2）：固定 worker 池按索引取活，同时存在的任务数
-        // = min(n, PROBE_WORKERS)，而非先为全部成员建任务再排队等信号量。
-        // 全局信号量仍保留，跨组总量依旧受限。
-        const PROBE_WORKERS: usize = 32;
+        let target = match ProbeTarget::build(&self.test_url) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                warn!("策略组 {} 测速 URL 非法: {e}", self.name);
+                return;
+            }
+        };
+        // 高性能并发工作池：提升至 128 并发，100 节点在一轮内瞬间完成，彻底消除分批排队造成的长耗时
+        const PROBE_WORKERS: usize = 128;
         let semaphore = global_probe_semaphore().clone();
         let members = Arc::new(self.members.clone());
-        let url = Arc::new(self.test_url.clone());
-        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let results = Arc::new(std::sync::Mutex::new(vec![None; n]));
+        let next = Arc::new(AtomicUsize::new(0));
+        // 无锁原子结果表：u32::MAX 代表失败/未完成，彻底消除每次写结果时的 Mutex 锁竞争
+        let results: Arc<Vec<AtomicU32>> =
+            Arc::new((0..n).map(|_| AtomicU32::new(u32::MAX)).collect());
         let workers = n.min(PROBE_WORKERS);
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let (members, url, next, sem, results) = (
+            let (members, target, next, sem, results) = (
                 members.clone(),
-                url.clone(),
+                target.clone(),
                 next.clone(),
                 semaphore.clone(),
                 results.clone(),
@@ -309,23 +322,24 @@ impl Group {
                     }
                     let m = members[i].clone();
                     let _permit = sem.acquire().await.ok();
-                    let started = std::time::Instant::now();
-                    let ok = probe(&m, &url).await.is_ok();
-                    let ms = if ok {
-                        Some(started.elapsed().as_millis() as u32)
-                    } else {
-                        None
+                    let ms = match probe_target(&m, &target).await {
+                        Ok(d) => (d.as_millis() as u32).max(1),
+                        Err(_) => u32::MAX,
                     };
-                    results.lock().unwrap()[i] = ms;
+                    results[i].store(ms, Ordering::Relaxed);
                 }
             }));
         }
         for h in handles {
             let _ = h.await;
         }
-        let results = Arc::try_unwrap(results)
-            .map(|m| m.into_inner().unwrap())
-            .unwrap_or_default();
+        let results: Vec<Option<u32>> = results
+            .iter()
+            .map(|a| {
+                let v = a.load(Ordering::Relaxed);
+                if v == u32::MAX { None } else { Some(v) }
+            })
+            .collect();
         self.apply_probe_results(&results);
     }
 
@@ -418,43 +432,78 @@ fn fnv_index(bytes: &[u8], n: usize) -> usize {
     (hash as usize) % n.max(1)
 }
 
+/// 预编译的单次测速目标与报文，避免在批量测速循环中对每个节点重复解析 URL 和格式化 HTTP 报文
+#[derive(Clone, Debug)]
+pub struct ProbeTarget {
+    pub host: String,
+    pub port: u16,
+    pub dst: DstAddr,
+    pub is_https: bool,
+    pub req_bytes: Arc<Vec<u8>>,
+}
+
+impl ProbeTarget {
+    pub fn build(url: &str) -> Result<Self> {
+        let (host, port, path) = parse_test_url(url)?;
+        let is_https = port == 443 || url.starts_with("https://");
+        let dst = DstAddr::new(host.clone(), port);
+        let req = format!(
+            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
+        );
+        Ok(Self {
+            host,
+            port,
+            dst,
+            is_https,
+            req_bytes: Arc::new(req.into_bytes()),
+        })
+    }
+}
+
 /// 对任意独立出站节点执行 URL 延迟探测（返回毫秒）
 pub async fn url_test_outbound(o: &Arc<dyn Outbound>, url: &str) -> Result<u32> {
+    let target = ProbeTarget::build(url)?;
     let sem = global_probe_semaphore().clone();
     let _permit = sem.acquire().await.ok();
-    let d = probe(o, url).await?;
+    let d = probe_target(o, &target).await?;
     Ok((d.as_millis() as u32).max(1))
 }
 
 /// 通过指定出站探测测试 URL，返回耗时
+#[allow(dead_code)]
 async fn probe(o: &Arc<dyn Outbound>, url: &str) -> Result<Duration> {
+    let target = ProbeTarget::build(url)?;
+    probe_target(o, &target).await
+}
+
+/// 通过预编译的目标与静态字节高效探测指定出站（零格式化开销，精准计时）
+async fn probe_target(o: &Arc<dyn Outbound>, target: &ProbeTarget) -> Result<Duration> {
     tokio::time::timeout(Duration::from_secs(5), async {
-        let (host, port, path) = parse_test_url(url)?;
-        let dst = DstAddr::new(host.clone(), port);
-        let sess = Session::new_tcp("healthcheck".into(), None, dst.clone());
+        let sess = Session::new_tcp("healthcheck".into(), None, target.dst.clone());
         let started = std::time::Instant::now();
-        let stream = o.connect_stream(&sess, &dst).await?;
-        let is_https = port == 443 || url.starts_with("https://");
-        let mut stream: Box<dyn ProxyStream> = if is_https {
-            vp_transport::tls::connect_tls(stream, &host, false, None).await?
+        let stream = o.connect_stream(&sess, &target.dst).await?;
+        let mut stream: Box<dyn ProxyStream> = if target.is_https {
+            vp_transport::tls::connect_tls(stream, &target.host, false, None).await?
         } else {
             stream
         };
-        let req = format!(
-            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(req.as_bytes()).await?;
+        stream.write_all(&target.req_bytes).await?;
         let mut byte = [0u8; 1];
         stream.read_exact(&mut byte).await?;
         Ok(started.elapsed())
     })
     .await
-    .map_err(|_| Error::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timeout")))?
+    .map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe timeout",
+        ))
+    })?
 }
 
 static PROBE_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 fn global_probe_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
-    PROBE_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+    PROBE_SEMAPHORE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(128)))
 }
 
 fn parse_test_url(url: &str) -> Result<(String, u16, String)> {

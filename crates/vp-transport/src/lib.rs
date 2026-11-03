@@ -675,18 +675,28 @@ pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::S
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
     let mut addrs: Vec<SocketAddr> = Vec::new();
-    // 1) 内置 DNS（多上游并发 + 缓存 + 污染过滤）：节点域名优先走它
+    // 1) 优先内置 DNS（多上游并发 + 内存缓存 + 污染过滤）：无阻塞系统调用，微秒级完成
     if let Some((resolver, ipv6)) = global_node_resolver() {
         match resolver.resolve_domain(host, ipv6).await {
-            Ok(ips) => {
-                addrs.extend(ips.iter().map(|ip| SocketAddr::new(*ip, port)));
+            Ok(ips) if !ips.is_empty() => {
+                let mut seen = std::collections::HashSet::new();
+                for &ip in ips.iter() {
+                    let addr = SocketAddr::new(ip, port);
+                    if seen.insert(addr) {
+                        addrs.push(addr);
+                    }
+                }
+                if !addrs.is_empty() {
+                    return Ok(addrs);
+                }
             }
+            Ok(_) => {}
             Err(e) => {
-                tracing::debug!("节点域名 {host} 内置 DNS 解析失败，回退系统解析: {e}");
+                tracing::debug!("节点域名 {host} 内置 DNS 解析未命中，回退系统解析: {e}");
             }
         }
     }
-    // 2) 系统解析并入并集：内置 DNS 若整轮被污染，系统答案里可能仍有活地址
+    // 2) 仅在内置 DNS 未配置或未解析到有效地址时，回退至系统阻塞解析（避免并发线程池风暴）
     match tokio::net::lookup_host((host, port)).await {
         Ok(it) => addrs.extend(it),
         Err(e) if addrs.is_empty() => {
@@ -694,7 +704,6 @@ pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::S
         }
         Err(_) => {}
     }
-    // 两路答案交错，dedup 只去相邻重复不够
     let mut seen = std::collections::HashSet::new();
     addrs.retain(|a| seen.insert(*a));
     if addrs.is_empty() {

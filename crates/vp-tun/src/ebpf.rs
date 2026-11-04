@@ -196,6 +196,7 @@ mod tests {
 
     #[test]
     fn test_ebpf_manager_lifecycle() {
+        #[allow(unused_mut)]
         let mut mgr = EbpfBypassManager::new(7890, None);
         assert!(!mgr.is_active());
         #[cfg(not(target_os = "linux"))]
@@ -203,6 +204,11 @@ mod tests {
             let res = mgr.try_attach();
             assert!(res.is_err());
             assert!(res.unwrap_err().contains("降级使用标准 TUN 模式"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // 在 Linux CI / 普通容器环境中，try_attach 将优雅返回降级 Err
+            let _ = mgr.try_attach();
         }
     }
 }

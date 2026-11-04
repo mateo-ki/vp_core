@@ -171,10 +171,12 @@ jobs:
 
       - name: Build iOS Static Libraries
         if: matrix.platform == 'ios'
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "14.0"
         run: |
-          cargo build --release --target aarch64-apple-ios -p vp-ffi
-          cargo build --release --target aarch64-apple-ios-sim -p vp-ffi
-          cargo build --release --target x86_64-apple-ios -p vp-ffi || true
+          cargo rustc --release --target aarch64-apple-ios -p vp-ffi --crate-type staticlib
+          cargo rustc --release --target aarch64-apple-ios-sim -p vp-ffi --crate-type staticlib
+          cargo rustc --release --target x86_64-apple-ios -p vp-ffi --crate-type staticlib || true
 
           mkdir -p dist/ios/include
           cp crates/vp-ffi/include/vpcore.h dist/ios/include/
@@ -195,6 +197,7 @@ jobs:
           cp target/aarch64-apple-ios/release/libvpcore.a dist/ios/device/
 
           # 打包 XCFramework
+          rm -rf dist/VPCore.xcframework
           xcodebuild -create-xcframework \
             -library dist/ios/device/libvpcore.a -headers dist/ios/include \
             -library dist/ios/sim/libvpcore.a -headers dist/ios/include \

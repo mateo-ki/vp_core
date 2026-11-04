@@ -1,6 +1,7 @@
 //! vp-app：应用组装层。配置 → 运行时（出站/组/规则/路由/入站/控制器 API）。
 
 pub mod api;
+pub mod consts;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,14 @@ impl RouterHandle {
 impl Router for RouterHandle {
     async fn pick(&self, sess: &Session) -> Resolution {
         self.current().pick(sess).await
+    }
+
+    fn needs_process(&self) -> bool {
+        self.current().needs_process()
+    }
+
+    fn fallback_proxy_outbound(&self) -> Option<Arc<dyn vp_core::Outbound>> {
+        self.current().fallback_proxy_outbound()
     }
 }
 
@@ -310,6 +319,8 @@ pub struct App {
     pub user_manager: Arc<vp_core::UserManager>,
     /// 内核级 UDP 端口重定向守卫（RAII 自动管理 iptables/ip6tables 规则）
     pub port_redirect_guards: Arc<RwLock<Vec<vp_tun::port_redirect::IptablesPortRedirectGuard>>>,
+    /// Fake-IP 持久化守护者（异步防抖落盘与优雅关机）
+    pub fakeip_persister: Option<Arc<vp_dns::FakeIpPersister>>,
 }
 
 impl App {
@@ -585,6 +596,16 @@ impl App {
             vp_dns::set_global_fake_ip_pool(global_fake_pool.clone());
         }
 
+        let fakeip_persister = if let Some(ref pool) = global_fake_pool {
+            let fakeip_path = base_dir.join(".cache").join("fakeip.bin");
+            Some(Arc::new(vp_dns::FakeIpPersister::start(
+                (**pool).clone(),
+                fakeip_path,
+            )))
+        } else {
+            None
+        };
+
         // 解析静态 hosts 映射表
         let mut hosts_map: HashMap<String, Vec<std::net::IpAddr>> = HashMap::new();
         for (domain, ip_strs) in &cfg.hosts {
@@ -773,23 +794,23 @@ impl App {
                                 ticker.tick().await;
                                 let u = url.clone();
                                 let fetch_res = tokio::task::spawn_blocking(move || {
-                                    fetch_remote_provider(&u, "vpcore/rule-provider")
+                                    fetch_remote_binary(&u, crate::consts::USER_AGENT_RULE_PROVIDER)
                                 })
                                 .await;
                                 match fetch_res {
-                                    Ok(Ok(new_text)) => {
+                                    Ok(Ok(new_bytes)) => {
                                         let is_same = {
                                             let guard = providers_state.read().unwrap();
                                             guard
                                                 .get(&name)
-                                                .map(|(_, old)| old == &new_text)
+                                                .map(|(_, old)| old == &new_bytes)
                                                 .unwrap_or(false)
                                         };
                                         if is_same {
                                             continue;
                                         }
-                                        if let Err(e) = vp_rule::provider::load_payload(
-                                            &new_text, behavior, None,
+                                        if let Err(e) = vp_rule::provider::load_payload_bytes(
+                                            &new_bytes, behavior, None,
                                         ) {
                                             warn!(
                                                 "rule-provider {name} 定时拉取内容校验未通过: {e}"
@@ -799,11 +820,11 @@ impl App {
                                         if let Some(parent) = cache_path.parent() {
                                             let _ = tokio::fs::create_dir_all(parent).await;
                                         }
-                                        let _ = tokio::fs::write(&cache_path, &new_text).await;
+                                        let _ = tokio::fs::write(&cache_path, &new_bytes).await;
                                         providers_state
                                             .write()
                                             .unwrap()
-                                            .insert(name.clone(), (behavior, new_text));
+                                            .insert(name.clone(), (behavior, new_bytes));
 
                                         let providers_guard = providers_state.read().unwrap();
                                         let is_known = |t: &str| {
@@ -1175,6 +1196,7 @@ impl App {
             dns,
             user_manager,
             port_redirect_guards: Arc::new(RwLock::new(port_redirect_guards)),
+            fakeip_persister,
         };
         Ok(Arc::new(app))
     }
@@ -1930,7 +1952,7 @@ async fn load_proxy_providers(
 async fn load_providers(
     cfg: &vp_config::Config,
     base_dir: &Path,
-) -> Result<HashMap<String, (vp_rule::provider::Behavior, String)>> {
+) -> Result<HashMap<String, (vp_rule::provider::Behavior, Vec<u8>)>> {
     let mut out = HashMap::new();
     for (name, p) in &cfg.rule_providers {
         let behavior = p
@@ -1947,16 +1969,16 @@ async fn load_providers(
             .map(|p| base_dir.join(p))
             .unwrap_or_else(|| base_dir.join(".cache").join(format!("{name}.txt")));
 
-        let text = if let Some(ref url) = p.url {
+        let bytes = if let Some(ref url) = p.url {
             // 在线拉取尝试
             let u = url.clone();
             let res = tokio::task::spawn_blocking(move || {
-                fetch_remote_provider(&u, "vpcore/rule-provider")
+                fetch_remote_binary(&u, "vpcore/rule-provider")
             })
             .await
             .map_err(|e| Error::Config(format!("拉取任务失败: {e}")))?;
             match res {
-                Ok(t) if vp_rule::provider::load_payload(&t, behavior, None).is_ok() => {
+                Ok(t) if vp_rule::provider::load_payload_bytes(&t, behavior, None).is_ok() => {
                     if let Some(parent) = cache_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -1974,7 +1996,7 @@ async fn load_providers(
                             "rule-provider {name:?} 在线拉取失败 ({err_msg})，降级使用本地缓存: {}",
                             cache_path.display()
                         );
-                        std::fs::read_to_string(&cache_path).map_err(|e| {
+                        std::fs::read(&cache_path).map_err(|e| {
                             Error::Config(format!("rule-provider {name:?} 缓存读取失败: {e}"))
                         })?
                     } else {
@@ -1986,11 +2008,11 @@ async fn load_providers(
             }
         } else {
             // 本地文件读取
-            std::fs::read_to_string(&cache_path)
+            std::fs::read(&cache_path)
                 .map_err(|e| Error::Config(format!("rule-provider {name:?} 读取失败: {e}")))?
         };
 
-        out.insert(name.clone(), (behavior, text));
+        out.insert(name.clone(), (behavior, bytes));
     }
     Ok(out)
 }

@@ -1,5 +1,6 @@
 //! vp-router：规则路由决策 + 策略组装配。
 
+pub mod consts;
 pub mod group;
 
 use std::collections::HashMap;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
+pub use consts::*;
 use vp_common::Result;
 use vp_config::Mode;
 use vp_core::{Outbound, Resolution, Router as RouterTrait, RuleHit, Session};
@@ -269,6 +271,24 @@ impl Router {
         }
         name
     }
+
+    /// 寻找默认的兜底代理策略出站（优先 PROXY 组，否则首个代理组，否则首个非内置出站）
+    pub fn fallback_proxy_outbound(&self) -> Option<Arc<dyn Outbound>> {
+        if let Some(ob) = self.outbounds.get(GROUP_PROXY) {
+            return Some(ob.clone());
+        }
+        for g in self.groups.values() {
+            if g.name().as_ref() != OUTBOUND_DIRECT && g.name().as_ref() != OUTBOUND_REJECT {
+                return Some(g.clone() as Arc<dyn Outbound>);
+            }
+        }
+        for ob in self.outbounds.values() {
+            if ob.name() != OUTBOUND_DIRECT && ob.name() != OUTBOUND_REJECT {
+                return Some(ob.clone());
+            }
+        }
+        None
+    }
 }
 
 impl Drop for Router {
@@ -283,13 +303,34 @@ impl RouterTrait for Router {
         let (outbound, rule) = match self.mode {
             Mode::Direct => (
                 self.outbounds
-                    .get("DIRECT")
+                    .get(OUTBOUND_DIRECT)
                     .cloned()
                     .unwrap_or(self.global_outbound.clone()),
                 None,
             ),
             Mode::Global => (self.global_outbound.clone(), None),
             Mode::Rule => {
+                if let Some(host_str) = sess.dst.host.as_domain() {
+                    if vp_core::adaptive::is_blocked(host_str) {
+                        if let Some(fallback) = self.fallback_proxy_outbound() {
+                            let via = self.resolve_via(&fallback, sess);
+                            tracing::debug!(
+                                "Router::pick: 目标 {} 命中自适应临时阻断缓存，直接切至代理 {}",
+                                host_str,
+                                fallback.name()
+                            );
+                            return Resolution {
+                                outbound: fallback,
+                                via,
+                                rule: Some(RuleHit {
+                                    rule: RULE_ADAPTIVE_LRU.into(),
+                                    target: GROUP_PROXY.into(),
+                                }),
+                            };
+                        }
+                    }
+                }
+
                 let dst_ip = match &sess.dst.host {
                     vp_common::Host::Ip(ip) => Some(*ip),
                     vp_common::Host::Domain(_) => None,
@@ -371,6 +412,10 @@ impl RouterTrait for Router {
 
     fn needs_process(&self) -> bool {
         self.rules.needs_process()
+    }
+
+    fn fallback_proxy_outbound(&self) -> Option<Arc<dyn Outbound>> {
+        Router::fallback_proxy_outbound(self)
     }
 }
 

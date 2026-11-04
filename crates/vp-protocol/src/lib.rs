@@ -6,6 +6,7 @@ pub mod anytls;
 pub mod basic_out;
 pub mod brook;
 pub mod chained;
+pub mod consts;
 pub mod direct;
 pub mod h3_min;
 pub mod hysteria;

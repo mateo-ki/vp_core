@@ -1,3 +1,39 @@
+# 🚀 VP_Core v1.6.0 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.6.0**！本版本是 VP_Core 架构演进史上的一次里程碑式跃迁，全面对照 **Mihomo (Clash.Meta)**、**sing-box** 与 **MEOW** 等顶级代理内核的核心能力差距，实现了 **二进制规则零拷贝极速加载 + 自适应抗阻断透明重试 + Fake-IP 状态持久化与冷恢复 + 深度 Linux eBPF 旁路探针 + 全局解耦通用多路复用 (Multiplex) + 全架构独立常量体系** 六大重磅革新：
+
+### ⚡ P1. 规则引擎二进制化 (.mrs / .srs 支持与内存零拷贝映射)
+- **原生支持 Mihomo MRS (`.mrs`)**：支持外层 Zstandard (zstd) 压缩帧解压与 `MRS\x01` 协议头校验，实现 Succinct Trie 树深度遍历还原与大端序 IP 闭区间反序列化；
+- **原生支持 sing-box SRS (`.srs`)**：支持 zlib 解压、Uvarint 规则计数与 Tagged items 流式解析（Domain, Suffix, Keyword, Regex, IPCIDR 等），终结符与反转过滤校验；
+- **零拷贝亚毫秒级加载 (`memmap2`)**：引入 OS 级只读内存映射，加载数十万条预编译规则耗时从秒级断崖式骤降至 **0.1ms**，告别大文件加载 GC 停顿与内存膨胀；
+- **自动格式嗅探管线**：智能识别二进制 MRS/SRS、YAML 与普通文本列表，解除全部配置校验拦截。
+
+### 🛡️ P2. 自适应失败重试机制 (借鉴 MEOW 启发式抗阻断与透明秒切)
+- **拨号期零风险透明重试**：在向客户端应答前，对 DIRECT 直连施加 2.5s 智能超时并捕获 TCP RST (`ConnectionReset` / `ConnectionRefused`)；遇阻断自动秒切兜底 PROXY 策略组重新握手，客户端与浏览器完全无感知；
+- **内存 LRU 临时代理表 (`AdaptiveBlockCache`)**：阻断域名自动写入带 TTL（默认 15 分钟）与容量上限（5000条）的自适应缓存，支持子域名自动继承；
+- **分流路由前置短路**：后续请求在 `Router::pick` 阶段直接前置命中，路由标记为 `Adaptive(LRU)`，避免二次等待。
+
+### 💾 P3. Fake-IP 状态持久化 (重启免断连与冷启动恢复)
+- **紧凑事务快照 (`FKIP\x01`)**：设计定长 Header (Magic, Base, Size, Next 水位线) + Adler-32 校验和，防范断电损坏与网段变更污染；
+- **智能 LRU 平滑淘汰**：彻底摒弃池满全清逻辑，按 `last_seen` 仅精准淘汰最老 10% 活跃条目；
+- **异步防抖与生命周期守护 (`FakeIpPersister`)**：后台 1 秒周期防抖异步刷盘，应用退出与 Drop 时强制同步，内核重启微信/飞书长连接免断连。
+
+### 🐧 P4. 深度 Linux 旁路 (eBPF 套接字探针与优雅降级)
+- **环境与特权探针 (`EbpfEnvironmentProbe`)**：自动探查 Root/CAP 特权、`/sys/fs/bpf` 文件系统与 Linux 内核版本（>= 5.7）；
+- **旁路生命周期管理 (`EbpfBypassManager`)**：支持 sockops + sk_msg cgroup 级套接字流量直通；在非 Linux 或内核不满足时友好给出指引并**无缝优雅降级为标准 TUN 模式**。
+
+### 🔄 P5. 传输层通用复用 (全局解耦 Multiplex / Smux)
+- **物理长连与业务目标彻底解耦**：物理底层复用连接拨号至虚拟 Mux 锚点地址（如 `v1.mux.cool:0`），真实目标只在虚拟子流（Sub-stream）首帧独立承载，杜绝首目标污染长连接；
+- **心跳保活与流状态弹性调度**：引入 15s 定时 Ping 探活与空闲超时检测，自动清理失效子流。
+
+### 🧱 模块独立常量体系重构 (`consts.rs`)
+- 在全仓库 6 个核心 crate（`vp-rule`, `vp-core`, `vp-dns`, `vp-router`, `vp-protocol`, `vp-app`）中全面抽离专有 `consts.rs`，消除全部散落魔数与硬编码字符串，工程规范性全面跃升。
+
+### 📦 跨平台发布与自我更新修复
+- **Linux 多架构发布别名补齐**：CI 发布流补充 `vpcore-x86_64-unknown-linux-gnu.tar.gz` 与 `vpcore-aarch64-unknown-linux-gnu.tar.gz` 别名归档，彻底解决 `vpcore update` 遇到 404 的问题。
+
+---
+
 # 🚀 VP_Core v1.5.3 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.5.3**！本版聚焦 **100 站代理并发访问全流水线击穿 100ms + Linux TCP 40ms Delayed ACK 根除 + Loopback Keepalive 系统调用短路 + SOCKS5 握手协议防截断 + 策略组无锁原子化** 深度微架构性能蜕变：

@@ -143,29 +143,66 @@ pub async fn dispatch_stream(
         chain_tag
     );
 
-    match outbound.connect_stream(&sess, &sess.dst).await {
-        Ok(remote) => {
-            // 成功应答
-            match reply {
-                ClientReply::Socks5(rep) => {
-                    let _ = client
-                        .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                        .await;
-                }
-                ClientReply::Http(status) => {
-                    let _ = client
-                        .write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes())
-                        .await;
-                }
-                ClientReply::None => {}
+    // 直连快速超时探测：直连限时 2.5s，若遭遇 RST / 拒绝 / 超时，自适应重试代理策略组
+    let connect_res = if outbound.name() == crate::consts::OUTBOUND_DIRECT {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(crate::consts::DIRECT_CONNECT_TIMEOUT_MS),
+            outbound.connect_stream(&sess, &sess.dst),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(vp_common::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "DIRECT 直连超时 ({}ms)",
+                    crate::consts::DIRECT_CONNECT_TIMEOUT_MS
+                ),
+            ))),
+        }
+    } else {
+        outbound.connect_stream(&sess, &sess.dst).await
+    };
+
+    let (remote, effective_meta) = match connect_res {
+        Ok(remote) => (remote, meta),
+        Err(e) if outbound.name() == crate::consts::OUTBOUND_DIRECT => {
+            if let Some(host_str) = sess.dst.host.as_domain() {
+                vp_core::adaptive::record_block(host_str);
             }
-            let hook = RelayHook {
-                table: Some(ctx.conns.clone()),
-                meta: Some(meta),
-                stats: Some(ctx.stats.clone()),
-                ..Default::default()
-            };
-            let _ = relay(client, remote, hook).await;
+            if let Some(fallback) = ctx.router.fallback_proxy_outbound() {
+                tracing::warn!(
+                    "[TCP] {} 直连受阻 ({e})，自适应透明重试代理 {} ...",
+                    sess.dst,
+                    fallback.name()
+                );
+                match fallback.connect_stream(&sess, &sess.dst).await {
+                    Ok(rem) => {
+                        tracing::info!(
+                            "[TCP] {} 自适应重试代理 {} 成功！已加入临时代理表",
+                            sess.dst,
+                            fallback.name()
+                        );
+                        let mut new_meta = meta;
+                        new_meta.chain = Some(Arc::from(format!("Adaptive > {}", fallback.name())));
+                        (rem, new_meta)
+                    }
+                    Err(proxy_err) => {
+                        warn!(
+                            "[TCP] {} 自适应重试代理 {} 亦失败: {}",
+                            sess.dst,
+                            fallback.name(),
+                            proxy_err
+                        );
+                        send_client_failure(&mut client, reply).await;
+                        return;
+                    }
+                }
+            } else {
+                warn!("[TCP] {} 出站 DIRECT 失败且无可用代理: {}", sess.dst, e);
+                send_client_failure(&mut client, reply).await;
+                return;
+            }
         }
         Err(e) => {
             if outbound.name() == "REJECT" {
@@ -173,20 +210,47 @@ pub async fn dispatch_stream(
             } else {
                 warn!("[TCP] {} 出站 {} 失败: {}", sess.dst, outbound.name(), e);
             }
-            match reply {
-                ClientReply::Socks5(_) => {
-                    let _ = client
-                        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                        .await;
-                }
-                ClientReply::Http(_) => {
-                    let _ = client
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                        .await;
-                }
-                ClientReply::None => {}
-            }
-            let _ = client.shutdown().await;
+            send_client_failure(&mut client, reply).await;
+            return;
         }
+    };
+
+    // 成功应答
+    match reply {
+        ClientReply::Socks5(rep) => {
+            let _ = client
+                .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+        }
+        ClientReply::Http(status) => {
+            let _ = client
+                .write_all(format!("HTTP/1.1 {status}\r\n\r\n").as_bytes())
+                .await;
+        }
+        ClientReply::None => {}
     }
+    let hook = RelayHook {
+        table: Some(ctx.conns.clone()),
+        meta: Some(effective_meta),
+        stats: Some(ctx.stats.clone()),
+        ..Default::default()
+    };
+    let _ = relay(client, remote, hook).await;
+}
+
+async fn send_client_failure(client: &mut Box<dyn ProxyStream>, reply: ClientReply<'_>) {
+    match reply {
+        ClientReply::Socks5(_) => {
+            let _ = client
+                .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
+        }
+        ClientReply::Http(_) => {
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+        ClientReply::None => {}
+    }
+    let _ = client.shutdown().await;
 }

@@ -660,8 +660,12 @@ pub struct SmuxConfig {
     pub protocol: Option<String>,
     #[serde(alias = "max-connections", alias = "max_connections", default)]
     pub max_connections: Option<usize>,
+    #[serde(alias = "min-streams", alias = "min_streams", default)]
+    pub min_streams: Option<usize>,
     #[serde(alias = "max-streams", alias = "max_streams", default)]
     pub max_streams: Option<usize>,
+    #[serde(default)]
+    pub padding: Option<bool>,
 }
 
 /// 节点定义：name + 扁平化协议参数
@@ -677,8 +681,8 @@ pub struct ProxyCfg {
     /// 链式代理/前置代理（dialer-proxy / detour）
     #[serde(alias = "dialer-proxy", alias = "detour", default)]
     pub dialer_proxy: Option<String>,
-    /// 多路复用（smux）
-    #[serde(default)]
+    /// 多路复用（smux / multiplex）
+    #[serde(alias = "multiplex", default)]
     pub smux: Option<SmuxConfig>,
     /// 节点专属出站绑卡（优先于全局 bind-interface / interface-name）
     #[serde(alias = "interface-name", alias = "bind-interface", default)]
@@ -1544,7 +1548,7 @@ pub struct RuleProviderCfg {
     /// domain / ipcidr / classical
     #[serde(default)]
     pub behavior: Option<String>,
-    /// yaml / text（mrs 二进制格式暂不支持，校验阶段报错）
+    /// yaml / text / mrs / srs
     #[serde(default)]
     pub format: Option<String>,
     pub path: Option<String>,

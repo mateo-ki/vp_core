@@ -94,7 +94,18 @@ cargo test --workspace
 
 ---
 
+## 🙏 致敬与鸣谢 (Acknowledgements)
+
+VP_Core 的架构演进与能力进化离不开开源社区优秀先行者的探索与沉淀，特别致谢以下杰出的开源项目：
+
+- **[Mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo)**：引领现代网络代理内核生态标杆。特别鸣谢其优秀的规则集架构与 `.mrs` 二进制预编译规则规范，为本项目实现零拷贝亚毫秒级规则加载提供了重要范式与灵感。
+- **[sing-box](https://github.com/SagerNet/sing-box)**：下一代通用网络代理平台的典范。特别鸣谢其严谨紧凑的 `.srs` 预编译规则设计与现代出入站解耦架构，为本项目的协议实现与跨平台演进提供了极高的工程参考价值。
+- **[MEOW](https://github.com/phuslu/goproxy)**：启发式自适应代理的先驱。特别鸣谢其经典的被动阻断学习与透明失败重试设计思想，本项目借鉴此机制打造了直连毫秒级抗阻断重试与动态 LRU 策略，实现了智能无感知的网络通达。
+
+---
+
 ## 社区与开源协议
 
 - 社区认可：[LINUX DO 社区](https://linux.do)
 - 开源协议：[MIT License](LICENSE)
+

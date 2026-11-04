@@ -69,6 +69,21 @@ impl ClassicalSet {
     }
 }
 
+/// 通过零拷贝内存映射 (memmap2) 直接加载规则集文件并反序列化
+pub fn load_file_mmap(
+    path: &std::path::Path,
+    behavior: Behavior,
+    env: Option<&CompileEnv>,
+) -> Result<ProviderPayload, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开规则集文件失败: {e}"))?;
+    if file.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
+        return load_payload_bytes(&[], behavior, env);
+    }
+    let mmap =
+        unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("mmap 映射规则集失败: {e}"))?;
+    load_payload_bytes(&mmap, behavior, env)
+}
+
 /// 解析规则集文本。`env` 为 None 时只做文本层校验（vp-app 拉取后校验内容用）：
 /// classical 中需要规则引擎编译的行会被略过、也不告警，正式编译时才处理。
 pub fn load_payload(
@@ -76,6 +91,25 @@ pub fn load_payload(
     behavior: Behavior,
     env: Option<&CompileEnv>,
 ) -> Result<ProviderPayload, String> {
+    load_payload_bytes(text.as_bytes(), behavior, env)
+}
+
+/// 解析规则集字节流（自动识别二进制 MRS / SRS 或文本/YAML 格式）
+pub fn load_payload_bytes(
+    data: &[u8],
+    behavior: Behavior,
+    env: Option<&CompileEnv>,
+) -> Result<ProviderPayload, String> {
+    // 1. 优先探测二进制格式
+    if data.starts_with(&crate::consts::MRS_MAGIC) || data.starts_with(&crate::consts::ZSTD_MAGIC) {
+        return crate::mrs::parse_mrs(data);
+    }
+    if data.starts_with(&crate::consts::SRS_MAGIC) {
+        return crate::srs::parse_srs(data);
+    }
+
+    // 2. 文本格式（YAML 或普通换行列表）
+    let text = std::str::from_utf8(data).map_err(|e| format!("规则集包含无效 UTF-8 编码: {e}"))?;
     let lines = extract_lines(text)?;
     match behavior {
         Behavior::Domain => {

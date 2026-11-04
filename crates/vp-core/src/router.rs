@@ -33,4 +33,9 @@ pub trait Router: Send + Sync {
     fn needs_process(&self) -> bool {
         false
     }
+
+    /// 寻找默认的兜底代理出站（直连失败时透明自适应重试用）
+    fn fallback_proxy_outbound(&self) -> Option<Arc<dyn Outbound>> {
+        None
+    }
 }

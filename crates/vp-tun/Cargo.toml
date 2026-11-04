@@ -20,5 +20,8 @@ tun.workspace = true
 ipstack.workspace = true
 etherparse.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [features]
 default = []

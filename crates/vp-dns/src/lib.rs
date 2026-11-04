@@ -1,10 +1,11 @@
 //! vp-dns：DNS 解析器（UDP/TCP）+ TTL 缓存。
 
+pub mod consts;
 pub mod fakeip;
 pub mod server;
 pub mod wire;
 
-pub use fakeip::FakeIpPool;
+pub use fakeip::{FakeIpPersister, FakeIpPool};
 pub use server::{DnsServer, is_fake_ip_filtered, set_global_geosite_db};
 
 static BIND_INTERFACE_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

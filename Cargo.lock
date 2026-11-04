@@ -305,6 +305,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -1284,6 +1286,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1648,6 +1660,12 @@ dependencies = [
  "fastrand",
  "futures-io",
 ]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platforms"
@@ -2671,7 +2689,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vp-app"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2699,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "vp-bin"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2723,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "vp-common"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2733,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "vp-config"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "json5",
  "serde",
@@ -2746,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "vp-core"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2764,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "vp-crypto"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2787,7 +2805,7 @@ dependencies = [
 
 [[package]]
 name = "vp-dns"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "bytes",
  "httparse",
@@ -2808,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "vp-ffi"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "tokio",
  "tracing",
@@ -2821,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "vp-plugin"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "libloading 0.8.9",
  "serde",
@@ -2835,11 +2853,11 @@ dependencies = [
 
 [[package]]
 name = "vp-plugin-sdk"
-version = "1.5.3"
+version = "1.6.0"
 
 [[package]]
 name = "vp-protocol"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2895,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "vp-router"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2912,8 +2930,9 @@ dependencies = [
 
 [[package]]
 name = "vp-rule"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
+ "flate2",
  "maxminddb",
  "memmap2",
  "regex",
@@ -2922,11 +2941,12 @@ dependencies = [
  "tracing",
  "vp-common",
  "windows-sys 0.59.0",
+ "zstd",
 ]
 
 [[package]]
 name = "vp-transport"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -2961,12 +2981,13 @@ dependencies = [
 
 [[package]]
 name = "vp-tun"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "async-trait",
  "bytes",
  "etherparse 0.17.0",
  "ipstack",
+ "libc",
  "tokio",
  "tracing",
  "tun",
@@ -3315,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "xor_mask"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3459,3 +3480,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.2+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

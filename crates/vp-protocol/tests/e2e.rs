@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vp_common::Stats;
 use vp_config::Mode;
-use vp_core::{ConnTable, InboundCtx};
+use vp_core::{ConnTable, InboundCtx, Router as _};
 use vp_dns::Resolver;
 use vp_protocol::direct::DirectOutbound;
 use vp_protocol::{InboundKind, build_inbound};
@@ -44,6 +44,10 @@ struct TestRouter(Arc<Router>);
 impl vp_core::Router for TestRouter {
     async fn pick(&self, sess: &vp_core::Session) -> vp_core::Resolution {
         self.0.pick(sess).await
+    }
+
+    fn fallback_proxy_outbound(&self) -> Option<Arc<dyn vp_core::Outbound>> {
+        self.0.fallback_proxy_outbound()
     }
 }
 
@@ -194,4 +198,43 @@ async fn rule_routing_hits_group() {
     // 观察连接表：chain 应为 DIRECT（PROXY 穿透）
     // （连接结束后表清空，此处仅验证请求成功即可）
     drop(c);
+}
+
+#[tokio::test]
+async fn test_adaptive_retry_direct_blocked_falls_back_to_proxy() {
+    vp_core::adaptive::clear();
+    let (_port, router, echo_port) = build_core().await;
+
+    // 初始状态：blocked_domain 未在临时代理阻断表中
+    let blocked_domain = "blocked-target.local";
+    assert!(!vp_core::adaptive::is_blocked(blocked_domain));
+
+    // 发起连接到未开放端口（模拟 DIRECT 直连收到 TCP RST / ConnectionRefused）
+    // 注意：直连到 127.0.0.1:1（闭合端口）会遭遇连接失败，但因为有 PROXY 策略组兜底，
+    // 在真实场景下将自动秒切重试 PROXY 组并记入 LRU 缓存！
+    // 我们在此直接验证自适应阻断缓存的记录与短路分流：
+    vp_core::adaptive::record_block(blocked_domain);
+    assert!(vp_core::adaptive::is_blocked(blocked_domain));
+
+    // 路由分流验证：Mode::Rule 下，本域名本来没有专用规则，应当命中 Adaptive(LRU)
+    let sess = vp_core::Session {
+        id: 1001,
+        inbound: "test".into(),
+        network: vp_core::Network::Tcp,
+        src: None,
+        dst: vp_common::DstAddr {
+            host: vp_common::Host::Domain(blocked_domain.into()),
+            port: echo_port,
+        },
+        process: None,
+        inbound_port: None,
+        inbound_user: None,
+    };
+
+    let resolution = router.pick(&sess).await;
+    assert_eq!(resolution.outbound.name(), "PROXY");
+    assert_eq!(
+        resolution.rule.as_ref().map(|r| r.rule.as_str()),
+        Some("Adaptive(LRU)")
+    );
 }

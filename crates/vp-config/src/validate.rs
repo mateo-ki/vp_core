@@ -145,16 +145,15 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
         }
     }
 
-    // 7. rule-provider 的 mrs（mihomo 二进制规则集）尚未实现：在此明确报错，
-    //    否则会在启动加载时把二进制当文本读，只得到一句费解的 UTF-8 错误
+    // 7. rule-provider 格式校验：支持 yaml, text, mrs, srs
     for (name, p) in &cfg.rule_providers {
-        if p.format
-            .as_deref()
-            .is_some_and(|f| f.trim().eq_ignore_ascii_case("mrs"))
-        {
-            errs.push(format!(
-                "rule-providers[{name:?}]: 暂不支持 mrs 二进制格式，请改用 format: yaml 或 text 的规则文件"
-            ));
+        if let Some(f) = p.format.as_deref() {
+            let f_lower = f.trim().to_ascii_lowercase();
+            if !matches!(f_lower.as_str(), "yaml" | "text" | "mrs" | "srs") {
+                errs.push(format!(
+                    "rule-providers[{name:?}]: 不支持的规则格式 {f:?}，当前支持 yaml, text, mrs, srs"
+                ));
+            }
         }
     }
 
@@ -203,15 +202,17 @@ mod tests {
     }
 
     #[test]
-    fn mrs_rule_provider_rejected_with_clear_error() {
+    fn mrs_and_srs_rule_provider_allowed() {
         let provider = |format: &str| {
             cfg_from_yaml(&format!(
                 "rule-providers:\n  g:\n    type: http\n    behavior: domain\n    format: {format}\n    url: https://example.com/g\n    path: ./g\nrules:\n  - RULE-SET,g,DIRECT\n  - MATCH,DIRECT\n"
             ))
         };
-        let errs = super::validate(&provider("mrs")).unwrap_err();
-        assert!(errs.iter().any(|e| e.contains("mrs")));
+        assert!(super::validate(&provider("mrs")).is_ok());
+        assert!(super::validate(&provider("srs")).is_ok());
         assert!(super::validate(&provider("yaml")).is_ok());
         assert!(super::validate(&provider("text")).is_ok());
+        let errs = super::validate(&provider("unknown_fmt")).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("unknown_fmt")));
     }
 }

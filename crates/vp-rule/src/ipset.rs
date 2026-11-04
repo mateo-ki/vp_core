@@ -80,6 +80,20 @@ impl IpIntervalSetBuilder {
         self.v4.push((base, base | !mask));
     }
 
+    /// 直接追加 IPv4 连续闭区间 [lo, hi]
+    pub fn push_v4_range(&mut self, lo: u32, hi: u32) {
+        if lo <= hi {
+            self.v4.push((lo, hi));
+        }
+    }
+
+    /// 直接追加 IPv6 连续闭区间 [lo, hi]
+    pub fn push_v6_range(&mut self, lo: u128, hi: u128) {
+        if lo <= hi {
+            self.v6.push((lo, hi));
+        }
+    }
+
     pub fn build(mut self) -> IpIntervalSet {
         self.v4.sort_unstable();
         self.v6.sort_unstable();
@@ -134,6 +148,10 @@ impl IpIntervalSet {
 
     pub fn is_empty(&self) -> bool {
         self.v4.is_empty() && self.v6.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.v4.len() + self.v6.len()
     }
 }
 

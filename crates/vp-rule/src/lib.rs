@@ -4,13 +4,16 @@
 
 #[cfg(feature = "geoip")]
 pub mod asn;
+pub mod consts;
 pub mod domain;
 #[cfg(feature = "geoip")]
 pub mod geoip;
 pub mod geosite;
 pub mod ipset;
+pub mod mrs;
 pub mod process;
 pub mod provider;
+pub mod srs;
 
 #[cfg(feature = "geoip")]
 pub use asn::{AsnDb, AsnMatcher};
@@ -339,8 +342,8 @@ pub struct CompileEnv<'a> {
     pub geoip: &'a Option<geoip::GeoIpDb>,
     #[cfg(feature = "geoip")]
     pub asn: &'a Option<asn::AsnDb>,
-    /// rule provider：name → (behavior, 文本内容)
-    pub providers: &'a HashMap<String, (provider::Behavior, String)>,
+    /// rule provider：name → (behavior, 载荷字节数据或文本)
+    pub providers: &'a HashMap<String, (provider::Behavior, Vec<u8>)>,
     /// 子规则定义
     pub sub_rules: &'a HashMap<String, Vec<String>>,
 }
@@ -816,11 +819,11 @@ fn parse_matcher(
             Ok(Matcher::Network(n))
         }
         "RULE-SET" => {
-            let (behavior, text) = env
+            let (behavior, bytes) = env
                 .providers
                 .get(payload)
                 .ok_or_else(|| format!("RULE-SET {payload:?} 未在 rule-providers 中定义"))?;
-            let loaded = provider::load_payload(text, *behavior, Some(env))
+            let loaded = provider::load_payload_bytes(bytes, *behavior, Some(env))
                 .map_err(|e| format!("RULE-SET {payload:?} 加载失败: {e}"))?;
             Ok(match loaded {
                 provider::ProviderPayload::Domain(d) => Matcher::RuleSetDomain(Arc::from(d)),
@@ -953,7 +956,7 @@ mod tests {
         static GEOIP: Option<geoip::GeoIpDb> = None;
         #[cfg(feature = "geoip")]
         static ASN: Option<asn::AsnDb> = None;
-        static PROVIDERS: std::sync::OnceLock<HashMap<String, (provider::Behavior, String)>> =
+        static PROVIDERS: std::sync::OnceLock<HashMap<String, (provider::Behavior, Vec<u8>)>> =
             std::sync::OnceLock::new();
         let sub = SUB.get_or_init(|| {
             let mut m = HashMap::new();
@@ -1167,7 +1170,7 @@ mod tests {
             "myset".to_string(),
             (
                 provider::Behavior::Domain,
-                "+.gg.com\ndomain:only.com\n".to_string(),
+                "+.gg.com\ndomain:only.com\n".as_bytes().to_vec(),
             ),
         );
         let env = CompileEnv {
@@ -1231,11 +1234,14 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             "cls".to_string(),
-            (provider::Behavior::Classical, classical),
+            (provider::Behavior::Classical, classical.into_bytes()),
         );
         providers.insert(
             "cls-ip".to_string(),
-            (provider::Behavior::Classical, "IP-CIDR,1.0.0.0/8\n".into()),
+            (
+                provider::Behavior::Classical,
+                "IP-CIDR,1.0.0.0/8\n".as_bytes().to_vec(),
+            ),
         );
         let env = CompileEnv {
             is_known_target: &|t| matches!(t, "DIRECT" | "PROXY"),

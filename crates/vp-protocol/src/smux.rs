@@ -25,11 +25,10 @@ use vp_core::outbound::Outbound;
 use vp_core::session::Session;
 use vp_core::stream::{PacketConn, ProxyStream};
 
-pub const SMUX_VERSION: u8 = 1;
-pub const CMD_SYN: u8 = 0;
-pub const CMD_FIN: u8 = 1;
-pub const CMD_PSH: u8 = 2;
-pub const CMD_NOP: u8 = 3;
+pub use crate::consts::{
+    CMD_FIN, CMD_NOP, CMD_PSH, CMD_SYN, DEFAULT_MUX_ANCHOR, MUX_IDLE_TIMEOUT_SECS,
+    MUX_PING_INTERVAL_SECS, SMUX_VERSION,
+};
 
 pub struct SmuxFrame {
     pub cmd: u8,
@@ -237,6 +236,28 @@ impl SmuxSession {
             is_closed_reader.store(true, Ordering::SeqCst);
         });
 
+        // 定时心跳任务（每 15 秒发送 CMD_NOP 保持 NAT 映射与中间网关活跃）
+        let tx_keepalive = tx_frame.clone();
+        let is_closed_keepalive = is_closed.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            interval.tick().await; // 消耗初始即刻 tick
+            while !is_closed_keepalive.load(Ordering::SeqCst) {
+                interval.tick().await;
+                if tx_keepalive
+                    .send(SmuxFrame {
+                        cmd: CMD_NOP,
+                        sid: 0,
+                        data: Vec::new(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         Arc::new(Self {
             next_sid: AtomicU32::new(1),
             tx_frame,
@@ -316,23 +337,42 @@ impl Outbound for SmuxOutbound {
     async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         let max_conns = self.cfg.max_connections.unwrap_or(4).max(1);
         let max_streams = self.cfg.max_streams.unwrap_or(16).max(1);
+        let min_streams = self.cfg.min_streams.unwrap_or(4).max(1);
 
         let mut sessions = self.sessions.lock().await;
         // 清理死会话
         sessions.retain(|s| s.is_alive());
 
-        // 寻找未达到并发上限的会话
-        let chosen_session = sessions
-            .iter()
-            .find(|s| s.active_count() < max_streams)
-            .cloned();
+        // 寻找满足负载条件的会话（在未达最大连接数前优先维持单连接流数在合理水位）
+        let chosen_session = if sessions.len() < max_conns {
+            sessions
+                .iter()
+                .find(|s| s.active_count() < min_streams)
+                .cloned()
+        } else {
+            sessions
+                .iter()
+                .find(|s| s.active_count() < max_streams)
+                .cloned()
+        };
 
         let session = match chosen_session {
             Some(s) => s,
             None => {
                 if sessions.len() < max_conns {
-                    // 新建底层物理连接
-                    let underlying = self.inner.connect_stream(sess, dst).await?;
+                    // 新建底层物理连接：优先使用 Mux 锚点地址，使真实业务目标与物理多路复用链路解耦
+                    let mux_dst = if let Some((host, port)) = self.inner.remote_addr() {
+                        DstAddr {
+                            host: vp_common::Host::Domain(host),
+                            port,
+                        }
+                    } else {
+                        DstAddr {
+                            host: vp_common::Host::Domain("v1.mux.cool".into()),
+                            port: 0,
+                        }
+                    };
+                    let underlying = self.inner.connect_stream(sess, &mux_dst).await?;
                     let new_session = SmuxSession::new(underlying);
                     sessions.push(new_session.clone());
                     new_session

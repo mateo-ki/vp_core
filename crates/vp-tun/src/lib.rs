@@ -22,8 +22,11 @@ use vp_core::stream::UdpPacket;
 use vp_dns::{FakeIpPool, Resolver};
 
 pub mod auto_route;
+pub mod ebpf;
 pub mod port_redirect;
 pub mod wintun_installer;
+
+pub use ebpf::{EbpfBypassManager, EbpfEnvironmentProbe, EbpfSupportLevel};
 
 #[derive(Clone)]
 pub struct TunConfig {

@@ -125,7 +125,10 @@ pub(crate) async fn handle_proxy_provider_put(
                                 meta.base_dir.join(".cache").join(format!("{name}.yaml"))
                             });
                         if let Ok(Ok(body)) = tokio::task::spawn_blocking(move || {
-                            crate::fetch_remote_provider(&url, "clash.meta/v1.18.0")
+                            crate::fetch_remote_provider(
+                                &url,
+                                crate::consts::USER_AGENT_PROXY_PROVIDER,
+                            )
                         })
                         .await
                         {
@@ -180,14 +183,23 @@ pub(crate) async fn handle_rule_providers_list(stream: &mut tokio::net::TcpStrea
                             .join("rules")
                             .join(format!("{name}.yaml"))
                     });
-                let rule_count = std::fs::read_to_string(&cache_path)
-                    .map(|t| {
-                        t.lines()
-                            .filter(|l| {
-                                let s = l.trim();
-                                !s.is_empty() && !s.starts_with('#') && s != "payload:"
-                            })
-                            .count()
+                let rule_count = std::fs::read(&cache_path)
+                    .map(|bytes| {
+                        let behavior = r
+                            .behavior
+                            .as_deref()
+                            .and_then(|b| vp_rule::provider::Behavior::parse(b).ok())
+                            .unwrap_or(vp_rule::provider::Behavior::Domain);
+                        match vp_rule::provider::load_payload_bytes(&bytes, behavior, None) {
+                            Ok(vp_rule::provider::ProviderPayload::Domain(d)) => {
+                                d.trie.len() + d.keywords.len()
+                            }
+                            Ok(vp_rule::provider::ProviderPayload::Ip(s)) => s.len(),
+                            Ok(vp_rule::provider::ProviderPayload::Classical(c)) => {
+                                c.domains.trie.len() + c.ips.len() + c.rest.len()
+                            }
+                            Err(_) => 0,
+                        }
                     })
                     .unwrap_or(0);
                 providers_map.insert(
@@ -276,7 +288,10 @@ pub(crate) async fn handle_rule_provider_put(
                                     .join(format!("{name}.yaml"))
                             });
                         if let Ok(Ok(body)) = tokio::task::spawn_blocking(move || {
-                            crate::fetch_remote_provider(&url, "vpcore/0.1")
+                            crate::fetch_remote_provider(
+                                &url,
+                                crate::consts::USER_AGENT_RULE_PROVIDER,
+                            )
                         })
                         .await
                         {

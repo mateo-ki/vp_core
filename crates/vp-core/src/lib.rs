@@ -3,7 +3,9 @@
 //! 依赖方向的最底层：定义流/出站/入站/路由器/转发引擎，
 //! 不依赖任何具体协议与配置实现。
 
+pub mod adaptive;
 pub mod conn_table;
+pub mod consts;
 pub mod gate;
 pub mod inbound;
 pub mod outbound;

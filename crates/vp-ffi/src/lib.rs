@@ -13,6 +13,8 @@ use std::time::Duration;
 use vp_app::App;
 use vp_config::Format;
 
+pub mod android_jni;
+
 // 状态码常量定义
 pub const VP_OK: c_int = 0;
 pub const VP_ERR_ALREADY_RUNNING: c_int = -1;

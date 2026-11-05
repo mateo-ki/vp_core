@@ -2828,6 +2828,7 @@ dependencies = [
 name = "vp-ffi"
 version = "1.6.0"
 dependencies = [
+ "jni",
  "tokio",
  "tracing",
  "tracing-subscriber",

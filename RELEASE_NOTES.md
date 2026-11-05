@@ -1,3 +1,18 @@
+# 🚀 VP_Core v1.6.1 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.6.1**！本版本聚焦 **移动端 TUN 虚拟网卡 epoll 异步事件驱动架构重构 + Android/Unix 外部 FD 阻塞死锁根除 + 移动网络切换与高并发防断连稳定性提升**：
+
+### ⚡ P1. 移动端 TUN 设备基于 epoll / AsyncFd 纯异步重构 (`vp-tun`)
+- **彻底根除字符设备阻塞式 read 死锁**：废弃原先将 `/dev/tun` 包装为 `tokio::fs::File` 走 `spawn_blocking` 线程池的缺陷实现，避免后台阻塞读线程在 `tokio::select!` 超时或取消时无法中断导致的线程池耗尽与死锁；
+- **原生 Linux / Android epoll 事件驱动**：采用 `tun::create_as_async` 封装外部 FD 注入模式，底层基于 Tokio `AsyncFd` 实现全事件驱动，零多余线程开销，实现微秒级网络包唤醒与极速转发；
+- **无缝对接 Android VpnService 非阻塞模式**：完美支持 `VpnService.Builder.setBlocking(false)`，彻底消除在移动端 Android/Unix 环境下的网络假死与丢包。
+
+### 🛡️ P2. 移动端网络生命周期与 DNS 稳定性增强
+- **配合 Android 底层承载网络保活**：支持与 Android `setUnderlyingNetworks` 和 `NetworkCallback` 联动，杜绝 Android 30 秒 `handleLingerComplete` 引发的 `agentDisconnect` 异常断线；
+- **Fake-IP 移动端极速劫持保障**：优化 TUN 私有网段 UDP 53 DNS 拦截与响应逻辑，杜绝移动端网络栈 TLS 853 / DoT 探测阻断。
+
+---
+
 # 🚀 VP_Core v1.6.0 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.6.0**！本版本是 VP_Core 架构演进史上的一次里程碑式跃迁，全面对照 **Mihomo (Clash.Meta)**、**sing-box** 与 **MEOW** 等顶级代理内核的核心能力差距，实现了 **二进制规则零拷贝极速加载 + 自适应抗阻断透明重试 + Fake-IP 状态持久化与冷恢复 + 深度 Linux eBPF 旁路探针 + 全局解耦通用多路复用 (Multiplex) + 全架构独立常量体系** 六大重磅革新：

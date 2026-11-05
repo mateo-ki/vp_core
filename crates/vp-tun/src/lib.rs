@@ -160,14 +160,28 @@ async fn create_tun_device(cfg: &TunConfig) -> Result<Box<dyn vp_core::ProxyStre
     if let Some(fd) = cfg.fd {
         #[cfg(unix)]
         {
-            use std::os::fd::FromRawFd;
-            let file = unsafe { std::fs::File::from_raw_fd(fd) };
-            let tokio_file = tokio::fs::File::from_std(file);
+            let mut tcfg = tun::Configuration::default();
+            tcfg.raw_fd(fd);
+            tcfg.close_fd_on_drop(true);
+            tcfg.mtu(cfg.mtu);
+            match cfg.address {
+                IpAddr::V4(v4) => {
+                    tcfg.address(v4);
+                    if let IpAddr::V4(mask) = cfg.netmask {
+                        tcfg.netmask(mask);
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    tcfg.address(v6);
+                }
+            }
             info!(
-                "TUN 移动端模式（外部 FD={fd}）: fakeip={}",
+                "TUN 移动端模式（外部 FD={fd}，基于 epoll 纯异步非阻塞事件驱动）: fakeip={}",
                 cfg.fake_ip_range
             );
-            return Ok(Box::new(vp_core::stream::Opaque(tokio_file)));
+            let dev = tun::create_as_async(&tcfg)
+                .map_err(|e| Error::Other(format!("从外部 FD 创建 TUN 异步设备失败: {e}")))?;
+            return Ok(Box::new(vp_core::stream::Opaque(dev)));
         }
         #[cfg(not(unix))]
         {

@@ -401,12 +401,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         }
         std::task::ready!(this.maybe_send_pong(cx))?;
         // 1. 如果缓冲区中还有未写出的数据，必须先完全排空；排空受阻返回 Pending，尚未消费 buf
-        while !this.write_out.is_empty() {
-            match this.flush_pending(cx) {
-                Poll::Ready(Ok(())) => break,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        if !this.write_out.is_empty() {
+            std::task::ready!(this.flush_pending(cx))?;
         }
         if this.closed {
             return Poll::Ready(Err(io::Error::new(
@@ -424,13 +420,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         this.encode_frame(&buf[..take], op);
 
         // 3. 尽力向底层流冲刷（冲刷不完留在 write_out，由后续 poll_write 或 poll_flush 继续推进）
-        while !this.write_out.is_empty() {
-            match this.flush_pending(cx) {
-                Poll::Ready(Ok(())) => break,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => break,
-            }
-        }
+        let _ = this.flush_pending(cx);
 
         // 4. 返回已成功编码入缓冲区的有效明文字节数
         Poll::Ready(Ok(take))

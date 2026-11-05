@@ -348,7 +348,9 @@ pub async fn tls_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
                         // 同一份配置撞同一堵墙，普通 TLS 永远轮不到，连接就此判死。
                         let retry = ech_retry_list_from(&e);
                         if should_retry_ech_with(retry.clone(), &list) {
-                            tracing::info!("ECH 被拒，服务端给出新的 retry config，重拨重试: {host}");
+                            tracing::info!(
+                                "ECH 被拒，服务端给出新的 retry config，重拨重试: {host}"
+                            );
                             note_ech_retry_config(host, retry.expect("should_retry 已确认 Some"));
                         } else {
                             tracing::info!("ECH 被拒且无新配置可用，本次回退普通 TLS: {host}");

@@ -895,7 +895,10 @@ pub async fn dial(
     .await?;
     match wrap_transport(Box::new(tcp), server_host, cfg).await {
         // ECH 被服务端拒绝或丢包超时：底层流已废弃，换新连接重拨并退回普通 TLS
-        Err(e) if e.to_string().contains("ECH_REJECTED_FALLBACK") || (cfg.ech.is_some() && e.to_string().contains("超时")) => {
+        Err(e)
+            if e.to_string().contains("ECH_REJECTED_FALLBACK")
+                || (cfg.ech.is_some() && e.to_string().contains("超时")) =>
+        {
             tls::note_ech_rejected(server_host);
             for _ in 0..2 {
                 let tcp = dial_tcp_multi_with_opts(

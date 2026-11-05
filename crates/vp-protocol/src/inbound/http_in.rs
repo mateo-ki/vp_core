@@ -258,7 +258,9 @@ where
             if outbound.outbound.name() == "REJECT" || e.to_string().contains("REJECT") {
                 tracing::info!("[HTTP] {} 出站 REJECT 阻断", sess.dst);
                 let _ = stream
-                    .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
                     .await;
                 return Ok(());
             }

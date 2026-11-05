@@ -29,6 +29,12 @@
 ### 🧱 模块独立常量体系重构 (`consts.rs`)
 - 在全仓库 6 个核心 crate（`vp-rule`, `vp-core`, `vp-dns`, `vp-router`, `vp-protocol`, `vp-app`）中全面抽离专有 `consts.rs`，消除全部散落魔数与硬编码字符串，工程规范性全面跃升。
 
+### 📱 移动端 SDK 独立分包 (Android / iOS / 鸿蒙 NEXT)
+- **Android 专属 SDK (`vpcore-android-v1.6.0.zip`)**：包含 `arm64-v8a`、`armeabi-v7a`、`x86_64` 全架构动态库，并集成开箱即用的原生 Kotlin 封装类 (`VPCore.kt`)，完美支持 Android `VpnService` 句柄注入；
+- **iOS 专属 SDK (`vpcore-ios-v1.6.0.zip`)**：包含符合 Apple 官方标准的 `VPCore.xcframework` 与 `VPCore.swift` 原生类，并提供官方 `Package.swift` 原生支持 Swift Package Manager (SPM) 一键导入；
+- **鸿蒙 NEXT 专属 SDK (`vpcore-harmonyos-v1.6.0.zip`)**：专为纯血鸿蒙设计，包含 `arm64-v8a`（真机）与 `x86_64`（DevEco 模拟器）架构库，提供纯血鸿蒙 ArkTS (`VPCore.ets`)、Node-API (`vpcore_napi.cpp`) 与类型定义 (`index.d.ts`)；
+- **向后兼容机制**：保留历史包名 `vpcore-android-ffi.tar.gz` 与 `vpcore-ios-xcframework.zip` 过渡 2 个版本，保证既有自动化下载脚本平稳平滑迁移。
+
 ### 📦 跨平台发布与自我更新修复
 - **Linux 多架构发布别名补齐**：CI 发布流补充 `vpcore-x86_64-unknown-linux-gnu.tar.gz` 与 `vpcore-aarch64-unknown-linux-gnu.tar.gz` 别名归档，彻底解决 `vpcore update` 遇到 404 的问题。
 

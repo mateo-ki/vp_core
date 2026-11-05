@@ -1,0 +1,4 @@
+module VPCore {
+    header "vpcore.h"
+    export *
+}

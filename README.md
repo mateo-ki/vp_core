@@ -94,6 +94,16 @@ cargo test --workspace
 
 ---
 
+## 📱 移动端 SDK 支持 (Android / iOS / 纯血鸿蒙)
+
+VP_Core 为三大主流移动端操作系统提供专属独立 SDK 发布包与开箱即用的高层封装（详见 `mobile/` 目录）：
+
+- **Android SDK**：包含 `arm64-v8a`、`armeabi-v7a`、`x86_64` 架构库，内置 `com.vpcore.VPCore` Kotlin 原生类，无缝对接 Android `VpnService`；
+- **iOS / macOS SDK**：包含 Apple 官方标准 `VPCore.xcframework` 与 `VPCore.swift` 原生类，原生支持 Swift Package Manager (SPM) 一键引入；
+- **鸿蒙 NEXT SDK**：专为华为纯血鸿蒙（HarmonyOS NEXT / OpenHarmony 4.0+）设计，提供 ArkTS (`VPCore.ets`)、Node-API C++ 桥接 (`vpcore_napi.cpp`) 与类型定义。
+
+---
+
 ## 🙏 致敬与鸣谢 (Acknowledgements)
 
 VP_Core 的架构演进与能力进化离不开开源社区优秀先行者的探索与沉淀，特别致谢以下杰出的开源项目：

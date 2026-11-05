@@ -1,7 +1,7 @@
 use super::*;
 
 const CFG: &str = r#"
-mixed-port: 17890
+mixed-port: 27895
 mode: rule
 log-level: info
 proxies:
@@ -24,7 +24,7 @@ async fn app_assemble_and_serve() {
     let dir = std::env::temp_dir();
     let app = App::start(CFG, Format::Yaml, &dir, true).await.unwrap();
     assert_eq!(app.listen_ports.len(), 1);
-    assert_eq!(app.listen_ports[0].1, 17890);
+    assert_eq!(app.listen_ports[0].1, 27895);
 
     // 经 mixed 端口做一次 socks5 CONNECT（目标 127.0.0.1 的临时 echo）
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -36,7 +36,7 @@ async fn app_assemble_and_serve() {
         let n = s.read(&mut b).await.unwrap();
         s.write_all(&b[..n]).await.unwrap();
     });
-    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", 17890))
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", 27895))
         .await
         .unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

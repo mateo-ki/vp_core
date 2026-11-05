@@ -808,7 +808,24 @@ impl Resolver {
                     .await
                     {
                         Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
-                        _ => return Err(e),
+                        _ => {
+                            // 主 DNS 与 fallback 均未查得有效 IP，平滑降级系统解析
+                            if let Ok(sys_ips) = self.system_lookup(domain).await {
+                                if !sys_ips.is_empty() {
+                                    sys_ips
+                                } else {
+                                    return Err(e);
+                                }
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                    }
+                } else if let Ok(sys_ips) = self.system_lookup(domain).await {
+                    if !sys_ips.is_empty() {
+                        sys_ips
+                    } else {
+                        return Err(e);
                     }
                 } else {
                     return Err(e);

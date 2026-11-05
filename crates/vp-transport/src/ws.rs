@@ -46,10 +46,17 @@ where
              Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
         )
     };
+    let mut has_ua = false;
     for (k, v) in &cfg.headers {
         if !k.eq_ignore_ascii_case("host") {
+            if k.eq_ignore_ascii_case("user-agent") {
+                has_ua = true;
+            }
             req.push_str(&format!("{k}: {v}\r\n"));
         }
+    }
+    if !has_ua {
+        req.push_str("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36\r\n");
     }
     req.push_str("\r\n");
     io.write_all(req.as_bytes()).await?;
@@ -393,8 +400,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
             return Pin::new(&mut this.inner).poll_write(cx, buf);
         }
         std::task::ready!(this.maybe_send_pong(cx))?;
-        if !this.write_out.is_empty() {
-            std::task::ready!(this.flush_pending(cx))?;
+        // 1. 如果缓冲区中还有未写出的数据，必须先完全排空；排空受阻返回 Pending，尚未消费 buf
+        while !this.write_out.is_empty() {
+            match this.flush_pending(cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
         if this.closed {
             return Poll::Ready(Err(io::Error::new(
@@ -402,19 +414,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
                 "ws: 已关闭",
             )));
         }
-        // 16KB 分帧，每帧独立 fin
-        let mut offset = 0;
-        let op = this.write_opcode;
-        while offset < buf.len() {
-            let end = (offset + 16 * 1024).min(buf.len());
-            this.encode_frame(&buf[offset..end], op);
-            offset = end;
-        }
         if buf.is_empty() {
-            this.encode_frame(&[], op);
+            return Poll::Ready(Ok(0));
         }
-        std::task::ready!(this.flush_pending(cx))?;
-        Poll::Ready(Ok(buf.len()))
+
+        // 2. 严格按块分帧编码（最多 16KB，避免大包塞爆缓冲区，且只回报实际吞入缓冲区的字节数）
+        let take = buf.len().min(16 * 1024);
+        let op = this.write_opcode;
+        this.encode_frame(&buf[..take], op);
+
+        // 3. 尽力向底层流冲刷（冲刷不完留在 write_out，由后续 poll_write 或 poll_flush 继续推进）
+        while !this.write_out.is_empty() {
+            match this.flush_pending(cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => break,
+            }
+        }
+
+        // 4. 返回已成功编码入缓冲区的有效明文字节数
+        Poll::Ready(Ok(take))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

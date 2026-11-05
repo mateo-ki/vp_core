@@ -325,34 +325,49 @@ pub async fn tls_connect<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin
             &list[..list.len().min(12)]
         );
         match get_ech_connector(cfg.skip_cert_verify, &cfg.alpn, &list) {
-            Ok(ech_conn) => match ech_conn.connect(name, stream).await {
-                Ok(s) => {
-                    tracing::debug!("ECH 握手成功: {host}");
-                    // 保留生效配置并解除回退标记：后续连接优先用它直连
-                    note_ech_retry_config(host, list);
-                    ech_undelete(host);
-                    return Ok(s);
-                }
-                Err(e) => {
-                    // 服务端拒绝 ECH 的三种结局（由 transport::dial 的重拨承接）：
-                    // - 给出与刚用过的不同的 retry config → 缓存，重拨再试一次 ECH；
-                    // - 原样吐回同一份配置（本机实测 Cloudflare 被拒时就是这种行为）
-                    //   或没给 → 清缓存，重拨直接走普通 TLS。
-                    // 注意绝不能无条件缓存 retry config：dial 只重拨一次，若重拨又带着
-                    // 同一份配置撞同一堵墙，普通 TLS 永远轮不到，连接就此判死。
-                    let retry = ech_retry_list_from(&e);
-                    if should_retry_ech_with(retry.clone(), &list) {
-                        tracing::info!("ECH 被拒，服务端给出新的 retry config，重拨重试: {host}");
-                        note_ech_retry_config(host, retry.expect("should_retry 已确认 Some"));
-                    } else {
-                        tracing::info!("ECH 被拒且无新配置可用，本次回退普通 TLS: {host}");
-                        clear_ech_retry_config(host);
+            Ok(ech_conn) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(2500),
+                    ech_conn.connect(name, stream),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => {
+                        tracing::debug!("ECH 握手成功: {host}");
+                        // 保留生效配置并解除回退标记：后续连接优先用它直连
+                        note_ech_retry_config(host, list);
+                        ech_undelete(host);
+                        return Ok(s);
                     }
-                    tracing::warn!("ECH 握手失败（{e}），回退普通 TLS: {host}");
-                    note_ech_rejected(host);
-                    return Err(Error::Io(std::io::Error::other("ECH_REJECTED_FALLBACK")));
+                    Ok(Err(e)) => {
+                        // 服务端拒绝 ECH 的三种结局（由 transport::dial 的重拨承接）：
+                        // - 给出与刚用过的不同的 retry config → 缓存，重拨再试一次 ECH；
+                        // - 原样吐回同一份配置（本机实测 Cloudflare 被拒时就是这种行为）
+                        //   或没给 → 清缓存，重拨直接走普通 TLS。
+                        // 注意绝不能无条件缓存 retry config：dial 只重拨一次，若重拨又带着
+                        // 同一份配置撞同一堵墙，普通 TLS 永远轮不到，连接就此判死。
+                        let retry = ech_retry_list_from(&e);
+                        if should_retry_ech_with(retry.clone(), &list) {
+                            tracing::info!("ECH 被拒，服务端给出新的 retry config，重拨重试: {host}");
+                            note_ech_retry_config(host, retry.expect("should_retry 已确认 Some"));
+                        } else {
+                            tracing::info!("ECH 被拒且无新配置可用，本次回退普通 TLS: {host}");
+                            clear_ech_retry_config(host);
+                        }
+                        tracing::warn!("ECH 握手失败（{e}），回退普通 TLS: {host}");
+                        note_ech_rejected(host);
+                        return Err(Error::Io(std::io::Error::other("ECH_REJECTED_FALLBACK")));
+                    }
+                    Err(_timeout) => {
+                        tracing::warn!(
+                            "ECH 握手 2.5s 超时（极可能遭遇防火墙静默丢包），回退普通 TLS: {host}"
+                        );
+                        clear_ech_retry_config(host);
+                        note_ech_rejected(host);
+                        return Err(Error::Io(std::io::Error::other("ECH_REJECTED_FALLBACK")));
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!("{e}，回退普通 TLS: {host}");
             }

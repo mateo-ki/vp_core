@@ -22,13 +22,34 @@ impl DirectOutbound {
     pub async fn resolve(&self, dst: &DstAddr) -> Result<Vec<std::net::SocketAddr>> {
         match &dst.host {
             Host::Ip(ip) => Ok(vec![std::net::SocketAddr::new(*ip, dst.port)]),
-            Host::Domain(domain) => {
-                let ips = self.dns.resolve_domain(domain, self.ipv6).await?;
-                Ok(ips
+            Host::Domain(domain) => match self.dns.resolve_domain(domain, self.ipv6).await {
+                Ok(ips) if !ips.is_empty() => Ok(ips
                     .iter()
                     .map(|ip| std::net::SocketAddr::new(*ip, dst.port))
-                    .collect())
-            }
+                    .collect()),
+                Ok(_) | Err(_) => {
+                    // 若主 DNS 解析未拿到有效 IP（如纯 IPv6 探测域名仅有 AAAA 记录，或无 A 记录），
+                    // 平滑降级至系统原生解析器，避免直接报错中断直连
+                    if let Ok(lookup) = tokio::net::lookup_host((domain.as_str(), dst.port)).await {
+                        let addrs: Vec<_> = lookup.collect();
+                        if !addrs.is_empty() {
+                            return Ok(addrs);
+                        }
+                    }
+                    // 若默认配置为非 IPv6，尝试额外查询 AAAA 记录作为兜底
+                    if !self.ipv6 {
+                        if let Ok(v6_ips) = self.dns.resolve_domain(domain, true).await {
+                            if !v6_ips.is_empty() {
+                                return Ok(v6_ips
+                                    .iter()
+                                    .map(|ip| std::net::SocketAddr::new(*ip, dst.port))
+                                    .collect());
+                            }
+                        }
+                    }
+                    Err(Error::Addr(format!("无法解析 {dst}")))
+                }
+            },
         }
     }
 }

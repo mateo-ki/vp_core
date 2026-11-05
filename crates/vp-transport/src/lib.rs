@@ -894,11 +894,9 @@ pub async fn dial(
     )
     .await?;
     match wrap_transport(Box::new(tcp), server_host, cfg).await {
-        // ECH 被服务端拒绝：底层流已废弃，只能换新连接重拨。tls 层状态机决定重拨走什么：
-        // 服务端给了新的 retry config → 再试一次 ECH；否则直接普通 TLS。
-        // 至多重拨两轮即可收敛：ECH(DNS 配置) → ECH(retry config) → 普通 TLS，
-        // 之后该主机被记住拒绝状态，后续连接首轮就直走普通 TLS，不再浪费握手。
-        Err(e) if e.to_string().contains("ECH_REJECTED_FALLBACK") => {
+        // ECH 被服务端拒绝或丢包超时：底层流已废弃，换新连接重拨并退回普通 TLS
+        Err(e) if e.to_string().contains("ECH_REJECTED_FALLBACK") || (cfg.ech.is_some() && e.to_string().contains("超时")) => {
+            tls::note_ech_rejected(server_host);
             for _ in 0..2 {
                 let tcp = dial_tcp_multi_with_opts(
                     server_host,

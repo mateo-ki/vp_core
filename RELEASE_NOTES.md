@@ -1,3 +1,25 @@
+# 🚀 VP_Core v1.6.2 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.6.2**！本版本聚焦 **全协议传输层高并发稳定性根治 + 防火墙 ECH 静默丢包超时自愈 + REJECT 规则静默拦截与 502 告警根除 + DNS 容灾平滑降级**：
+
+### ⚡ P1. 传输层稳定性重构：根除 WebSocket 分帧异步重发导致的数据损坏 (`vp-transport`)
+- **异步分帧写入状态机严格对齐 Tokio 契约**：彻底重构 `WsStream::poll_write` 实现，当底层 TCP 发送缓冲区被打满导致 `flush_pending` 返回 `Pending` 时，前置拦截并保持未消费状态；排空缓冲区后严格按 16KB 单帧编码并仅返回已吸纳字节数；
+- **根除重复发包与流解密校验失败**：杜绝因调用方重复重试触发同一数据块被二次编码发出的严重缺陷，彻底解决大流量传输（如 YouTube 4K 播放、大文件下载）与高并发场景下的突发断流与 TCP RST 掐线。
+
+### 🛡️ P2. 防火墙 ECH 静默黑洞丢包超时自愈与自动回退 (`vp-transport`)
+- **引入 ECH 2.5s 独立超时探测**：针对大陆防火墙（GFW）对含 ECH（Encrypted Client Hello）扩展的 TLS 握手包实施全网静默丢包（黑洞）策略，引入 2.5 秒快速熔断保护；
+- **自愈式普通 TLS 快速重拨**：当检测到 ECH 握手超时或被服务端拒绝时，自动标记该主机屏蔽 ECH 并立即以普通 TLS 重新拨号，将原先 10~30 秒的死等超时降至 200ms 快速自愈秒连。
+
+### 🚫 P3. 规则拦截规范化：REJECT 静默阻断与 502 Bad Gateway 根除 (`vp-protocol`)
+- **HTTP 入站阻断行为对齐成熟内核**：彻底修复 `RejectOutbound` 向上抛出 `Error::Unsupported` 导致 HTTP 入站向客户端回写 `HTTP/1.1 502 Bad Gateway` 并疯狂打印 Warn 日志的问题；
+- **标准 403 Forbidden 响应**：命中广告拦截或自定义 REJECT 规则时，降级为友好 Info 日志并回传轻量 `403 Forbidden` 立即关闭，杜绝系统后台上报触发的代理网关故障报警。
+
+### 🌐 P4. DNS 直连解析查空平滑降级与 Windows 网络状态保障 (`vp-dns`, `vp-protocol`)
+- **NODATA 查空自动降级系统解析**：针对微软 NCSI 网络探测域名（`ipv6.msftncsi.com` 等纯 AAAA 域名）在默认非 IPv6 模式下请求 A 记录返回空答案的情况，增加系统原生解析器二次兜底与自动 AAAA 探测；
+- **彻底消除 Windows 误报“无 Internet 访问”**：解决系统因直连解析失败弹出黄色感叹号与无法上网的误判。
+
+---
+
 # 🚀 VP_Core v1.6.1 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.6.1**！本版本聚焦 **移动端 TUN 虚拟网卡 epoll 异步事件驱动架构重构 + Android/Unix 外部 FD 阻塞死锁根除 + 移动网络切换与高并发防断连稳定性提升**：

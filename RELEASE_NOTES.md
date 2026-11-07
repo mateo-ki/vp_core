@@ -1,3 +1,21 @@
+# 🚀 VP_Core v1.6.3 发布说明 / Release Notes
+
+🎉 欢迎使用 **VP_Core v1.6.3**！本版本聚焦 **REALITY 客户端证书公钥校验对齐 Xray 行为（支持非 Ed25519 真实伪装站证书平滑回退 WebPKI） + Linux 守护进程 Broken Pipe 递归 Panic 引发 SIGABRT 崩溃根除 + 真实网络节点端到端校验**：
+
+### ⚡ P1. REALITY 客户端证书公钥校验拦截修复（对齐 Xray 规范） (`vp-transport`)
+- **取消强制 32 字节 Ed25519 断言**：彻底解决服务端下发目标伪装网站（如 `tesla.com` 等）真实证书（RSA-2048 270 字节 SPKI 或 ECDSA 证书）时，客户端报错 `protocol: utls reality: 证书公钥长度 270 != 32 字节 (非 Ed25519)` 并阻断连接的问题；
+- **优雅回退 WebPKI 校验链**：在握手 `HS_CERT` 阶段，若对端返回定制 32 字节 Ed25519 证书则执行 HMAC-SHA512 签名防篡改校验并跳过 WebPKI；若为非 Ed25519 证书，保持 `reality_verified = false` 并平滑回退至后续标准 WebPKI 证书链与 SNI 校验，行为完全对齐 Xray；
+- **动态适配 X.509 TBSCertificate 结构**：重构 `extract_spki`，支持根据首元素 tag 动态识别 X.509 v1 与 v3 规范，精准定位 SPKI 证书公钥；
+- **真实订阅库与节点端到端实测验证**：在本地 2,828 个 REALITY 节点真实测试中全线通过，成功打通 Cloudflare 与 Microsoft 混合代理访问。
+
+### 🛡️ P2. Linux 守护进程 Broken Pipe 递归 Panic 引发 SIGABRT 崩溃根除 (`vp-bin`)
+- **系统层 SIGPIPE 信号主动忽略**：在 Unix 入口主动设置 `libc::signal(libc::SIGPIPE, libc::SIG_IGN)`，杜绝因对端 socket 或日志管道断开引发系统级强杀；
+- **智能识别管道中断并重定向 `/dev/null`**：在全局 panic hook 中精准过滤 `Broken pipe`、`os error 32`、`failed printing to stderr` 等由标准流写入失败引起的 panic，自动调用 `libc::dup2` 将 stdout / stderr 重定向至 `/dev/null`，避免再次写入破损流；
+- **`catch_unwind` 日志隔离机制**：针对非破损流 panic 使用 `std::panic::catch_unwind` 进行安全打印，彻底防止 panic 处理期间二次 panic 触发 Rust runtime `abort()` (SIGABRT)；
+- **热重载事件循环日志改造**：将主循环与 SIGHUP 处理逻辑中的裸 `println!` / `eprintln!` 全面升级为结构化 `tracing::info!` 与 `tracing::error!`。
+
+---
+
 # 🚀 VP_Core v1.6.2 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.6.2**！本版本聚焦 **全协议传输层高并发稳定性根治 + 防火墙 ECH 静默丢包超时自愈 + REJECT 规则静默拦截与 502 告警根除 + DNS 容灾平滑降级**：

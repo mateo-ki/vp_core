@@ -214,6 +214,62 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     }
 }
 
+#[cfg(unix)]
+fn redirect_broken_std_to_devnull() {
+    unsafe {
+        let devnull = libc::open(
+            b"/dev/null\0".as_ptr() as *const libc::c_char,
+            libc::O_WRONLY,
+        );
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+        }
+    }
+}
+
+fn is_broken_pipe_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    let payload_str = if let Some(s) = info.payload().downcast_ref::<&str>() {
+        *s
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        ""
+    };
+    if payload_str.contains("Broken pipe")
+        || payload_str.contains("os error 32")
+        || payload_str.contains("failed printing to stderr")
+        || payload_str.contains("failed printing to stdout")
+    {
+        return true;
+    }
+    let display_str = info.to_string();
+    display_str.contains("Broken pipe")
+        || display_str.contains("os error 32")
+        || display_str.contains("failed printing to stderr")
+        || display_str.contains("failed printing to stdout")
+}
+
+fn setup_panic_hook(with_tracing: bool) {
+    std::panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic(info) {
+            #[cfg(unix)]
+            redirect_broken_std_to_devnull();
+            return;
+        }
+        // 对于其他 panic，防范写入破损流时发生二次递归 panic 导致系统 SIGABRT 强杀
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if with_tracing {
+                tracing::error!("panic（已隔离）: {info}");
+            } else {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "panic（已隔离）: {info}");
+            }
+        }));
+    }));
+}
+
 fn init_logging(level: &str) {
     use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
@@ -225,10 +281,8 @@ fn init_logging(level: &str) {
         .with_target(false)
         .with_ansi(ansi)
         .init();
-    // panic 不退出（任务级隔离），但记录到日志
-    std::panic::set_hook(Box::new(|info| {
-        tracing::error!("panic（已隔离）: {info}");
-    }));
+    // 切换为 tracing 记录 panic，保持 Broken pipe 防御与 catch_unwind 隔离
+    setup_panic_hook(true);
 }
 
 #[cfg(windows)]
@@ -254,6 +308,13 @@ fn trim_working_set() {
 fn trim_working_set() {}
 
 fn main() {
+    #[cfg(unix)]
+    unsafe {
+        // 忽略 SIGPIPE 信号，防止往关闭的 socket 或 pipe 写入时被系统信号强杀
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    setup_panic_hook(false);
+
     let threads = std::env::var("TOKIO_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -604,10 +665,10 @@ async fn async_main() {
                         Some(_) = hup.recv() => {
                             match app.reload().await {
                                 Ok(()) => {
-                                    println!("✓ SIGHUP：配置已平滑热重载");
+                                    tracing::info!("✓ SIGHUP：配置已平滑热重载");
                                     trim_working_set();
                                 }
-                                Err(e) => eprintln!("✗ SIGHUP：热重载失败（保留旧配置）: {e}"),
+                                Err(e) => tracing::error!("✗ SIGHUP：热重载失败（保留旧配置）: {e}"),
                             }
                         }
                         _ = ticker.tick() => {
@@ -621,10 +682,10 @@ async fn async_main() {
                                     last_mtime = Some(m);
                                     match app.reload().await {
                                         Ok(()) => {
-                                            println!("✓ 配置文件变动，已平滑热重载");
+                                            tracing::info!("✓ 配置文件变动，已平滑热重载");
                                             trim_working_set();
                                         }
-                                        Err(e) => eprintln!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
+                                        Err(e) => tracing::error!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
                                     }
                                 } else if last_mtime.is_none() {
                                     last_mtime = Some(m);
@@ -652,10 +713,10 @@ async fn async_main() {
                                     last_mtime = Some(m);
                                     match app.reload().await {
                                         Ok(()) => {
-                                            println!("✓ 配置文件变动，已平滑热重载");
+                                            tracing::info!("✓ 配置文件变动，已平滑热重载");
                                             trim_working_set();
                                         }
-                                        Err(e) => eprintln!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
+                                        Err(e) => tracing::error!("✗ 配置文件变动，热重载失败（保留旧配置）: {e}"),
                                     }
                                 } else if last_mtime.is_none() {
                                     last_mtime = Some(m);
@@ -696,5 +757,26 @@ async fn async_main() {
                 (_, Err(e)) => eprintln!("✗ 清理 iptables 端口重定向失败: {e}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_broken_pipe_panic_detection() {
+        setup_panic_hook(false);
+
+        // 验证针对标准流 Broken pipe，catch_unwind 能够正常拦截，且不会引发二次 panic
+        let res = std::panic::catch_unwind(|| {
+            panic!("failed printing to stderr: Broken pipe (os error 32)");
+        });
+        assert!(res.is_err(), "panic 应被正常捕获");
+
+        let res2 = std::panic::catch_unwind(|| {
+            panic!("failed printing to stdout: Broken pipe (os error 32)");
+        });
+        assert!(res2.is_err(), "stdout panic 应被正常捕获");
     }
 }

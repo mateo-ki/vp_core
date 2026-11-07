@@ -773,17 +773,22 @@ fn extract_spki(cert: &CertificateDer<'_>) -> Result<Vec<u8>> {
     let mut pos = 0usize;
     let mut spki: Option<Vec<u8>> = None;
     let mut count = 0;
+    let mut has_version = false;
     while pos < tbs.len() {
         let (tag, h, l) = header(tbs, pos)?;
         if pos + h + l > tbs.len() {
             return Err(Error::Proto("utls: DER 越界"));
         }
         count += 1;
-        if tag == 0x30 && count == 7 {
+        if count == 1 && tag == 0xa0 {
+            has_version = true;
+        }
+        let target_count = if has_version { 7 } else { 6 };
+        if tag == 0x30 && count == target_count {
             spki = Some(tbs[pos..pos + h + l].to_vec());
             break;
         }
-        if count > 7 {
+        if count > target_count {
             break;
         }
         pos += h + l;
@@ -861,33 +866,46 @@ fn spki_header(b: &[u8], pos: usize) -> Result<(u8, usize, usize)> {
     Ok((tag, hl, len))
 }
 
-/// 从 X.509 证书 DER 中提取 Ed25519 公钥（32 字节）
-fn extract_ed25519_pubkey(leaf: &CertificateDer<'_>) -> Result<Vec<u8>> {
-    let spki = extract_spki(leaf)?;
-    let (t, h, l) = spki_header(&spki, 0)?;
+/// 从 X.509 证书 DER 中尝试提取 Ed25519 公钥（若为非 32 字节或非 Ed25519 格式返回 Ok(None)）
+fn try_extract_ed25519_pubkey(leaf: &CertificateDer<'_>) -> Result<Option<Vec<u8>>> {
+    let Ok(spki) = extract_spki(leaf) else {
+        return Ok(None);
+    };
+    let Ok((t, h, l)) = spki_header(&spki, 0) else {
+        return Ok(None);
+    };
     if t != 0x30 {
-        return Err(Error::Proto("utls reality: SPKI 首元素非 SEQ"));
+        return Ok(None);
     }
     let mut pos = h;
     let end = h + l;
     let mut bits: Option<(usize, usize)> = None;
     while pos < end {
-        let (t2, h2, l2) = spki_header(&spki, pos)?;
-        if t2 == 0x03 {
+        let Ok((t2, h2, l2)) = spki_header(&spki, pos) else {
+            return Ok(None);
+        };
+        if t2 == 0x03 && l2 > 1 {
             // 跳过 1 字节 unused-bits
             bits = Some((pos + h2 + 1, l2 - 1));
         }
         pos += h2 + l2;
     }
-    let (s, n) = bits.ok_or(Error::Proto("utls reality: SPKI 缺 BIT STRING"))?;
-    let pubkey = spki[s..s + n].to_vec();
-    if pubkey.len() != 32 {
-        return Err(Error::ProtoMsg(format!(
-            "utls reality: 证书公钥长度 {} != 32 字节 (非 Ed25519)",
-            pubkey.len()
-        )));
+    let Some((s, n)) = bits else {
+        return Ok(None);
+    };
+    if n != 32 || s + n > spki.len() {
+        return Ok(None);
     }
-    Ok(pubkey)
+    Ok(Some(spki[s..s + n].to_vec()))
+}
+
+/// 从 X.509 证书 DER 中提取 Ed25519 公钥（32 字节）
+#[cfg(test)]
+fn extract_ed25519_pubkey(leaf: &CertificateDer<'_>) -> Result<Vec<u8>> {
+    match try_extract_ed25519_pubkey(leaf)? {
+        Some(k) => Ok(k),
+        None => Err(Error::Proto("utls reality: 证书非 32 字节 Ed25519 公钥")),
+    }
 }
 
 /// 从 X.509 证书 DER 中提取证书签名（BIT STRING 内容，跳过 unused-bits 字节）
@@ -1051,16 +1069,29 @@ where
                 HS_CERT => {
                     let c = parse_certificate(&msg)?;
                     if let Some(ref aead_key) = ch.aead_key {
-                        let pubkey = extract_ed25519_pubkey(&c.0)?;
-                        let cert_sig = extract_cert_signature(&c.0)?;
-                        let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, aead_key);
-                        let expected = ring::hmac::sign(&hmac_key, &pubkey);
-                        if cert_sig != expected.as_ref() {
-                            return Err(Error::Proto(
-                                "utls reality: 证书 HMAC-SHA512 签名校验失败，服务端未通过认证",
-                            ));
+                        // REALITY 证书认证规范（对齐 Xray 行为）：
+                        // 1. 若服务端下发定制 Ed25519 临时证书（公钥为 32 字节）：
+                        //    计算 HMAC-SHA512(auth_key, ed25519_pubkey) 与证书签名比对认证。
+                        //    比对成功则置 reality_verified = true，后续跳过 WebPKI 校验。
+                        //    比对失败则拒绝连接（防中间人篡改）。
+                        // 2. 若服务端返回目标网站真实证书（如 tesla.com 的 RSA-2048 270 字节 SPKI 或 ECDSA 证书）：
+                        //    非 Ed25519 证书不直接阻断报错，保持 reality_verified = false，
+                        //    在后续流程中平滑回退至标准 WebPKI 证书链与 SNI 校验。
+                        if let Some(pubkey) = try_extract_ed25519_pubkey(&c.0)? {
+                            let cert_sig = extract_cert_signature(&c.0)?;
+                            let hmac_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA512, aead_key);
+                            let expected = ring::hmac::sign(&hmac_key, &pubkey);
+                            if cert_sig != expected.as_ref() {
+                                return Err(Error::Proto(
+                                    "utls reality: 证书 HMAC-SHA512 签名校验失败，服务端未通过认证",
+                                ));
+                            }
+                            reality_verified = true;
+                        } else {
+                            tracing::debug!(
+                                "utls reality: 服务端返回非 Ed25519 证书（如目标伪装站真实 RSA/ECDSA 证书），回退至 WebPKI 校验"
+                            );
                         }
-                        reality_verified = true;
                     }
                     chain = Some(c);
                 }
@@ -2463,5 +2494,61 @@ mod tests {
         })
         .await
         .expect("e2e_reality_handshake_and_tamper_detection 超时（15s）");
+    }
+
+    #[tokio::test]
+    async fn test_reality_rsa_certificate_fallback() {
+        // 1. 验证针对标准非 Ed25519 证书（如 ECDSA P-256 证书），try_extract_ed25519_pubkey 正确识别为非 Ed25519 并返回 Ok(None)
+        let cert = rcgen::generate_simple_self_signed(vec!["tesla.com".into()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let cert_obj = CertificateDer::from(cert_der);
+        let res = try_extract_ed25519_pubkey(&cert_obj).unwrap();
+        assert_eq!(res, None, "非 Ed25519 证书公钥不应被当作 Ed25519 处理");
+
+        // 2. 验证针对标准 Ed25519 证书，正确提取 32 字节公钥
+        let ed_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let ed_params = rcgen::CertificateParams::new(vec!["tesla.com".to_string()]).unwrap();
+        let ed_cert = ed_params.self_signed(&ed_kp).unwrap();
+        let ed_der = ed_cert.der().to_vec();
+        let ed_obj = CertificateDer::from(ed_der);
+        let ed_pub = try_extract_ed25519_pubkey(&ed_obj).unwrap();
+        assert!(ed_pub.is_some());
+        assert_eq!(ed_pub.unwrap().len(), 32);
+
+        // 3. 构造真实 270 字节 RSA-2048 SPKI 证书，验证绝不报错且正确返回 None 平滑回退 WebPKI
+        let mut rsa_spki = Vec::new();
+        rsa_spki.extend_from_slice(&[0x30, 0x82, 0x01, 0x22]); // SEQ len 290
+        rsa_spki.extend_from_slice(&[
+            0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05,
+            0x00,
+        ]); // rsaEncryption OID + NULL
+        rsa_spki.extend_from_slice(&[0x03, 0x82, 0x01, 0x0f, 0x00]); // BIT STRING len 271, 0 unused bits
+        rsa_spki.extend_from_slice(&[0xaa; 270]); // 270 字节 RSA 公钥 (模数与指数)
+
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&[0xa0, 0x03, 0x02, 0x01, 0x02]); // v3 (0xa0)
+        tbs.extend_from_slice(&[0x02, 0x01, 0x01]); // serial (0x02)
+        tbs.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]); // sig (0x30)
+        tbs.extend_from_slice(&[0x30, 0x03, 0x31, 0x01, 0x00]); // issuer (0x30)
+        tbs.extend_from_slice(&[0x30, 0x06, 0x17, 0x01, 0x00, 0x17, 0x01, 0x00]); // validity (0x30)
+        tbs.extend_from_slice(&[0x30, 0x03, 0x31, 0x01, 0x00]); // subject (0x30)
+        tbs.extend_from_slice(&rsa_spki); // count == 7: SPKI (0x30)
+
+        let mut fake_cert = Vec::new();
+        let total_inner = tbs.len() + 10;
+        fake_cert.extend_from_slice(&[0x30, 0x82]);
+        fake_cert.extend_from_slice(&[(total_inner >> 8) as u8, total_inner as u8]);
+        fake_cert.extend_from_slice(&[0x30, 0x82]);
+        fake_cert.extend_from_slice(&[(tbs.len() >> 8) as u8, tbs.len() as u8]);
+        fake_cert.extend_from_slice(&tbs);
+        fake_cert.extend_from_slice(&[0x30, 0x02, 0x05, 0x00]); // sig alg
+        fake_cert.extend_from_slice(&[0x03, 0x02, 0x00, 0x00]); // sig
+
+        let fake_cert_obj = CertificateDer::from(fake_cert);
+        let rsa_res = try_extract_ed25519_pubkey(&fake_cert_obj).unwrap();
+        assert_eq!(
+            rsa_res, None,
+            "270 字节 RSA SPKI 绝不能报错，必须平滑返回 None 回退 WebPKI"
+        );
     }
 }

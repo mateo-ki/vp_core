@@ -215,12 +215,10 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
 }
 
 #[cfg(unix)]
+#[allow(clippy::manual_c_str_literals)]
 fn redirect_broken_std_to_devnull() {
     unsafe {
-        let devnull = libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_WRONLY,
-        );
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
         if devnull >= 0 {
             libc::dup2(devnull, libc::STDOUT_FILENO);
             libc::dup2(devnull, libc::STDERR_FILENO);

@@ -1,3 +1,153 @@
+# 🚀 VP_Core v1.7.0 架构革新：统一中间表示 VP IR、声明式全量配置 DSL 与微秒级全景链路诊断
+
+> **“性能早已不是瓶颈，真正的工业级代理内核应当全力优化路由模块，把易用性做到极致，并彻底消除破坏性更新。”**
+>
+> 🎉 欢迎使用 **VP_Core v1.7.0**！这是项目演进历程中极具里程碑意义的重大版本。我们彻底打破了传统代理内核在配置格式与规则表达上的陈旧桎梏：确立了纯净强类型的**统一中间表示层 (Unified VP IR)**；推出了专为人类直觉与大模型（LLM）打造的**声明式全量配置语言 (`.vp` DSL)**；实现了手写 Pratt 攀爬算法的 **Google CEL 表达式引擎**；并带来了精确至微秒（µs）的 **Chrome DevTools 风格全景链路诊断系统 (`vpcore explain`)**。
+
+### 🌟 核心革新全览 (Highlights)
+
+| 核心特性 | 解决的传统痛点 | 带来突破性价值 |
+| :--- | :--- | :--- |
+| **统一中间表示 (VP IR)** | Clash YAML 序列化别名污染运行时模型，版本变更极易引发破坏性更新 | 借鉴 LLVM IR/Envoy xDS 架构，构建纯净强类型契约，多前端零损耗降维 |
+| **全量配置 DSL (`vp-dsl`)** | 传统 YAML 缩进脆弱、少个空格全盘报错、JSON 嵌套深如迷宫 | 类似 Terraform/HCL 的极简块声明语法，杜绝缩进陷阱，天然契合 AI 生成 |
+| **Google CEL 表达式引擎** | 传统规则无法表达复合条件，无法书写 `&&`、`\|\|`、`in` 逻辑 | 手写 Pratt 算符攀爬解析器，支持 Wireshark 风格纳秒级短路规则分流 |
+| **全景链路诊断 (`explain`)** | 节点连不上或首包卡顿如抓瞎排错，翻找千行调试日志耗时费力 | 终端高亮决策树，精确度量规则匹配、DNS、节点测速与全流程耗时（µs/ms） |
+| **策略组容灾兜底 (fallback)** | 机场节点变动导致正则匹配为空、组内全灭时直接报错断网 | 正则动态过滤匹配 + 空成员自动平滑切换 fallback 兜底，网络永不中断 |
+| **外部订阅零拷贝直转 IR** | 传统“拼装临时 YAML 字符串 -> 二次反序列化”的反模式损耗性能 | 订阅 URI 零中转直出强类型 `OutboundSpec`，解析吞吐翻倍提升 |
+
+### 🔍 P1. 全景链路诊断与微秒级可观测性引擎 (`explain`)
+告别黑盒盲猜！通过 `vpcore explain <target>` 即可获得毫秒/微秒级全景决策树：
+```text
+================================================================================
+                    VP_Core 路由链路诊断追踪 (explain)
+================================================================================
+[*] 诊断目标: www.google.com:443 (Domain)
+[*] 会话环境: Network: TCP | Inbound: mixed | Process: None
+
+┌── [1] 分流运行模式
+│   └── Mode: rule (规则优先分流)
+│
+├── [2] 目标地址与嗅探
+│   ├── Host: www.google.com
+│   ├── Port: 443
+│   └── Type: Domain (域名)
+│
+├── [3] 惰性 DNS 解析
+│   ├── 触发状态: 已触发 (触发规则: GEOIP,CN)
+│   ├── 解析耗时: 38ms   (精确捕获 DNS 首包查询延迟)
+│   └── 解析结果: 142.250.190.46
+│
+├── [4] 规则匹配决策
+│   ├── 评估进度: 评估至第 1 条 (总数: 50 条，规则匹配耗时: 12 µs)
+│   ├── 命中规则: #1 EXPR,(host.endsWith(".google.com")),PROXY
+│   ├── 规则类型: EXPR
+│   └── 分流目标: PROXY
+│
+├── [5] 策略组穿透决策链
+│   └── [1] 组名: PROXY (url-test)
+│       ├── 决策依据: 自动优选延迟最低存活节点
+│       ├── 选中成员: 香港-01
+│       └── 组内成员快照 (2 个):
+│           ├── 香港-01 (存活, 延迟: 45ms, UDP:支持) [* 选中]
+│           └── 日本-01 (存活, 延迟: 110ms, UDP:支持)
+│
+└── [6] 终结出站节点 (Leaf Outbound)
+    ├── 节点名称: 香港-01
+    ├── 出站类型: proxy
+    ├── 远程地址: 1.2.3.4:443
+    ├── UDP 支持: 支持
+    ├── 决策总耗时: 70 µs (全流程瞬时完成)
+    └── 决策全路径: [Rule 1: EXPR] -> PROXY > PROXY(url-test) -> 香港-01
+================================================================================
+```
+- **CLI 原生 `--json` 格式化**：直接产出标准 JSON 数据，供脚本、前端面板、外部巡检与监控调用；
+- **在线实时 REST API**：后台守护进程开放 `GET/POST /routes/explain` 端点，无需重启即可动态模拟任何目标与进程的分流路径。
+
+### 📝 P2. 现代声明式配置 DSL (`.vp`) 与 Google CEL 表达式引擎
+分流规则的本质是元编程逻辑！现在你可以用最直观的语法编写全量配置 (`config.vp`)：
+```dsl
+inbound mixed {
+    listen: "127.0.0.1:7890"
+}
+
+node "香港-01" vless {
+    server: "hk.example.com:443"
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    flow: "xtls-rprx-vision"
+    tls: reality {
+        sni: "www.amazon.com"
+        public_key: "abc1234567890"
+        short_id: "abcd"
+    }
+}
+
+group "AUTO" url_test {
+    members: ["香港-01", "日本-01"]
+    interval: 300s
+    tolerance: 50ms
+    filter: "(?i)香港"
+    fallback: "DIRECT"
+}
+
+group "PROXY" select {
+    members: ["AUTO", "香港-01", "DIRECT"]
+}
+
+route {
+    // 进程与端口精确比对（Cost 0 极速短路）
+    process.name == "git" && dst.port == 22 => "PROXY"
+
+    // 协议、端口与域名后缀复合匹配
+    net == "tcp" && dst.port in [80, 443] && host.endsWith(".google.com") => "AUTO"
+
+    // IP CIDR 与源 IP 网段判断
+    dst.ip in "10.0.0.0/8" || src.ip in "192.168.1.0/24" => "DIRECT"
+    dst.ip in "127.0.0.0/8" => "DIRECT"
+
+    // GeoIP 国家代码
+    geoip == "CN" => "DIRECT"
+
+    // 通配兜底
+    _ => "PROXY"
+}
+```
+- **Pratt 算符优先级攀爬算法**：严格保证 `&&`、`||`、`!`、`in`、`==`、`!=` 优先级无歧义；
+- **基于评估开销的自动重排序优化**：Cost 0 端口/协议整数比对优先执行，纳秒级快速短路跳出；
+- **全格式 100% 向后兼容**：既支持独立的 `.vp` 脚本，也完全支持在传统 Clash YAML 的 `rules` 中直接嵌入单行 CEL 表达式。
+
+### 🤖 P3. 面向 AI 的大模型专属 Prompt 与文档体系
+为了方便用户让 **ChatGPT / Claude / DeepSeek** 根据自然语言一键生成零错误配置，配套推出了完善的文档：
+- **语法规范与速查手册**：详见项目文档 [`docs/dsl.md`](docs/dsl.md)；
+- **开箱即用 AI Prompt**：复制文档中第四章的专属 Prompt 丢给任何大语言模型，即可通过日常对话定制专属代理与分流方案。
+
+### 🌐 P4. 统一中间表示层 (VP IR) 与底层解耦重构
+- **独立纯数据结构层 (`crates/vp-ir`)**：解耦所有外部序列化细节与运行时协议栈；
+- **多源汇聚前端**：Clash YAML、JSON5、外部订阅链接和 `.vp` DSL 统一无损降维至 `VpIr`；
+- **运行时纯净装配**：`vp-app` 重构为直接消费 `VpIr` 的装配内核 `App::start_from_ir`。
+
+### 📱 P5. 移动端与全平台发布包矩阵 (Desktop & Mobile SDKs)
+全套桌面二进制与移动端 SDK 同步发布：
+- **Desktop 桌面端**：Windows (`x86_64-pc-windows-msvc`)、Linux Musl (`x86_64` / `aarch64`)、macOS (`x86_64` / `aarch64 Apple Silicon`)；
+- **Android SDK**：包含 `arm64-v8a`、`armeabi-v7a`、`x86_64` 预编译动态库与 Kotlin 原生封装；
+- **iOS / macOS SDK**：包含 Apple 官方标准 `VPCore.xcframework` 与 Swift Package Manager 支持；
+- **纯血鸿蒙 NEXT SDK**：专为 HarmonyOS NEXT / OpenHarmony 设计的 ArkTS + Node-API C++ 桥接包。
+
+### ⚡ 极速体验与升级指南
+- **客户端平滑自我更新**：
+  ```bash
+  vpcore update
+  ```
+- **体验全新链路诊断**：
+  ```bash
+  vpcore explain https://www.google.com -c config.yaml
+  ```
+- **校验配置有效性**：
+  ```bash
+  vpcore validate -c config.yaml
+  ```
+
+---
+
 # 🚀 VP_Core v1.6.3 发布说明 / Release Notes
 
 🎉 欢迎使用 **VP_Core v1.6.3**！本版本聚焦 **REALITY 客户端证书公钥校验对齐 Xray 行为（支持非 Ed25519 真实伪装站证书平滑回退 WebPKI） + Linux 守护进程 Broken Pipe 递归 Panic 引发 SIGABRT 崩溃根除 + 真实网络节点端到端校验**：

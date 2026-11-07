@@ -111,6 +111,17 @@ rules: ['MATCH,PROXY']
     assert_eq!(resp_clash.0, 200);
     assert!(resp_clash.1.contains("proxies:"));
 
+    // 验证 /routes/explain 诊断追踪 API
+    let resp_explain = http_get(
+        &ctl_addr,
+        "/routes/explain?url=https://github.com",
+        Some("s3cret"),
+    )
+    .await;
+    assert_eq!(resp_explain.0, 200);
+    assert!(resp_explain.1.contains("github.com"));
+    assert!(resp_explain.1.contains("decision_chain"));
+
     // PATCH /configs 免停热切至 global
     let resp = http_patch(
         &ctl_addr,

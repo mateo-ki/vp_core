@@ -12,9 +12,12 @@ path = "src/main.rs"
 
 [dependencies]
 vp-common.workspace = true
+vp-core.workspace = true
 vp-app.workspace = true
 vp-protocol.workspace = true
 vp-config.workspace = true
+vp-ir.workspace = true
+vp-dsl.workspace = true
 vp-tun.workspace = true
 tokio.workspace = true
 clap.workspace = true

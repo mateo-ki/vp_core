@@ -13,6 +13,7 @@ use crate::RouterHandle;
 
 mod configs;
 mod connections;
+pub mod explain;
 mod metrics;
 mod providers;
 mod proxies;
@@ -215,6 +216,12 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
         }
         ("GET", ["rules"]) => {
             configs::handle_rules_get(&mut stream, &router).await;
+        }
+        ("GET", ["routes", "explain"]) | ("POST", ["routes", "explain"]) => {
+            explain::handle_routes_explain(&mut stream, &router, &req).await;
+        }
+        ("GET", ["rules", "explain"]) | ("POST", ["rules", "explain"]) => {
+            explain::handle_routes_explain(&mut stream, &router, &req).await;
         }
         ("GET", ["connections"]) => {
             connections::handle_connections_list(&mut stream, st).await;

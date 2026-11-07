@@ -1,0 +1,11 @@
+[package]
+name = "vp-ir"
+description = "VP_Core 统一中间表示层 (Unified Intermediate Representation)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+serde.workspace = true

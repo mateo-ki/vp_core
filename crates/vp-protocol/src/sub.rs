@@ -103,6 +103,20 @@ impl SubNode {
         out.push('\n');
         out
     }
+
+    /// 将节点直转为强类型 IR OutboundSpec
+    pub fn to_outbound_spec(&self) -> Result<vp_ir::OutboundSpec> {
+        let yaml = format!("proxies:\n{}", self.to_yaml());
+        let cfg = vp_config::parse(&yaml, vp_config::Format::Yaml)
+            .map_err(|e| Error::Config(format!("订阅节点解析为 IR 失败: {e}")))?;
+        let ir = cfg
+            .into_ir()
+            .map_err(|errs| Error::Config(errs.join("; ")))?;
+        ir.outbounds
+            .into_iter()
+            .find(|o| o.name == self.name())
+            .ok_or_else(|| Error::Config(format!("未找到节点 {}", self.name())))
+    }
 }
 
 fn q(s: &str) -> String {
@@ -969,6 +983,27 @@ pub fn parse_subscription(text: &str) -> Vec<SubNode> {
     out
 }
 
+/// 直接将订阅文本（Base64 或逐行 URI）转换为强类型 IR OutboundSpec 列表
+pub fn parse_subscription_to_outbounds(text: &str) -> Vec<vp_ir::OutboundSpec> {
+    let nodes = parse_subscription(text);
+    if nodes.is_empty() {
+        if let Ok(cfg) = vp_config::parse(text, vp_config::Format::Yaml) {
+            if let Ok(ir) = cfg.into_ir() {
+                return ir
+                    .outbounds
+                    .into_iter()
+                    .filter(|o| o.name != "DIRECT" && o.name != "REJECT")
+                    .collect();
+            }
+        }
+        return Vec::new();
+    }
+    nodes
+        .into_iter()
+        .filter_map(|n| n.to_outbound_spec().ok())
+        .collect()
+}
+
 /// 生成完整可运行配置
 pub fn build_config(nodes: &[SubNode], port: u16) -> String {
     let mut out = String::new();
@@ -1520,5 +1555,31 @@ payload:
         assert_eq!(from_payload.len(), 2);
         assert_eq!(from_payload[0].name, "HK-Payload");
         assert_eq!(from_payload[1].name, "US-Payload");
+    }
+
+    #[test]
+    fn test_subscription_direct_to_ir_outbounds() {
+        let sub = "trojan://pw@h.com:443?sni=h.com&type=ws&path=/t#t1\nvless://b831381d-6324-4d53-ad4f-8cda48b30811@h2.com:443?security=tls&sni=h2.com&type=ws&path=/v&host=h2.com#v1";
+        let outbounds = parse_subscription_to_outbounds(sub);
+        assert_eq!(outbounds.len(), 2);
+        assert_eq!(outbounds[0].name, "t1");
+        assert_eq!(outbounds[1].name, "v1");
+        match &outbounds[0].kind {
+            vp_ir::OutboundKind::Trojan { server, port, .. } => {
+                assert_eq!(server, "h.com");
+                assert_eq!(*port, 443);
+            }
+            other => panic!("expected trojan, got {other:?}"),
+        }
+        match &outbounds[1].kind {
+            vp_ir::OutboundKind::Vless {
+                server, port, uuid, ..
+            } => {
+                assert_eq!(server, "h2.com");
+                assert_eq!(*port, 443);
+                assert_eq!(uuid, "b831381d-6324-4d53-ad4f-8cda48b30811");
+            }
+            other => panic!("expected vless, got {other:?}"),
+        }
     }
 }

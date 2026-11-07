@@ -12,7 +12,11 @@ use tracing::debug;
 pub use consts::*;
 use vp_common::Result;
 use vp_config::Mode;
-use vp_core::{Outbound, Resolution, Router as RouterTrait, RuleHit, Session};
+use vp_core::{
+    DestinationTrace, DnsTrace, GroupMemberTrace, GroupStepTrace, LeafOutboundTrace, Outbound,
+    Resolution, RouteTrace, Router as RouterTrait, RuleHit, RuleHitDetail, RuleMatchTrace, Session,
+    SessionTrace,
+};
 use vp_dns::Resolver;
 use vp_rule::{MatchCtx, Net, RuleEngine};
 
@@ -89,20 +93,18 @@ impl Router {
                         break;
                     }
                 }
+                let mut fallback_outbound: Option<Arc<dyn Outbound>> = None;
+                if let Some(ref fb_name) = gs.fallback {
+                    if let Some(o) = resolved.get(fb_name) {
+                        fallback_outbound = Some(o.clone());
+                    } else if let Some(g) = groups.get(fb_name) {
+                        fallback_outbound = Some(g.clone() as Arc<dyn Outbound>);
+                    } else {
+                        ok = false;
+                    }
+                }
                 if ok {
-                    let g = Group::new(
-                        GroupSpec {
-                            name: gs.name.clone(),
-                            ty: gs.ty,
-                            members: gs.members.clone(),
-                            test_url: gs.test_url.clone(),
-                            interval: gs.interval,
-                            tolerance: gs.tolerance,
-                            lazy: gs.lazy,
-                            lb_strategy: gs.lb_strategy,
-                        },
-                        members,
-                    );
+                    let g = Group::new(gs.clone(), members, fallback_outbound);
                     groups.insert(gs.name.clone(), g.clone());
                     resolved.insert(gs.name.clone(), g);
                     progress = true;
@@ -410,6 +412,297 @@ impl RouterTrait for Router {
         }
     }
 
+    async fn explain(&self, sess: &Session) -> RouteTrace {
+        let t_start = std::time::Instant::now();
+        let destination = DestinationTrace {
+            original: format!("{}", sess.dst),
+            host: match &sess.dst.host {
+                vp_common::Host::Domain(d) => d.clone(),
+                vp_common::Host::Ip(ip) => ip.to_string(),
+            },
+            is_domain: sess.dst.host.as_domain().is_some(),
+            port: sess.dst.port,
+        };
+
+        let session = SessionTrace {
+            network: match sess.network {
+                vp_core::Network::Tcp => "tcp",
+                vp_core::Network::Udp => "udp",
+            }
+            .to_string(),
+            inbound: sess.inbound.to_string(),
+            inbound_port: sess.inbound_port,
+            inbound_user: sess.inbound_user.as_deref().map(|s| s.to_string()),
+            process: sess.process.as_deref().map(|s| s.to_string()),
+            src_ip: sess.src.map(|s| s.ip().to_string()),
+        };
+
+        let mode_str = match self.mode {
+            Mode::Direct => "direct",
+            Mode::Global => "global",
+            Mode::Rule => "rule",
+        }
+        .to_string();
+
+        let mut dns_trace: Option<DnsTrace> = None;
+        let mut adaptive_blocked = false;
+        let mut rule_match = RuleMatchTrace {
+            matched: None,
+            evaluated_count: 0,
+            total_rules: self.rules.rules().len(),
+            elapsed_us: 0,
+        };
+
+        let outbound = match self.mode {
+            Mode::Direct => self
+                .outbounds
+                .get(OUTBOUND_DIRECT)
+                .cloned()
+                .unwrap_or(self.global_outbound.clone()),
+            Mode::Global => self.global_outbound.clone(),
+            Mode::Rule => {
+                let mut found_outbound = None;
+                if let Some(host_str) = sess.dst.host.as_domain() {
+                    if vp_core::adaptive::is_blocked(host_str) {
+                        adaptive_blocked = true;
+                        if let Some(fallback) = self.fallback_proxy_outbound() {
+                            rule_match.matched = Some(RuleHitDetail {
+                                index: 0,
+                                rule_type: "ADAPTIVE-LRU".into(),
+                                payload: host_str.to_string(),
+                                target: GROUP_PROXY.into(),
+                                raw: RULE_ADAPTIVE_LRU.into(),
+                                no_resolve: false,
+                            });
+                            found_outbound = Some(fallback);
+                        }
+                    }
+                }
+
+                if found_outbound.is_none() {
+                    let dst_ip = match &sess.dst.host {
+                        vp_common::Host::Ip(ip) => Some(*ip),
+                        vp_common::Host::Domain(_) => None,
+                    };
+
+                    let mut ctx = MatchCtx {
+                        host: sess.dst.host.as_domain(),
+                        dst_ip,
+                        src_ip: sess.src.map(|s| s.ip()),
+                        dst_port: sess.dst.port,
+                        src_port: sess.src.map(|s| s.port()).unwrap_or(0),
+                        network: match sess.network {
+                            vp_core::Network::Tcp => Net::Tcp,
+                            vp_core::Network::Udp => Net::Udp,
+                        },
+                        process: sess.process.as_deref(),
+                        inbound: &sess.inbound,
+                        inbound_port: sess.inbound_port,
+                        inbound_user: sess.inbound_user.as_deref(),
+                    };
+
+                    let mut evaluated = 0;
+                    let mut matched_info = None;
+
+                    let t_rules = std::time::Instant::now();
+                    for (idx, r) in self.rules.rules().iter().enumerate() {
+                        evaluated += 1;
+                        if ctx.dst_ip.is_none() && r.needs_dst_ip() {
+                            let t0 = std::time::Instant::now();
+                            let dns_res = self.dns.resolve(&sess.dst.host, self.ipv6).await;
+                            let duration_ms = t0.elapsed().as_millis() as u64;
+                            match dns_res {
+                                Ok(ips) => {
+                                    if let Some(first) = ips.first() {
+                                        ctx.dst_ip = Some(*first);
+                                    }
+                                    dns_trace = Some(DnsTrace {
+                                        triggered: true,
+                                        trigger_rule: Some(r.raw.to_string()),
+                                        resolved_ips: ips.iter().map(|ip| ip.to_string()).collect(),
+                                        duration_ms,
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    dns_trace = Some(DnsTrace {
+                                        triggered: true,
+                                        trigger_rule: Some(r.raw.to_string()),
+                                        resolved_ips: Vec::new(),
+                                        duration_ms,
+                                        error: Some(e.to_string()),
+                                    });
+                                }
+                            }
+                        }
+
+                        if let Some((target, rule_str)) = r.match_target(&ctx) {
+                            let (rule_type, payload) =
+                                if let Some((t, p)) = rule_str.split_once(',') {
+                                    (t.to_string(), p.to_string())
+                                } else {
+                                    (rule_str.to_string(), String::new())
+                                };
+                            matched_info = Some((
+                                target.to_string(),
+                                RuleHitDetail {
+                                    index: idx + 1,
+                                    rule_type,
+                                    payload,
+                                    target: target.to_string(),
+                                    raw: rule_str.to_string(),
+                                    no_resolve: r.no_resolve,
+                                },
+                            ));
+                            break;
+                        }
+                    }
+
+                    rule_match.evaluated_count = evaluated;
+                    rule_match.elapsed_us = t_rules.elapsed().as_micros() as u64;
+
+                    match matched_info {
+                        Some((target, hit_detail)) => {
+                            rule_match.matched = Some(hit_detail);
+                            let ob = match self.outbounds.get(&target).cloned() {
+                                Some(ob) => ob,
+                                None => self
+                                    .outbounds
+                                    .get("REJECT")
+                                    .cloned()
+                                    .unwrap_or(self.global_outbound.clone()),
+                            };
+                            found_outbound = Some(ob);
+                        }
+                        None => {
+                            found_outbound = Some(self.global_outbound.clone());
+                        }
+                    }
+                }
+                found_outbound.unwrap_or(self.global_outbound.clone())
+            }
+        };
+
+        // 穿透策略组并记录每一级
+        let mut group_chain = Vec::new();
+        let mut cur = outbound.clone();
+        let mut depth = 0;
+        let mut decision_parts = Vec::new();
+
+        if let Some(ref m) = rule_match.matched {
+            decision_parts.push(format!("[Rule {}: {}] -> {}", m.index, m.raw, m.target));
+        } else {
+            decision_parts.push(format!("[Mode: {}] -> {}", mode_str, outbound.name()));
+        }
+
+        while let Some(g) = self.groups.get(cur.name()) {
+            if depth > 8 {
+                break;
+            }
+            depth += 1;
+
+            let picked_tcp = g.pick(sess);
+            let picked_udp = g.pick_udp(sess);
+            let (picked, udp_adjusted) = match sess.network {
+                vp_core::Network::Udp if picked_tcp.name() != picked_udp.name() => {
+                    (picked_udp, true)
+                }
+                vp_core::Network::Udp => (picked_udp, false),
+                vp_core::Network::Tcp => (picked_tcp, false),
+            };
+
+            let states = g.member_states();
+            let mut member_traces = Vec::with_capacity(states.len());
+            let mut picked_delay = None;
+
+            for (m_name, delay, alive) in states {
+                let support_udp = self
+                    .outbounds
+                    .get(&*m_name)
+                    .map_or(true, |o| o.support_udp());
+                if &*m_name == picked.name() {
+                    picked_delay = delay;
+                }
+                member_traces.push(GroupMemberTrace {
+                    name: m_name.to_string(),
+                    delay_ms: delay,
+                    alive,
+                    support_udp,
+                });
+            }
+
+            let group_type_str = format!("{:?}", g.ty()).to_lowercase();
+            let reason = match g.ty() {
+                GroupType::Select => format!("手动选中 (当前节点: {})", picked.name()),
+                GroupType::UrlTest => {
+                    if let Some(d) = picked_delay {
+                        format!("最低延迟优先 ({}ms)", d)
+                    } else {
+                        "测速选优".into()
+                    }
+                }
+                GroupType::Fallback => "故障转移优先存活节点".into(),
+                GroupType::LoadBalance => "负载均衡调度".into(),
+                GroupType::Relay => "链式中继下一跳".into(),
+            };
+
+            let reason_summary = if udp_adjusted {
+                format!("{reason} [UDP自动降级切换]")
+            } else {
+                reason.clone()
+            };
+
+            decision_parts.push(format!(
+                "{}({}) -> {}",
+                g.name(),
+                group_type_str,
+                picked.name()
+            ));
+
+            group_chain.push(GroupStepTrace {
+                group_name: g.name().to_string(),
+                group_type: group_type_str,
+                picked_member: picked.name().to_string(),
+                reason: reason_summary,
+                members: member_traces,
+                udp_adjusted,
+            });
+
+            cur = picked;
+        }
+
+        let leaf_name = cur.name().to_string();
+        let leaf_remote = cur.remote_addr().map(|(h, p)| format!("{h}:{p}"));
+        let final_outbound = LeafOutboundTrace {
+            name: leaf_name.clone(),
+            outbound_type: if self.groups.contains_key(&leaf_name) {
+                "group".into()
+            } else if leaf_name == "DIRECT" || leaf_name == "REJECT" {
+                "builtin".into()
+            } else {
+                "proxy".into()
+            },
+            support_udp: cur.support_udp(),
+            remote_addr: leaf_remote,
+            dialer_proxy: None,
+        };
+
+        let elapsed_us = t_start.elapsed().as_micros() as u64;
+
+        RouteTrace {
+            mode: mode_str,
+            destination,
+            session,
+            dns: dns_trace,
+            adaptive_blocked,
+            rule_match,
+            group_chain,
+            final_outbound,
+            decision_chain: decision_parts.join(" > "),
+            elapsed_us,
+        }
+    }
+
     fn needs_process(&self) -> bool {
         self.rules.needs_process()
     }
@@ -491,16 +784,7 @@ mod tests {
 
         Router::build(RouterSpec {
             outbounds,
-            groups: vec![GroupSpec {
-                name: "G".into(),
-                ty: GroupType::Select,
-                members: vec!["P1".into()],
-                test_url: None,
-                interval: 300,
-                tolerance: 0,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            }],
+            groups: vec![GroupSpec::new("G", GroupType::Select, vec!["P1".into()])],
             dialers: HashMap::new(),
             rules,
             mode,
@@ -594,5 +878,23 @@ mod tests {
         let g = r.get_group("G").unwrap();
         assert_eq!(g.selected_name().as_ref(), "P1");
         assert!(g.set_selected("P1"));
+    }
+
+    #[tokio::test]
+    async fn test_explain_full_diagnostic_trace() {
+        let r = build_router(Mode::Rule).await;
+        let trace = r.explain(&sess("www.google.com")).await;
+
+        assert_eq!(trace.mode, "rule");
+        assert_eq!(trace.destination.host, "www.google.com");
+        assert!(trace.destination.is_domain);
+        assert_eq!(trace.destination.port, 443);
+        assert!(trace.rule_match.matched.is_some());
+
+        let matched = trace.rule_match.matched.unwrap();
+        assert_eq!(matched.target, "P1");
+        assert_eq!(matched.rule_type, "DOMAIN-SUFFIX");
+        assert_eq!(trace.final_outbound.name, "P1");
+        assert!(trace.decision_chain.contains("-> P1"));
     }
 }

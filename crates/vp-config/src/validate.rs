@@ -64,18 +64,50 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
                 ));
             }
         }
+        if let Some(ref fb) = g.fallback {
+            if fb == &g.name {
+                errs.push(format!("组 {:?} fallback 不能引用自身", g.name));
+            } else if !names.contains(fb.as_str())
+                && !group_names.contains(fb.as_str())
+                && !is_builtin(fb)
+            {
+                errs.push(format!(
+                    "组 {:?} fallback 引用了不存在的出站 {:?}",
+                    g.name, fb
+                ));
+            }
+        }
+        if let Some(ref f) = g.filter {
+            if let Err(e) = regex::Regex::new(f) {
+                errs.push(format!("组 {:?} filter 不是合法的正则表达式: {e}", g.name));
+            }
+        }
+        if let Some(ref ef) = g.exclude_filter {
+            if let Err(e) = regex::Regex::new(ef) {
+                errs.push(format!(
+                    "组 {:?} exclude-filter 不是合法的正则表达式: {e}",
+                    g.name
+                ));
+            }
+        }
     }
 
     // 4. 组环检测（DFS 三色标记）
-    let group_map: HashMap<&str, &Vec<String>> = cfg
+    let group_map: HashMap<&str, Vec<&str>> = cfg
         .proxy_groups
         .iter()
-        .map(|g| (g.name.as_str(), &g.proxies))
+        .map(|g| {
+            let mut deps: Vec<&str> = g.proxies.iter().map(|s| s.as_str()).collect();
+            if let Some(ref fb) = g.fallback {
+                deps.push(fb.as_str());
+            }
+            (g.name.as_str(), deps)
+        })
         .collect();
     let mut state: HashMap<&str, u8> = HashMap::new(); // 0=未访问 1=栈上 2=完成
     fn dfs<'a>(
         name: &'a str,
-        groups: &HashMap<&'a str, &'a Vec<String>>,
+        groups: &HashMap<&'a str, Vec<&'a str>>,
         state: &mut HashMap<&'a str, u8>,
         path: &mut Vec<&'a str>,
     ) -> bool {
@@ -90,7 +122,7 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
         path.push(name);
         if let Some(members) = groups.get(name) {
             for m in members.iter() {
-                if groups.contains_key(m.as_str()) && dfs(m, groups, state, path) {
+                if groups.contains_key(m) && dfs(m, groups, state, path) {
                     return true;
                 }
             }

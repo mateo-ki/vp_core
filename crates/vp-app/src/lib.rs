@@ -51,6 +51,10 @@ impl Router for RouterHandle {
         self.current().pick(sess).await
     }
 
+    async fn explain(&self, sess: &Session) -> vp_core::RouteTrace {
+        self.current().explain(sess).await
+    }
+
     fn needs_process(&self) -> bool {
         self.current().needs_process()
     }
@@ -446,8 +450,7 @@ impl App {
         .await?;
 
         // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
-        let new_cfg: vp_config::Config =
-            vp_config::parse(&new_text, new_fmt).map_err(|e| Error::Config(format!("{e}")))?;
+        let new_cfg = parse_config_for_fmt(&new_text, new_fmt)?;
         sync_tun_state(
             &self.tun_runtime,
             &self.router,
@@ -490,8 +493,7 @@ impl App {
         .await?;
 
         // TUN 开关差量同步（先于路由替换：失败则整体放弃重载，旧状态原样保留）
-        let new_cfg: vp_config::Config =
-            vp_config::parse(new_text, meta.fmt).map_err(|e| Error::Config(format!("{e}")))?;
+        let new_cfg = parse_config_for_fmt(new_text, meta.fmt)?;
         sync_tun_state(
             &self.tun_runtime,
             &self.router,
@@ -514,6 +516,40 @@ impl App {
         info!("配置已通过文本平滑热重载");
         Ok(())
     }
+}
+
+fn parse_config_for_fmt(text: &str, fmt: Format) -> Result<vp_config::Config> {
+    match fmt {
+        Format::Dsl => {
+            let ir = vp_dsl::parse(text).map_err(Error::Config)?;
+            Ok(vp_config::Config::from(ir))
+        }
+        Format::Yaml | Format::Json => {
+            vp_config::parse(text, fmt).map_err(|e| Error::Config(format!("{e}")))
+        }
+    }
+}
+
+impl App {
+    /// 从纯净统一中间表示 VpIr 直接装配并启动运行时
+    pub async fn start_from_ir(
+        ir: vp_ir::VpIr,
+        base_dir: &Path,
+        start_listeners: bool,
+    ) -> Result<Arc<App>> {
+        let cfg = vp_config::Config::from(ir);
+        if let Err(errs) = vp_config::validate::validate(&cfg) {
+            return Err(Error::Config(format!(
+                "IR 配置校验失败:\n  - {}",
+                errs.join("\n  - ")
+            )));
+        }
+        let app = Self::assemble_cfg(cfg, base_dir.to_path_buf(), start_listeners, None).await?;
+        if start_listeners {
+            app.start_background_tasks();
+        }
+        Ok(app)
+    }
 
     async fn assemble(
         text: String,
@@ -523,10 +559,7 @@ impl App {
         config_path: Option<std::path::PathBuf>,
         tun_fd: Option<i32>,
     ) -> Result<Arc<App>> {
-        let t_start = std::time::Instant::now();
-        let mut cfg: vp_config::Config =
-            vp_config::parse(&text, fmt).map_err(|e| Error::Config(format!("{e}")))?;
-        let t_parse = t_start.elapsed();
+        let mut cfg = parse_config_for_fmt(&text, fmt)?;
         if let Some(fd) = tun_fd {
             let mut tun = cfg.tun.take().unwrap_or_default();
             tun.enable = true;
@@ -539,7 +572,22 @@ impl App {
                 errs.join("\n  - ")
             )));
         }
-        let t_validate = t_start.elapsed();
+        let meta = ConfigMeta {
+            path: config_path,
+            text,
+            fmt,
+            base_dir: base_dir.clone(),
+        };
+        Self::assemble_cfg(cfg, base_dir, start_listeners, Some(meta)).await
+    }
+
+    async fn assemble_cfg(
+        cfg: vp_config::Config,
+        base_dir: PathBuf,
+        start_listeners: bool,
+        initial_meta: Option<ConfigMeta>,
+    ) -> Result<Arc<App>> {
+        let t_start = std::time::Instant::now();
 
         if let Some(tuning) = &cfg.tuning {
             let rcv = tuning.so_rcvbuf.or(tuning.socket_buffer_size).unwrap_or(0);
@@ -696,10 +744,8 @@ impl App {
         };
         let t_rules = t_start.elapsed();
         tracing::debug!(
-            "assemble 阶段耗时: parse={:?}, validate={:?}, geosite={:?}, geoip={:?}, dns={:?}, rules={:?}",
-            t_parse,
-            t_validate - t_parse,
-            t_geosite - t_validate,
+            "assemble 阶段耗时: geosite={:?}, geoip={:?}, dns={:?}, rules={:?}",
+            t_geosite,
             t_geoip - t_geosite,
             t_dns - t_geoip,
             t_rules - t_dns
@@ -708,10 +754,32 @@ impl App {
         let mut group_specs = Vec::new();
         for g in &cfg.proxy_groups {
             let mut gs = group_spec(g);
+            let filter_re = g.filter.as_ref().and_then(|f| regex::Regex::new(f).ok());
+            let exclude_re = g
+                .exclude_filter
+                .as_ref()
+                .and_then(|ef| regex::Regex::new(ef).ok());
+
+            // 1. 若配置了 filter / exclude_filter 且有静态 proxies 成员，按规则筛选非内置出站节点
+            if (filter_re.is_some() || exclude_re.is_some()) && !g.proxies.is_empty() {
+                gs.members.retain(|m| {
+                    if vp_config::is_builtin(m) {
+                        return true;
+                    }
+                    let match_filter = filter_re.as_ref().is_none_or(|re| re.is_match(m));
+                    let match_exclude = exclude_re.as_ref().is_some_and(|re| re.is_match(m));
+                    match_filter && !match_exclude
+                });
+            }
+
+            // 2. 解析外部 proxy-providers (use) 并执行动态正则过滤
             for u in &g.r#use {
                 if let Some(plist) = proxy_providers.get(u) {
                     for p in plist {
-                        if !gs.members.contains(&p.name) {
+                        let match_filter = filter_re.as_ref().is_none_or(|re| re.is_match(&p.name));
+                        let match_exclude =
+                            exclude_re.as_ref().is_some_and(|re| re.is_match(&p.name));
+                        if match_filter && !match_exclude && !gs.members.contains(&p.name) {
                             gs.members.push(p.name.clone());
                         }
                     }
@@ -1151,12 +1219,7 @@ impl App {
             dns_status = Arc::new(RwLock::new(DnsStatus::default()));
         }
 
-        let config_meta = Arc::new(RwLock::new(Some(ConfigMeta {
-            path: config_path,
-            text: text.to_string(),
-            fmt,
-            base_dir: base_dir.to_path_buf(),
-        })));
+        let config_meta = Arc::new(RwLock::new(initial_meta));
 
         // TUN 运行时：App 与外部控制器共享同一份（热重载差量同步用）
         let tun_runtime = Arc::new(RwLock::new(tun_runtime_opt));

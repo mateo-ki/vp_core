@@ -10,7 +10,7 @@ use vp_core::{ConnTable, InboundCtx, Router as _};
 use vp_dns::Resolver;
 use vp_protocol::direct::DirectOutbound;
 use vp_protocol::{InboundKind, build_inbound};
-use vp_router::{GroupSpec, GroupType, LbStrategy, Router, RouterSpec};
+use vp_router::{GroupSpec, GroupType, Router, RouterSpec};
 
 async fn spawn_echo() -> u16 {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -78,16 +78,11 @@ async fn build_core() -> (u16 /*mixed port*/, Arc<Router>, u16 /*echo port*/) {
 
     let router = Router::build(RouterSpec {
         outbounds,
-        groups: vec![GroupSpec {
-            name: "PROXY".into(),
-            ty: GroupType::Select,
-            members: vec!["DIRECT".into()],
-            test_url: None,
-            interval: 300,
-            tolerance: 0,
-            lazy: true,
-            lb_strategy: LbStrategy::RoundRobin,
-        }],
+        groups: vec![GroupSpec::new(
+            "PROXY",
+            GroupType::Select,
+            vec!["DIRECT".into()],
+        )],
         dialers: HashMap::new(),
         rules,
         mode: Mode::Rule,

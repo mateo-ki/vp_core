@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 vp-common.workspace = true
 vp-core.workspace = true
+vp-ir.workspace = true
+vp-dsl.workspace = true
 vp-config.workspace = true
 vp-rule.workspace = true
 vp-router.workspace = true

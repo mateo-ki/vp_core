@@ -7,6 +7,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod explain;
 mod gen_server;
 mod update;
 
@@ -28,7 +29,7 @@ enum Cmd {
         /// GUI 托管模式：stdin 收到 stop 或管道关闭时正常退出
         #[arg(long)]
         managed_stdin: bool,
-        /// 配置文件（.yaml / .yml / .json）
+        /// 配置文件（.yaml / .yml / .json / .vp）
         #[arg(short, long)]
         config: PathBuf,
         /// 工作目录 / 规则库目录（支持 -d / -D / --directory）
@@ -41,7 +42,7 @@ enum Cmd {
     /// 校验配置
     #[command(alias = "check")]
     Validate {
-        /// 配置文件（.yaml / .yml / .json）
+        /// 配置文件（.yaml / .yml / .json / .vp）
         #[arg(short, long)]
         config: PathBuf,
         /// 工作目录 / 规则库目录（支持 -d / -D / --directory）
@@ -164,6 +165,9 @@ enum Cmd {
         #[arg(short, long)]
         url: Option<String>,
     },
+    /// 诊断路由分流决策链路 (explain)
+    #[command(name = "explain", alias = "trace")]
+    Explain(explain::ExplainArgs),
 }
 
 /// HTTP GET 拉取（ureq 默认跟随重定向，支持代理与标准客户端 User-Agent）
@@ -387,6 +391,13 @@ async fn async_main() {
                 std::process::exit(1);
             }
         }
+        Cmd::Explain(args) => {
+            init_logging("warn");
+            if let Err(e) = explain::run(args).await {
+                eprintln!("\x1b[31m[!] 诊断失败: {e}\x1b[0m");
+                std::process::exit(1);
+            }
+        }
         Cmd::ImportLinks { input, output } => {
             let result = (|| -> Result<(), String> {
                 let text = std::fs::read_to_string(&input).map_err(|e| e.to_string())?;
@@ -429,22 +440,52 @@ async fn async_main() {
                 }
             };
             let fmt = vp_config::Format::from_path(&config.to_string_lossy());
-            match vp_config::parse_and_validate(&text, fmt) {
-                Ok(cfg) => {
-                    println!(
-                        "✓ 配置有效：{} 个节点，{} 个组，{} 条规则，模式 {:?}",
-                        cfg.proxies.len(),
-                        cfg.proxy_groups.len(),
-                        cfg.rules.len(),
-                        cfg.mode
-                    );
-                }
-                Err(errs) => {
-                    eprintln!("✗ 配置无效：");
-                    for e in errs {
-                        eprintln!("  - {e}");
+            if fmt == vp_config::Format::Dsl {
+                match vp_dsl::parse(&text) {
+                    Ok(ir) => {
+                        let cfg = vp_config::Config::from(ir);
+                        match vp_config::validate::validate(&cfg) {
+                            Ok(()) => {
+                                println!(
+                                    "✓ 配置有效（VP DSL）：{} 个节点，{} 个组，{} 条规则，模式 {:?}",
+                                    cfg.proxies.len(),
+                                    cfg.proxy_groups.len(),
+                                    cfg.rules.len(),
+                                    cfg.mode
+                                );
+                            }
+                            Err(errs) => {
+                                eprintln!("✗ 配置语义无效：");
+                                for e in errs {
+                                    eprintln!("  - {e}");
+                                }
+                                std::process::exit(1);
+                            }
+                        }
                     }
-                    std::process::exit(1);
+                    Err(e) => {
+                        eprintln!("✗ VP DSL 语法解析失败：\n  - {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match vp_config::parse_and_validate(&text, fmt) {
+                    Ok(cfg) => {
+                        println!(
+                            "✓ 配置有效：{} 个节点，{} 个组，{} 条规则，模式 {:?}",
+                            cfg.proxies.len(),
+                            cfg.proxy_groups.len(),
+                            cfg.rules.len(),
+                            cfg.mode
+                        );
+                    }
+                    Err(errs) => {
+                        eprintln!("✗ 配置无效：");
+                        for e in errs {
+                            eprintln!("  - {e}");
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -594,7 +635,9 @@ async fn async_main() {
                         let l = l.trim();
                         let rest = l
                             .strip_prefix("log-level:")
-                            .or_else(|| l.strip_prefix("log_level:"))?;
+                            .or_else(|| l.strip_prefix("log_level:"))
+                            .or_else(|| l.strip_prefix("log-level ="))
+                            .or_else(|| l.strip_prefix("log_level ="))?;
                         Some(
                             rest.trim()
                                 .trim_matches(|c| c == '\'' || c == '"')

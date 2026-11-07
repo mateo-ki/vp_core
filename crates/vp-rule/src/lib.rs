@@ -6,6 +6,7 @@
 pub mod asn;
 pub mod consts;
 pub mod domain;
+pub mod dsl;
 #[cfg(feature = "geoip")]
 pub mod geoip;
 pub mod geosite;
@@ -106,6 +107,8 @@ pub enum Matcher {
     RuleSetDomain(Arc<provider::DomainSet>),
     RuleSetIp(Arc<IpIntervalSet>),
     RuleSetClassical(Arc<provider::ClassicalSet>),
+    /// Google CEL 声明式表达式（短路求值与开销感知优化）
+    Expr(Arc<dsl::CompiledExpr>),
 }
 
 impl Matcher {
@@ -170,6 +173,7 @@ impl Matcher {
             Matcher::RuleSetDomain(d) => ctx.host.is_some_and(|h| d.matches(h)),
             Matcher::RuleSetIp(s) => ctx.dst_ip.is_some_and(|ip| s.contains(ip)),
             Matcher::RuleSetClassical(c) => c.matches(ctx),
+            Matcher::Expr(e) => e.eval(ctx),
         }
     }
 
@@ -206,6 +210,7 @@ impl Matcher {
             Matcher::RuleSetClassical(c) => c.needs_dst_ip(),
             Matcher::Logic { subs, .. } => subs.iter().any(|m| m.needs_dst_ip()),
             Matcher::SubRules(list) => list.iter().any(|r| r.matcher.needs_dst_ip()),
+            Matcher::Expr(e) => e.needs_dst_ip(),
             _ => false,
         }
     }
@@ -215,6 +220,7 @@ impl Matcher {
             Matcher::ProcessName(_) | Matcher::ProcessPath(_) => true,
             Matcher::Logic { subs, .. } => subs.iter().any(|m| m.needs_process()),
             Matcher::SubRules(list) => list.iter().any(|r| r.matcher.needs_process()),
+            Matcher::Expr(e) => e.needs_process(),
             _ => false,
         }
     }
@@ -582,6 +588,29 @@ fn compile_one(raw: &str, env: &CompileEnv, depth: usize) -> Result<CompiledRule
             no_resolve: false,
         });
     }
+    if ty == "EXPR" || ty == "CEL" {
+        if parts.len() < 3 {
+            return Err(format!("EXPR 规则需要表达式与目标: {raw:?}"));
+        }
+        let expr_str = parts[1].trim();
+        let expr_clean = expr_str
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(expr_str);
+        let target = check_target(parts[2].trim(), env, raw)?;
+        let no_resolve = parts
+            .iter()
+            .skip(3)
+            .any(|p| p.trim().eq_ignore_ascii_case("no-resolve"));
+        let compiled = dsl::compile_expr(expr_clean, env)
+            .map_err(|e| format!("CEL 表达式解析失败 ({expr_clean}): {e}"))?;
+        return Ok(CompiledRule {
+            raw: raw.into(),
+            target,
+            matcher: Matcher::Expr(Arc::new(compiled)),
+            no_resolve,
+        });
+    }
     if matches!(ty.as_str(), "AND" | "OR" | "NOT") {
         if parts.len() != 3 {
             return Err(format!("{ty} 需要规则组与目标: {raw:?}"));
@@ -831,6 +860,15 @@ fn parse_matcher(
                 provider::ProviderPayload::Classical(c) => Matcher::RuleSetClassical(Arc::from(c)),
             })
         }
+        "EXPR" | "CEL" => {
+            let expr_clean = payload
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
+                .unwrap_or(payload);
+            let compiled = dsl::compile_expr(expr_clean, env)
+                .map_err(|e| format!("CEL 表达式解析失败 ({expr_clean}): {e}"))?;
+            Ok(Matcher::Expr(Arc::new(compiled)))
+        }
         other => {
             // 未知规则类型（如暂不支持的 IP-ASN 变体 / 拼写差异）：
             // 警告后跳过而非拒绝启动，保证 mihomo 等来源的配置可平滑运行
@@ -892,22 +930,57 @@ fn compile_logic_str(s: &str, env: &CompileEnv, depth: usize) -> Result<Matcher,
     parse_plain_rule(s, env, depth, s)
 }
 
-/// 顶层逗号分割（括号感知）
+/// 顶层逗号分割（括号、中括号与引号感知）
 pub fn split_top_level(s: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut in_quote = None;
+    let mut escaped = false;
     let mut cur = String::new();
+
     for ch in s.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            cur.push(ch);
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            }
+            cur.push(ch);
+            continue;
+        }
         match ch {
+            '"' | '\'' => {
+                in_quote = Some(ch);
+                cur.push(ch);
+            }
             '(' => {
-                depth += 1;
+                paren_depth += 1;
                 cur.push(ch);
             }
             ')' => {
-                depth = depth.saturating_sub(1);
+                paren_depth = paren_depth.saturating_sub(1);
                 cur.push(ch);
             }
-            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            '[' => {
+                bracket_depth += 1;
+                cur.push(ch);
+            }
+            ']' => {
+                bracket_depth = bracket_depth.saturating_sub(1);
+                cur.push(ch);
+            }
+            ',' if paren_depth == 0 && bracket_depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
             _ => cur.push(ch),
         }
     }
@@ -1370,5 +1443,33 @@ mod tests {
                 .target,
             "PROXY"
         );
+    }
+
+    #[test]
+    fn test_expr_cel_rules_end_to_end() {
+        let e = engine(&[
+            "EXPR,(process.name == 'git' && dst.port == 22),PROXY",
+            "EXPR,(net == 'tcp' && dst.port in [80, 443] && host.endsWith('.google.com')),PROXY",
+            "EXPR,(dst.ip in '10.0.0.0/8' || src.ip in '192.168.1.0/24'),DIRECT,no-resolve",
+            "MATCH,REJECT",
+        ]);
+
+        // 1. git 22 端口 -> PROXY
+        let mut c_git = ctx(Some("github.com"), None);
+        c_git.process = Some("C:\\Program Files\\Git\\bin\\git.exe");
+        c_git.dst_port = 22;
+        assert_eq!(e.r#match(&c_git).unwrap().target, "PROXY");
+
+        // 2. git 但非 22 端口 -> 不匹配第 1 条，转后序
+        c_git.dst_port = 8080;
+        assert_eq!(e.r#match(&c_git).unwrap().target, "REJECT");
+
+        // 3. google 443 -> PROXY
+        let c_google = ctx(Some("mail.google.com"), None);
+        assert_eq!(e.r#match(&c_google).unwrap().target, "PROXY");
+
+        // 4. 内网 IP -> DIRECT
+        let c_internal = ctx(None, Some("10.1.2.3".parse().unwrap()));
+        assert_eq!(e.r#match(&c_internal).unwrap().target, "DIRECT");
     }
 }

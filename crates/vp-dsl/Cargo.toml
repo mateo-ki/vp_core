@@ -1,0 +1,14 @@
+[package]
+name = "vp-dsl"
+description = "VP_Core 全量配置与路由 DSL 编译引擎"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vp-common.workspace = true
+vp-ir.workspace = true
+vp-rule.workspace = true
+serde.workspace = true
+serde_json.workspace = true

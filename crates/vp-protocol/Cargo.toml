@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 vp-common.workspace = true
 vp-core.workspace = true
+vp-ir.workspace = true
 vp-config.workspace = true
 vp-transport.workspace = true
 quinn.workspace = true

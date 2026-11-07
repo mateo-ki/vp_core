@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/vp-common",
     "crates/vp-core",
+    "crates/vp-ir",
+    "crates/vp-dsl",
     "crates/vp-config",
     "crates/vp-rule",
     "crates/vp-router",
@@ -20,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.6.3"
+version = "1.7.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -29,6 +31,8 @@ license = "MIT"
 # 内部 crate
 vp-common = { path = "crates/vp-common" }
 vp-core = { path = "crates/vp-core" }
+vp-ir = { path = "crates/vp-ir" }
+vp-dsl = { path = "crates/vp-dsl" }
 vp-config = { path = "crates/vp-config" }
 vp-rule = { path = "crates/vp-rule" }
 vp-router = { path = "crates/vp-router" }

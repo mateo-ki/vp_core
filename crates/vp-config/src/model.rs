@@ -191,13 +191,13 @@ pub struct Config {
         deserialize_with = "null_to_default"
     )]
     pub proxy_providers: HashMap<String, ProxyProviderCfg>,
-    #[serde(default, deserialize_with = "null_to_default")]
+    #[serde(default, deserialize_with = "de_rules_seq")]
     pub rules: Vec<String>,
     #[serde(
         alias = "sub-rules",
         alias = "sub_rules",
         default,
-        deserialize_with = "null_to_default"
+        deserialize_with = "de_sub_rules_map"
     )]
     pub sub_rules: HashMap<String, Vec<String>>,
     #[serde(
@@ -281,6 +281,87 @@ where
         if !list.is_empty() {
             out.insert(k, list);
         }
+    }
+    Ok(out)
+}
+
+fn parse_rule_value(val: serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let expr = map
+                .get("expr")
+                .or_else(|| map.get("expression"))
+                .or_else(|| map.get("cel"))
+                .and_then(|v| v.as_str());
+            let target = map
+                .get("target")
+                .or_else(|| map.get("proxy"))
+                .or_else(|| map.get("outbound"))
+                .and_then(|v| v.as_str());
+            let no_resolve = map
+                .get("no-resolve")
+                .or_else(|| map.get("no_resolve"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if let (Some(e), Some(t)) = (expr, target) {
+                let e = e.trim();
+                let t = t.trim();
+                if no_resolve {
+                    Some(format!("EXPR,({e}),{t},no-resolve"))
+                } else {
+                    Some(format!("EXPR,({e}),{t}"))
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn de_rules_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?;
+    let Some(raw_items) = opt else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(raw_items.len());
+    for item in raw_items {
+        if let Some(r) = parse_rule_value(item) {
+            out.push(r);
+        }
+    }
+    Ok(out)
+}
+
+fn de_sub_rules_map<'de, D>(deserializer: D) -> Result<HashMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<HashMap<String, Vec<serde_json::Value>>>::deserialize(deserializer)?;
+    let Some(raw_map) = opt else {
+        return Ok(HashMap::new());
+    };
+    let mut out = HashMap::new();
+    for (k, items) in raw_map {
+        let mut list = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some(r) = parse_rule_value(item) {
+                list.push(r);
+            }
+        }
+        out.insert(k, list);
     }
     Ok(out)
 }
@@ -1503,6 +1584,15 @@ pub struct GroupCfg {
     pub strategy: Option<String>,
     #[serde(alias = "disable-udp", alias = "disable_udp", default)]
     pub disable_udp: Option<bool>,
+    /// 正则表达式过滤（仅保留匹配的成员）
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// 反向排除正则表达式（剔除匹配的成员）
+    #[serde(alias = "exclude-filter", alias = "exclude_filter", default)]
+    pub exclude_filter: Option<String>,
+    /// 策略组全不可用或空节点时的兜底出站/节点
+    #[serde(default)]
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

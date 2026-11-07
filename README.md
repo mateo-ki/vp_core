@@ -10,6 +10,8 @@
 
 - ⚡ **极致轻量**：Linux Musl 单文件仅 **4.3 MB**，空载常驻内存 (RSS) 仅 **10~20 MB**（零 GC 停顿），512MB 低配 VPS 轻松拉满。
 - 🚀 **极高吞吐**：基于 Rust + Tokio 异步运行时，全链路池化零拷贝，千兆线速轻松跑满。
+- 🔍 **全景链路诊断与微秒可观测性 (`explain`)**：Chrome DevTools 风格终端高亮决策树，精确度量规则匹配、DNS 解析、节点延迟及全链路决策耗时（精确至微秒 µs），告别黑盒排错。
+- 📝 **工业级声明式 DSL 与 Google CEL 表达式**：消除 YAML 缩进陷阱，支持类似 Wireshark 风格的 `process.name == "git" && dst.port == 22` 复合分流规则，并提供专为大语言模型打造的配置规范与 AI Prompt（详见 [docs/dsl.md](docs/dsl.md)）。
 - 🛡️ **生产级服务端**：原生支持 VLESS (REALITY/WS CDN穿透)、SS-2022、Hysteria 2、Trojan、TUIC v5，内置内核级 iptables 端口跳跃重定向、UDP RRL 防反射与端口敲门隐身防御。
 - 🌐 **一键开服与订阅**：内置开服引擎与动态 HTTP 订阅端点（`/sub`），自动输出 Clash 规则配置与通用节点链接。
 - 🔌 **全协议原生 UDP**：原生支持 VLESS/VMess/Trojan UDP、XUDP (Mux.Cool) 及 packetaddr 编码，支持单连接多目标 (Full-Cone)。
@@ -41,13 +43,42 @@ vpcore update            # 内核跨平台平滑自我更新 (带健康校验)
 
 # 客户端运行
 vpcore sub "<URL>" -o config.yaml   # 拉取远程订阅生成客户端配置
-vpcore validate -c config.yaml      # 校验配置文件语法与端口
+vpcore validate -c config.yaml      # 校验配置文件语法（支持 .yaml / .json / .vp）
 vpcore run -c config.yaml           # 启动代理 / VPN 服务
 vpcore test -c config.yaml          # 全节点延迟并发测速
 vpcore clean-routes                 # 应急清理残留路由与 iptables 端口重定向
+
+# 链路诊断与可观测性 (explain)
+vpcore explain https://www.google.com -c config.yaml  # 诊断路由分流决策与微秒/毫秒耗时
+vpcore explain 10.0.0.1:80 -c config.vp --json         # 输出结构化 JSON 供脚本/面板消费
 ```
 
-### 3. 极简配置示例 (`config.yaml`)
+### 3. 配置示例
+
+#### A. 声明式 DSL 语法 (`config.vp`，推荐，专为 AI 优化)
+详细语法规范与一键丢给 AI 的 Prompt 请参见 [docs/dsl.md](docs/dsl.md)。
+
+```dsl
+inbound mixed { listen: "127.0.0.1:7890" }
+
+node "hk-01" vless {
+    server: "hk.example.com:443"
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    flow: "xtls-rprx-vision"
+    tls: reality { sni: "www.amazon.com", public_key: "abc...", short_id: "abcd" }
+}
+
+group "PROXY" select { members: ["hk-01", "DIRECT"] }
+
+route {
+    process.name == "git" && dst.port == 22 => "PROXY"
+    net == "tcp" && dst.port in [80, 443] && host.endsWith(".google.com") => "PROXY"
+    geoip == "CN" => "DIRECT"
+    _ => "PROXY"
+}
+```
+
+#### B. 兼容 Clash YAML 语法 (`config.yaml`，支持内嵌 CEL 表达式)
 
 ```yaml
 mixed-port: 7890
@@ -68,6 +99,9 @@ proxies:
     client-fingerprint: chrome
 
 rules:
+  # 支持行内 Google CEL 复合规则
+  - 'process.name == "git" && dst.port == 22,vless-reality'
+  - 'net == "tcp" && dst.port in [80, 443] && host.endsWith(".google.com"),vless-reality'
   - GEOIP,CN,DIRECT
   - MATCH,vless-reality
 ```

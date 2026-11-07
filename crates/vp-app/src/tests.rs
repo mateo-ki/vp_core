@@ -298,6 +298,51 @@ rules: ['MATCH,DIRECT']
     assert_eq!(&buf, b"listener-e2e");
 }
 
+#[tokio::test]
+async fn app_start_from_ir_and_dsl_e2e() {
+    let dsl = r#"
+inbound mixed {
+    listen: "127.0.0.1:0"
+}
+
+node "loopback" socks5 {
+    server: "127.0.0.1"
+    port: 10800
+}
+
+group "PROXY" select {
+    members: ["loopback", "DIRECT"]
+}
+
+route {
+    host.endsWith(".google.com") => "PROXY"
+    dst.ip in "127.0.0.0/8" => "DIRECT"
+    _ => "PROXY"
+}
+"#;
+    let dir = std::env::temp_dir();
+    // 1. 测试 Format::Dsl 前端解析启动
+    let app = App::start(dsl, Format::Dsl, &dir, false).await.unwrap();
+    let r = app.router.current();
+    let sess = vp_core::Session::new_tcp(
+        "t".into(),
+        None,
+        vp_common::DstAddr::new("mail.google.com", 443),
+    );
+    let trace = r.explain(&sess).await;
+    assert_eq!(trace.rule_match.matched.as_ref().unwrap().target, "PROXY");
+
+    // 2. 测试直接通过 VpIr 启动 App::start_from_ir
+    let ir = vp_dsl::parse(dsl).expect("dsl parse");
+    let app_ir = App::start_from_ir(ir, &dir, false).await.unwrap();
+    let r_ir = app_ir.router.current();
+    let trace_ir = r_ir.explain(&sess).await;
+    assert_eq!(
+        trace_ir.rule_match.matched.as_ref().unwrap().target,
+        "PROXY"
+    );
+}
+
 /// 全栈：App ss listener + shadow-tls v3 伪装 ← SsOutbound(plugin: shadow-tls) ← echo
 #[tokio::test]
 async fn ss_shadowtls_listener_e2e() {
@@ -1849,4 +1894,57 @@ rules: ['MATCH,DIRECT']
 
     let _ = std::fs::remove_file(cert_path);
     let _ = std::fs::remove_file(key_path);
+}
+
+#[tokio::test]
+async fn test_proxy_group_filter_and_fallback() {
+    let temp_dir = std::env::temp_dir().join(format!("vp_filter_test_{}", std::process::id()));
+    let _ = tokio::fs::create_dir_all(&temp_dir).await;
+
+    let cfg = r#"
+mode: rule
+proxies:
+  - name: "HK-01"
+    type: socks5
+    server: 127.0.0.1
+    port: 10801
+  - name: "HK-02-高倍率"
+    type: socks5
+    server: 127.0.0.1
+    port: 10802
+  - name: "US-01"
+    type: socks5
+    server: 127.0.0.1
+    port: 10803
+proxy-groups:
+  - name: "HK_SELECT"
+    type: select
+    proxies: ["HK-01", "HK-02-高倍率", "US-01", DIRECT]
+    filter: "HK"
+    exclude-filter: "高倍"
+    fallback: DIRECT
+  - name: "EMPTY_FALLBACK"
+    type: select
+    proxies: ["US-01"]
+    filter: "JAPAN"
+    fallback: DIRECT
+rules:
+  - MATCH,DIRECT
+"#;
+
+    let app = App::start(cfg, Format::Yaml, &temp_dir, false)
+        .await
+        .expect("启动带 filter 与 fallback 的配置应成功");
+
+    let router = app.router.current();
+    let hk_group = router.get_group("HK_SELECT").unwrap();
+    // 验证 filter: "HK" && exclude: "高倍"：保留 HK-01 与 DIRECT，排除 HK-02-高倍率 与 US-01
+    assert_eq!(hk_group.member_names(), &["HK-01".into(), "DIRECT".into()]);
+
+    let empty_group = router.get_group("EMPTY_FALLBACK").unwrap();
+    // 验证 JAPAN 过滤后成员为空，但配置了 fallback: DIRECT
+    assert!(empty_group.member_names().is_empty());
+    assert_eq!(empty_group.selected_name().as_ref(), "DIRECT");
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
 }

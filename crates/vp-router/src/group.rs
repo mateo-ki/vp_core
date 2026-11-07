@@ -39,6 +39,7 @@ pub enum LbStrategy {
     ConsistentHash,
 }
 
+#[derive(Debug, Clone)]
 pub struct GroupSpec {
     pub name: String,
     pub ty: GroupType,
@@ -48,6 +49,27 @@ pub struct GroupSpec {
     pub tolerance: u32,
     pub lazy: bool,
     pub lb_strategy: LbStrategy,
+    pub filter: Option<String>,
+    pub exclude_filter: Option<String>,
+    pub fallback: Option<String>,
+}
+
+impl GroupSpec {
+    pub fn new(name: impl Into<String>, ty: GroupType, members: Vec<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+            members,
+            test_url: None,
+            interval: 300,
+            tolerance: 0,
+            lazy: true,
+            lb_strategy: LbStrategy::RoundRobin,
+            filter: None,
+            exclude_filter: None,
+            fallback: None,
+        }
+    }
 }
 
 /// 将配置中的组定义转为 GroupSpec
@@ -71,6 +93,9 @@ pub fn group_spec(g: &vp_config::GroupCfg) -> GroupSpec {
             Some("consistent-hashing") => LbStrategy::ConsistentHash,
             _ => LbStrategy::RoundRobin,
         },
+        filter: g.filter.clone(),
+        exclude_filter: g.exclude_filter.clone(),
+        fallback: g.fallback.clone(),
     }
 }
 
@@ -90,11 +115,16 @@ pub struct Group {
     tolerance: u32,
     lazy: bool,
     lb_strategy: LbStrategy,
+    fallback: Option<Arc<dyn Outbound>>,
 }
 
 impl Group {
     /// 构建组（成员必须已解析为 Outbound）
-    pub fn new(spec: GroupSpec, members: Vec<Arc<dyn Outbound>>) -> Arc<Self> {
+    pub fn new(
+        spec: GroupSpec,
+        members: Vec<Arc<dyn Outbound>>,
+        fallback: Option<Arc<dyn Outbound>>,
+    ) -> Arc<Self> {
         let member_names: Vec<Arc<str>> = members.iter().map(|m| m.name().into()).collect();
         let n = members.len();
         Arc::new(Group {
@@ -114,6 +144,7 @@ impl Group {
             tolerance: spec.tolerance,
             lazy: spec.lazy,
             lb_strategy: spec.lb_strategy,
+            fallback,
         })
     }
 
@@ -172,8 +203,14 @@ impl Group {
 
     /// 当前生效成员
     pub fn pick(&self, sess: &Session) -> Arc<dyn Outbound> {
+        if self.members.is_empty() {
+            if let Some(ref fb) = self.fallback {
+                return fb.clone();
+            }
+            return Arc::new(EmptyOutbound(self.name.clone()));
+        }
         let i = self.pick_index(sess);
-        self.members[i.min(self.members.len().saturating_sub(1))].clone()
+        self.members[i.min(self.members.len() - 1)].clone()
     }
 
     // ---------------- API 操作 ----------------
@@ -210,15 +247,27 @@ impl Group {
         &self.test_url
     }
 
+    pub fn fallback(&self) -> Option<Arc<dyn Outbound>> {
+        self.fallback.clone()
+    }
+
     pub fn selected_name(&self) -> Arc<str> {
+        if self.member_names.is_empty() {
+            return self
+                .fallback
+                .as_ref()
+                .map(|fb| fb.name().into())
+                .unwrap_or_else(|| "EMPTY".into());
+        }
+        let n = self.member_names.len();
         match self.ty {
             GroupType::Select => {
                 let i = self.select_now.load(Ordering::Relaxed);
-                self.member_names[i.min(self.member_names.len() - 1)].clone()
+                self.member_names[i.min(n - 1)].clone()
             }
             _ => {
                 let i = self.selected.load(Ordering::Relaxed);
-                self.member_names[i.min(self.member_names.len() - 1)].clone()
+                self.member_names[i.min(n - 1)].clone()
             }
         }
     }
@@ -550,7 +599,13 @@ impl Outbound for Group {
 
     async fn connect_stream(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
         if self.members.is_empty() {
-            return Err(Error::Unsupported(format!("组 {} 无成员", self.name)));
+            if let Some(ref fb) = self.fallback {
+                return fb.connect_stream(sess, dst).await;
+            }
+            return Err(Error::Unsupported(format!(
+                "组 {} 无成员且未配置 fallback",
+                self.name
+            )));
         }
         if self.ty == GroupType::Relay {
             if self.members.len() == 1 {
@@ -624,6 +679,16 @@ impl Outbound for Group {
                         }
                     }
                 }
+                if let Some(ref fb) = self.fallback {
+                    warn!(
+                        "组 {} 全部成员连接失败: {first_err}，尝试回退至 fallback 出站 {}",
+                        self.name,
+                        fb.name()
+                    );
+                    if let Ok(stream) = fb.connect_stream(sess, dst).await {
+                        return Ok(stream);
+                    }
+                }
                 Err(first_err)
             }
         }
@@ -641,24 +706,92 @@ impl Outbound for Group {
     }
 
     fn support_udp(&self) -> bool {
+        if self.members.is_empty() {
+            return self.fallback.as_ref().is_some_and(|fb| fb.support_udp());
+        }
         match self.ty {
             GroupType::Relay => self.members.iter().all(|m| m.support_udp()),
-            // 手动选择尊重用户的选择：选中成员不支持 UDP 就是不支持（同 mihomo / sing-box）
-            GroupType::Select => self.selected_member().support_udp(),
+            GroupType::Select => {
+                let i = self.select_now.load(Ordering::Relaxed);
+                self.members
+                    .get(i.min(self.members.len() - 1))
+                    .is_some_and(|m| m.support_udp())
+            }
             _ => self.members.iter().any(|m| m.support_udp()),
         }
     }
 
     async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        self.pick_udp(sess).connect_packet(sess, dst).await
+        if self.members.is_empty() {
+            if let Some(ref fb) = self.fallback {
+                return fb.connect_packet(sess, dst).await;
+            }
+            return Err(Error::Unsupported(format!(
+                "组 {} 无成员且未配置 fallback",
+                self.name
+            )));
+        }
+        match self.pick_udp(sess).connect_packet(sess, dst).await {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                if let Some(ref fb) = self.fallback {
+                    warn!(
+                        "组 {} UDP 连接失败: {e}，尝试 fallback 出站 {}",
+                        self.name,
+                        fb.name()
+                    );
+                    if let Ok(c) = fb.connect_packet(sess, dst).await {
+                        return Ok(c);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+}
+
+struct EmptyOutbound(Arc<str>);
+
+#[async_trait]
+impl Outbound for EmptyOutbound {
+    fn name(&self) -> &str {
+        &self.0
+    }
+
+    async fn connect_stream(
+        &self,
+        _sess: &Session,
+        _dst: &DstAddr,
+    ) -> Result<Box<dyn ProxyStream>> {
+        Err(Error::Unsupported(format!("策略组 {} 无可用成员", self.0)))
+    }
+
+    async fn connect_over(
+        &self,
+        _sess: &Session,
+        _dst: &DstAddr,
+        _underlying: Box<dyn ProxyStream>,
+    ) -> Result<Box<dyn ProxyStream>> {
+        Err(Error::Unsupported(format!("策略组 {} 无可用成员", self.0)))
+    }
+
+    fn support_udp(&self) -> bool {
+        false
+    }
+
+    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+        Err(Error::Unsupported(format!("策略组 {} 无可用成员", self.0)))
     }
 }
 
 impl Group {
     /// select 组当前选中的成员
-    fn selected_member(&self) -> &Arc<dyn Outbound> {
+    pub fn selected_member(&self) -> Option<Arc<dyn Outbound>> {
+        if self.members.is_empty() {
+            return self.fallback.clone();
+        }
         let i = self.select_now.load(Ordering::Relaxed);
-        &self.members[i.min(self.members.len().saturating_sub(1))]
+        self.members.get(i.min(self.members.len() - 1)).cloned()
     }
 
     /// 按会话网络类型取实际生效的成员（TCP 走 pick，UDP 走 pick_udp）；连接表 / 日志展示用
@@ -672,7 +805,7 @@ impl Group {
     /// UDP 选成员：url-test / fallback / load-balance 当前成员不支持 UDP（如 http 节点）时，
     /// 改用支持 UDP 的成员——存活的优先；url-test 取延迟最低，其余按配置顺序。
     /// 同 sing-box urltest 按网络类型分别择优；否则"首个成员是 http 节点"的常见分组里 UDP 永远失败。
-    fn pick_udp(&self, sess: &Session) -> Arc<dyn Outbound> {
+    pub(crate) fn pick_udp(&self, sess: &Session) -> Arc<dyn Outbound> {
         let picked = self.pick(sess);
         if picked.support_udp() || matches!(self.ty, GroupType::Select | GroupType::Relay) {
             return picked;
@@ -773,20 +906,16 @@ mod tests {
 
     fn group(ty: GroupType, members: &[Arc<MockOutbound>]) -> Arc<Group> {
         Group::new(
-            GroupSpec {
-                name: "G".into(),
+            GroupSpec::new(
+                "G",
                 ty,
-                members: members.iter().map(|m| m.name.to_string()).collect(),
-                test_url: None,
-                interval: 300,
-                tolerance: 0,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
+                members.iter().map(|m| m.name.to_string()).collect(),
+            ),
             members
                 .iter()
                 .map(|m| m.clone() as Arc<dyn Outbound>)
                 .collect(),
+            None,
         )
     }
 
@@ -838,19 +967,11 @@ mod tests {
     #[tokio::test]
     async fn health_task_lifecycle_on_swap() {
         let m1 = MockOutbound::new("a");
-        let g = Group::new(
-            GroupSpec {
-                name: "UT".into(),
-                ty: GroupType::UrlTest,
-                members: vec!["a".into()],
-                test_url: Some("http://127.0.0.1:9/generate_204".into()),
-                interval: 3600,
-                tolerance: 0,
-                lazy: false,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
-            vec![m1],
-        );
+        let mut spec = GroupSpec::new("UT", GroupType::UrlTest, vec!["a".into()]);
+        spec.test_url = Some("http://127.0.0.1:9/generate_204".into());
+        spec.interval = 3600;
+        spec.lazy = false;
+        let g = Group::new(spec, vec![m1], None);
 
         let h = g.start_health_checks(0).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -866,17 +987,9 @@ mod tests {
         let m1 = MockOutbound::new("a");
         let m2 = MockOutbound::new("b");
         let g = Group::new(
-            GroupSpec {
-                name: "SEL".into(),
-                ty: GroupType::Select,
-                members: vec!["a".into(), "b".into()],
-                test_url: None,
-                interval: 300,
-                tolerance: 0,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
+            GroupSpec::new("SEL", GroupType::Select, vec!["a".into(), "b".into()]),
             vec![m1.clone(), m2.clone()],
+            None,
         );
         assert_eq!(g.selected_name().as_ref(), "a");
         let _ = g.connect_stream(&sess(), &dst()).await.unwrap();
@@ -893,17 +1006,9 @@ mod tests {
         let m1 = MockOutbound::new("a");
         let m2 = MockOutbound::new("b");
         let g = Group::new(
-            GroupSpec {
-                name: "LB".into(),
-                ty: GroupType::LoadBalance,
-                members: vec!["a".into(), "b".into()],
-                test_url: None,
-                interval: 300,
-                tolerance: 0,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
+            GroupSpec::new("LB", GroupType::LoadBalance, vec!["a".into(), "b".into()]),
             vec![m1.clone(), m2.clone()],
+            None,
         );
         for _ in 0..4 {
             let _ = g.connect_stream(&sess(), &dst()).await.unwrap();
@@ -917,17 +1022,9 @@ mod tests {
         let m1 = MockOutbound::new("a");
         let m2 = MockOutbound::new("b");
         let g = Group::new(
-            GroupSpec {
-                name: "FB".into(),
-                ty: GroupType::Fallback,
-                members: vec!["a".into(), "b".into()],
-                test_url: None,
-                interval: 300,
-                tolerance: 0,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
+            GroupSpec::new("FB", GroupType::Fallback, vec!["a".into(), "b".into()]),
             vec![m1.clone(), m2.clone()],
+            None,
         );
         // 全部失败 → 保持 0
         g.apply_probe_results(&[None, None]);
@@ -947,19 +1044,9 @@ mod tests {
     async fn url_test_tolerance() {
         let m1 = MockOutbound::new("a");
         let m2 = MockOutbound::new("b");
-        let g = Group::new(
-            GroupSpec {
-                name: "UT".into(),
-                ty: GroupType::UrlTest,
-                members: vec!["a".into(), "b".into()],
-                test_url: None,
-                interval: 300,
-                tolerance: 50,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
-            vec![m1, m2],
-        );
+        let mut spec = GroupSpec::new("UT", GroupType::UrlTest, vec!["a".into(), "b".into()]);
+        spec.tolerance = 50;
+        let g = Group::new(spec, vec![m1, m2], None);
         g.apply_probe_results(&[Some(100), Some(130)]);
         assert_eq!(g.selected_name().as_ref(), "a");
         // b 只快 10ms < tolerance 50：不切换
@@ -975,21 +1062,40 @@ mod tests {
         let a = MockOutbound::new("a");
         let b = MockOutbound::new("b");
         let g = Group::new(
-            GroupSpec {
-                name: "RL".into(),
-                ty: GroupType::Relay,
-                members: vec!["a".into(), "b".into()],
-                test_url: None,
-                interval: 300,
-                tolerance: 0,
-                lazy: true,
-                lb_strategy: LbStrategy::RoundRobin,
-            },
+            GroupSpec::new("RL", GroupType::Relay, vec!["a".into(), "b".into()]),
             vec![a.clone(), b.clone()],
+            None,
         );
         let _s = g.connect_stream(&sess(), &dst()).await.unwrap();
         assert_eq!(a.connects.load(Ordering::Relaxed), 1);
         assert_eq!(b.overs.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn group_fallback_behavior() {
+        let fb_node = MockOutbound::with_udp("fb_node", true);
+        let fb_outbound: Arc<dyn Outbound> = fb_node.clone();
+
+        // 1. 空成员策略组配合 fallback
+        let spec = GroupSpec {
+            name: "EMPTY_GROUP".into(),
+            ty: GroupType::Select,
+            members: vec![],
+            test_url: None,
+            interval: 300,
+            tolerance: 0,
+            lazy: true,
+            lb_strategy: LbStrategy::RoundRobin,
+            filter: None,
+            exclude_filter: None,
+            fallback: Some("fb_node".into()),
+        };
+        let g = Group::new(spec, vec![], Some(fb_outbound));
+        assert_eq!(g.selected_name().as_ref(), "fb_node");
+        assert!(g.support_udp());
+
+        let _stream = g.connect_stream(&sess(), &dst()).await.unwrap();
+        assert_eq!(fb_node.connects.load(Ordering::Relaxed), 1);
     }
 
     #[test]

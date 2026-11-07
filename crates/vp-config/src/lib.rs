@@ -5,6 +5,7 @@
 //! - JSON / JSON5（`.json`，容忍注释）
 
 pub mod convert;
+pub mod ir;
 pub mod model;
 pub mod validate;
 
@@ -16,6 +17,7 @@ use vp_common::{Error, Result};
 pub enum Format {
     Yaml,
     Json,
+    Dsl,
 }
 
 impl Format {
@@ -23,6 +25,8 @@ impl Format {
         let lower = path.to_ascii_lowercase();
         if lower.ends_with(".yaml") || lower.ends_with(".yml") {
             Format::Yaml
+        } else if lower.ends_with(".vp") {
+            Format::Dsl
         } else {
             Format::Json
         }
@@ -39,6 +43,11 @@ pub fn parse(text: &str, fmt: Format) -> Result<Config> {
         }
         Format::Json => {
             json5::from_str(text).map_err(|e| Error::Config(format!("JSON 解析失败: {e}")))?
+        }
+        Format::Dsl => {
+            return Err(Error::Config(
+                ".vp DSL 脚本请使用 vp_dsl::parse 解析为统一 VP IR".into(),
+            ));
         }
     };
     sanitize_proxy_aliases(&mut json_value);
@@ -170,7 +179,7 @@ fn coerce_numeric_strings(val: &mut serde_json::Value) {
     for key in ["proxy-groups", "proxy_groups"] {
         if let Some(groups) = val.get_mut(key).and_then(|g| g.as_array_mut()) {
             for obj in groups.iter_mut().filter_map(|g| g.as_object_mut()) {
-                stringify(obj, &["name", "proxies", "use"]);
+                stringify(obj, &["name", "proxies", "use", "fallback"]);
             }
         }
     }
@@ -642,5 +651,41 @@ proxies:
             validate::validate(&cfg).expect("example/config.yaml 业务规则校验失败");
             assert!(cfg.tuning.is_some());
         }
+    }
+
+    #[test]
+    fn test_structured_cel_rules_in_yaml() {
+        let yaml = r#"
+proxies:
+  - name: "node-1"
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - node-1
+rules:
+  - DOMAIN-SUFFIX,example.com,DIRECT
+  - expr: 'process.name == "git" && dst.port == 22'
+    target: "PROXY"
+  - expression: 'host.endsWith(".google.com") && dst.port in [80, 443]'
+    proxy: "PROXY"
+    no-resolve: true
+  - MATCH,PROXY
+"#;
+        let cfg = parse(yaml, Format::Yaml).expect("CEL 表达式 YAML 映射解析应当成功");
+        assert_eq!(cfg.rules.len(), 4);
+        assert_eq!(cfg.rules[0], "DOMAIN-SUFFIX,example.com,DIRECT");
+        assert_eq!(
+            cfg.rules[1],
+            "EXPR,(process.name == \"git\" && dst.port == 22),PROXY"
+        );
+        assert_eq!(
+            cfg.rules[2],
+            "EXPR,(host.endsWith(\".google.com\") && dst.port in [80, 443]),PROXY,no-resolve"
+        );
+        assert_eq!(cfg.rules[3], "MATCH,PROXY");
     }
 }

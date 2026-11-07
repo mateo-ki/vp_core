@@ -24,7 +24,10 @@ pub use gate::{InboundGate, KnockGate, RrlDecision, UdpRrlLimiter};
 pub use inbound::{Inbound, InboundCtx};
 pub use outbound::{ChainedOutbound, Outbound};
 pub use rate_limit::{BandwidthLimiter, BrutalPacer, TokenBucket};
-pub use router::{Resolution, Router, RuleHit};
+pub use router::{
+    DestinationTrace, DnsTrace, GroupMemberTrace, GroupStepTrace, LeafOutboundTrace, Resolution,
+    RouteTrace, Router, RuleHit, RuleHitDetail, RuleMatchTrace, SessionTrace,
+};
 pub use session::{Network, Session};
 pub use sniff::{PeekedStream, parse_http_host, parse_tls_sni, sniff_stream};
 pub use stream::{PacketConn, ProxyStream, UdpPacket};

@@ -773,6 +773,7 @@ mod tests {
             inbound: "mixed",
             inbound_port: None,
             inbound_user: None,
+            cache: Default::default(),
         };
         assert!(expr.eval(&ctx_hit));
 

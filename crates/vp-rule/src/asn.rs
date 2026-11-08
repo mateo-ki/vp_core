@@ -67,4 +67,26 @@ impl AsnMatcher {
         hit.and_then(|a| a.asn)
             .is_some_and(|n| self.asns.contains(&n))
     }
+
+    /// 原始 ASN 查询（供 MatchCtx 跨规则缓存）
+    pub fn lookup_asn(&self, ip: IpAddr) -> Option<u32> {
+        let hit: Option<AsnLookup> = match &self.db {
+            AsnDb::MmdbMmap(reader) => reader.lookup(ip).ok().flatten(),
+            AsnDb::MmdbMem(reader) => reader.lookup(ip).ok().flatten(),
+        };
+        hit.and_then(|a| a.asn)
+    }
+
+    /// 使用 MatchCtx 惰性缓存判断：同一连接的多条 IP-ASN 规则共享一次 mmdb 遍历
+    pub fn matches_cached(
+        &self,
+        ip: IpAddr,
+        cache: &std::sync::OnceLock<(IpAddr, Option<u32>)>,
+    ) -> bool {
+        let hit = cache.get_or_init(|| (ip, self.lookup_asn(ip)));
+        if hit.0 != ip {
+            return self.matches(ip);
+        }
+        hit.1.is_some_and(|n| self.asns.contains(&n))
+    }
 }

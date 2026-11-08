@@ -333,6 +333,7 @@ mod tests {
                         inbound: "",
                         inbound_port: None,
                         inbound_user: None,
+                        cache: Default::default(),
                     }
                 }
                 assert!(s.matches(&ctx(Some("www.github.com"), None)));

@@ -496,13 +496,32 @@ impl Group {
     }
 }
 
-fn fnv_index(bytes: &[u8], n: usize) -> usize {
-    let mut hash: u32 = 0x811c9dc5;
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
     for &b in bytes {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(0x01000193);
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
-    (hash as usize) % n.max(1)
+    hash
+}
+
+/// Jump Consistent Hash（Google 论文原式）：一致性哈希的 O(1) 整数实现——
+/// 成员数 n 增减时每个 key 仅以 ~1/n 概率迁移（旧取模方案会全量洗牌，
+/// 造成 LB 组下 UDP NAT 会话大面积漂移、游戏/QUIC 断流）。
+fn jump_index(key: u64, n: usize) -> usize {
+    let mut k = key;
+    let mut b: i64 = -1;
+    let mut j: i64 = 0;
+    while j < n as i64 {
+        b = j;
+        k = k.wrapping_mul(2862933555777941757).wrapping_add(1);
+        j = ((b as f64 + 1.0) * (2147483648.0 / ((k >> 33) as f64 + 1.0))) as i64;
+    }
+    b as usize
+}
+
+fn fnv_index(bytes: &[u8], n: usize) -> usize {
+    jump_index(fnv64(bytes), n.max(1))
 }
 
 /// 预编译的单次测速目标与报文，避免在批量测速循环中对每个节点重复解析 URL 和格式化 HTTP 报文
@@ -1110,5 +1129,44 @@ mod tests {
             (h.as_str(), p, path.as_str()),
             ("example.com", 8443, "/x?a=1")
         );
+    }
+
+    /// Jump Consistent Hash 迁移率回归：成员 n → n-1 时，每个 key 仅以 ~1/n
+    /// 概率迁移（旧取模方案全量洗牌）。采样 1 万 key，迁移率上界取 3/n。
+    #[test]
+    fn jump_hash_migration_is_one_over_n() {
+        let keys: Vec<u64> = (0..10_000u64)
+            .map(|i| i.wrapping_mul(0x9E3779B97F4A7C15))
+            .collect();
+        let old: Vec<usize> = keys.iter().map(|&k| jump_index(k, 10)).collect();
+        let new: Vec<usize> = keys.iter().map(|&k| jump_index(k, 9)).collect();
+        let migrated = old.iter().zip(&new).filter(|(a, b)| a != b).count();
+        let rate = migrated as f64 / keys.len() as f64;
+        assert!(
+            rate <= 3.0 / 10.0,
+            "迁移率 {rate:.3} 超过 1/n 上界 0.3，一致性哈希失效"
+        );
+        // 分布均匀性：各桶占比不得偏离均值一倍以上
+        let mut buckets = [0usize; 10];
+        for v in &old {
+            buckets[*v] += 1;
+        }
+        let expect = keys.len() / 10;
+        for (i, c) in buckets.iter().enumerate() {
+            assert!(
+                *c > expect / 2 && *c < expect * 3 / 2,
+                "桶 {i} 分布失衡: {c} vs 均值 {expect}"
+            );
+        }
+    }
+
+    /// 同一 key 在成员不变时必须稳定映射（LB 会话粘性）
+    #[test]
+    fn jump_hash_is_stable() {
+        let k = 0xDEADBEEF_CAFEBABE_u64;
+        let a = jump_index(k, 7);
+        for _ in 0..100 {
+            assert_eq!(jump_index(k, 7), a);
+        }
     }
 }

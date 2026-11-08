@@ -38,6 +38,26 @@ pub enum Net {
     Udp,
 }
 
+/// 匹配热路径跨规则共享缓存：多条同类规则复用一次昂贵查询/一次转换。
+/// 单连接单线程使用，OnceLock 语义天然幂等。
+#[derive(Debug, Default)]
+pub struct MatchCtxCache {
+    /// GEOIP mmdb 记录（按 IP 去重）：N 条 GEOIP 规则共享一次 mmdb 树遍历
+    pub geo_record: std::sync::OnceLock<(IpAddr, Option<Box<crate::geoip::MmdbRecord>>)>,
+    /// IP-ASN 原始 ASN 查询结果
+    pub asn_result: std::sync::OnceLock<(IpAddr, Option<u32>)>,
+    /// 小写化 host：N 条 DOMAIN-KEYWORD 共享一次转换
+    pub host_lower: std::sync::OnceLock<Box<str>>,
+}
+
+impl Clone for MatchCtxCache {
+    /// OnceLock 不可克隆：ctx 克隆（..base 展开构造新连接）时重置缓存，
+    /// 新连接重新惰性填充
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 /// 匹配输入（由 Session 派生）
 #[derive(Debug, Clone)]
 pub struct MatchCtx<'a> {
@@ -52,6 +72,19 @@ pub struct MatchCtx<'a> {
     pub inbound: &'a str,
     pub inbound_port: Option<u16>,
     pub inbound_user: Option<&'a str>,
+    /// 跨规则共享查询缓存
+    pub cache: MatchCtxCache,
+}
+
+impl MatchCtx<'_> {
+    /// host 的小写形式：惰性转换一次（多条 DOMAIN-KEYWORD 规则共享，消除
+    /// 每规则一次的堆分配）；重复调用同一 host 直接命中缓存
+    fn lower_host(&self, host: &str) -> &str {
+        self.cache
+            .host_lower
+            .get_or_init(|| host.to_ascii_lowercase().into_boxed_str())
+            .as_ref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,9 +151,7 @@ impl Matcher {
             Matcher::NeverMatch => false,
             Matcher::Domain(t) => ctx.host.is_some_and(|h| t.is_exact_match(h)),
             Matcher::DomainSuffix(t) => ctx.host.is_some_and(|h| t.is_match(h)),
-            Matcher::DomainKeyword(k) => ctx
-                .host
-                .is_some_and(|h| h.to_ascii_lowercase().contains(&**k)),
+            Matcher::DomainKeyword(k) => ctx.host.is_some_and(|h| ctx.lower_host(h).contains(&**k)),
             Matcher::DomainRegex(re) => ctx.host.is_some_and(|h| re.is_match(h)),
             Matcher::IpCidr { set, src } => match (*src, ctx.src_ip, ctx.dst_ip) {
                 (true, Some(ip), _) | (false, _, Some(ip)) => set.contains(ip),
@@ -128,10 +159,14 @@ impl Matcher {
             },
             Matcher::GeoSite(s) => ctx.host.is_some_and(|h| s.matches(h)),
             #[cfg(feature = "geoip")]
-            Matcher::GeoIp(g) => ctx.dst_ip.is_some_and(|ip| g.matches(ip)),
+            Matcher::GeoIp(g) => ctx
+                .dst_ip
+                .is_some_and(|ip| g.matches_cached(ip, &ctx.cache.geo_record)),
             #[cfg(feature = "geoip")]
             Matcher::IpAsn { matcher, src } => match (*src, ctx.src_ip, ctx.dst_ip) {
-                (true, Some(ip), _) | (false, _, Some(ip)) => matcher.matches(ip),
+                (true, Some(ip), _) | (false, _, Some(ip)) => {
+                    matcher.matches_cached(ip, &ctx.cache.asn_result)
+                }
                 _ => false,
             },
             Matcher::Port { src, ranges } => {
@@ -1099,7 +1134,22 @@ mod tests {
             inbound: "mixed-1",
             inbound_port: Some(7890),
             inbound_user: Some("alice"),
+            cache: Default::default(),
         }
+    }
+
+    /// DOMAIN-KEYWORD：host 大写时经惰性缓存转换后仍匹配（多规则共享一次转换），
+    /// 且第二次查询命中缓存路径结果一致
+    #[test]
+    fn domain_keyword_case_insensitive_shared_cache() {
+        let e = engine(&["DOMAIN-KEYWORD,google,PROXY"]);
+        let c = ctx(Some("WWW.GOOGLE.COM"), None);
+        assert!(c.cache.host_lower.get().is_none(), "首查前缓存应为空");
+        assert!(e.r#match(&c).is_some());
+        assert!(c.cache.host_lower.get().is_some(), "首查后缓存应已填充");
+        assert!(e.r#match(&c).is_some(), "缓存路径下仍应匹配");
+        let miss = ctx(Some("baidu.com"), None);
+        assert!(e.r#match(&miss).is_none());
     }
 
     #[test]

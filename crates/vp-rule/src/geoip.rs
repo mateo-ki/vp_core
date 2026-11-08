@@ -16,39 +16,39 @@ pub enum GeoIpDb {
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
-struct CountryNode {
+pub struct CountryNode {
     iso_code: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
-struct ContinentNode {
+pub struct ContinentNode {
     code: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
-enum CountryField {
+pub enum CountryField {
     Object(CountryNode),
     String(String),
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
-enum ContinentField {
+pub enum ContinentField {
     Object(ContinentNode),
     String(String),
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
-enum TagsField {
+pub enum TagsField {
     List(Vec<String>),
     Single(String),
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
 #[serde(untagged)]
-enum MmdbRecord {
+pub enum MmdbRecord {
     /// 字典格式（兼顾 MaxMind 标准结构、自定义 code/country 扁平字段以及 tags 标签）
     Map {
         #[serde(default)]
@@ -270,6 +270,36 @@ impl GeoIpMatcher {
                 hit.is_some_and(|r| r.matches_code(code))
             }
             GeoIpMatcher::Dat { set } => set.contains(ip),
+        }
+    }
+
+    /// mmdb 变体的原始记录查询（供 MatchCtx 跨规则缓存：N 条 GEOIP 规则共享一次
+    /// mmdb 树遍历）；其余变体返回 None 走零查询路径
+    pub fn lookup_record(&self, ip: IpAddr) -> Option<MmdbRecord> {
+        match self {
+            GeoIpMatcher::MmdbMmap { reader, .. } => reader.lookup(ip).ok().flatten(),
+            GeoIpMatcher::MmdbMem { reader, .. } => reader.lookup(ip).ok().flatten(),
+            _ => None,
+        }
+    }
+
+    /// 使用 MatchCtx 惰性缓存判断国家归属：缓存按 IP 记录首查结果，
+    /// 同一连接的多条 GEOIP 规则（CN/US/LAN…）只遍历一次 mmdb
+    pub fn matches_cached(
+        &self,
+        ip: IpAddr,
+        cache: &std::sync::OnceLock<(IpAddr, Option<Box<MmdbRecord>>)>,
+    ) -> bool {
+        match self {
+            GeoIpMatcher::MmdbMmap { code, .. } | GeoIpMatcher::MmdbMem { code, .. } => {
+                let rec = cache.get_or_init(|| (ip, self.lookup_record(ip).map(Box::new)));
+                if rec.0 != ip {
+                    // 缓存已被其他 IP 占用（同一 ctx 不应发生，防御回退）
+                    return self.matches(ip);
+                }
+                rec.1.as_ref().is_some_and(|r| r.matches_code(code))
+            }
+            _ => self.matches(ip),
         }
     }
 }

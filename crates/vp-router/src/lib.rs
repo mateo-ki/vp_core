@@ -435,6 +435,7 @@ impl RouterTrait for Router {
                     inbound: &sess.inbound,
                     inbound_port: sess.inbound_port,
                     inbound_user: sess.inbound_user.as_deref(),
+                    cache: Default::default(),
                 };
 
                 let mut matched = None;
@@ -589,6 +590,7 @@ impl RouterTrait for Router {
                         inbound: &sess.inbound,
                         inbound_port: sess.inbound_port,
                         inbound_user: sess.inbound_user.as_deref(),
+                        cache: Default::default(),
                     };
 
                     let mut evaluated = 0;

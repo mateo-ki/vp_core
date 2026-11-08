@@ -38,3 +38,9 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --verbose
+
+      - name: Gate-check bundled .vp DSL example (validate + fmt --check)
+        shell: bash
+        run: |
+          cargo run -q -p vp-bin -- validate -c example/config.vp
+          cargo run -q -p vp-bin -- fmt --check example/config.vp

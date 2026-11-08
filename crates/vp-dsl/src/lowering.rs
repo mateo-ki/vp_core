@@ -295,7 +295,7 @@ fn lower_node(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let udp = map.get("udp").and_then(|v| v.as_bool()).unwrap_or(true);
+    let udp = map.get("udp").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let mut transport = TransportSpec::default();
     if let Some(sni) = map
@@ -644,6 +644,131 @@ fn lower_node(
                 exit_node_allow_lan: false,
             }
         }
+        "snell" => {
+            let psk = map
+                .get("psk")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let version = map.get("version").and_then(|v| v.as_u64()).unwrap_or(4) as u8;
+            OutboundKind::Snell {
+                server,
+                port,
+                psk,
+                version,
+                obfs_opts: None,
+                udp,
+            }
+        }
+        "ssh" => {
+            let username = map
+                .get("username")
+                .or_else(|| map.get("user"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let private_key = map
+                .get("private_key")
+                .or_else(|| map.get("private-key"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let host_key = map
+                .get("host_key")
+                .or_else(|| map.get("host-key"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            OutboundKind::Ssh {
+                server,
+                port,
+                username,
+                password: if password.is_empty() {
+                    None
+                } else {
+                    Some(password)
+                },
+                private_key,
+                private_key_passphrase: None,
+                host_key,
+            }
+        }
+        "anytls" => OutboundKind::Anytls {
+            server,
+            port,
+            password,
+            sni: transport.sni.clone(),
+            client_fingerprint: transport.client_fingerprint.clone(),
+            udp,
+        },
+        "ssr" => {
+            let cipher = map
+                .get("cipher")
+                .and_then(|v| v.as_str())
+                .unwrap_or("aes-128-gcm")
+                .to_string();
+            let protocol = map
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("origin")
+                .to_string();
+            let obfs = map
+                .get("obfs")
+                .and_then(|v| v.as_str())
+                .unwrap_or("plain")
+                .to_string();
+            let obfs_param = map
+                .get("obfs_param")
+                .or_else(|| map.get("obfs-param"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let protocol_param = map
+                .get("protocol_param")
+                .or_else(|| map.get("protocol-param"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            OutboundKind::Ssr {
+                server,
+                port,
+                password,
+                cipher,
+                protocol,
+                obfs,
+                obfs_param,
+                protocol_param,
+                udp,
+            }
+        }
+        "hysteria" | "hy" => {
+            let auth = map
+                .get("auth")
+                .or_else(|| map.get("auth_str"))
+                .or_else(|| map.get("auth-str"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .or_else(|| (!password.is_empty()).then_some(password));
+            let up_mbps = map.get("up").and_then(|v| v.as_u64());
+            let down_mbps = map.get("down").and_then(|v| v.as_u64());
+            let obfs = map
+                .get("obfs")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let obfs_password = map
+                .get("obfs_password")
+                .or_else(|| map.get("obfs-password"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            OutboundKind::Hysteria {
+                server,
+                port,
+                auth,
+                up_mbps,
+                down_mbps,
+                obfs,
+                obfs_password,
+                sni: transport.sni.clone(),
+                alpn: transport.alpn.clone(),
+                insecure: transport.insecure,
+            }
+        }
         "direct" => OutboundKind::Direct,
         "reject" => OutboundKind::Reject,
         other => return Err(format!("未识别的节点协议类型: '{other}'")),
@@ -655,6 +780,7 @@ fn lower_node(
         transport,
         dialer_proxy: map
             .get("dialer_proxy")
+            .or_else(|| map.get("dialer-proxy"))
             .and_then(|v| v.as_str())
             .map(ToString::to_string),
         routing_mark: map.get("routing_mark").and_then(|v| v.as_u32()),

@@ -171,15 +171,60 @@ route {
 
 ---
 
-## 五、 常用命令
+## 五、 常用命令与生态工具链
 
+### 1. 语法与语义校验
 ```bash
-# 1. 语法与语义校验
 vpcore validate -c config.vp
+```
 
-# 2. 路由决策链路诊断（查看命中哪条 CEL 规则及毫秒/微秒耗时）
+### 2. 代码自动格式化与 CI 门禁 (`vpcore fmt`)
+```bash
+# 原地格式化并对齐 .vp 文件代码
+vpcore fmt -w config.vp
+
+# CI/CD 门禁检查（若未规范格式化则非零退出）
+vpcore fmt --check config.vp
+
+# 查看格式化结果（输出至标准输出）
+vpcore fmt config.vp
+```
+
+### 3. 一键无损互转 (`vpcore convert`)
+无缝将存量 Clash YAML / JSON 配置无损转为规范的 `.vp` DSL，或将 `.vp` 导出为标准格式：
+```bash
+# 将 Clash YAML 配置转换为极简 .vp DSL
+vpcore convert -i config.yaml -o config.vp
+
+# 将 .vp DSL 逆向导出为标准 YAML
+vpcore convert -i config.vp -o exported.yaml
+
+# 转换并导出为 JSON
+vpcore convert -i config.vp -o exported.json
+
+# 直接在终端标准输出打印转换结果
+vpcore convert -i config.yaml
+```
+
+### 4. 远程机场订阅直接拉取并产出 `.vp` 配置 (`vpcore sub`)
+```bash
+# 拉取订阅并直接保存为 .vp DSL 配置
+vpcore sub "https://subscribe.example.com/api/v1/client/subscribe?token=xxx" -o sub.vp
+
+# 显式指定输出格式为 vp
+vpcore sub "https://subscribe.example.com/api/v1/client/subscribe?token=xxx" -o myconfig -f vp
+```
+
+### 5. 路由决策链路诊断（查看命中哪条 CEL 规则及毫秒/微秒耗时）
+```bash
+# 交互式全景诊断
 vpcore explain https://www.google.com -c config.vp
 
-# 3. 启动内核运行
+# 输出 JSON 格式（供 Web 面板或监控集成）
+vpcore explain https://www.google.com -c config.vp --json
+```
+
+### 6. 启动内核运行
+```bash
 vpcore run -c config.vp
 ```

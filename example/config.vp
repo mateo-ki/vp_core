@@ -1,0 +1,89 @@
+inbound mixed {
+    listen: "0.0.0.0:7890"
+}
+
+node "ss-示例" ss {
+    server: "server.example.com"
+    port: 8388
+    cipher: "aes-256-gcm"
+    password: "your-password"
+    udp: true
+}
+
+node "vmess-示例" vmess {
+    server: "v.example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    cipher: "auto"
+    tls: true
+    sni: "v.example.com"
+    ws: {
+        path: "/path"
+        headers: { Host: "v.example.com" }
+    }
+}
+
+node "vless-示例" vless {
+    server: "vl.example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    flow: "xtls-rprx-vision"
+    tls: true
+}
+
+node "snell-示例" snell {
+    server: "sn.example.com"
+    port: 1234
+    psk: "your-snell-psk"
+    version: 4
+    udp: true
+}
+
+node "trojan-示例" trojan {
+    server: "t.example.com"
+    port: 443
+    password: "your-password"
+    tls: true
+    sni: "t.example.com"
+}
+
+node "chained-trojan-示例" trojan {
+    server: "landing.example.com"
+    port: 443
+    password: "your-password"
+    dialer_proxy: "ss-示例"
+    tls: true
+    sni: "landing.example.com"
+}
+
+node "vless-smux-示例" vless {
+    server: "vl.example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    tls: true
+}
+
+group "PROXY" select {
+    members: ["自动选择", "ss-示例", "vless-示例", "snell-示例", "DIRECT"]
+}
+
+group "自动选择" url_test {
+    members: ["vmess-示例", "vless-示例", "snell-示例", "trojan-示例"]
+    url: "http://www.gstatic.com/generate_204"
+}
+
+dns {
+    nameservers: ["223.5.5.5", "119.29.29.29"]
+}
+
+services {
+    mode: "rule"
+    external_controller: "127.0.0.1:9090"
+    secret: ""
+}
+
+route {
+    dst.ip in "127.0.0.0/8" => "DIRECT" no-resolve
+    dst.ip in "192.168.0.0/16" => "DIRECT" no-resolve
+    _ => "DIRECT"
+}

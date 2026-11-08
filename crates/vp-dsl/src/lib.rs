@@ -7,9 +7,11 @@
 pub mod ast;
 pub mod lowering;
 pub mod parser;
+pub mod serializer;
 pub mod token;
 
 pub use ast::*;
+pub use serializer::{format_dsl, ir_to_dsl};
 pub use token::Lexer;
 
 use vp_ir::VpIr;
@@ -175,5 +177,70 @@ sub_rule "custom_flow" {
         assert_eq!(sub.len(), 2);
         assert_eq!(sub[0].target, "DIRECT");
         assert_eq!(sub[1].target, "PROXY");
+    }
+
+    #[test]
+    fn test_ir_to_dsl_and_format_roundtrip() {
+        let original_dsl = r#"
+inbound mixed {
+    listen: "127.0.0.1:7890"
+}
+
+node "hk-01" vless {
+    server: "hk.example.com"
+    port: 443
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    flow: "xtls-rprx-vision"
+    tls: reality {
+        sni: "www.amazon.com"
+        public_key: "abc123"
+        short_id: "1234"
+    }
+}
+
+group "AUTO" url_test {
+    members: ["hk-01"]
+    interval: 300s
+    tolerance: 50ms
+    filter: "hk"
+    fallback: "DIRECT"
+}
+
+dns {
+    nameservers: ["https://doh.pub/dns-query", "223.5.5.5"]
+    fake_ip: "198.18.0.0/15"
+}
+
+services {
+    mode: "rule"
+    log_level: "info"
+}
+
+route {
+    process.name == "git" => "AUTO"
+    host.endsWith(".google.com") => "AUTO"
+    geoip == "CN" => "DIRECT"
+    _ => "AUTO"
+}
+"#;
+        let ir = parse(original_dsl).expect("首次解析 DSL 成功");
+        let generated_dsl = ir_to_dsl(&ir);
+        assert!(generated_dsl.contains("inbound mixed {"));
+        assert!(generated_dsl.contains("node \"hk-01\" vless {"));
+        assert!(generated_dsl.contains("tls: reality {"));
+        assert!(generated_dsl.contains("group \"AUTO\" url_test {"));
+        assert!(generated_dsl.contains("dns {"));
+        assert!(generated_dsl.contains("host.endsWith(\".google.com\") => \"AUTO\""));
+
+        // 二次往返解析：确认生成的 DSL 代码可被 100% 成功解析且等价
+        let roundtrip_ir = parse(&generated_dsl).expect("往返解析生成的 DSL 成功");
+        assert_eq!(roundtrip_ir.inbounds.len(), ir.inbounds.len());
+        assert_eq!(roundtrip_ir.outbounds.len(), ir.outbounds.len());
+        assert_eq!(roundtrip_ir.groups.len(), ir.groups.len());
+        assert_eq!(roundtrip_ir.routes.len(), ir.routes.len());
+
+        // 测试 format_dsl
+        let formatted = format_dsl(original_dsl).expect("format_dsl 应当成功");
+        assert_eq!(formatted, generated_dsl);
     }
 }

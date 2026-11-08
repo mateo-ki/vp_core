@@ -1,3 +1,77 @@
+# 🚀 VP_Core v1.7.1 发布说明 / Release Notes：一键无损转换与 DSL 格式化工具链 (`convert` & `fmt`)
+
+> **“配置迁移不该是手工苦力活，格式规范更不该靠肉眼自觉。”**
+>
+> 🎉 欢迎使用 **VP_Core v1.7.1**！本版本为 v1.7.0 推出的统一中间表示 (VP IR) 与 `.vp` DSL 补全了完整的**生态工具链闭环**：新增 `vpcore convert` 实现 Clash YAML / JSON / `.vp` DSL **任意双向无损互转**；新增 `vpcore fmt` 提供 `cargo fmt` 风格的 DSL 自动对齐与 CI/CD 格式门禁；`vpcore sub` 订阅拉取现已支持**直出规范 `.vp` DSL 配置**。从此存量配置一键无痛迁移，DSL 代码风格全局统一。
+
+### 🌟 核心更新全览 (Highlights)
+
+| 新特性 | 解决的传统痛点 | 带来突破性价值 |
+| :--- | :--- | :--- |
+| **一键无损互转 (`convert`)** | 手头积压大量 Clash YAML/JSON 配置，手工翻译成 DSL 费时费力且易丢字段 | 基于 VP IR 的三格式任意互转（YAML ⇄ JSON ⇄ `.vp`），格式自动推断，语义 100% 保真 |
+| **DSL 格式化引擎 (`fmt`)** | 团队协作与 AI 生成的 `.vp` 代码风格混乱，缩进与对齐全凭自觉 | `parse -> IR -> ir_to_dsl` 确定性规范化排版；`-w` 原地写回，`--check` 非零退出码门禁 |
+| **订阅直出 DSL (`sub`)** | 拉取机场订阅只能得到 YAML，仍需手工二次转换 | `vpcore sub <URL> -o sub.vp` 一步到位产出规范 DSL 配置文件 |
+| **协议覆盖全面补齐** | DSL 对部分冷门协议与链式代理支持不全 | 新增 Snell、SSH、AnyTLS、SSR、Hysteria (v1) 支持与 `dialer_proxy` / `routing_mark` / `interface` 出站字段 |
+| **CI 门禁与鲁棒性加固** | 混乱输入可能导致工具链 panic 崩溃，格式规范无强制保障 | 仓库内置 `example/config.vp` 并纳入 CI `fmt --check` + `validate` 双门禁；混沌模糊测试确保畸形输入优雅报错绝不 panic |
+
+### 🔄 P1. 一键无损互转 (`vpcore convert`)
+存量配置的迁移成本直接降为零：
+```bash
+# Clash YAML 一键转为极简 .vp DSL
+vpcore convert -i config.yaml -o config.vp
+
+# .vp DSL 逆向导出标准 YAML / JSON
+vpcore convert -i config.vp -o exported.yaml
+vpcore convert -i config.vp -o exported.json
+
+# 直接在终端打印转换结果；支持 --from / --to 强制指定格式
+vpcore convert -i config.yaml
+```
+- **全自动格式推断**：依据扩展名（`.yaml` / `.yml` / `.json` / `.vp`）自动识别输入输出格式，`--from` / `--to` 可显式覆盖；
+- **统一 IR 枢纽架构**：所有转换均经由强类型 `VpIr` 中转，杜绝“字符串拼装”反模式，语义零丢失；
+- **闭环可验证**：转换产物可直接通过 `vpcore validate` 校验，测试覆盖 `YAML -> .vp -> validate -> fmt --check -> YAML` 全生命周期。
+
+### 🎨 P2. DSL 自动格式化与 CI/CD 门禁 (`vpcore fmt`)
+```bash
+# 原地格式化并对齐 .vp 文件
+vpcore fmt -w config.vp
+
+# CI/CD 门禁检查（未规范格式化时以退出码 1 失败）
+vpcore fmt --check config.vp
+
+# 预览格式化结果（输出至标准输出）
+vpcore fmt config.vp
+```
+- **确定性规范化**：基于统一 IR 重新生成，天然完成语法校验——无法格式化的文件即非法配置；
+- **仓库级门禁范例**：本仓库 `example/config.vp` 已纳入 GitHub Actions，每次 PR 强制执行 `validate` + `fmt --check` 双重门禁。
+
+### 📥 P3. 订阅直出 DSL (`vpcore sub`)
+```bash
+# 拉取订阅并直接保存为规范 .vp DSL 配置
+vpcore sub "https://subscribe.example.com/api/v1/client/subscribe?token=xxx" -o sub.vp
+```
+- 按 `-o` 输出文件扩展名自动识别格式，亦可通过 `-f vp` 显式指定；
+- 终端回显明确标注输出格式（`格式: VP DSL`）。
+
+### 🧪 P4. 工程质量与鲁棒性加固
+- **混沌模糊测试**：空文件、二进制垃圾、截断 YAML/JSON、非法 DSL 语法等 10 类畸形输入全部优雅报错退出，绝不 panic；
+- **Mock 订阅端到端测试**：本地 HTTP 订阅服务器 -> `sub` 拉取 -> 直出 DSL -> `validate` + `fmt --check` 双门禁全链路自动化验证；
+- **全套质量门禁**：全工作区 390+ 项测试 100% 通过，`clippy -D warnings` 零警告，`cargo fmt --check` 全对齐。
+
+### ⚡ 极速体验与升级指南
+- **客户端平滑自我更新**：
+  ```bash
+  vpcore update
+  ```
+- **存量配置一键迁移**：
+  ```bash
+  vpcore convert -i config.yaml -o config.vp
+  vpcore fmt -w config.vp
+  vpcore run -c config.vp
+  ```
+
+---
+
 # 🚀 VP_Core v1.7.0 架构革新：统一中间表示 VP IR、声明式全量配置 DSL 与微秒级全景链路诊断
 
 > **“性能早已不是瓶颈，真正的工业级代理内核应当全力优化路由模块，把易用性做到极致，并彻底消除破坏性更新。”**

@@ -42,11 +42,16 @@ vpcore gen-sub           # 导出当前服务端订阅 (支持 clash / base64)
 vpcore update            # 内核跨平台平滑自我更新 (带健康校验)
 
 # 客户端运行
-vpcore sub "<URL>" -o config.yaml   # 拉取远程订阅生成客户端配置
-vpcore validate -c config.yaml      # 校验配置文件语法（支持 .yaml / .json / .vp）
-vpcore run -c config.yaml           # 启动代理 / VPN 服务
-vpcore test -c config.yaml          # 全节点延迟并发测速
+vpcore sub "<URL>" -o config.vp     # 拉取远程订阅生成客户端配置（直接支持 .vp / .yaml）
+vpcore validate -c config.vp        # 校验配置文件语法（支持 .yaml / .json / .vp）
+vpcore run -c config.vp             # 启动代理 / VPN 服务
+vpcore test -c config.vp            # 全节点延迟并发测速
 vpcore clean-routes                 # 应急清理残留路由与 iptables 端口重定向
+
+# 工具链：一键互转与代码格式化 (convert & fmt)
+vpcore convert -i config.yaml -o config.vp   # YAML / JSON 与 .vp DSL 双向无损互转
+vpcore fmt -w config.vp                     # 自动格式化并对齐 .vp DSL 代码
+vpcore fmt --check config.vp                # CI 门禁检查代码格式规范
 
 # 链路诊断与可观测性 (explain)
 vpcore explain https://www.google.com -c config.yaml  # 诊断路由分流决策与微秒/毫秒耗时

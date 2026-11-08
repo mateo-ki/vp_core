@@ -49,6 +49,38 @@ enum Cmd {
         #[arg(short = 'd', short_alias = 'D', long, alias = "dir")]
         directory: Option<PathBuf>,
     },
+    /// 配置文件格式无损转换（YAML / JSON / .vp DSL 互转）
+    Convert {
+        /// 输入配置文件路径（支持 .yaml / .yml / .json / .vp）
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// 输出配置文件路径（缺省直接输出至标准输出 stdout）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// 强制指定输入格式（yaml / json / vp / dsl，缺省根据扩展名推断）
+        #[arg(long)]
+        from: Option<String>,
+
+        /// 强制指定输出格式（yaml / json / vp / dsl，缺省根据输出文件名扩展名推断，否则为 vp）
+        #[arg(short = 't', long)]
+        to: Option<String>,
+    },
+    /// 格式化 .vp DSL 配置文件
+    Fmt {
+        /// 目标配置文件（.vp）
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+
+        /// 原地写回格式化后的内容
+        #[arg(short = 'w', long)]
+        write: bool,
+
+        /// 仅检查文件是否已规范化格式（未格式化时退出码 1）
+        #[arg(short = 'c', long)]
+        check: bool,
+    },
     /// 将本地分享链接列表转换为 proxies YAML（不发起网络请求）
     ImportLinks {
         #[arg(short, long)]
@@ -65,9 +97,12 @@ enum Cmd {
     Sub {
         /// 订阅 URL
         url: String,
-        /// 输出配置文件路径
+        /// 输出配置文件路径（支持 .yaml / .vp）
         #[arg(short, long, default_value = "vpcore-sub.yaml")]
         output: PathBuf,
+        /// 输出格式覆盖（yaml / vp / dsl，缺省根据 output 后缀自动推断）
+        #[arg(short = 'f', long)]
+        format: Option<String>,
         /// 本地 mixed 监听端口
         #[arg(short, long, default_value_t = 7890)]
         port: u16,
@@ -489,9 +524,166 @@ async fn async_main() {
                 }
             }
         }
+        Cmd::Convert {
+            input,
+            output,
+            from,
+            to,
+        } => {
+            let text = match std::fs::read_to_string(&input) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("读取 {} 失败: {e}", input.display());
+                    std::process::exit(2);
+                }
+            };
+
+            // 1. 判断输入格式并转换为统一 IR
+            let src_fmt = from.as_deref().map(|s| s.to_ascii_lowercase());
+            let is_src_dsl = match src_fmt.as_deref() {
+                Some("vp") | Some("dsl") => true,
+                Some("yaml") | Some("yml") => false,
+                Some("json") => false,
+                _ => {
+                    vp_config::Format::from_path(&input.to_string_lossy()) == vp_config::Format::Dsl
+                }
+            };
+
+            let ir = if is_src_dsl {
+                match vp_dsl::parse(&text) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        eprintln!("解析 VP DSL 失败: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                let fmt = match src_fmt.as_deref() {
+                    Some("json") => vp_config::Format::Json,
+                    Some("yaml") | Some("yml") => vp_config::Format::Yaml,
+                    _ => vp_config::Format::from_path(&input.to_string_lossy()),
+                };
+                match vp_config::parse(&text, fmt).and_then(|c| {
+                    c.into_ir()
+                        .map_err(|errs| vp_common::Error::Config(errs.join("; ")))
+                }) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        eprintln!("解析输入配置并转换为统一 IR 失败: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            };
+
+            // 2. 判断目标格式并生成目标文本
+            let dst_fmt = to
+                .as_deref()
+                .map(|s| s.to_ascii_lowercase())
+                .or_else(|| {
+                    output.as_ref().map(|o| {
+                        let s = o.to_string_lossy().to_ascii_lowercase();
+                        if s.ends_with(".yaml") || s.ends_with(".yml") {
+                            "yaml".into()
+                        } else if s.ends_with(".json") {
+                            "json".into()
+                        } else {
+                            "vp".into()
+                        }
+                    })
+                })
+                .unwrap_or_else(|| {
+                    if is_src_dsl {
+                        "yaml".into()
+                    } else {
+                        "vp".into()
+                    }
+                });
+
+            let out_str = match dst_fmt.as_str() {
+                "vp" | "dsl" => vp_dsl::ir_to_dsl(&ir),
+                "yaml" | "yml" => serde_yaml::to_string(&ir).unwrap_or_else(|e| {
+                    eprintln!("序列化为 YAML 失败: {e}");
+                    std::process::exit(1);
+                }),
+                "json" => serde_json::to_string_pretty(&ir).unwrap_or_else(|e| {
+                    eprintln!("序列化为 JSON 失败: {e}");
+                    std::process::exit(1);
+                }),
+                other => {
+                    eprintln!("不支持的目标格式: '{other}' (可选: vp, yaml, json)");
+                    std::process::exit(1);
+                }
+            };
+
+            if let Some(ref out_path) = output {
+                if let Err(e) = std::fs::write(out_path, &out_str) {
+                    eprintln!("写入 {} 失败: {e}", out_path.display());
+                    std::process::exit(2);
+                }
+                println!(
+                    "✓ 转换成功: {} -> {} (目标格式: {})",
+                    input.display(),
+                    out_path.display(),
+                    dst_fmt.to_uppercase()
+                );
+            } else {
+                print!("{out_str}");
+            }
+        }
+        Cmd::Fmt {
+            files,
+            write,
+            check,
+        } => {
+            let mut has_unformatted = false;
+            let mut failed = false;
+
+            for file in &files {
+                let text = match std::fs::read_to_string(file) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("读取 {} 失败: {e}", file.display());
+                        failed = true;
+                        continue;
+                    }
+                };
+
+                let formatted = match vp_dsl::format_dsl(&text) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("格式化 {} 失败 (语法错误): {e}", file.display());
+                        failed = true;
+                        continue;
+                    }
+                };
+
+                if check {
+                    if text.trim() != formatted.trim() {
+                        eprintln!("✗ 未格式化: {}", file.display());
+                        has_unformatted = true;
+                    }
+                } else if write {
+                    if text.trim() != formatted.trim() {
+                        if let Err(e) = std::fs::write(file, &formatted) {
+                            eprintln!("写入 {} 失败: {e}", file.display());
+                            failed = true;
+                        } else {
+                            println!("✓ 已格式化: {}", file.display());
+                        }
+                    }
+                } else {
+                    print!("{formatted}");
+                }
+            }
+
+            if failed || (check && has_unformatted) {
+                std::process::exit(1);
+            }
+        }
         Cmd::Sub {
             url,
             output,
+            format,
             port,
             proxy,
             user_agent,
@@ -583,12 +775,37 @@ async fn async_main() {
                 std::process::exit(1);
             };
 
-            std::fs::write(&output, cfg).unwrap_or_else(|e| {
+            let is_dsl = match format.as_deref() {
+                Some(f) if f.eq_ignore_ascii_case("vp") || f.eq_ignore_ascii_case("dsl") => true,
+                Some(f) if f.eq_ignore_ascii_case("yaml") || f.eq_ignore_ascii_case("yml") => false,
+                _ => output
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(".vp"),
+            };
+
+            let final_content = if is_dsl {
+                match vp_config::parse(&cfg, vp_config::Format::Yaml).and_then(|c| {
+                    c.into_ir()
+                        .map_err(|errs| vp_common::Error::Config(errs.join("; ")))
+                }) {
+                    Ok(ir) => vp_dsl::ir_to_dsl(&ir),
+                    Err(e) => {
+                        eprintln!("转换订阅配置为 VP DSL 失败: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                cfg
+            };
+
+            std::fs::write(&output, final_content).unwrap_or_else(|e| {
                 eprintln!("写入 {} 失败: {e}", output.display());
                 std::process::exit(2);
             });
+            let format_label = if is_dsl { "，格式: VP DSL" } else { "" };
             println!(
-                "✓ {} 个节点 → {}（mixed-port {port}）",
+                "✓ {} 个节点 → {}（mixed-port {port}{format_label}）",
                 count,
                 output.display()
             );

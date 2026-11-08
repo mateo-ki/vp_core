@@ -272,13 +272,12 @@ impl UdpNat {
             GAME_UDP_IDLE_TIMEOUT
         };
 
-        let direct_for_task = direct.clone();
+        // 直发会话：rx 臂用布尔禁用，但 rx 必须恒持有——GC 以 tx.is_closed()
+        // 判活，drop rx 会让会话在首次扫描即被误删，NAT 表失效后每个上行
+        // 报文都重新建连（服务器主动推送的下行随之全部丢失）
+        let rx_enabled = direct.is_none();
         tokio::spawn(async move {
-            let mut rx = if direct_for_task.is_some() {
-                None
-            } else {
-                Some(rx)
-            };
+            let mut rx = rx;
             loop {
                 tokio::select! {
                     biased;
@@ -306,8 +305,9 @@ impl UdpNat {
                             }
                         }
                     }
-                    // 客户端 → 出站（直发句柄存在时上行已旁路，此臂关闭）
-                    out = async { rx.as_mut().unwrap().recv().await }, if rx.is_some() => {
+                    // 客户端 → 出站（直发句柄存在时上行已旁路，此臂禁用；
+                    // rx 仍持有以维持 GC 判活，channel 恒空零开销）
+                    out = async { rx.recv().await }, if rx_enabled => {
                         match out {
                             Some(pkt) => {
                                 if conn.send(&pkt).await.is_err() {
@@ -343,6 +343,28 @@ mod tests {
     fn test_dual_mode_timeout_constants() {
         assert_eq!(DNS_IDLE_TIMEOUT, Duration::from_secs(5));
         assert_eq!(GAME_UDP_IDLE_TIMEOUT, Duration::from_secs(180));
+    }
+
+    /// 直发会话 GC 判活回归：spawn_session 直发分支不消费 rx 但必须恒持有——
+    /// GC 以 tx.is_closed() 判活，rx 被 drop 会让会话在首次扫描即被误删
+    /// （NAT 表失效 → 每个上行报文重新建连，服务器主动下行全部丢失）
+    #[tokio::test]
+    async fn direct_send_session_keeps_rx_alive_for_gc() {
+        let (tx, mut rx) = mpsc::channel::<UdpPacket>(64);
+        // 模拟直发任务：rx 恒持有（select 臂被 rx_enabled 禁用）不消费
+        let task = tokio::spawn(async move {
+            let _held = &mut rx;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // 任务在此结束，rx 随之 drop
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !tx.is_closed(),
+            "直发会话任务存活期间 tx 不得 closed（GC 判活依据）"
+        );
+        task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(tx.is_closed(), "任务退出后 GC 应能正常回收会话");
     }
 
     #[tokio::test]

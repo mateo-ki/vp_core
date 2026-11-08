@@ -139,6 +139,16 @@ RustCrypto 的 SIMD 内联循环，加密吞吐掉 4-5 倍）。
   必选项**（本批次两个 Linux-only 事故——try_io 空转是 Windows 必现、
   REUSEPORT EADDRINUSE 是 Linux 必现——互相为对方平台补位才抓全）。
 
+**UDP 直发 GC 判活 bug（自查抓出，第三起）**：
+
+- 直发会话最初把 rx drop 成 `None` 以关闭 select 上行臂 → GC 以
+  `tx.is_closed()` 判活 → **直发会话在首次 GC 扫描即被误删**：NAT 表失效
+  后每个上行报文都重新建连（每包握手），服务器主动推送的下行全部丢失。
+  纯逻辑 bug，双平台测试都测不出（需要 GC 触发 + 非响应式下行的组合场景）。
+- 修复：rx 恒持有（任务存活 = 会话存活 = GC 判活正确），select 臂改用
+  `rx_enabled` 布尔禁用——channel 恒空零开销；新增回归测试
+  `direct_send_session_keeps_rx_alive_for_gc` 锁住该不变量。
+
 **三项明确取舍（诚实记录）**：
 
 - **4 分层聚合规则索引**：暂缓。确定性路由缓存（项 3）已覆盖稳态 98%+ 连接的 O(1) 决策，

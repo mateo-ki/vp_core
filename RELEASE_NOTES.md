@@ -1,3 +1,32 @@
+# 🚀 VP_Core v1.7.2 发布说明 / Release Notes：全链路性能优化与真实订阅兼容性大考
+
+> **“25821 个真实订阅节点全量压测、双平台互为盲区的事故互查、真实节点穿透验证——性能与兼容性这次都见真章。”**
+>
+> 🎉 欢迎使用 **VP_Core v1.7.2**！本版本包含两批入站→出站全链路优化（12 项方案落地 9 项）、25821 个真实订阅节点的全量兼容性压测修复（15 种协议）与真实节点端到端穿透验证。所有优化均经基准留档（`docs/benchmarks.md`），所有修过的坑都有回归测试或事故复盘锁死。
+
+### 🌟 核心更新全览 (Highlights)
+
+| 类别 | 内容 | 收益 |
+| :--- | :--- | :--- |
+| **入站性能** | Linux `TCP_DEFER_ACCEPT`(3s) + 多核 `SO_REUSEPORT` 多监听器（mixed/socks5/http，`min(cpus,8)` 槽） | 空握手零唤醒、端口扫描免疫；万级并发接入打散 accept 互斥与 epoll 惊群 |
+| **路由性能** | 确定性路由决策缓存（`uses_session_state` 静态内省，进程/源地址/入站标识依赖自动禁用） | 日常浏览 98%+ 连接 O(1) 决策，热重载自然失效 |
+| **DNS 性能** | RFC 8305 双栈地址交叉编排 + RFC 8767 stale-while-revalidate（60s 窗口+在途去重） | v6 黑洞首包延迟 -200ms+；高频域名 DNS 感知延迟恒为 0 |
+| **中继性能** | 非对称缓冲 上行 32K / 下行 128K | 单连接缓冲内存 -37.5%，同内存多承载 ~60% 并发 |
+| **UDP 性能** | `PacketSend` 直发句柄绕过 mpsc（DIRECT/SOCKS5/SS 三出站）+ quinn-udp recvmmsg 批量收包 | 游戏/QUIC 上行 Jitter 显著下降，高 PPS 收包 syscall -90%+ |
+| **真实订阅兼容** | 25821 节点全量压测：alpn 字符串（40% 节点）、V2Ray 平铺字段（vless 74%）、字符串布尔/数字、双键并存、null 占位、DSL 往返 8 处破坏 | 真实机场订阅"拿来即用"，convert/fmt 全链路幂等无损 |
+
+### 🧯 事故与修复（工程透明）
+
+- **socks5 UDP 中继活锁**（Windows 必现）：`readable()` + 裸 quinn-udp `recv` 绕过 `try_io` → tokio 就绪标志永不清除 → 100% CPU 空转。包进 `try_io` 修复，并防御 GRO `stride==0` 死循环（§3.6 splice 自旋之后第二次同类教训）。
+- **REUSEPORT 上线即翻车**（Linux 多核必现）：多监听器跟随全局 tuning 默认 `reuse_port=false` → 第 2+ listener `EADDRINUSE` 整个入站起不来。强制开启修复。**结论：cfg(linux) 差异 Windows 测不出，WSL 兜底测试升级为固定门禁。**
+- **UDP 直发会话 GC 误删**（纯逻辑）：直发分支 drop rx → GC 以 `tx.is_closed()` 判活误删会话 → NAT 失效每包重连。rx 恒持有修复 + 回归测试锁死。
+
+### ✅ 质量门禁
+
+Windows 393 测试 0 失败 + `cargo fmt --check`；WSL Linux `clippy -D warnings` 0 告警 + 全量测试；25821 真实节点 `validate ✓ → convert → fmt --check` 幂等 0 差异；真实 vless/trojan 节点端到端穿透（HTTP 204 + 出口 IP 落地正确）。
+
+---
+
 # 🚀 VP_Core v1.7.1 发布说明 / Release Notes：一键无损转换与 DSL 格式化工具链 (`convert` & `fmt`)
 
 > **“配置迁移不该是手工苦力活，格式规范更不该靠肉眼自觉。”**

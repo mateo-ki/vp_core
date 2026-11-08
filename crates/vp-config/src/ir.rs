@@ -943,7 +943,8 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
                 server: s.server,
                 port: s.port,
                 username: s.username,
-                password: s.password,
+                // 空密码归一为缺省（与 DSL parse 侧语义对齐，保证往返幂等）
+                password: s.password.filter(|p| !p.is_empty()),
                 tls: s.tls,
                 sni: None,
                 insecure: false,
@@ -959,7 +960,8 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
                 server: h.server,
                 port: h.port,
                 username: h.username,
-                password: h.password,
+                // 空密码归一为缺省（与 DSL parse 侧语义对齐，保证往返幂等）
+                password: h.password.filter(|p| !p.is_empty()),
                 tls: h.tls,
                 sni: None,
                 insecure: false,

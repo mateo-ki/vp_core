@@ -308,8 +308,8 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             down_mbps,
             obfs,
             obfs_password,
-            sni,
-            insecure,
+            sni: _,
+            insecure: _,
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
             out.push_str(&format!("    port: {port}\n"));
@@ -331,12 +331,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             if let Some(op) = obfs_password {
                 out.push_str(&format!("    obfs_password: \"{}\"\n", escape_str(op)));
             }
-            if let Some(s) = sni {
-                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
-            }
-            if *insecure {
-                out.push_str("    insecure: true\n");
-            }
+            // sni/insecure 归 serialize_transport 统一输出
         }
         OutboundKind::Tuic {
             server,
@@ -347,8 +342,8 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             udp_relay_mode,
             zero_rtt_handshake,
             heartbeat,
-            sni,
-            insecure,
+            sni: _,
+            insecure: _,
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
             out.push_str(&format!("    port: {port}\n"));
@@ -369,12 +364,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             if let Some(hb) = heartbeat {
                 out.push_str(&format!("    heartbeat: \"{}\"\n", escape_str(hb)));
             }
-            if let Some(s) = sni {
-                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
-            }
-            if *insecure {
-                out.push_str("    insecure: true\n");
-            }
+            // sni/insecure 归 serialize_transport 统一输出
         }
         OutboundKind::Wireguard {
             server,
@@ -414,40 +404,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             port,
             username,
             password,
-            tls,
-            sni,
-            insecure,
             udp,
-        } => {
-            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
-            out.push_str(&format!("    port: {port}\n"));
-            if let Some(u) = username {
-                out.push_str(&format!("    username: \"{}\"\n", escape_str(u)));
-            }
-            if let Some(p) = password {
-                out.push_str(&format!("    password: \"{}\"\n", escape_str(p)));
-            }
-            if *tls {
-                out.push_str("    tls: true\n");
-            }
-            if let Some(s) = sni {
-                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
-            }
-            if *insecure {
-                out.push_str("    insecure: true\n");
-            }
-            if *udp {
-                out.push_str("    udp: true\n");
-            }
-        }
-        OutboundKind::Http {
-            server,
-            port,
-            username,
-            password,
-            tls,
-            sni,
-            insecure,
             ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
@@ -458,14 +415,46 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             if let Some(p) = password {
                 out.push_str(&format!("    password: \"{}\"\n", escape_str(p)));
             }
-            if *tls {
-                out.push_str("    tls: true\n");
+            // tls/sni/insecure 由公共 serialize_transport 统一输出（与 kind.tls 同源），
+            // 此处再写一遍会产生重复字段导致解析端 duplicate 报错
+            if *udp {
+                out.push_str("    udp: true\n");
             }
-            if let Some(s) = sni {
-                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
+        }
+        OutboundKind::Http {
+            server,
+            port,
+            username,
+            password,
+            ..
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            if let Some(u) = username {
+                out.push_str(&format!("    username: \"{}\"\n", escape_str(u)));
             }
-            if *insecure {
-                out.push_str("    insecure: true\n");
+            if let Some(p) = password {
+                out.push_str(&format!("    password: \"{}\"\n", escape_str(p)));
+            }
+            // 同上：tls/sni/insecure 归 serialize_transport 统一输出
+        }
+        OutboundKind::Mieru {
+            server,
+            port,
+            username,
+            password,
+            transport,
+            multiplexing,
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            out.push_str(&format!("    username: \"{}\"\n", escape_str(username)));
+            out.push_str(&format!("    password: \"{}\"\n", escape_str(password)));
+            if let Some(t) = transport {
+                out.push_str(&format!("    transport: \"{}\"\n", escape_str(t)));
+            }
+            if let Some(m) = multiplexing {
+                out.push_str(&format!("    multiplexing: \"{}\"\n", escape_str(m)));
             }
         }
         OutboundKind::Snell {
@@ -555,8 +544,6 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             down_mbps,
             obfs,
             obfs_password,
-            sni,
-            insecure,
             ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
@@ -576,11 +563,40 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             if let Some(op) = obfs_password {
                 out.push_str(&format!("    obfs_password: \"{}\"\n", escape_str(op)));
             }
-            if let Some(s) = sni {
-                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
+            // sni/insecure 归 serialize_transport 统一输出
+        }
+        OutboundKind::Brook {
+            server,
+            port,
+            password,
+            protocol,
+            udp,
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            out.push_str(&format!("    password: \"{}\"\n", escape_str(password)));
+            if let Some(pr) = protocol {
+                out.push_str(&format!("    protocol: \"{}\"\n", escape_str(pr)));
             }
-            if *insecure {
-                out.push_str("    insecure: true\n");
+            if *udp {
+                out.push_str("    udp: true\n");
+            }
+        }
+        OutboundKind::Naive {
+            server,
+            port,
+            username,
+            password,
+            udp,
+            ..
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            out.push_str(&format!("    username: \"{}\"\n", escape_str(username)));
+            out.push_str(&format!("    password: \"{}\"\n", escape_str(password)));
+            // sni/client_fingerprint 归 serialize_transport 统一输出
+            if *udp {
+                out.push_str("    udp: true\n");
             }
         }
         _ => {}

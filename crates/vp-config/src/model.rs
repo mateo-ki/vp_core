@@ -49,16 +49,41 @@ where
     de_u64_lenient(deserializer).map(|v| v as u16)
 }
 
-/// ALPN 宽容反序列化：接受字符串（逗号分隔或单值）或字符串列表
-fn de_alpn_list_lenient<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+/// 布尔宽容反序列化：真实订阅里常见 `tls: "tls"` / `tls: "none"`（V2Ray 风格）
+/// 与 `skip-cert-verify: "true"` 字符串写法，mihomo 一律接受，这里对齐
+fn de_bool_lenient<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None | Some(serde_yaml::Value::Null) => Ok(false),
+        Some(serde_yaml::Value::Bool(b)) => Ok(b),
+        Some(serde_yaml::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            // "auto" 兜底为 true（sanitize 层已按端口推断过，此处多为 443 的 TLS 节点）
+            "tls" | "auto" | "true" | "1" | "yes" | "on" => Ok(true),
+            "none" | "false" | "0" | "no" | "off" | "" => Ok(false),
+            other => Err(D::Error::custom(format!("布尔字段非法: {other:?}"))),
+        },
+        Some(serde_yaml::Value::Number(n)) => Ok(n.as_i64().unwrap_or(0) != 0),
+        other => Err(D::Error::custom(format!("布尔字段非法: {other:?}"))),
+    }
+}
+
+/// 可选 ALPN 宽容反序列化：None 语义保留（区别于空列表）
+fn de_opt_alpn_list_lenient<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error as _;
-    let val = Option::<serde_yaml::Value>::deserialize(deserializer)?;
-    let Some(val) = val else {
-        return Ok(Vec::new());
-    };
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(val) => de_alpn_value(val).map(Some).map_err(D::Error::custom),
+    }
+}
+
+/// 拆出 ALPN 值解析（字符串/序列共用）
+fn de_alpn_value(val: serde_yaml::Value) -> std::result::Result<Vec<String>, String> {
     match val {
         serde_yaml::Value::Sequence(items) => Ok(items
             .into_iter()
@@ -70,9 +95,39 @@ where
             .map(|p| p.trim().to_owned())
             .filter(|p| !p.is_empty())
             .collect()),
-        serde_yaml::Value::Null => Ok(Vec::new()),
-        other => Err(D::Error::custom(format!("alpn 非法: {other:?}"))),
+        other => Err(format!("alpn 非法: {other:?}")),
     }
+}
+
+/// 可选 u16 宽容反序列化：真实订阅里 `keepalive: "25"` 字符串数字常见
+fn de_opt_u16_lenient<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    match Option::<serde_yaml::Value>::deserialize(deserializer)? {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_yaml::Value::Number(n)) => Ok(Some(n.as_u64().unwrap_or(0) as u16)),
+        Some(serde_yaml::Value::String(s)) => s
+            .trim()
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|e| D::Error::custom(format!("u16 字段非法: {s:?}: {e}"))),
+        other => Err(D::Error::custom(format!("u16 字段非法: {other:?}"))),
+    }
+}
+
+/// ALPN 宽容反序列化：接受字符串（逗号分隔或单值）或字符串列表
+fn de_alpn_list_lenient<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let val = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+    let Some(val) = val else {
+        return Ok(Vec::new());
+    };
+    de_alpn_value(val).map_err(D::Error::custom)
 }
 
 fn de_opt_bandwidth_mbps<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
@@ -984,7 +1039,7 @@ pub struct VmessCfg {
     pub alter_id: u32,
     #[serde(alias = "cipher", alias = "security", default = "default_vmess_cipher")]
     pub cipher: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub tls: bool,
     #[serde(
         alias = "servername",
@@ -1000,7 +1055,8 @@ pub struct VmessCfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
@@ -1008,7 +1064,7 @@ pub struct VmessCfg {
     #[serde(default)]
     pub network: Option<String>,
     /// TLS ALPN 列表（Clash 语义：["h2","http/1.1"]）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_alpn_list_lenient")]
     pub alpn: Option<Vec<String>>,
     #[serde(alias = "ech-opts", alias = "ech_opts", default)]
     pub ech_opts: Option<EchOpts>,
@@ -1041,7 +1097,7 @@ pub struct VlessCfg {
     pub uuid: String,
     #[serde(default)]
     pub flow: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub tls: bool,
     #[serde(
         alias = "servername",
@@ -1057,7 +1113,8 @@ pub struct VlessCfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
@@ -1065,7 +1122,7 @@ pub struct VlessCfg {
     #[serde(default)]
     pub network: Option<String>,
     /// TLS ALPN 列表（Clash 语义：["h2","http/1.1"]）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_alpn_list_lenient")]
     pub alpn: Option<Vec<String>>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
@@ -1105,7 +1162,7 @@ pub struct TrojanCfg {
     pub port: u16,
     pub password: String,
     /// Clash 语义：trojan 天然 TLS，缺省即 true（显式 `tls: false` 仍可覆盖）
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "de_bool_lenient")]
     pub tls: bool,
     #[serde(
         alias = "servername",
@@ -1121,7 +1178,8 @@ pub struct TrojanCfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
@@ -1129,7 +1187,7 @@ pub struct TrojanCfg {
     #[serde(default)]
     pub network: Option<String>,
     /// TLS ALPN 列表（Clash 语义：["h2","http/1.1"]）
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_alpn_list_lenient")]
     pub alpn: Option<Vec<String>>,
     #[serde(alias = "ws-opts", alias = "ws_opts", default)]
     pub ws_opts: Option<WsOpts>,
@@ -1265,12 +1323,13 @@ pub struct AnytlsCfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_alpn_list_lenient")]
     pub alpn: Option<Vec<String>>,
     #[serde(
         alias = "reality-opts",
@@ -1307,14 +1366,15 @@ pub struct NaiveCfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(alias = "client-fingerprint", alias = "client_fingerprint", default)]
     pub client_fingerprint: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_alpn_list_lenient")]
     pub alpn: Option<Vec<String>>,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "de_bool_lenient")]
     pub tls: bool,
     #[serde(default)]
     pub udp: bool,
@@ -1340,7 +1400,8 @@ pub struct Hysteria2Cfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(
@@ -1413,7 +1474,8 @@ pub struct Hysteria1Cfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
 }
@@ -1439,7 +1501,8 @@ pub struct TuicCfg {
         alias = "allowInsecure",
         alias = "allow_insecure",
         alias = "insecure",
-        default
+        default,
+        deserialize_with = "de_bool_lenient"
     )]
     pub skip_cert_verify: bool,
     #[serde(
@@ -1467,7 +1530,8 @@ pub struct WgCfg {
     #[serde(
         alias = "persistent-keepalive",
         alias = "persistent_keepalive",
-        default
+        default,
+        deserialize_with = "de_opt_u16_lenient"
     )]
     pub persistent_keepalive: Option<u16>,
     /// 本机隧道 IPv4 地址（点对点）
@@ -1534,7 +1598,7 @@ pub struct SocksCfg {
     pub password: Option<String>,
     #[serde(default)]
     pub udp: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub tls: bool,
 }
 
@@ -1547,7 +1611,7 @@ pub struct HttpCfg {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bool_lenient")]
     pub tls: bool,
     #[serde(alias = "skip-cert-verify", default)]
     pub skip_cert_verify: bool,

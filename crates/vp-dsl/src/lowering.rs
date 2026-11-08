@@ -412,6 +412,23 @@ fn lower_node(
         }
     }
 
+    // grpc 子对象（serializer 输出形态: grpc: { service_name: "..." }）
+    if transport.grpc.is_none() {
+        if let Some(g_val) = map.get("grpc").or_else(|| map.get("grpc_opts")) {
+            if let Some(gm) = g_val.as_map() {
+                let g_map: HashMap<String, DslValue> = gm.iter().cloned().collect();
+                let service_name = g_map
+                    .get("service_name")
+                    .or_else(|| g_map.get("grpc_service_name"))
+                    .or_else(|| g_map.get("grpc-service-name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                transport.grpc = Some(GrpcSpec { service_name });
+            }
+        }
+    }
+
     let kind = match lower_kind.as_str() {
         "vless" => {
             let uuid = map
@@ -423,12 +440,18 @@ fn lower_node(
                 .get("flow")
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
+            let packet_encoding = map
+                .get("packet_encoding")
+                .or_else(|| map.get("packet-encoding"))
+                .or_else(|| map.get("packetEncoding"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
             OutboundKind::Vless {
                 server,
                 port,
                 uuid,
                 flow,
-                packet_encoding: None,
+                packet_encoding,
                 udp,
             }
         }
@@ -439,13 +462,19 @@ fn lower_node(
                 .unwrap_or("")
                 .to_string();
             let alter_id = map.get("alter_id").and_then(|v| v.as_u32()).unwrap_or(0);
+            let cipher = map
+                .get("cipher")
+                .or_else(|| map.get("security"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("auto")
+                .to_string();
             OutboundKind::Vmess {
                 server,
                 port,
                 uuid,
                 alter_id,
-                security: Some("auto".into()),
-                udp: false,
+                security: Some(cipher),
+                udp,
             }
         }
         "ss" | "shadowsocks" => {
@@ -464,14 +493,45 @@ fn lower_node(
         }
         "trojan" => {
             transport.tls = true;
+            let network = map
+                .get("network")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
             OutboundKind::Trojan {
                 server,
                 port,
                 password,
-                network: None,
+                network,
                 udp,
             }
         }
+        "brook" => {
+            let protocol = map
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            OutboundKind::Brook {
+                server,
+                port,
+                password,
+                protocol,
+                udp,
+            }
+        }
+        "naive" | "naiveproxy" => OutboundKind::Naive {
+            server,
+            port,
+            username: map
+                .get("username")
+                .or_else(|| map.get("user"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            password,
+            sni: transport.sni.clone(),
+            client_fingerprint: transport.client_fingerprint.clone(),
+            udp,
+        },
         "hysteria2" | "hy2" => {
             let up_mbps = map.get("up").and_then(|v| v.as_u64());
             let down_mbps = map.get("down").and_then(|v| v.as_u64());
@@ -491,7 +551,7 @@ fn lower_node(
                     .get("ports")
                     .and_then(|v| v.as_str())
                     .map(ToString::to_string),
-                password: Some(password),
+                password: (!password.is_empty()).then_some(password),
                 up_mbps,
                 down_mbps,
                 obfs,
@@ -512,12 +572,23 @@ fn lower_node(
                 uuid,
                 password,
                 congestion_controller: map
-                    .get("congestion_control")
+                    .get("congestion_controller")
+                    .or_else(|| map.get("congestion-controller"))
+                    .or_else(|| map.get("congestion_control"))
                     .and_then(|v| v.as_str())
                     .map(ToString::to_string),
-                udp_relay_mode: None,
-                zero_rtt_handshake: false,
-                heartbeat: None,
+                udp_relay_mode: map
+                    .get("udp_relay_mode")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                zero_rtt_handshake: map
+                    .get("zero_rtt_handshake")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                heartbeat: map
+                    .get("heartbeat")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
                 sni: transport.sni.clone(),
                 insecure: transport.insecure,
             }
@@ -767,6 +838,30 @@ fn lower_node(
                 sni: transport.sni.clone(),
                 alpn: transport.alpn.clone(),
                 insecure: transport.insecure,
+            }
+        }
+        "mieru" => {
+            let username = map
+                .get("username")
+                .or_else(|| map.get("user"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mieru_transport = map
+                .get("transport")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let multiplexing = map
+                .get("multiplexing")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            OutboundKind::Mieru {
+                server,
+                port,
+                username,
+                password,
+                transport: mieru_transport,
+                multiplexing,
             }
         }
         "direct" => OutboundKind::Direct,

@@ -126,11 +126,181 @@ fn sanitize_proxy_aliases(val: &mut serde_json::Value) {
                 let o1 = obj.remove("obfs");
                 let o2 = obj.remove("obfs-type");
                 let o3 = obj.remove("obfs_type");
-                if let Some(o) = o1.or(o2).or(o3) {
-                    obj.insert("obfs".into(), o);
+                if let Some(s) = o1.or(o2).or(o3) {
+                    obj.insert("obfs".into(), s);
+                }
+
+                // 9. auth-str / auth_str（hysteria1，真实订阅两键并存即 serde duplicate）
+                let au1 = obj.remove("auth-str");
+                let au2 = obj.remove("auth_str");
+                if let Some(s) = au1.or(au2) {
+                    obj.insert("auth_str".into(), s);
+                }
+
+                // 10. udp-relay-mode / udp_relay_mode（tuic，真实订阅两键并存）
+                let ur1 = obj.remove("udp-relay-mode");
+                let ur2 = obj.remove("udp_relay_mode");
+                if let Some(s) = ur1.or(ur2) {
+                    obj.insert("udp_relay_mode".into(), s);
+                }
+
+                // 11. V2Ray 原生/分享链接平铺字段 → Clash 结构化字段
+                //     （2969 个 vmess 用 id/aid/net/scy，7845 个 vless 用 pbk/sid/security）
+                normalize_v2ray_flat_fields(obj);
+
+                // 11b. 数据侧损坏清洗：密码为字面量 "None"（导出器 str(None) 泄漏）
+                if obj.get("password").and_then(|v| v.as_str()) == Some("None") {
+                    obj.remove("password");
+                }
+
+                // 12a. 删除全部 null 标量键（V2Ray JSON 常写 scy: null / sni: null；
+                //      null 与缺省对 Option 等价，对非 Option 字段则消除 null 类型错误）
+                strip_null_scalars(obj);
+
+                // 12b. tls: "auto" → 按端口推断（mihomo 语义：443 才自动启用 TLS）
+                if obj.get("tls").and_then(|v| v.as_str()) == Some("auto") {
+                    let port = obj.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                    obj.insert("tls".into(), serde_json::Value::Bool(port == 443));
                 }
             }
         }
+    }
+}
+
+/// V2Ray 原生 JSON / 分享链接展开风格字段 → Clash 结构化字段。
+/// 仅在目标键不存在时填充（绝不覆盖已有结构化配置）；unknown 键 serde 会
+/// 自行忽略，这里只搬有语义的。真实订阅里 vmess 57%、vless 74% 是这种形态。
+fn normalize_v2ray_flat_fields(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let ptype = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    // id → uuid（vmess/vless 通用；仅当无 uuid）
+    if !obj.contains_key("uuid") {
+        if let Some(id) = obj.remove("id") {
+            obj.insert("uuid".into(), id);
+        }
+    }
+    // aid → alter_id（仅当无 alterId/alter_id）
+    if !obj.contains_key("alterId") && !obj.contains_key("alter_id") {
+        if let Some(a) = obj.remove("aid") {
+            obj.insert("alter_id".into(), a);
+        }
+    }
+    // net → network（仅当无 network）
+    let flat_net = obj.remove("net");
+    let has_network = obj.get("network").is_some();
+    if let Some(n) = flat_net {
+        if !has_network {
+            obj.insert("network".into(), n);
+        }
+    }
+
+    // ws 平铺 path/host → ws-opts（net/network == ws 且无 ws-opts 时）
+    let net_val = obj
+        .get("network")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if net_val == "ws" && !obj.contains_key("ws-opts") && !obj.contains_key("ws_opts") {
+        let path = obj.remove("path").map(flat_to_string);
+        let host = obj.remove("host").map(flat_to_string);
+        if path.is_some() || host.is_some() {
+            let mut ws = serde_json::Map::new();
+            if let Some(p) = path {
+                ws.insert("path".into(), p);
+            }
+            if let Some(h) = host {
+                let mut headers = serde_json::Map::new();
+                headers.insert("Host".into(), h);
+                ws.insert("headers".into(), serde_json::Value::Object(headers));
+            }
+            obj.insert("ws-opts".into(), serde_json::Value::Object(ws));
+        }
+    }
+
+    if ptype == "vmess" {
+        // scy/security/cipher 三键归一（cipher 的 alias 是 security，两键并存即
+        // serde duplicate；真实订阅 981 个节点 security 与 cipher 并存）
+        let scy = obj.remove("scy");
+        let security = obj.remove("security");
+        if !obj.contains_key("cipher") {
+            if let Some(c) = scy.or(security) {
+                obj.insert("cipher".into(), c);
+            }
+        }
+    }
+
+    if ptype == "vless" {
+        // security: "reality" → 强制开 TLS（reality 必然 TLS）
+        if obj.get("security").and_then(|v| v.as_str()) == Some("reality") {
+            obj.insert("tls".into(), serde_json::Value::Bool(true));
+        }
+        // pbk/sid → reality-opts（仅当无 reality-opts）
+        if !obj.contains_key("reality-opts") && !obj.contains_key("reality_opts") {
+            let pbk = obj.remove("pbk");
+            let sid = obj.remove("sid");
+            if pbk.is_some() || sid.is_some() {
+                let mut r = serde_json::Map::new();
+                if let Some(p) = pbk {
+                    r.insert("public-key".into(), p);
+                }
+                if let Some(s) = sid {
+                    r.insert("short-id".into(), s);
+                }
+                obj.insert("reality-opts".into(), serde_json::Value::Object(r));
+            }
+        }
+        // serviceName → grpc-opts.grpc-service-name（仅当无 grpc-opts 且网络确为
+        // grpc；真实订阅里大量 ws 节点带 serviceName 残留（订阅器导出垃圾字段），
+        // 不分网络类型归并会把 ws 节点污染出假 grpc 配置）
+        if !obj.contains_key("grpc-opts") && !obj.contains_key("grpc_opts") {
+            let is_grpc = obj
+                .get("network")
+                .and_then(|v| v.as_str())
+                .map(|n| n.eq_ignore_ascii_case("grpc") || n.eq_ignore_ascii_case("gun"))
+                .unwrap_or(false);
+            if is_grpc {
+                if let Some(sn) = obj.remove("serviceName") {
+                    let mut g = serde_json::Map::new();
+                    g.insert("grpc-service-name".into(), sn);
+                    obj.insert("grpc-opts".into(), serde_json::Value::Object(g));
+                }
+            }
+        }
+    }
+}
+
+/// 递归删除对象中值为 null 的键（V2Ray 原生 JSON 大量 null 占位字段）
+fn strip_null_scalars(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let null_keys: Vec<String> = obj
+        .iter()
+        .filter(|(_, v)| v.is_null())
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in null_keys {
+        obj.remove(&k);
+    }
+    for (_, v) in obj.iter_mut() {
+        if let serde_json::Value::Object(inner) = v {
+            strip_null_scalars(inner);
+        }
+    }
+}
+
+/// V2Ray 平铺字段宽容归一：host/path 在 V2Ray JSON 里常为数组，取首个字符串值
+fn flat_to_string(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .find_map(|it| match it {
+                serde_json::Value::String(s) => Some(serde_json::Value::String(s)),
+                _ => None,
+            })
+            .unwrap_or(serde_json::Value::String(String::new())),
+        other => other,
     }
 }
 

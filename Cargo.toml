@@ -154,3 +154,12 @@ opt-level = 3
 
 [profile.bench]
 debug = false
+
+# debug 构建产物瘦身：MSVC 全量 PDB 曾把 target/debug 推到 23GB。
+# 行号表足够 panic 回溯定位；第三方依赖（占体积大头）干脆不带调试符号，
+# 仅本 workspace 代码保留行号表。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -117,9 +117,60 @@ pub fn bind_tcp_listener_with_opts(
         }
     }
 
+    // TCP_DEFER_ACCEPT：内核等到客户端首个带真实数据的包才唤醒 accept()，
+    // 消除"三次握手完成但首包未达"的空唤醒上下文切换；只握手不发包的端口扫描器零唤醒。
+    // 全部 TCP 入站协议（mixed/socks5/http/redir/tproxy/各服务端）均为客户端先发言，语义安全。
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let secs: libc::c_int = 3;
+        unsafe {
+            let _ = libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_DEFER_ACCEPT,
+                &secs as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&secs) as libc::socklen_t,
+            );
+        }
+    }
+
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     tokio::net::TcpListener::from_std(socket.into())
+}
+
+/// 多监听器绑定（SO_REUSEPORT）：多核 Linux 下每个 accept 循环持独立 listener，
+/// 内核按四元组哈希把新连接硬分流到不同接收队列，打散单套接字 accept 互斥与 epoll 惊群。
+/// 非 Linux 平台退化为单监听器（reuse_port 标志自动忽略）。
+pub fn bind_tcp_listener_many(
+    addr: std::net::SocketAddr,
+    count: usize,
+) -> std::io::Result<Vec<tokio::net::TcpListener>> {
+    let t = tuning_snapshot();
+    let n = count.max(1);
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        // 多监听器的存在前提就是 SO_REUSEPORT：必须强制开启，不能跟随全局
+        // tuning 默认值（false）——否则第 2+ 个 listener bind 时 EADDRINUSE，
+        // 多核 Linux 上整个入站起不来（count==1 时该标志无副作用）
+        out.push(bind_tcp_listener_with_opts(addr, true, t.tcp_fast_open)?);
+    }
+    Ok(out)
+}
+
+/// 入站多监听器数量：Linux 且 >= 4 核时启用 REUSEPORT 分流（上限 8，避免小机过度开槽）
+#[cfg(target_os = "linux")]
+pub fn inbound_listener_count() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if cpus >= 4 { cpus.min(8) } else { 1 }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn inbound_listener_count() -> usize {
+    1
 }
 
 /// 使用当前全局调优配置绑定 TCP 监听器
@@ -137,6 +188,23 @@ pub fn tune(stream: &tokio::net::TcpStream) {
     let sock = socket2::SockRef::from(stream);
     let t = tuning_snapshot();
     let _ = sock.set_tcp_nodelay(t.tcp_nodelay);
+
+    // TCP_QUICKACK：首包阶段关闭延迟 ACK（Linux 默认最长可拖 40ms），
+    // TLS ClientHello 与协议首帧往返不再等待捎带确认（尽力而为，随内核交互自动失效）
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let one: libc::c_int = 1;
+        unsafe {
+            let _ = libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_QUICKACK,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            );
+        }
+    }
 
     if t.rcvbuf > 0 {
         let _ = sock.set_recv_buffer_size(t.rcvbuf);
@@ -647,6 +715,32 @@ pub async fn connect_tcp_stream_with_opts(
 // bind_socket_to_interface 已上移到 vp_dns（bind_tcp_socket_to_interface / connect_tcp_bound），
 // DNS 上游与节点拨号共用同一套"UNICAST_IF + 源 IP 绑定"实现，避免两份实现漂移。
 
+/// RFC 8305 双栈地址交叉编排：[v6_1, v4_1, v6_2, v4_2 ...]（v6 优先保序）。
+/// IPv6 路由黑洞（国内家宽/部分移动网常见）下，错峰竞速 150ms 内即可落到 IPv4，
+/// 无需依次等待多个 v6 地址逐个连接失败。
+fn interleave_rfc8305(addrs: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let (v6, v4): (Vec<_>, Vec<_>) = addrs
+        .into_iter()
+        .partition(|a: &std::net::SocketAddr| a.is_ipv6());
+    let mut out = Vec::with_capacity(v6.len() + v4.len());
+    let mut i6 = v6.into_iter();
+    let mut i4 = v4.into_iter();
+    loop {
+        match (i6.next(), i4.next()) {
+            (None, None) => break,
+            (a, b) => {
+                if let Some(x) = a {
+                    out.push(x);
+                }
+                if let Some(x) = b {
+                    out.push(x);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 多地址竞速 TCP 拨号。
 pub async fn dial_tcp_multi(
     host: &str,
@@ -714,7 +808,7 @@ pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::S
                     }
                 }
                 if !addrs.is_empty() {
-                    return Ok(addrs);
+                    return Ok(interleave_rfc8305(addrs));
                 }
             }
             Ok(_) => {}
@@ -736,7 +830,7 @@ pub async fn resolve_node_addrs(host: &str, port: u16) -> Result<Vec<std::net::S
     if addrs.is_empty() {
         return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
     }
-    Ok(addrs)
+    Ok(interleave_rfc8305(addrs))
 }
 
 /// Happy Eyeballs 式错峰间隔（RFC 8305 建议 250ms）

@@ -58,35 +58,43 @@ impl vp_core::Inbound for HttpInbound {
                 )));
             }
         };
-        let listener = vp_transport::bind_tcp_listener(addr)?;
-        let bound = listener.local_addr()?.port();
+        // SO_REUSEPORT 多监听器：多核 Linux 下每 accept 循环持独立 listener，
+        // 内核按四元组哈希把新连接硬分流到不同接收队列，打散单套接字 accept 互斥与 epoll 惊群
+        let listeners =
+            vp_transport::bind_tcp_listener_many(addr, vp_transport::inbound_listener_count())?;
+        let bound = listeners[0].local_addr()?.port();
         let tag = self.tag.clone();
         let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, src)) => {
-                        if let Some(ref g) = this.gate {
-                            if !g.check_accept(src.ip()) {
-                                continue;
+        for listener in listeners {
+            let ctx = ctx.clone();
+            let tag = tag.clone();
+            let this = this.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, src)) => {
+                            if let Some(ref g) = this.gate {
+                                if !g.check_accept(src.ip()) {
+                                    continue;
+                                }
                             }
+                            vp_transport::tune(&stream);
+                            let ctx = ctx.clone();
+                            let tag = tag.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = serve_http(stream, src, tag, &ctx).await {
+                                    debug!("http 入站会话结束: {e}");
+                                }
+                            });
                         }
-                        vp_transport::tune(&stream);
-                        let ctx = ctx.clone();
-                        let tag = tag.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = serve_http(stream, src, tag, &ctx).await {
-                                debug!("http 入站会话结束: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!("http 入站 accept 失败: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(e) => {
+                            warn!("http 入站 accept 失败: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         Ok(bound)
     }
 }

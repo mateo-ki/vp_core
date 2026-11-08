@@ -4,7 +4,8 @@ pub mod consts;
 pub mod group;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::debug;
@@ -44,8 +45,32 @@ pub struct Router {
     dns: Arc<Resolver>,
     ipv6: bool,
     global_outbound: Arc<dyn Outbound>,
+    /// 确定性路由决策缓存：(network, host, port) -> (出站, 规则命中)。
+    /// 仅当规则集不依赖连接动态特征（进程/源地址/入站标识）时启用，
+    /// 日常浏览的 98%+ 连接 O(1) 直出，免除逐条线性规则扫描
+    route_cache: Mutex<RouteCacheMap>,
+    route_cache_enabled: bool,
     /// 健康检查等后台任务句柄：热替换时 abort，防止旧 Router 任务滞留
     background_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// 缓存命中的决策值：(出站, 规则命中)
+type CachedHit = (Arc<dyn Outbound>, Option<(String, String)>);
+
+/// 路由决策缓存条目
+type CachedRoute = (Arc<dyn Outbound>, Option<(String, String)>, Instant);
+
+/// 路由决策缓存表：(network, host, port) -> 缓存条目
+type RouteCacheMap = HashMap<(u8, vp_common::Host, u16), CachedRoute>;
+
+/// 路由决策缓存容量与存活期（热重载自然失效：缓存在 Router 内，随旧 Router 一起丢弃）
+const ROUTE_CACHE_CAP: usize = 1024;
+const ROUTE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// 构造路由缓存：仅规则模式下且规则集不依赖连接动态特征时启用
+fn new_route_cache(rules: &RuleEngine, mode: &Mode) -> (Mutex<RouteCacheMap>, bool) {
+    let enabled = matches!(mode, Mode::Rule) && !rules.uses_session_state();
+    (Mutex::new(HashMap::new()), enabled)
 }
 
 impl Router {
@@ -147,9 +172,12 @@ impl Router {
                 }
             }
         }
+        let route_cache = new_route_cache(&spec.rules, &spec.mode);
         let router = Arc::new(Router {
             outbounds: resolved,
             groups,
+            route_cache: route_cache.0,
+            route_cache_enabled: route_cache.1,
             rules: spec.rules,
             mode: spec.mode,
             dns: spec.dns,
@@ -225,9 +253,12 @@ impl Router {
                 background_tasks.push(h);
             }
         }
+        let route_cache = new_route_cache(&rules, &self.mode);
         Arc::new(Router {
             outbounds: self.outbounds.clone(),
             groups: self.groups.clone(),
+            route_cache: route_cache.0,
+            route_cache_enabled: route_cache.1,
             rules,
             mode: self.mode,
             dns: self.dns.clone(),
@@ -246,9 +277,12 @@ impl Router {
                 background_tasks.push(h);
             }
         }
+        let route_cache = new_route_cache(&self.rules, &mode);
         Arc::new(Router {
             outbounds: self.outbounds.clone(),
             groups: self.groups.clone(),
+            route_cache: route_cache.0,
+            route_cache_enabled: route_cache.1,
             rules: self.rules.clone(),
             mode,
             dns: self.dns.clone(),
@@ -272,6 +306,35 @@ impl Router {
             depth += 1;
         }
         name
+    }
+
+    /// 确定性路由缓存查询（过期即未命中，由后续连接的写入路径顺带清理）
+    fn route_cache_lookup(&self, key: &(u8, vp_common::Host, u16)) -> Option<CachedHit> {
+        let m = self.route_cache.lock().unwrap();
+        let (ob, rule, at) = m.get(key)?;
+        if at.elapsed() < ROUTE_CACHE_TTL {
+            Some((ob.clone(), rule.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// 确定性路由缓存写入（容量触顶先清过期，仍满则整表清空；TTL 仅 60s，代价可控）
+    fn route_cache_store(
+        &self,
+        key: (u8, vp_common::Host, u16),
+        outbound: Arc<dyn Outbound>,
+        rule: Option<(String, String)>,
+    ) {
+        let mut m = self.route_cache.lock().unwrap();
+        if m.len() >= ROUTE_CACHE_CAP {
+            let now = Instant::now();
+            m.retain(|_, (_, _, at)| now.duration_since(*at) < ROUTE_CACHE_TTL);
+            if m.len() >= ROUTE_CACHE_CAP {
+                m.clear();
+            }
+        }
+        m.insert(key, (outbound, rule, Instant::now()));
     }
 
     /// 寻找默认的兜底代理策略出站（优先 PROXY 组，否则首个代理组，否则首个非内置出站）
@@ -337,6 +400,27 @@ impl RouterTrait for Router {
                     vp_common::Host::Ip(ip) => Some(*ip),
                     vp_common::Host::Domain(_) => None,
                 };
+                let cache_key = (
+                    match sess.network {
+                        vp_core::Network::Tcp => 0u8,
+                        vp_core::Network::Udp => 1,
+                    },
+                    sess.dst.host.clone(),
+                    sess.dst.port,
+                );
+                // 确定性路由缓存：规则集不依赖连接动态特征时，同 (协议, 目标, 端口)
+                // 60s 内 O(1) 直出，免除数千条规则的线性扫描与惰性 DNS
+                if self.route_cache_enabled {
+                    if let Some((outbound, rule)) = self.route_cache_lookup(&cache_key) {
+                        debug!("Router::pick 命中确定性路由缓存: {}", sess.dst);
+                        let via = self.resolve_via(&outbound, sess);
+                        return Resolution {
+                            outbound,
+                            via,
+                            rule: rule.map(|(target, rule)| RuleHit { rule, target }),
+                        };
+                    }
+                }
                 let mut ctx = MatchCtx {
                     host: sess.dst.host.as_domain(),
                     dst_ip,
@@ -395,10 +479,16 @@ impl RouterTrait for Router {
                                 };
                             }
                         };
+                        if self.route_cache_enabled {
+                            self.route_cache_store(cache_key, ob.clone(), Some((target, rule_str)));
+                        }
                         (ob, Some(hit))
                     }
                     None => {
                         debug!("无规则命中，回落 DIRECT: {}", sess.dst);
+                        if self.route_cache_enabled {
+                            self.route_cache_store(cache_key, self.global_outbound.clone(), None);
+                        }
                         (self.global_outbound.clone(), None)
                     }
                 }

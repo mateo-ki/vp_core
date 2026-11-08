@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use vp_common::{DstAddr, Error, Host, Result};
-use vp_core::{Outbound, PacketConn, ProxyStream, Session, UdpPacket};
+use vp_core::{Outbound, PacketConn, PacketSend, ProxyStream, Session, UdpPacket};
 use vp_dns::Resolver;
 
 #[derive(Clone)]
@@ -132,13 +132,29 @@ impl Outbound for DirectOutbound {
             }
         };
         sock.connect(target).await?;
-        Ok(Box::new(DirectPacket { sock, target }))
+        Ok(Box::new(DirectPacket {
+            sock: std::sync::Arc::new(sock),
+            target,
+        }))
     }
 }
 
 pub struct DirectPacket {
-    sock: tokio::net::UdpSocket,
+    sock: std::sync::Arc<tokio::net::UdpSocket>,
     target: std::net::SocketAddr,
+}
+
+/// DIRECT UDP 直发句柄：NAT 命中会话时上行数据报绕过 mpsc 队列零调度发包，压低 Jitter
+struct DirectSendHandle {
+    sock: std::sync::Arc<tokio::net::UdpSocket>,
+}
+
+#[async_trait]
+impl PacketSend for DirectSendHandle {
+    async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+        self.sock.send(&pkt.data).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -157,5 +173,11 @@ impl PacketConn for DirectPacket {
             dst: self.target,
             data: buf.into(),
         })
+    }
+
+    fn send_handle(&self) -> Option<std::sync::Arc<dyn PacketSend>> {
+        Some(std::sync::Arc::new(DirectSendHandle {
+            sock: self.sock.clone(),
+        }))
     }
 }

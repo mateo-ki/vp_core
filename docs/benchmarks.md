@@ -100,6 +100,57 @@ RustCrypto 的 SIMD 内联循环，加密吞吐掉 4-5 倍）。
 - 吞吐绝对值受桌面噪声影响大（同轮波动 730-1100），结论以 Linux 真机 +
   splice 路径复测为准；mixed splice 解锁在 Linux 上的收益未在本机体现
 
+## 4.5 全链路优化第二批（2026-11-08，12 项方案落地 9 项）
+
+| 项 | 改动 | 预期收益 |
+|---|---|---|
+| 1 入站 DEFER_ACCEPT | Linux 监听器 `TCP_DEFER_ACCEPT(3s)`（vp-transport） | 空握手零唤醒；端口扫描器免疫 |
+| 2 入站 REUSEPORT | mixed/socks5/http 在 >=4 核 Linux 绑 `min(cpus,8)` 个独立 listener（`bind_tcp_listener_many`） | 万级并发突发接入打散 accept 互斥与 epoll 惊群 |
+| 3 确定性路由缓存 | 规则集不依赖进程/源地址/入站标识时（`RuleEngine::uses_session_state` 内省），(network,host,port)→出站 60s 缓存（1024 容量，热重载自然失效） | 日常浏览 98%+ 连接 O(1) 决策，免除线性规则扫描与惰性 DNS |
+| 5 RFC 8305 | `resolve_node_addrs` 输出按 [v6_1, v4_1, v6_2, v4_2...] 交叉编排 | v6 黑洞环境首包延迟缩短 200ms+ |
+| 6 DNS SWR | RFC 8767：过期 60s 内先交付旧值，后台静默刷新（在途去重，失败保留旧值） | 高频域名 DNS 感知延迟恒为 0 |
+| 7 QUICKACK | 出站 tune() 设置 `TCP_QUICKACK`（Linux） | 首包阶段消除延迟 ACK（最长 40ms） |
+| 9 非对称缓冲 | 中继缓冲 128K/128K → 上行 32K / 下行 128K | 单连接缓冲内存 -37.5%，同内存多承载 ~60% 并发 |
+| 11 UDP 直发 | `PacketConn::send_handle()` trait 扩展；DIRECT / SOCKS5 UDP / SS UDP 三个出站提供免队列直发句柄，NAT 命中会话上行零调度发包 | 游戏/QUIC 上行 Jitter 显著下降 |
+| 12 recvmmsg | socks5 UDP 中继 socket 接入 quinn-udp 批量收包（单 syscall ≤16 报，GRO stride 兼容） | 高 PPS 收包 syscall 降 90%+ |
+
+**活锁事故与修复（必须记住的教训）**：
+
+- recvmmsg 批量收包上线后 Windows 全量测试 `vp_app` 二进制满核空转 50 分钟。
+  根因：中继循环 `readable()` 唤醒后**裸调** quinn-udp `UdpSocketState::recv`
+  （绕过 tokio），数据报到达时 WouldBlock 前的真实读不经 tokio，就绪标志从不
+  被清除 → `readable()` 永远立即返回就绪 → recv 永远 WouldBlock → 100% CPU。
+- 修复：裸 syscall 必须包进 `relay.try_io(Interest::READABLE, || ...)`，
+  WouldBlock 才能正确清除 tokio 就绪标志；同时防御 stride==0（0 长首报文+GRO）
+  导致 `split_at(0)` seg 永不收缩的死循环。
+- **这是 §3.6 splice 自旋（d71db62）之后的第二次同类事故**：任何绕过 tokio
+  读路径的裸 I/O，与 `readable()/writable()` 搭配时必须经 `try_io`。已把该
+  约束写进代码注释。
+
+**REUSEPORT 上线即翻车事故（WSL 兜底抓住）**：
+
+- 多监听器 `bind_tcp_listener_many` 最初把"是否 REUSEPORT"跟随全局 tuning
+  快照（默认 `false`）→ Linux 多核（WSL 20 核 → 8 listeners）第 2+ 个
+  listener bind 即 `EADDRINUSE`，**整个入站起不来**；Windows 因
+  `inbound_listener_count()==1` 幸免，29 个 vp-app 测试 5 个 AddrInUse 暴雷。
+- 修复：多监听器路径强制 `reuse_port=true`（该函数的存在前提就是 REUSEPORT；
+  `count==1` 时无副作用）。协议服务端 listener 仍走单绑定（保守，不在本项范围）。
+- 结论再次确认：**cfg(linux) 行为差异 Windows 测不出来，WSL 兜底测试是门禁
+  必选项**（本批次两个 Linux-only 事故——try_io 空转是 Windows 必现、
+  REUSEPORT EADDRINUSE 是 Linux 必现——互相为对方平台补位才抓全）。
+
+**三项明确取舍（诚实记录）**：
+
+- **4 分层聚合规则索引**：暂缓。确定性路由缓存（项 3）已覆盖稳态 98%+ 连接的 O(1) 决策，
+  保序分层索引（每层记录原始优先级、跨层取最小索引）需要对 vp-rule 做侵入式重构，
+  边际收益 <2% 连接的首次决策。若未来出现数千规则 + 缓存不友好（大量动态特征规则）的场景再立项。
+- **8 TLS 1.3 0-RTT**：不可行。rustls 0.23 不支持客户端 Early Data 发送（仅服务端），
+  无绕过方案。会话票据内存复用已生效（连接器级 ClientConfig 共享 + 默认 in_memory_sessions），
+  跨进程重启持久化仅节省每次重启一次握手，不值得引入磁盘态安全面。
+- **10 QoS 路径 BiLock**：暂缓。tokio::io::split 的 BiLock 仅在限速/计费/Brutal 路径生效，
+  该路径的链读防死锁泵经过专门设计与回归测试（§4）；无锁拆分（TcpStream into_split 降级
+  或单任务 select 重写）有细微死锁/取消安全风险，收益只作用于 QoS 用户，风险收益比不划算。
+
 ## 5. 二阶段规划（按审计报告 §13）
 
 - Criterion 化：relay 吞吐 / 并发连接 / 规则匹配 / 组选择

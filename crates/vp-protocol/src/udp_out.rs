@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use vp_common::addr::{decode_socks_addr, encode_socks_addr};
 use vp_common::{DstAddr, Error, Result};
-use vp_core::stream::{PacketConn, UdpPacket};
+use vp_core::stream::{PacketConn, PacketSend, UdpPacket};
 
 // ---------------------------------------------------------------------------
 // SOCKS5 UDP
@@ -105,6 +105,28 @@ pub async fn socks5_udp_connect(
     })
 }
 
+/// SOCKS5 UDP 直发句柄：帧编码无共享状态，NAT 命中时绕过 mpsc 队列
+struct Socks5SendHandle {
+    relay: Arc<UdpSocket>,
+}
+
+#[async_trait]
+impl PacketSend for Socks5SendHandle {
+    async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+        let mut dgram = vec![0x00, 0x00, 0x00]; // rsv rsv frag
+        encode_socks_addr(
+            &DstAddr {
+                host: vp_common::Host::Ip(pkt.dst.ip()),
+                port: pkt.dst.port(),
+            },
+            &mut dgram,
+        );
+        dgram.extend_from_slice(&pkt.data);
+        self.relay.send(&dgram).await?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl PacketConn for Socks5PacketConn {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
@@ -148,11 +170,59 @@ impl PacketConn for Socks5PacketConn {
             });
         }
     }
+    fn send_handle(&self) -> Option<std::sync::Arc<dyn PacketSend>> {
+        Some(std::sync::Arc::new(Socks5SendHandle {
+            relay: self.relay.clone(),
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Shadowsocks UDP（每包独立 salt）
 // ---------------------------------------------------------------------------
+
+/// SS UDP 数据报编码：明文 [socks addr][payload] 整体一个分块，每包独立 salt
+fn ss_encode_udp_dgram(
+    cipher: &vp_crypto::ss::Cipher,
+    key: &[u8],
+    pkt: &UdpPacket,
+    _server: std::net::SocketAddr,
+) -> Result<Vec<u8>> {
+    let mut plain = Vec::with_capacity(pkt.data.len() + 24);
+    encode_socks_addr(
+        &DstAddr {
+            host: vp_common::Host::Ip(pkt.dst.ip()),
+            port: pkt.dst.port(),
+        },
+        &mut plain,
+    );
+    plain.extend_from_slice(&pkt.data);
+
+    let mut salt = vec![0u8; cipher.salt_len()];
+    vp_common::rand_bytes(&mut salt);
+    let sub = cipher.subkey(key, &salt)?;
+    let mut codec = vp_crypto::ss::AeadChunkCodec::new(cipher, &sub)?;
+    let mut dgram = salt;
+    codec.seal_chunk_into(&plain, &mut dgram);
+    Ok(dgram)
+}
+
+/// SS UDP 直发句柄：每包独立 salt 无共享状态，NAT 命中时绕过 mpsc 队列
+struct SsSendHandle {
+    sock: Arc<UdpSocket>,
+    cipher: vp_crypto::ss::Cipher,
+    key: Vec<u8>,
+    server: std::net::SocketAddr,
+}
+
+#[async_trait]
+impl PacketSend for SsSendHandle {
+    async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+        let dgram = ss_encode_udp_dgram(&self.cipher, &self.key, pkt, self.server)?;
+        self.sock.send_to(&dgram, self.server).await?;
+        Ok(())
+    }
+}
 
 pub struct SsUdpConn {
     sock: Arc<UdpSocket>,
@@ -184,25 +254,18 @@ impl SsUdpConn {
 #[async_trait]
 impl PacketConn for SsUdpConn {
     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
-        // 明文：[socks addr][payload]，整体一个分块；独立 salt
-        let mut plain = Vec::with_capacity(pkt.data.len() + 24);
-        encode_socks_addr(
-            &DstAddr {
-                host: vp_common::Host::Ip(pkt.dst.ip()),
-                port: pkt.dst.port(),
-            },
-            &mut plain,
-        );
-        plain.extend_from_slice(&pkt.data);
-
-        let mut salt = vec![0u8; self.cipher.salt_len()];
-        vp_common::rand_bytes(&mut salt);
-        let sub = self.cipher.subkey(&self.key, &salt)?;
-        let mut codec = vp_crypto::ss::AeadChunkCodec::new(&self.cipher, &sub)?;
-        let mut dgram = salt;
-        codec.seal_chunk_into(&plain, &mut dgram);
+        let dgram = ss_encode_udp_dgram(&self.cipher, &self.key, pkt, self.server)?;
         self.sock.send_to(&dgram, self.server).await?;
         Ok(())
+    }
+
+    fn send_handle(&self) -> Option<std::sync::Arc<dyn PacketSend>> {
+        Some(std::sync::Arc::new(SsSendHandle {
+            sock: self.sock.clone(),
+            cipher: self.cipher.clone(),
+            key: self.key.clone(),
+            server: self.server,
+        }))
     }
 
     async fn recv(&mut self) -> Result<UdpPacket> {

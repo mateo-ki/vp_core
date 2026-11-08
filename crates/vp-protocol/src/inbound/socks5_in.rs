@@ -62,35 +62,43 @@ impl vp_core::Inbound for Socks5Inbound {
                 )));
             }
         };
-        let listener = vp_transport::bind_tcp_listener(addr)?;
-        let bound = listener.local_addr()?.port();
+        // SO_REUSEPORT 多监听器：多核 Linux 下每 accept 循环持独立 listener，
+        // 内核按四元组哈希把新连接硬分流到不同接收队列，打散单套接字 accept 互斥与 epoll 惊群
+        let listeners =
+            vp_transport::bind_tcp_listener_many(addr, vp_transport::inbound_listener_count())?;
+        let bound = listeners[0].local_addr()?.port();
         let tag = self.tag.clone();
         let this = self.clone();
-        tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, src)) => {
-                        if let Some(ref g) = this.gate {
-                            if !g.check_accept(src.ip()) {
-                                continue;
+        for listener in listeners {
+            let ctx = ctx.clone();
+            let tag = tag.clone();
+            let this = this.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, src)) => {
+                            if let Some(ref g) = this.gate {
+                                if !g.check_accept(src.ip()) {
+                                    continue;
+                                }
                             }
+                            vp_transport::tune(&stream);
+                            let ctx = ctx.clone();
+                            let tag = tag.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = serve_socks5(stream, src, tag, &ctx).await {
+                                    debug!("socks5 入站会话结束: {e}");
+                                }
+                            });
                         }
-                        vp_transport::tune(&stream);
-                        let ctx = ctx.clone();
-                        let tag = tag.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = serve_socks5(stream, src, tag, &ctx).await {
-                                debug!("socks5 入站会话结束: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        warn!("socks5 入站 accept 失败: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        Err(e) => {
+                            warn!("socks5 入站 accept 失败: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
         Ok(bound)
     }
 }
@@ -166,51 +174,102 @@ where
                 pkt
             }));
             let mut tcp_buf = [0u8; 1];
-            // 客户端 → 中继 socket（限定来源地址）
-            let mut buf = vec![0u8; 65535];
+            // 客户端 → 中继 socket（限定来源地址）。
+            // recvmmsg 批量收包（Linux recvmmsg / 其他平台单包回退）：单次 syscall 至多 16 报，
+            // 高 PPS 场景收包 syscall 与任务唤醒大幅下降
+            const UDP_BATCH: usize = 16;
+            let udp_state =
+                match quinn_udp::UdpSocketState::new(quinn_udp::UdpSockRef::from(&*relay)) {
+                    Ok(st) => st,
+                    Err(e) => return Err(Error::Io(e)),
+                };
+            let mut batch_bufs: Vec<Vec<u8>> = (0..UDP_BATCH).map(|_| vec![0u8; 65535]).collect();
+            let mut batch_meta = vec![quinn_udp::RecvMeta::default(); UDP_BATCH];
             let mut idle = tokio::time::interval(Duration::from_secs(300));
             idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             idle.tick().await; // interval 首个 tick 立即就绪，先消耗
             loop {
                 tokio::select! {
-                    r = relay.recv_from(&mut buf) => {
-                        let Ok((n, from)) = r else { break };
-                        tracing::debug!("udp relay 收到 {n}B from {from} (src={src})");
-                        // RFC1928 允许客户端使用不同于控制连接的 UDP 端口，
-                        // 仅校验同 IP（防外部注入）；严格校验随 M3 配置项提供
-                        if from.ip() != src.ip() {
-                            tracing::debug!("udp 来源 IP 不匹配 {from} != {src}");
-                            continue;
-                        }
-                        if n < 4 {
-                            continue;
-                        }
-                        // socks udp: [rsv2][frag1][socks addr][payload]
-                        if buf[2] != 0x00 {
-                            continue; // 分片不支持
-                        }
-                        let (dst_addr, used) = match vp_common::addr::decode_socks_addr(&buf[3..n]) {
-                            Ok(x) => x,
-                            Err(_) => continue,
-                        };
-                        let pkt = UdpPacket {
-                            src: from,
-                            dst: std::net::SocketAddr::new(
-                                match &dst_addr.host {
-                                    vp_common::Host::Ip(ip) => *ip,
-                                    // 域名目标（socks5 UDP 支持域名）：让 NAT 决策时解析
-                                    vp_common::Host::Domain(_) => [0, 0, 0, 0].into(),
-                                },
-                                dst_addr.port,
-                            ),
-                            data: buf[3 + used..n].to_vec().into(),
-                        };
-                        let fake = match &dst_addr.host {
-                            vp_common::Host::Domain(d) => Some(d.clone()),
-                            vp_common::Host::Ip(_) => None,
-                        };
-                        if let Err(e) = nat.dispatch(pkt, fake).await {
-                            debug!("udp 分发失败: {e}");
+                    biased;
+                    _ = relay.readable() => {
+                        loop {
+                            let mut slices: Vec<std::io::IoSliceMut<'_>> = batch_bufs
+                                .iter_mut()
+                                .map(|b| std::io::IoSliceMut::new(b.as_mut_slice()))
+                                .collect();
+                            // 就绪标志必须经 try_io 清除（与 splice 同款教训 §3.6）：
+                            // 裸 syscall 返回 WouldBlock 若绕过 try_io，tokio 会永远
+                            // 认为可读 → readable() 秒回 → 100% CPU 空转
+                            match relay.try_io(tokio::io::Interest::READABLE, || {
+                                udp_state.recv(
+                                    quinn_udp::UdpSockRef::from(&*relay),
+                                    &mut slices,
+                                    &mut batch_meta,
+                                )
+                            }) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    for (bi, item) in batch_meta.iter().enumerate().take(n) {
+                                        // GRO 场景单个 meta 可能含多个 stride 段；
+                                        // stride==0（如 0 长首报文 + GRO）时退化为整段单报文，
+                                        // 防止 step=0 导致 seg 永不收缩的死循环
+                                        let stride = if item.stride == 0 {
+                                            item.len
+                                        } else {
+                                            item.stride
+                                        };
+                                        let mut seg = &batch_bufs[bi][..item.len];
+                                        while !seg.is_empty() && seg.len() >= stride {
+                                            let step = stride.min(seg.len());
+                                            let (one, rest) = seg.split_at(step);
+                                            seg = rest;
+                                            let from = item.addr;
+                                            let n = one.len();
+                                            if n < 4 {
+                                                continue;
+                                            }
+                                            // RFC1928 允许客户端使用不同于控制连接的 UDP 端口，
+                                            // 仅校验同 IP（防外部注入）；严格校验随 M3 配置项提供
+                                            if from.ip() != src.ip() {
+                                                continue;
+                                            }
+                                            // socks udp: [rsv2][frag1][socks addr][payload]
+                                            if one[2] != 0x00 {
+                                                continue; // 分片不支持
+                                            }
+                                            let (dst_addr, used) =
+                                                match vp_common::addr::decode_socks_addr(&one[3..n]) {
+                                                    Ok(x) => x,
+                                                    Err(_) => continue,
+                                                };
+                                            let pkt = UdpPacket {
+                                                src: from,
+                                                dst: std::net::SocketAddr::new(
+                                                    match &dst_addr.host {
+                                                        vp_common::Host::Ip(ip) => *ip,
+                                                        // 域名目标（socks5 UDP 支持域名）：让 NAT 决策时解析
+                                                        vp_common::Host::Domain(_) => [0, 0, 0, 0].into(),
+                                                    },
+                                                    dst_addr.port,
+                                                ),
+                                                data: one[3 + used..n].to_vec().into(),
+                                            };
+                                            let fake = match &dst_addr.host {
+                                                vp_common::Host::Domain(d) => Some(d.clone()),
+                                                vp_common::Host::Ip(_) => None,
+                                            };
+                                            if let Err(e) = nat.dispatch(pkt, fake).await {
+                                                debug!("udp 分发失败: {e}");
+                                            }
+                                        }
+                                    }
+                                    if n < UDP_BATCH {
+                                        break;
+                                    }
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(_) => break,
+                            }
                         }
                     }
                     // TCP 控制连接断开即结束

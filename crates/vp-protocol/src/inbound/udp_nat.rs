@@ -34,9 +34,15 @@ struct SessionKey {
     port: u16,
 }
 
+/// 会话发送端：mpsc 队列 + 可选直发句柄（命中时上行数据报零调度发包）
+type UdpSessionSender = (
+    tokio::sync::mpsc::Sender<UdpPacket>,
+    Option<std::sync::Arc<dyn vp_core::PacketSend>>,
+);
+
 /// 分片会话表：命中路径零额外 String 分配（键直接消费嗅探结果所有权）
 struct SessionMap {
-    shards: Vec<tokio::sync::Mutex<HashMap<SessionKey, tokio::sync::mpsc::Sender<UdpPacket>>>>,
+    shards: Vec<tokio::sync::Mutex<HashMap<SessionKey, UdpSessionSender>>>,
     /// 单分片高水位（全局上限均摊到各分片，哈希分布均匀）
     shard_cap: usize,
 }
@@ -170,7 +176,7 @@ impl UdpNat {
             let mut map = self.sessions.shards[idx].lock().await;
             // 分片高水位 GC 清理：剔除断开会话；仍满则随机裁剪
             if map.len() >= self.sessions.shard_cap {
-                map.retain(|_, tx| !tx.is_closed());
+                map.retain(|_, (tx, _)| !tx.is_closed());
                 if map.len() >= self.sessions.shard_cap {
                     let overflow = map.len() - self.sessions.shard_cap + 1;
                     let to_remove: Vec<_> = map.keys().take(overflow).cloned().collect();
@@ -182,29 +188,34 @@ impl UdpNat {
             map.get(&key).cloned()
         };
 
-        let tx = match existing {
-            Some(tx) => tx,
+        let (tx, direct) = match existing {
+            Some(sess_tx) => sess_tx,
             None => {
                 // 先释放分片锁再拨号建会话：路由决策与出站建连不应阻塞同分片其他数据报
                 let dst = DstAddr {
                     host: key.host.clone(),
                     port: key.port,
                 };
-                let tx = self.spawn_session(client_addr, &dst).await?;
+                let sess_tx = self.spawn_session(client_addr, &dst).await?;
                 let mut map = self.sessions.shards[idx].lock().await;
                 // 双检：并发建会话可能已插入同键会话
                 match map.get(&key) {
                     Some(existing) => existing.clone(),
                     None => {
                         if map.len() >= self.sessions.shard_cap {
-                            map.retain(|_, tx| !tx.is_closed());
+                            map.retain(|_, (tx, _)| !tx.is_closed());
                         }
-                        map.insert(key, tx.clone());
-                        tx
+                        map.insert(key, sess_tx.clone());
+                        sess_tx
                     }
                 }
             }
         };
+        // 直发快速路径：上行数据报绕过 mpsc 队列与任务唤醒，压低游戏/QUIC 端到端 Jitter
+        if let Some(handle) = direct {
+            let _ = handle.send(&pkt).await;
+            return Ok(());
+        }
         let _ = tx.send(pkt).await;
         Ok(())
     }
@@ -218,7 +229,7 @@ impl UdpNat {
         self: &Arc<Self>,
         client: SocketAddr,
         dst: &DstAddr,
-    ) -> Result<tokio::sync::mpsc::Sender<UdpPacket>> {
+    ) -> Result<UdpSessionSender> {
         let mut sess = Session::new_udp(self.tag.clone(), Some(client), dst.clone());
         sess.network = Network::Udp;
         let res = self.ctx.router.pick(&sess).await;
@@ -246,9 +257,11 @@ impl UdpNat {
             )));
         }
         let mut conn = res.outbound.connect_packet(&sess, dst).await?;
+        // 直发句柄需在建连后、conn 移交后台任务前提取
+        let direct = conn.send_handle();
         let relay = self.relay.clone();
         let reply_formatter = self.reply_formatter.lock().unwrap().clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
         let dst_key = dst.clone();
         let this = self.clone();
 
@@ -259,7 +272,13 @@ impl UdpNat {
             GAME_UDP_IDLE_TIMEOUT
         };
 
+        let direct_for_task = direct.clone();
         tokio::spawn(async move {
+            let mut rx = if direct_for_task.is_some() {
+                None
+            } else {
+                Some(rx)
+            };
             loop {
                 tokio::select! {
                     biased;
@@ -287,8 +306,8 @@ impl UdpNat {
                             }
                         }
                     }
-                    // 客户端 → 出站
-                    out = rx.recv() => {
+                    // 客户端 → 出站（直发句柄存在时上行已旁路，此臂关闭）
+                    out = async { rx.as_mut().unwrap().recv().await }, if rx.is_some() => {
                         match out {
                             Some(pkt) => {
                                 if conn.send(&pkt).await.is_err() {
@@ -311,7 +330,7 @@ impl UdpNat {
             let idx = SessionMap::index(&key);
             this.sessions.shards[idx].lock().await.remove(&key);
         });
-        Ok(tx)
+        Ok((tx, direct))
     }
 }
 

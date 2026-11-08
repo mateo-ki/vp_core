@@ -197,14 +197,16 @@ pub async fn relay(
             t1: None,
             t2: None,
         };
-        // 128KB 大缓冲对齐缓冲池块尺寸：tokio 默认 8KB 在高 BDP 链路与回环
-        // 基准下严重欠喂，直接限制单流吞吐上限（基准实测 1229 vs 工具上限 3703 MB/s）
-        const RELAY_BUF_SIZE: usize = 128 * 1024;
+        // 非对称自适应缓冲：代理流量 95%+ 为下行（视频/网页/文件），上行多为 ACK/头/按键；
+        // 上行 32KB（仍是 tokio 默认 8KB 的 4 倍）+ 下行 128KB，单连接缓冲内存 256KB → 160KB（省 37.5%），
+        // 等量内存可多承载约 60% 并发连接。下行 128KB 与缓冲池块尺寸对齐。
+        const UP_BUF_SIZE: usize = 32 * 1024;
+        const DOWN_BUF_SIZE: usize = 128 * 1024;
         let (up_bytes, down_bytes) = match tokio::io::copy_bidirectional_with_sizes(
             &mut left,
             &mut right,
-            RELAY_BUF_SIZE,
-            RELAY_BUF_SIZE,
+            UP_BUF_SIZE,
+            DOWN_BUF_SIZE,
         )
         .await
         {

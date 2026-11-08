@@ -498,6 +498,8 @@ const MIN_TTL: u32 = 30;
 const NEG_TTL: u32 = 30;
 /// 真实 TTL 存储上限
 const MAX_TTL: u32 = 86400;
+/// RFC 8767 stale-while-revalidate 窗口：缓存过期后该时长内仍可先交付旧值
+const STALE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -570,7 +572,9 @@ pub struct Resolver {
     hosts: HashMap<String, Vec<IpAddr>>,
     fake_ip: Option<Arc<FakeIpPool>>,
     bootstrap_servers: Vec<SocketAddr>,
-    cache: Mutex<CacheInner>,
+    cache: Arc<Mutex<CacheInner>>,
+    /// stale-while-revalidate 在途刷新去重集
+    refreshing: Arc<Mutex<std::collections::HashSet<(String, bool)>>>,
     /// ECH 配置缓存（域名 → (HTTPS 记录 ech SvcParam 字节, 记录时间)；None=确认无/查询失败）
     ech_cache: Mutex<HashMap<String, EchCacheEntry>>,
     /// 无 nameserver 配置时走系统解析
@@ -611,7 +615,8 @@ impl Resolver {
             hosts: HashMap::new(),
             fake_ip: None,
             bootstrap_servers: default_bootstrap_servers(),
-            cache: Mutex::new(CacheInner::default()),
+            cache: Arc::new(Mutex::new(CacheInner::default())),
+            refreshing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system,
         }
@@ -637,7 +642,8 @@ impl Resolver {
             hosts: HashMap::new(),
             fake_ip: None,
             bootstrap_servers: default_bootstrap_servers(),
-            cache: Mutex::new(CacheInner::default()),
+            cache: Arc::new(Mutex::new(CacheInner::default())),
+            refreshing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system,
         }
@@ -652,7 +658,8 @@ impl Resolver {
             hosts: HashMap::new(),
             fake_ip: None,
             bootstrap_servers: default_bootstrap_servers(),
-            cache: Mutex::new(CacheInner::default()),
+            cache: Arc::new(Mutex::new(CacheInner::default())),
+            refreshing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ech_cache: Mutex::new(std::collections::HashMap::new()),
             use_system: true,
         }
@@ -798,12 +805,23 @@ impl Resolver {
         {
             let c = self.cache.lock().unwrap();
             if let Some(e) = c.map.get(&key) {
-                if e.at.elapsed() < Duration::from_secs(e.ttl.max(MIN_TTL) as u64) {
+                let age = e.at.elapsed();
+                let ttl = Duration::from_secs(e.ttl.max(MIN_TTL) as u64);
+                if age < ttl {
                     return match &e.ips {
                         Some(ips) => Ok(ips.clone()),
                         // 负缓存命中：域名确认不存在，直接快速失败防穿透
                         None => Err(Error::Dns(format!("域名 {domain} 不存在（负缓存）"))),
                     };
+                }
+                // RFC 8767 stale-while-revalidate：刚过期（<60s）先交付旧缓存零延迟建连，
+                // 同时后台静默刷新；刷新失败保留旧值，下次继续 SWR
+                if age < ttl + STALE_WINDOW {
+                    if let Some(ips) = &e.ips {
+                        let stale = ips.clone();
+                        self.spawn_stale_refresh(key, domain.to_string(), ipv6);
+                        return Ok(stale);
+                    }
                 }
             }
         }
@@ -843,7 +861,7 @@ impl Resolver {
 
         // 3. 主 DNS 解析
         let primary_res = if self.servers.is_empty() {
-            self.system_lookup(domain).await.map(|ips| Resolved {
+            Self::system_lookup(domain).await.map(|ips| Resolved {
                 ips: ips.to_vec(),
                 min_ttl: MIN_TTL,
                 nxdomain: false,
@@ -937,7 +955,7 @@ impl Resolver {
                         }
                         _ => {
                             // 主 DNS 与 fallback 均未查得有效 IP，平滑降级系统解析
-                            if let Ok(sys_ips) = self.system_lookup(domain).await {
+                            if let Ok(sys_ips) = Self::system_lookup(domain).await {
                                 if !sys_ips.is_empty() {
                                     sys_ips
                                 } else {
@@ -948,7 +966,7 @@ impl Resolver {
                             }
                         }
                     }
-                } else if let Ok(sys_ips) = self.system_lookup(domain).await {
+                } else if let Ok(sys_ips) = Self::system_lookup(domain).await {
                     if !sys_ips.is_empty() {
                         sys_ips
                     } else {
@@ -1006,7 +1024,7 @@ impl Resolver {
             }
         }
         // 降级使用系统快速并发解析
-        let ips = self.system_lookup(domain).await?;
+        let ips = Self::system_lookup(domain).await?;
         if !ips.is_empty() {
             self.cache_store(key, ips.clone(), MIN_TTL);
             return Ok(ips);
@@ -1040,6 +1058,62 @@ impl Resolver {
                 ttl: NEG_TTL,
             },
         );
+    }
+
+    /// RFC 8767 后台静默刷新：仅由 stale-while-revalidate 命中路径触发，
+    /// 在途去重（同域名并发请求只刷一次）；失败保留旧 stale 值供下次继续兜底
+    fn spawn_stale_refresh(&self, key: (String, bool), domain: String, ipv6: bool) {
+        {
+            let mut r = self.refreshing.lock().unwrap();
+            if !r.insert(key.clone()) {
+                return; // 已有在途刷新
+            }
+        }
+        let key_for_remove = key.clone();
+        let servers = self.servers.clone();
+        let fallbacks = self.fallbacks.clone();
+        let bootstrap = self.bootstrap_servers.clone();
+        let cache = self.cache.clone();
+        let refreshing = self.refreshing.clone();
+        // 全部捕获为 'static 克隆，不持有 &self；查询走关联函数
+        tokio::spawn(async move {
+            let qtype = if ipv6 { QType::Aaaa } else { QType::A };
+            let mut resolved: Option<(Vec<IpAddr>, u32)> = None;
+            if !servers.is_empty() {
+                if let Ok(r) = Self::query_servers(&servers, &domain, qtype, &bootstrap).await {
+                    if !r.ips.is_empty() && !r.nxdomain {
+                        resolved = Some((r.ips, r.min_ttl));
+                    }
+                }
+            }
+            if resolved.is_none() && !fallbacks.is_empty() {
+                if let Ok(r) = Self::query_servers(&fallbacks, &domain, qtype, &bootstrap).await {
+                    if !r.ips.is_empty() && !r.nxdomain {
+                        resolved = Some((r.ips, r.min_ttl));
+                    }
+                }
+            }
+            if resolved.is_none() {
+                if let Ok(ips) = Self::system_lookup(&domain).await {
+                    if !ips.is_empty() {
+                        resolved = Some((ips.to_vec(), MIN_TTL));
+                    }
+                }
+            }
+            if let Some((ips, ttl)) = resolved {
+                let mut c = cache.lock().unwrap();
+                evict_cache(&mut c.map, 1);
+                c.map.insert(
+                    key,
+                    CacheEntry {
+                        ips: Some(Arc::new(ips)),
+                        at: Instant::now(),
+                        ttl: ttl.clamp(MIN_TTL, MAX_TTL),
+                    },
+                );
+            }
+            refreshing.lock().unwrap().remove(&key_for_remove);
+        });
     }
 
     /// 查询域名的 HTTPS(type65) 记录，取 ech SvcParam（ECHConfigList 原始字节）。
@@ -1167,7 +1241,7 @@ impl Resolver {
         })
     }
 
-    async fn system_lookup(&self, domain: &str) -> Result<Arc<Vec<IpAddr>>> {
+    async fn system_lookup(domain: &str) -> Result<Arc<Vec<IpAddr>>> {
         let d = domain.to_string();
         let addrs = tokio::task::spawn_blocking(move || {
             use std::net::ToSocketAddrs;

@@ -13,6 +13,7 @@ vp-ir.workspace = true
 vp-config.workspace = true
 vp-transport.workspace = true
 quinn.workspace = true
+quinn-udp.workspace = true
 boringtun.workspace = true
 smoltcp.workspace = true
 rustls.workspace = true

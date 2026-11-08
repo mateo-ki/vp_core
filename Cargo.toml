@@ -102,6 +102,7 @@ x25519-dalek = { version = "2.0.0-rc.3", default-features = false, features = ["
 httparse = "1"
 h2 = "0.4"
 quinn = "0.11"
+quinn-udp = "0.5"
 http = "1"
 tun = { version = "0.8", features = ["async"] }
 ipstack = "1.0"

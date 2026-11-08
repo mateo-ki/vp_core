@@ -2908,6 +2908,7 @@ dependencies = [
  "md-5",
  "poly1305",
  "quinn",
+ "quinn-udp",
  "rand 0.9.5",
  "rcgen",
  "regex",

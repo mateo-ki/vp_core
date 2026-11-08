@@ -225,6 +225,12 @@ impl Matcher {
         }
     }
 
+    /// 是否依赖每连接动态特征（进程 / 源地址 / 源端口 / 入站标识）。
+    /// 规则集完全不依赖时，路由决策对 (协议, 目标, 端口) 是幂等确定的，可安全缓存。
+    pub fn uses_session_state(&self) -> bool {
+        matcher_uses_session(self)
+    }
+
     /// 是否含降级占位（NeverMatch：缺数据库 / 未知类型 / 嵌套过深）
     fn is_degraded(&self) -> bool {
         match self {
@@ -244,6 +250,22 @@ fn logic(op: LogicOp, subs: Vec<Matcher>) -> Matcher {
     Matcher::Logic {
         op,
         subs: Arc::new(subs),
+    }
+}
+
+/// 递归判定单条 Matcher 是否依赖连接动态特征
+fn matcher_uses_session(m: &Matcher) -> bool {
+    match m {
+        Matcher::ProcessName(_) | Matcher::ProcessPath(_) => true,
+        Matcher::Inbound(_) | Matcher::InPort(_) | Matcher::InUser(_) => true,
+        Matcher::IpCidr { src: true, .. } => true,
+        Matcher::IpAsn { src: true, .. } => true,
+        Matcher::Port { src: true, .. } => true,
+        // 经典规则集内容不可静态判定（可能含 SRC 类条目），保守视为依赖
+        Matcher::RuleSetClassical(_) => true,
+        Matcher::Logic { subs, .. } => subs.iter().any(matcher_uses_session),
+        Matcher::SubRules(list) => list.iter().any(|r| matcher_uses_session(&r.matcher)),
+        _ => false,
     }
 }
 
@@ -311,6 +333,18 @@ impl RuleEngine {
 
     pub fn needs_process(&self) -> bool {
         self.needs_process
+    }
+
+    /// 规则集整体是否依赖连接动态特征（决定路由决策缓存能否启用）：
+    /// 结构化 Matcher 静态判定；CEL 表达式按原文保守子串扫描（src/process/inbound）
+    pub fn uses_session_state(&self) -> bool {
+        self.rules.iter().any(|r| match &r.matcher {
+            Matcher::Expr(_) => {
+                let t = r.raw.as_ref();
+                t.contains("src") || t.contains("process") || t.contains("inbound")
+            }
+            m => matcher_uses_session(m),
+        })
     }
 
     pub fn rules(&self) -> &[CompiledRule] {

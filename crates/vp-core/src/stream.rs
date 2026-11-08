@@ -89,6 +89,19 @@ pub struct UdpPacket {
 pub trait PacketConn: Send {
     async fn send(&self, pkt: &UdpPacket) -> Result<()>;
     async fn recv(&mut self) -> Result<UdpPacket>;
+
+    /// 若实现允许跨任务共享发送端（内部为 Arc 化 socket / 无状态发送路径），
+    /// 返回直发句柄：NAT 命中会话时上行数据报绕过 mpsc 队列直发，压低端到端 Jitter。
+    /// 默认 None（不可共享，维持队列路径）。
+    fn send_handle(&self) -> Option<std::sync::Arc<dyn PacketSend>> {
+        None
+    }
+}
+
+/// 可跨任务共享的 UDP 发送句柄（仅需 &self 发送能力）
+#[async_trait::async_trait]
+pub trait PacketSend: Send + Sync {
+    async fn send(&self, pkt: &UdpPacket) -> Result<()>;
 }
 
 /// 外来流的通用不透明包装（ipstack / tun / rustls 等无法直接实现本 crate trait 的类型）：

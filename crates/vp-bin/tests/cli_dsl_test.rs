@@ -475,3 +475,81 @@ fn test_cli_sub_local_mock_subscription_to_vp_dsl() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+/// 回归测试：CRLF 行尾的 .vp 文件不应导致 fmt 门禁误报（Windows git autocrlf 检出场景）。
+#[test]
+fn test_cli_fmt_crlf_tolerant() {
+    let unique_id = format!(
+        "vp_crlf_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let temp_dir = std::env::temp_dir().join(unique_id);
+    fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+    let vpcore_bin = env!("CARGO_BIN_EXE_vpcore");
+
+    // 先生成规范格式化文本（与序列化器输出完全一致，不依赖其内部细节）
+    let raw_path = temp_dir.join("raw.vp");
+    fs::write(
+        &raw_path,
+        "node \"a\" ss { server: \"1.1.1.1\" port: 8388 cipher: \"aes-128-gcm\" password: \"p\" udp: true } route { _ => \"DIRECT\" }",
+    )
+    .expect("write raw");
+    let canon_out = Command::new(vpcore_bin)
+        .arg("fmt")
+        .arg(&raw_path)
+        .output()
+        .expect("fmt raw");
+    assert!(canon_out.status.success());
+    let canonical = String::from_utf8_lossy(&canon_out.stdout).to_string();
+
+    // 规范文本 -> CRLF 行尾写入（模拟 Windows git autocrlf 检出）
+    let crlf_path = temp_dir.join("crlf.vp");
+    fs::write(&crlf_path, canonical.replace('\n', "\r\n")).expect("write crlf file");
+
+    // CRLF 文件 fmt --check 必须通过（内容等价，仅行尾不同）
+    let check = Command::new(vpcore_bin)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&crlf_path)
+        .output()
+        .expect("fmt --check crlf");
+    assert!(
+        check.status.success(),
+        "CRLF 文件不应被 fmt --check 误报: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    // fmt -w 在内容等价时不应改写文件（避免与 git 行尾转换互相打架产生 churn）
+    let before = fs::read(&crlf_path).unwrap();
+    let write = Command::new(vpcore_bin)
+        .arg("fmt")
+        .arg("-w")
+        .arg(&crlf_path)
+        .output()
+        .expect("fmt -w crlf");
+    assert!(write.status.success());
+    let after = fs::read(&crlf_path).unwrap();
+    assert_eq!(before, after, "内容等价时 fmt -w 不应改写 CRLF 文件");
+
+    // 格式真正被破坏的内容（单行压缩写法 + CRLF）仍要被 --check 拦下
+    let bad = "node \"a\" ss { server: \"2.2.2.2\" port: 8388 cipher: \"aes-128-gcm\" password: \"p\" udp: true }\nroute { _ => \"DIRECT\" }\n".replace('\n', "\r\n");
+    let bad_path = temp_dir.join("bad_crlf.vp");
+    fs::write(&bad_path, bad).expect("write bad crlf");
+    let bad_check = Command::new(vpcore_bin)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&bad_path)
+        .output()
+        .expect("fmt --check bad crlf");
+    assert!(
+        !bad_check.status.success(),
+        "内容不同的 CRLF 文件必须被门禁拦截"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

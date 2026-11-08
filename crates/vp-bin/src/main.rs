@@ -657,13 +657,17 @@ async fn async_main() {
                     }
                 };
 
+                // 行尾无关比较：Windows 下 git autocrlf 会将文件检出为 CRLF，
+                // 内容等价即视为已格式化，避免与 git 行尾转换互相打架。
+                let normalized = text.replace("\r\n", "\n");
+
                 if check {
-                    if text.trim() != formatted.trim() {
+                    if normalized.trim() != formatted.trim() {
                         eprintln!("✗ 未格式化: {}", file.display());
                         has_unformatted = true;
                     }
                 } else if write {
-                    if text.trim() != formatted.trim() {
+                    if normalized.trim() != formatted.trim() {
                         if let Err(e) = std::fs::write(file, &formatted) {
                             eprintln!("写入 {} 失败: {e}", file.display());
                             failed = true;

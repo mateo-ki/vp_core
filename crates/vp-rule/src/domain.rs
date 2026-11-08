@@ -6,7 +6,51 @@
 //!
 //! 三种标记可共存于同一节点；哈希表索引子节点，插入与匹配均为 O(1)，启动构建零阻塞。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::Hasher;
+
+/// FNV-1a 64 无序哈希器：域名标签短且分布均匀，SipHash（抗碰撞但 ~150ns/次）
+/// 在 trie 下钻的每次 get 上都是纯开销——数万条规则线性扫描时 3-4 层/条 × N 条
+/// 的哈希成本是首连匹配的最大热点；FNV ~15ns/次，约 10 倍提速。
+/// 域名标签来自外部输入，FNV 抗碰撞性弱由应用层语义兜底（误命中仅影响分流目标，
+/// 且 trie 语义下哈希冲突不会导致误匹配——冲突只是链表探测，键仍精确比较）。
+#[derive(Default, Clone, Copy)]
+pub struct FnvBuild;
+
+impl std::hash::BuildHasher for FnvBuild {
+    type Hasher = FnvHasher;
+    fn build_hasher(&self) -> FnvHasher {
+        FnvHasher(0xcbf29ce484222325)
+    }
+}
+
+#[derive(Default)]
+pub struct FnvHasher(u64);
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
+type NodeChildren = HashMap<Box<str>, Node, FnvBuild>;
+
+/// 域名小写化：本就全小写时零分配借用（热路径绝大多数查询命中此分支），
+/// 含大写时才分配转换。数万条规则线性扫描下，每条一次的堆分配是真实热点。
+fn lowered(domain: &str) -> Cow<'_, str> {
+    if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(domain.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(domain)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitKind {
@@ -17,7 +61,7 @@ pub enum HitKind {
 
 #[derive(Debug, Default, Clone)]
 struct Node {
-    children: HashMap<Box<str>, Node>,
+    children: NodeChildren,
     /// `*` 通配子节点（仅 insert_wildcard 产生）：匹配任意一级标签
     wild: Option<Box<Node>>,
     exact: bool,
@@ -113,11 +157,7 @@ impl DomainTrie {
     /// 返回最深的可达节点（按反向标签）
     fn node_for(&self, domain: &str) -> Option<&Node> {
         let mut node = &self.root;
-        for label in domain
-            .to_ascii_lowercase()
-            .rsplit('.')
-            .filter(|l| !l.is_empty())
-        {
+        for label in lowered(domain).rsplit('.').filter(|l| !l.is_empty()) {
             node = node.children.get(label)?;
         }
         Some(node)
@@ -187,9 +227,8 @@ impl DomainTrie {
     }
 
     pub fn match_kind(&self, domain: &str) -> Option<HitKind> {
-        let lowered = domain.to_ascii_lowercase();
         self.root
-            .walk(lowered.rsplit('.').filter(|l| !l.is_empty()))
+            .walk(lowered(domain).rsplit('.').filter(|l| !l.is_empty()))
     }
 }
 

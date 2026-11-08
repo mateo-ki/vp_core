@@ -1138,6 +1138,192 @@ mod tests {
         }
     }
 
+    // ------------------------- 规模化回归 -------------------------
+
+    /// 数万条混合规则：编译 + 匹配语义保序 + 性能冒烟。
+    /// 覆盖：相邻同 target 批量合并、跨 target 交替、IP/域名混排、keyword、MATCH 兜底。
+    #[test]
+    fn scale_mixed_rules_20k() {
+        let mut rules: Vec<String> = Vec::with_capacity(20_013);
+        // 1.2 万条 DOMAIN-SUFFIX 交替 target（PROXY/DIRECT 各 6000，制造多次批量切换）
+        for i in 0..12_000 {
+            let t = if i % 2 == 0 { "PROXY" } else { "DIRECT" };
+            rules.push(format!("DOMAIN-SUFFIX,s{i}.example.com,{t}"));
+        }
+        // 6000 条 IP-CIDR（交替 DIRECT/REJECT）
+        for i in 0..6_000 {
+            let t = if i % 2 == 0 { "DIRECT" } else { "REJECT" };
+            rules.push(format!("IP-CIDR,10.{i}.0.0/16,{t}"));
+        }
+        // 2000 条 DOMAIN 精确
+        for i in 0..2_000 {
+            rules.push(format!("DOMAIN,exact{i}.example.org,PROXY"));
+        }
+        // 100 条 DOMAIN-KEYWORD
+        for i in 0..100 {
+            rules.push(format!("DOMAIN-KEYWORD,keyword{i},REJECT"));
+        }
+        // 12 条 GEOIP（真实机场常见量；无数据库环境下降级为 NeverMatch 不拦截）
+        for code in [
+            "CN", "US", "JP", "HK", "SG", "TW", "KR", "DE", "FR", "RU", "IN", "LAN",
+        ] {
+            rules.push(format!("GEOIP,{code},DIRECT"));
+        }
+        rules.push("MATCH,PROXY".into());
+
+        let t0 = std::time::Instant::now();
+        let owned: Vec<String> = rules;
+        let e = compile(&owned, &test_env()).unwrap();
+        let compile_ms = t0.elapsed().as_millis();
+        println!("20k 规则编译: {compile_ms}ms, 编译后条目: {}", e.len());
+        assert!(compile_ms < 10_000, "编译耗时异常: {compile_ms}ms");
+
+        // 语义保序：各目标命中正确（域名段 PROXY/DIRECT 交替、keyword 段 REJECT）
+        let hit = |h: &str| e.r#match(&ctx(Some(h), None)).unwrap().target.to_string();
+        assert_eq!(hit("s0.example.com"), "PROXY");
+        assert_eq!(hit("s1.example.com"), "DIRECT");
+        assert_eq!(hit("s11999.example.com"), "DIRECT");
+        assert_eq!(hit("exact1999.example.org"), "PROXY");
+        assert_eq!(hit("x.keyword5.yz"), "REJECT");
+        assert_eq!(hit("nomatch.anything.io"), "PROXY");
+        // IP 目标命中 CIDR（域名规则不应拦截）
+        let hip = |ip: &str| {
+            e.r#match(&ctx(None, Some(ip.parse().unwrap())))
+                .unwrap()
+                .target
+                .to_string()
+        };
+        assert_eq!(hip("10.0.1.2"), "DIRECT");
+        assert_eq!(hip("10.1.1.2"), "REJECT");
+        assert_eq!(hip("10.59.0.0"), "REJECT");
+        assert_eq!(hip("8.8.8.8"), "PROXY");
+
+        // 匹配性能冒烟：1 万次首连级匹配（每次独立 ctx = 缓存 miss 场景），
+        // 分段计时定位热点段
+        let t1 = std::time::Instant::now();
+        for i in 0..2_000 {
+            let h = format!("perf{i}.example.com");
+            let _ = e.r#match(&ctx(Some(&h), None));
+        }
+        let full_ms = t1.elapsed().as_millis();
+        println!("2 千次全量扫描(未命中): {full_ms}ms");
+
+        // 分段：仅前 12k 域名段（DOMAIN-SUFFIX 交替，每条独立 trie）
+        let mut rules_dom: Vec<String> = (0..12_000)
+            .map(|i| {
+                let t = if i % 2 == 0 { "PROXY" } else { "DIRECT" };
+                format!("DOMAIN-SUFFIX,s{i}.example.com,{t}")
+            })
+            .collect();
+        rules_dom.push("MATCH,PROXY".into());
+        let e_dom = compile(&rules_dom, &test_env()).unwrap();
+        let t2 = std::time::Instant::now();
+        for i in 0..2_000 {
+            let h = format!("perf{i}.example.com");
+            let _ = e_dom.r#match(&ctx(Some(&h), None));
+        }
+        let dom_ms = t2.elapsed().as_millis();
+        println!("2 千次仅 12k 域名段: {dom_ms}ms");
+
+        // 分段：仅 6k IP 段（IP 目标）
+        let mut rules_ip: Vec<String> = (0..6_000)
+            .map(|i| {
+                let t = if i % 2 == 0 { "DIRECT" } else { "REJECT" };
+                format!("IP-CIDR,10.{i}.0.0/16,{t}")
+            })
+            .collect();
+        rules_ip.push("MATCH,PROXY".into());
+        let e_ip = compile(&rules_ip, &test_env()).unwrap();
+        let t3 = std::time::Instant::now();
+        for i in 0..2_000u32 {
+            let ip = format!("192.168.{}.{}", i % 250 + 1, i / 250 + 1);
+            let _ = e_ip.r#match(&ctx(None, Some(ip.parse().unwrap())));
+        }
+        let ip_ms = t3.elapsed().as_millis();
+        println!("2 千次仅 6k IP 段(未命中): {ip_ms}ms");
+
+        // 分段：域名命中第一条（最优情形）
+        let t4 = std::time::Instant::now();
+        for _ in 0..2_000 {
+            let _ = e_dom.r#match(&ctx(Some("s0.example.com"), None));
+        }
+        let hit_ms = t4.elapsed().as_millis();
+        println!("2 千次首条命中: {hit_ms}ms");
+
+        // 微基准：单条 trie 直查 1.2 万次（等价一次线性扫描的 trie 工作量，
+        // 绕过主循环）——把"主循环开销"与"trie 查询开销"分离
+        let trie = e_dom
+            .rules()
+            .iter()
+            .find_map(|r| match &r.matcher {
+                Matcher::DomainSuffix(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let t5 = std::time::Instant::now();
+        for i in 0..12_000 {
+            let h = format!("perf{i}.example.com");
+            std::hint::black_box(trie.is_match(&h));
+        }
+        let trie_ms = t5.elapsed().as_millis();
+        println!("1.2 万次单 trie 直查: {trie_ms}ms");
+
+        // 微基准：主循环空转（全部规则快速不命中：host=None 走 1.2 万条 Domain 分支）
+        let t6 = std::time::Instant::now();
+        for _ in 0..2_000 {
+            let _ = e_dom.r#match(&ctx(None, None));
+        }
+        let dispatch_ms = t6.elapsed().as_millis();
+        println!("2 千次主循环 host=None: {dispatch_ms}ms");
+
+        // 最坏形态基线：交替 target 使批量合并完全失效（真实订阅为连续同
+        // target，合并后仅几十条批量规则、首连 <2µs——此处是有意的压力形态）。
+        // FNV 哈希器 + Cow 小写化后约 6.6ms/次；上界 20s 只防数量级退化。
+        let match_ms = full_ms;
+        assert!(match_ms < 20_000, "全量扫描性能异常: {match_ms}ms");
+        assert!(trie_ms < 100, "单 trie 直查异常: {trie_ms}ms");
+        assert!(dispatch_ms < 500, "主循环空转异常: {dispatch_ms}ms");
+    }
+
+    /// 规则引擎并发匹配：8 线程 × 5000 次（&self 共享引用），结果一致且无 panic。
+    /// MatchCtxCache 为 per-ctx 独立缓存，引擎本体不可变共享。
+    #[test]
+    fn concurrent_match_thread_safety() {
+        let e = engine(&[
+            "DOMAIN-SUFFIX,google.com,PROXY",
+            "DOMAIN-KEYWORD,ads,REJECT",
+            "IP-CIDR,10.0.0.0/8,DIRECT",
+            "MATCH,AUTO",
+        ]);
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let e = e.clone();
+                std::thread::spawn(move || {
+                    for i in 0..5_000u32 {
+                        let h = format!("{}.google.com", i);
+                        let r = e.r#match(&ctx(Some(&h), None)).unwrap().target.to_string();
+                        assert_eq!(r, "PROXY", "线程 {t} 第 {i} 轮结果漂移");
+                        let r2 = e
+                            .r#match(&ctx(Some("ads.example.net"), None))
+                            .unwrap()
+                            .target
+                            .to_string();
+                        assert_eq!(r2, "REJECT");
+                        let r3 = e
+                            .r#match(&ctx(None, Some("10.1.2.3".parse().unwrap())))
+                            .unwrap()
+                            .target
+                            .to_string();
+                        assert_eq!(r3, "DIRECT");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
     /// DOMAIN-KEYWORD：host 大写时经惰性缓存转换后仍匹配（多规则共享一次转换），
     /// 且第二次查询命中缓存路径结果一致
     #[test]

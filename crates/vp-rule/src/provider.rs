@@ -37,10 +37,18 @@ pub struct DomainSet {
 
 impl DomainSet {
     pub fn matches(&self, domain: &str) -> bool {
-        if self.trie.is_match(domain) {
+        // 零分配快速路径：全小写域名直接借用（trie 内部同款 Cow），
+        // 含大写时才分配一次并与 keywords 共用
+        let owned;
+        let lower = if domain.bytes().any(|b| b.is_ascii_uppercase()) {
+            owned = domain.to_ascii_lowercase();
+            owned.as_str()
+        } else {
+            domain
+        };
+        if self.trie.is_match(lower) {
             return true;
         }
-        let lower = domain.to_ascii_lowercase();
         self.keywords.iter().any(|k| lower.contains(&**k))
     }
 }

@@ -385,7 +385,6 @@ fn total_memory_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
     line["MemTotal:".len()..]
-        .trim()
         .split_whitespace()
         .next()?
         .parse::<u64>()

@@ -108,7 +108,7 @@ pub async fn relay(
             // 若某侧持有嗅探/预读未消费的首包字节，在切入内核态 splice 前先写出至对端，防首包丢失
             let mut pre_up = 0u64;
             let mut pre_down = 0u64;
-            let mut drain_ok = drain_side(&mut left, &mut right, &mut pre_up).await
+            let drain_ok = drain_side(&mut left, &mut right, &mut pre_up).await
                 && drain_side(&mut right, &mut left, &mut pre_down).await;
             if drain_ok {
                 if let (Some(a), Some(b)) = (left.raw_socket(), right.raw_socket()) {

@@ -76,6 +76,30 @@ RustCrypto 的 SIMD 内联循环，加密吞吐掉 4-5 倍）。
 - 连接表分片语义：`cargo test -p vp-core --lib conn_table`
 - 测速有界并发/健康检查：`cargo test -p vp-router --lib`
 
+## 3.9 转发热路径优化批次（2026-11-08，v1.7.1 后）
+
+一批 10 项入站→出站全链路优化（详见 commit 记录）：
+
+| 项 | 改动 | 预期收益 |
+|---|---|---|
+| 中继缓冲 | `copy_bidirectional` → `copy_bidirectional_with_sizes(128K,128K)`（tunnel.rs） | 通用泵路径摆脱 tokio 默认 8KB 限制 |
+| mixed splice 解锁 | `PrefixedStream` 补齐 `raw_socket`/`unconsumed_peek`/`consume_peek` 委托 + relay 多层排空 | Linux mixed 主力入站打通 splice 零拷贝 |
+| SOCKS5 地址解析 | 逐字节 `read_exact` → 至多 2 次批量 `read_exact` | 握手 syscall 从 ~10 次降到 2 次 |
+| tokio worker | `clamp(2,4)` → 核数全释放（<1GB 内存设备收敛 2 线程，`TOKIO_WORKER_THREADS` 仍可覆盖） | 多核服务器不再欠配 |
+| DNS 缓存 | 真实 TTL 存储 + 权威 NXDOMAIN 负缓存（30s）+ 水位淘汰替代整表 clear | 重复查询零上游请求；NXDOMAIN 防穿透 |
+| 嗅探缓存 | (ip,port)→域名 60s 短缓存，TCP/QUIC/UDP 三路接入 | 浏览器并发建连免重复 30ms 嗅探等待 |
+| UDP NAT | 全表单锁 → 16 分片（FNV 路由）+ 零分配键 + 锁外拨号 | 高 PPS 锁竞争摊薄 16 倍 |
+| TFO | Linux 出站 `TCP_FASTOPEN_CONNECT`（尽力而为） | 高频短连接省 1 RTT |
+| TUN 窗口 | ipstack `TcpConfig`：read 16K→256K、max_unacked 16K→1M | 高 BDP 跨洋链路单流吞吐提升一个数量级 |
+| DoH/DoT 连接池 | 每查询新建 TCP+TLS → keep-alive 长连接池（单端点 4 条、120s 空闲回收、失效自动重拨） | 每次查询省一次完整 TLS 握手 |
+
+环回基准留档（Windows x64，opt-level=3，桌面噪声较大，仅作趋势参考）：
+
+- 工具上限 3536 MB/s；经内核中位 954 / 最大 1100 MB/s（历史：1229/1639）
+- **内核 CPU 效率 0.0005 s/MB（历史 0.0006，改善约 17%）** —— 本批次最可靠的硬指标
+- 吞吐绝对值受桌面噪声影响大（同轮波动 730-1100），结论以 Linux 真机 +
+  splice 路径复测为准；mixed splice 解锁在 Linux 上的收益未在本机体现
+
 ## 5. 二阶段规划（按审计报告 §13）
 
 - Criterion 化：relay 吞吐 / 并发连接 / 规则匹配 / 组选择

@@ -29,7 +29,9 @@ pub use router::{
     RouteTrace, Router, RuleHit, RuleHitDetail, RuleMatchTrace, SessionTrace,
 };
 pub use session::{Network, Session};
-pub use sniff::{PeekedStream, parse_http_host, parse_tls_sni, sniff_stream};
+pub use sniff::{
+    PeekedStream, parse_http_host, parse_tls_sni, sniff_cache_get, sniff_cache_put, sniff_stream,
+};
 pub use stream::{PacketConn, ProxyStream, UdpPacket};
 pub use tunnel::{RelayHook, relay};
 pub use user::{UserAccount, UserManager, UserSnapshot};

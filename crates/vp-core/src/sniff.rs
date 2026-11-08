@@ -1,13 +1,54 @@
 //! 流量嗅探（Sniffing）：在建立出站连接前无损窥探首包数据，
-//! 提取 TLS SNI 或 HTTP Host 域名，以精准激活域名分流规则。
+//! 提取 TLS SNI 或 HTTP Host 域名，以精准激活域名规则分流。
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::stream::ProxyStream;
+
+// ---------------------------------------------------------------------------
+// 嗅探结果短缓存：浏览器对同一目标并发建连（6 连接 / 资源分片）极为常见，
+// 缓存 (dst ip, port) -> 域名 让后续连接免除重复的 30ms 嗅探等待
+// ---------------------------------------------------------------------------
+
+const SNIFF_CACHE_TTL: Duration = Duration::from_secs(60);
+const SNIFF_CACHE_CAP: usize = 4096;
+
+/// (目标 ip, port) -> (嗅探域名, 记录时间)
+type SniffCacheMap = HashMap<(IpAddr, u16), (String, Instant)>;
+
+static SNIFF_CACHE: std::sync::OnceLock<Mutex<SniffCacheMap>> = std::sync::OnceLock::new();
+
+/// 查询嗅探结果缓存（未过期命中返回域名）
+pub fn sniff_cache_get(ip: IpAddr, port: u16) -> Option<String> {
+    let m = SNIFF_CACHE.get_or_init(Default::default).lock().unwrap();
+    let (domain, at) = m.get(&(ip, port))?;
+    if at.elapsed() < SNIFF_CACHE_TTL {
+        Some(domain.clone())
+    } else {
+        None
+    }
+}
+
+/// 写入嗅探结果；容量触顶时先清理过期条目，仍满则整表清空（短 TTL 下代价可控）
+pub fn sniff_cache_put(ip: IpAddr, port: u16, domain: String) {
+    let mut m = SNIFF_CACHE.get_or_init(Default::default).lock().unwrap();
+    if m.len() >= SNIFF_CACHE_CAP {
+        let now = std::time::Instant::now();
+        m.retain(|_, (_, at)| now.duration_since(*at) < SNIFF_CACHE_TTL);
+        m.shrink_to_fit();
+        if m.len() >= SNIFF_CACHE_CAP {
+            m.clear();
+        }
+    }
+    m.insert((ip, port), (domain, std::time::Instant::now()));
+}
 
 /// 带有预读缓冲区的包装流：
 /// 首先排空已预读但未消耗的 `buffer` 字节，随后完全直通底层 `inner`。

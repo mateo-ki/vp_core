@@ -23,6 +23,59 @@ use vp_core::stream::UdpPacket;
 pub const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 游戏、对战联机与常规 UDP 长保活超时（180 秒）：防止游戏对局与 VoIP 语音中断
 pub const GAME_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// NAT 会话表分片数：锁竞争随分片摊薄，高 PPS 场景不再全表单锁串行
+const NAT_SHARDS: usize = 16;
+
+/// UDP NAT 会话键：客户端源地址 + 目标（域名或 IP + 端口）
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SessionKey {
+    client: SocketAddr,
+    host: Host,
+    port: u16,
+}
+
+/// 分片会话表：命中路径零额外 String 分配（键直接消费嗅探结果所有权）
+struct SessionMap {
+    shards: Vec<tokio::sync::Mutex<HashMap<SessionKey, tokio::sync::mpsc::Sender<UdpPacket>>>>,
+    /// 单分片高水位（全局上限均摊到各分片，哈希分布均匀）
+    shard_cap: usize,
+}
+
+impl SessionMap {
+    fn new(max_sessions: usize) -> Self {
+        SessionMap {
+            shards: (0..NAT_SHARDS)
+                .map(|_| tokio::sync::Mutex::new(HashMap::new()))
+                .collect(),
+            shard_cap: (max_sessions / NAT_SHARDS).max(8),
+        }
+    }
+
+    /// FNV-1a 分片路由（零分配、免 SipHash 开销）
+    fn index(key: &SessionKey) -> usize {
+        fn fnv(h: &mut u64, bytes: &[u8]) {
+            for &b in bytes {
+                *h ^= b as u64;
+                *h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        let mut h: u64 = 0xcbf29ce484222325;
+        let client_ip: &[u8] = match key.client.ip() {
+            std::net::IpAddr::V4(v4) => &v4.octets(),
+            std::net::IpAddr::V6(v6) => &v6.octets(),
+        };
+        fnv(&mut h, client_ip);
+        fnv(&mut h, &key.client.port().to_be_bytes());
+        fnv(&mut h, &key.port.to_be_bytes());
+        let host_bytes: &[u8] = match &key.host {
+            Host::Domain(d) => d.as_bytes(),
+            Host::Ip(std::net::IpAddr::V4(v4)) => &v4.octets(),
+            Host::Ip(std::net::IpAddr::V6(v6)) => &v6.octets(),
+        };
+        fnv(&mut h, host_bytes);
+        (h as usize) % NAT_SHARDS
+    }
+}
 
 /// 一个客户端 UDP 关联
 pub type ReplyFormatter = Arc<dyn Fn(SocketAddr, &[u8]) -> Vec<u8> + Send + Sync>;
@@ -34,14 +87,12 @@ pub struct UdpNat {
     client: Mutex<Option<SocketAddr>>,
     /// 中继 socket（客户端发往此地址；回包也从这里发出）
     relay: Arc<UdpSocket>,
-    /// (客户端源地址, 目标地址) → 发送队列（实现多客户端 Full-Cone EIM 会话隔离）
-    sessions: Mutex<HashMap<(SocketAddr, DstAddr), tokio::sync::mpsc::Sender<UdpPacket>>>,
+    /// 分片会话表：(客户端源地址, 目标地址) → 发送队列（实现多客户端 Full-Cone EIM 会话隔离）
+    sessions: SessionMap,
     /// 回包格式化（None = 裸转发，TUN 场景）
     reply_formatter: std::sync::Mutex<Option<ReplyFormatter>>,
     /// 安全门禁与 RRL 限制器（可选）
     gate: Option<Arc<vp_core::InboundGate>>,
-    /// 会话表最大容量上限（防止探测泛洪消耗内存）
-    max_sessions: usize,
 }
 
 impl UdpNat {
@@ -60,10 +111,9 @@ impl UdpNat {
             tag,
             client: Mutex::new(None),
             relay,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: SessionMap::new(4096),
             reply_formatter: std::sync::Mutex::new(None),
             gate,
-            max_sessions: 4096,
         })
     }
 
@@ -89,49 +139,72 @@ impl UdpNat {
                 *c = Some(client_addr);
             }
         }
+        let dst_port = pkt.dst.port();
         let resolved_domain = fake_domain
             .or_else(|| vp_dns::reverse_fake_ip(pkt.dst.ip()))
             .or_else(|| {
-                if matches!(pkt.dst.port(), 443 | 8443 | 2053 | 2083 | 2087 | 2096) {
-                    vp_core::sniff::sniff_quic_sni(&pkt.data)
+                if matches!(dst_port, 443 | 8443 | 2053 | 2083 | 2087 | 2096) {
+                    // QUIC SNI 嗅探结果短缓存：同目标后续数据报免除重复 HKDF+AES-GCM 解密
+                    if let Some(d) = vp_core::sniff::sniff_cache_get(pkt.dst.ip(), dst_port) {
+                        return Some(d);
+                    }
+                    let d = vp_core::sniff::sniff_quic_sni(&pkt.data)?;
+                    vp_core::sniff::sniff_cache_put(pkt.dst.ip(), dst_port, d.clone());
+                    Some(d)
                 } else {
                     None
                 }
             });
-        let dst = DstAddr {
+        // 键直接消费嗅探结果所有权：命中路径零额外 String 分配
+        let key = SessionKey {
+            client: client_addr,
             host: match resolved_domain {
                 Some(domain) => Host::Domain(domain),
                 None => Host::Ip(pkt.dst.ip()),
             },
-            port: pkt.dst.port(),
+            port: dst_port,
         };
 
-        let session_key = (client_addr, dst.clone());
-        let mut map = self.sessions.lock().await;
-        // 高水位 GC 清理：当会话数量达到上限时剔除断开或最早的会话
-        if map.len() >= self.max_sessions {
-            map.retain(|_, tx| !tx.is_closed());
-            if map.len() >= self.max_sessions {
-                let to_remove: Vec<_> = map
-                    .keys()
-                    .take(map.len() - self.max_sessions + 1)
-                    .cloned()
-                    .collect();
-                for k in to_remove {
-                    map.remove(&k);
+        let idx = SessionMap::index(&key);
+        let existing = {
+            let mut map = self.sessions.shards[idx].lock().await;
+            // 分片高水位 GC 清理：剔除断开会话；仍满则随机裁剪
+            if map.len() >= self.sessions.shard_cap {
+                map.retain(|_, tx| !tx.is_closed());
+                if map.len() >= self.sessions.shard_cap {
+                    let overflow = map.len() - self.sessions.shard_cap + 1;
+                    let to_remove: Vec<_> = map.keys().take(overflow).cloned().collect();
+                    for k in to_remove {
+                        map.remove(&k);
+                    }
                 }
             }
-        }
+            map.get(&key).cloned()
+        };
 
-        let tx = match map.get(&session_key) {
-            Some(tx) => tx.clone(),
+        let tx = match existing {
+            Some(tx) => tx,
             None => {
+                // 先释放分片锁再拨号建会话：路由决策与出站建连不应阻塞同分片其他数据报
+                let dst = DstAddr {
+                    host: key.host.clone(),
+                    port: key.port,
+                };
                 let tx = self.spawn_session(client_addr, &dst).await?;
-                map.insert(session_key, tx.clone());
-                tx
+                let mut map = self.sessions.shards[idx].lock().await;
+                // 双检：并发建会话可能已插入同键会话
+                match map.get(&key) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        if map.len() >= self.sessions.shard_cap {
+                            map.retain(|_, tx| !tx.is_closed());
+                        }
+                        map.insert(key, tx.clone());
+                        tx
+                    }
+                }
             }
         };
-        drop(map);
         let _ = tx.send(pkt).await;
         Ok(())
     }
@@ -187,7 +260,6 @@ impl UdpNat {
         };
 
         tokio::spawn(async move {
-            let sessions = &this.sessions;
             loop {
                 tokio::select! {
                     biased;
@@ -231,7 +303,13 @@ impl UdpNat {
                 }
             }
             debug!("udp 会话回收: {} -> {dst_key}", client);
-            sessions.lock().await.remove(&(client, dst_key));
+            let key = SessionKey {
+                client,
+                host: dst_key.host.clone(),
+                port: dst_key.port,
+            };
+            let idx = SessionMap::index(&key);
+            this.sessions.shards[idx].lock().await.remove(&key);
         });
         Ok(tx)
     }

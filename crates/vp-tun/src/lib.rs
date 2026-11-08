@@ -274,6 +274,13 @@ where
         .mtu(cfg.mtu)
         .map_err(|e| Error::Config(format!("MTU 非法: {e}")))?;
     stack_cfg.packet_information(false);
+    // 用户态 TCP 栈缓冲调优：ipstack 默认 read_buffer/max_unacked 仅 16KB，
+    // 高 BDP 跨洋链路（1Gbps×200ms ≈ 25MB 窗口需求）下单流吞吐被死死压住；
+    // 256KB 读缓冲 + 1MB 未确认窗口可提升单流吞吐一个数量级（内存代价 ≈ 每活跃流 ~1.25MB）
+    let mut tcp_cfg = ipstack::TcpConfig::default();
+    tcp_cfg.read_buffer_size = 256 * 1024;
+    tcp_cfg.max_unacked_bytes = 1024 * 1024;
+    stack_cfg.with_tcp_config(tcp_cfg);
     let mut stack = IpStack::new(stack_cfg, dev);
 
     loop {
@@ -370,12 +377,22 @@ async fn dispatch_tcp(
     if matches!(sess.dst.host, vp_common::Host::Ip(_))
         && vp_core::sniff::is_sniffable_port(sess.dst.port)
     {
-        let (sniffed, peeked) =
-            vp_core::sniff_stream(client, std::time::Duration::from_millis(30)).await;
-        client = peeked;
-        if let Some(domain) = sniffed {
-            debug!("tun sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+        // 嗅探结果短缓存：同目标短时重复建连（浏览器并发连）免重复 30ms 嗅探等待
+        let vp_common::Host::Ip(dst_ip) = sess.dst.host else {
+            unreachable!("外层 if 已保证 Ip 分支");
+        };
+        if let Some(domain) = vp_core::sniff::sniff_cache_get(dst_ip, sess.dst.port) {
+            debug!("tun sniff: 缓存命中 {} -> {}", sess.dst, domain);
             sess.dst.host = vp_common::Host::Domain(domain);
+        } else {
+            let (sniffed, peeked) =
+                vp_core::sniff_stream(client, std::time::Duration::from_millis(30)).await;
+            client = peeked;
+            if let Some(domain) = sniffed {
+                debug!("tun sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+                vp_core::sniff::sniff_cache_put(dst_ip, sess.dst.port, domain.clone());
+                sess.dst.host = vp_common::Host::Domain(domain);
+            }
         }
     }
 
@@ -449,13 +466,21 @@ async fn dispatch_udp(
     if matches!(sess.dst.host, vp_common::Host::Ip(_))
         && matches!(sess.dst.port, 443 | 8443 | 2053 | 2083 | 2087 | 2096)
     {
-        if let Ok(Ok(n)) =
+        // 嗅探结果短缓存：同目标短时重复建流免除重复的 HKDF+AES-GCM 首包解密
+        let vp_common::Host::Ip(dst_ip) = sess.dst.host else {
+            unreachable!("外层 if 已保证 Ip 分支");
+        };
+        if let Some(domain) = vp_core::sniff::sniff_cache_get(dst_ip, sess.dst.port) {
+            debug!("tun quic sniff: 缓存命中 {} -> {}", sess.dst, domain);
+            sess.dst.host = vp_common::Host::Domain(domain);
+        } else if let Ok(Ok(n)) =
             tokio::time::timeout(std::time::Duration::from_millis(50), udp.read(&mut up_buf)).await
         {
             if n > 0 {
                 first_n = Some(n);
                 if let Some(domain) = vp_core::sniff::sniff_quic_sni(&up_buf[..n]) {
                     debug!("tun quic sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+                    vp_core::sniff::sniff_cache_put(dst_ip, sess.dst.port, domain.clone());
                     sess.dst.host = vp_common::Host::Domain(domain);
                 }
             } else {

@@ -226,24 +226,29 @@ where
     }
 }
 
-/// 增量读取 SOCKS 地址
+/// 增量读取 SOCKS 地址。
+/// 批量读取优化：全程至多 2 次 `read_exact`（首批 5 字节 ATYP+前缀，再按地址类型定长补齐），
+/// 彻底消除旧实现逐字节 `read_exact` 的 syscall 风暴与线程唤醒开销。
 pub async fn read_socks_addr<S>(io: &mut S) -> Result<DstAddr>
 where
     S: AsyncRead + Unpin,
 {
-    let mut rest: Vec<u8> = Vec::with_capacity(300);
-    loop {
-        match decode_socks_addr(&rest) {
-            Ok((dst, _)) => return Ok(dst),
-            Err(Error::Proto("address truncated")) | Err(Error::Proto("empty domain")) => {
-                let mut b = [0u8; 1];
-                io.read_exact(&mut b).await?;
-                rest.push(b[0]);
-                if rest.len() > 262 {
-                    return Err(Error::Proto("地址过长"));
-                }
+    // 最长地址 = [atyp 1][len 1][domain 255][port 2] = 259 字节
+    let mut buf = [0u8; 259];
+    io.read_exact(&mut buf[..5]).await?;
+    let need = match buf[0] {
+        vp_common::addr::ATYP_IPV4 => 1 + 4 + 2,
+        vp_common::addr::ATYP_DOMAIN => {
+            let len = buf[1] as usize;
+            if len == 0 {
+                return Err(Error::Proto("empty domain"));
             }
-            Err(e) => return Err(e),
+            2 + len + 2
         }
-    }
+        vp_common::addr::ATYP_IPV6 => 1 + 16 + 2,
+        other => return Err(Error::ProtoMsg(format!("不支持的地址类型 {other}"))),
+    };
+    io.read_exact(&mut buf[5..need]).await?;
+    let (dst, _) = decode_socks_addr(&buf[..need])?;
+    Ok(dst)
 }

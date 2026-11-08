@@ -83,12 +83,22 @@ pub async fn dispatch_stream(
         && matches!(reply, ClientReply::None)
         && crate::sniff::is_sniffable_port(sess.dst.port)
     {
-        let (sniffed, peeked) =
-            crate::sniff::sniff_stream(client, std::time::Duration::from_millis(30)).await;
-        client = peeked;
-        if let Some(domain) = sniffed {
-            debug!("sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+        // 嗅探结果短缓存：同目标短时重复建连（浏览器并发连）免重复 30ms 嗅探等待
+        let vp_common::Host::Ip(dst_ip) = sess.dst.host else {
+            unreachable!("外层 if 已保证 Ip 分支");
+        };
+        if let Some(domain) = vp_core::sniff::sniff_cache_get(dst_ip, sess.dst.port) {
+            debug!("sniff: 嗅探缓存命中 {} -> {}", sess.dst, domain);
             sess.dst.host = vp_common::Host::Domain(domain);
+        } else {
+            let (sniffed, peeked) =
+                crate::sniff::sniff_stream(client, std::time::Duration::from_millis(30)).await;
+            client = peeked;
+            if let Some(domain) = sniffed {
+                debug!("sniff: 嗅探到真实域名 {} -> {}", sess.dst, domain);
+                vp_core::sniff::sniff_cache_put(dst_ip, sess.dst.port, domain.clone());
+                sess.dst.host = vp_common::Host::Domain(domain);
+            }
         }
     }
 

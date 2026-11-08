@@ -355,18 +355,82 @@ fn main() {
     let threads = std::env::var("TOKIO_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2);
-            cpus.clamp(2, 4)
-        });
+        .unwrap_or_else(auto_worker_threads);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(threads)
         .enable_all()
         .build()
         .expect("初始化 tokio 运行时失败")
         .block_on(async_main());
+}
+
+/// 依据 CPU 核数与系统内存自动分级 tokio worker 线程数：
+/// - 低内存设备（< 1GB，路由器/老旧手机）收敛至 2 线程控制驻留内存；
+/// - 其余机器释放全部物理核心，消除旧版 clamp(2,4) 在多核服务器上的欠配。
+fn auto_worker_threads() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .max(1);
+    if total_memory_bytes().is_some_and(|m| m < 1024 * 1024 * 1024) {
+        cpus.min(2)
+    } else {
+        cpus
+    }
+}
+
+/// 读取系统物理内存总量（字节）。探测失败返回 None，按非低内存处理。
+#[cfg(target_os = "linux")]
+fn total_memory_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
+    line["MemTotal:".len()..]
+        .trim()
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb * 1024)
+}
+
+#[cfg(target_vendor = "apple")]
+fn total_memory_bytes() -> Option<u64> {
+    let mut size: u64 = 0;
+    let mut len = std::mem::size_of_val(&size);
+    let name = b"hw.memsize\0";
+    unsafe {
+        if libc::sysctlbyname(
+            name.as_ptr().cast::<libc::c_char>(),
+            (&mut size as *mut u64).cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) == 0
+        {
+            Some(size)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn total_memory_bytes() -> Option<u64> {
+    let mut status: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX =
+        unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of_val(&status) as u32;
+    unsafe {
+        if windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut status) != 0 {
+            Some(status.ullTotalPhys)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+fn total_memory_bytes() -> Option<u64> {
+    None
 }
 
 async fn async_main() {

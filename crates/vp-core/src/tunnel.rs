@@ -66,6 +66,32 @@ enum Dir {
     Down,
 }
 
+/// 排空某侧全部预读层的未消费字节并写出至对端。
+/// 预读层可能多层叠加（嗅探层 PeekedStream 之下还有 mixed 前缀层 PrefixedStream），
+/// 必须循环排空至 None —— 单次 if 会漏掉下层的前缀字节。返回 false 表示写出失败。
+/// 层数有界（至多嗅探 + 前缀两层），上限 4 纯属防御。
+#[cfg(target_os = "linux")]
+async fn drain_side(
+    src: &mut Box<dyn ProxyStream>,
+    dst: &mut Box<dyn ProxyStream>,
+    moved: &mut u64,
+) -> bool {
+    for _ in 0..4 {
+        match src.unconsumed_peek() {
+            Some(peek) if !peek.is_empty() => {
+                let len = peek.len();
+                if dst.write_all(peek).await.is_err() {
+                    return false;
+                }
+                src.consume_peek(len);
+                *moved += len as u64;
+            }
+            _ => return true,
+        }
+    }
+    true
+}
+
 /// 双向转发。返回 (up, down) 字节数。任何一侧结束都会向对端传播关闭。
 pub async fn relay(
     #[allow(unused_mut)] mut left: Box<dyn ProxyStream>,
@@ -82,31 +108,8 @@ pub async fn relay(
             // 若某侧持有嗅探/预读未消费的首包字节，在切入内核态 splice 前先写出至对端，防首包丢失
             let mut pre_up = 0u64;
             let mut pre_down = 0u64;
-            let mut drain_ok = true;
-            if let Some(peek) = left.unconsumed_peek() {
-                if !peek.is_empty() {
-                    let len = peek.len();
-                    if right.write_all(peek).await.is_err() {
-                        drain_ok = false;
-                    } else {
-                        pre_up += len as u64;
-                        left.consume_peek(len);
-                    }
-                }
-            }
-            if drain_ok {
-                if let Some(peek) = right.unconsumed_peek() {
-                    if !peek.is_empty() {
-                        let len = peek.len();
-                        if left.write_all(peek).await.is_err() {
-                            drain_ok = false;
-                        } else {
-                            pre_down += len as u64;
-                            right.consume_peek(len);
-                        }
-                    }
-                }
-            }
+            let mut drain_ok = drain_side(&mut left, &mut right, &mut pre_up).await
+                && drain_side(&mut right, &mut left, &mut pre_down).await;
             if drain_ok {
                 if let (Some(a), Some(b)) = (left.raw_socket(), right.raw_socket()) {
                     let registered = match (&hook.table, &hook.meta) {
@@ -194,11 +197,20 @@ pub async fn relay(
             t1: None,
             t2: None,
         };
-        let (up_bytes, down_bytes) =
-            match tokio::io::copy_bidirectional(&mut left, &mut right).await {
-                Ok((u, d)) => (u, d),
-                Err(_) => (0, 0),
-            };
+        // 128KB 大缓冲对齐缓冲池块尺寸：tokio 默认 8KB 在高 BDP 链路与回环
+        // 基准下严重欠喂，直接限制单流吞吐上限（基准实测 1229 vs 工具上限 3703 MB/s）
+        const RELAY_BUF_SIZE: usize = 128 * 1024;
+        let (up_bytes, down_bytes) = match tokio::io::copy_bidirectional_with_sizes(
+            &mut left,
+            &mut right,
+            RELAY_BUF_SIZE,
+            RELAY_BUF_SIZE,
+        )
+        .await
+        {
+            Ok((u, d)) => (u, d),
+            Err(_) => (0, 0),
+        };
         up.store(up_bytes, Ordering::Relaxed);
         down.store(down_bytes, Ordering::Relaxed);
         if let Some(s) = &hook.stats {

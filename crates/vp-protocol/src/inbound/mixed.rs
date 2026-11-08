@@ -133,9 +133,46 @@ pub struct PrefixedStream<S> {
     pos: usize,
 }
 
-impl<S> vp_core::ProxyStream for PrefixedStream<S> where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static
+impl<S> vp_core::ProxyStream for PrefixedStream<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static + vp_core::ProxyStream,
 {
+    // 透传底层裸 socket：mixed 是 Linux 主力入站，缺失本委托会导致
+    // 整条 mixed 链路被 splice 零拷贝快速路径排除
+    fn raw_socket(&self) -> Option<&tokio::net::TcpStream> {
+        if self.pos < self.prefix.len() {
+            // 前缀字节尚未排空时绝不能暴露裸 socket：旁路直拷会丢失已读出的前缀
+            return None;
+        }
+        self.inner.raw_socket()
+    }
+
+    fn unconsumed_peek(&self) -> Option<&[u8]> {
+        if self.pos < self.prefix.len() {
+            Some(&self.prefix[self.pos..])
+        } else {
+            self.inner.unconsumed_peek()
+        }
+    }
+
+    fn consume_peek(&mut self, len: usize) {
+        if self.pos < self.prefix.len() {
+            let avail = self.prefix.len() - self.pos;
+            let take = avail.min(len);
+            self.pos += take;
+            let rem = len - take;
+            if rem > 0 {
+                self.inner.consume_peek(rem);
+            }
+        } else {
+            self.inner.consume_peek(len);
+        }
+    }
+
+    /// 预读前缀在本层之上照常先交付，切换只影响其后从 inner 读取的部分
+    fn switch_to_raw_read(&mut self) -> bool {
+        self.inner.switch_to_raw_read()
+    }
 }
 
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S> {

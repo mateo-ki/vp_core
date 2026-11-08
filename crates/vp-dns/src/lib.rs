@@ -384,7 +384,61 @@ pub async fn connect_tcp_bound_with_opts(
             }
         }
     }
+    // Linux TCP_FASTOPEN_CONNECT：出站 connect 后内核尝试把首次写入的数据并入 SYN 包，
+    // 高频短连接可省去一个完整 RTT；对不支持 TFO 的服务端内核自动回退普通握手，安全无损。
+    // 尽力而为：socket 创建或 setsockopt 失败（老内核/未启用 TFO）落回普通 connect。
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(socket) = tfo_connect_socket(addr) {
+            socket.set_nonblocking(true)?;
+            match socket.connect(&addr.into()) {
+                Ok(()) => {
+                    let std_stream: std::net::TcpStream = socket.into();
+                    return tokio::net::TcpStream::from_std(std_stream);
+                }
+                Err(e)
+                    if e.raw_os_error() == Some(libc::EINPROGRESS)
+                        || e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    let std_stream: std::net::TcpStream = socket.into();
+                    let tokio_stream = tokio::net::TcpStream::from_std(std_stream)?;
+                    tokio_stream.writable().await?;
+                    if let Some(err) = tokio_stream.take_error()? {
+                        return Err(err);
+                    }
+                    return Ok(tokio_stream);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     tokio::net::TcpStream::connect(addr).await
+}
+
+/// 创建开启 TCP_FASTOPEN_CONNECT 的出站 TCP socket（仅 Linux）
+#[cfg(target_os = "linux")]
+fn tfo_connect_socket(addr: SocketAddr) -> std::io::Result<socket2::Socket> {
+    use std::os::fd::AsRawFd;
+
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    let opt: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_FASTOPEN_CONNECT,
+            &opt as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(socket)
 }
 
 #[cfg(windows)]
@@ -440,17 +494,52 @@ pub use wire::QType;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const CACHE_CAP: usize = 4096;
 const MIN_TTL: u32 = 30;
+/// 负缓存（权威 NXDOMAIN）存活时长：防不存在域名反复穿透打上游
+const NEG_TTL: u32 = 30;
+/// 真实 TTL 存储上限
+const MAX_TTL: u32 = 86400;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    ips: Arc<Vec<IpAddr>>,
+    /// Some = 正缓存答案；None = 负缓存（权威确认域名不存在）
+    ips: Option<Arc<Vec<IpAddr>>>,
     at: Instant,
     ttl: u32,
+}
+
+/// 上游查询结果：IP 集合 + 答案真实最小 TTL + 权威 NXDOMAIN 标记
+#[derive(Debug, Clone)]
+struct Resolved {
+    ips: Vec<IpAddr>,
+    min_ttl: u32,
+    nxdomain: bool,
 }
 
 #[derive(Default)]
 struct CacheInner {
     map: HashMap<(String, bool), CacheEntry>,
+}
+
+/// 容量水位淘汰：先清理全部过期条目；仍超限则按写入时间裁掉最旧一批。
+/// 替代旧版整表 clear()，避免容量触顶时缓存瞬时清空引发上游查询风暴。
+fn evict_cache(map: &mut HashMap<(String, bool), CacheEntry>, incoming: usize) {
+    if map.len() + incoming <= CACHE_CAP {
+        return;
+    }
+    let now = Instant::now();
+    map.retain(|_, e| now.duration_since(e.at) < Duration::from_secs(e.ttl as u64));
+    if map.len() + incoming <= CACHE_CAP {
+        return;
+    }
+    let overflow = map.len() + incoming - CACHE_CAP;
+    let mut by_at: Vec<((String, bool), Instant)> =
+        map.iter().map(|(k, e)| (k.clone(), e.at)).collect();
+    by_at.sort_by_key(|(_, at)| *at);
+    // 多裁 1/8 余量，避免每次插入都触发淘汰
+    let target = (overflow + CACHE_CAP / 8).min(by_at.len());
+    for (k, _) in by_at.into_iter().take(target) {
+        map.remove(&k);
+    }
 }
 
 #[derive(Clone)]
@@ -710,7 +799,11 @@ impl Resolver {
             let c = self.cache.lock().unwrap();
             if let Some(e) = c.map.get(&key) {
                 if e.at.elapsed() < Duration::from_secs(e.ttl.max(MIN_TTL) as u64) {
-                    return Ok(e.ips.clone());
+                    return match &e.ips {
+                        Some(ips) => Ok(ips.clone()),
+                        // 负缓存命中：域名确认不存在，直接快速失败防穿透
+                        None => Err(Error::Dns(format!("域名 {domain} 不存在（负缓存）"))),
+                    };
                 }
             }
         }
@@ -720,7 +813,7 @@ impl Resolver {
             if rule.trie.is_match(domain) || rule.geosite.iter().any(|s| s.matches(domain)) {
                 if let Ok(ips) = Box::pin(rule.resolver.resolve_domain(domain, ipv6)).await {
                     if !ips.is_empty() {
-                        self.cache_store(key, ips.clone());
+                        self.cache_store(key, ips.clone(), MIN_TTL);
                         return Ok(ips);
                     }
                 }
@@ -735,28 +828,56 @@ impl Resolver {
             if (ff.domain.is_match(domain) || ff.geosite.iter().any(|s| s.matches(domain)))
                 && !self.fallbacks.is_empty()
             {
-                if let Ok(ips) =
+                if let Ok(r) =
                     Self::query_servers(&self.fallbacks, domain, qtype, &self.bootstrap_servers)
                         .await
                 {
-                    let ips = Arc::new(ips);
-                    self.cache_store(key, ips.clone());
-                    return Ok(ips);
+                    if !r.ips.is_empty() && !r.nxdomain {
+                        let ips = Arc::new(r.ips);
+                        self.cache_store(key, ips.clone(), r.min_ttl);
+                        return Ok(ips);
+                    }
                 }
             }
         }
 
         // 3. 主 DNS 解析
         let primary_res = if self.servers.is_empty() {
-            self.system_lookup(domain).await
+            self.system_lookup(domain).await.map(|ips| Resolved {
+                ips: ips.to_vec(),
+                min_ttl: MIN_TTL,
+                nxdomain: false,
+            })
         } else {
-            Self::query_servers(&self.servers, domain, qtype, &self.bootstrap_servers)
-                .await
-                .map(Arc::new)
+            Self::query_servers(&self.servers, domain, qtype, &self.bootstrap_servers).await
         };
 
+        let mut res_ttl = MIN_TTL;
         let ips = match primary_res {
-            Ok(ips) => {
+            Ok(r) if r.nxdomain && r.ips.is_empty() => {
+                // 权威 NXDOMAIN：先给 fallback 一次机会，仍不存在则写入负缓存快速失败
+                let fb = if !self.fallbacks.is_empty() {
+                    Self::query_servers(&self.fallbacks, domain, qtype, &self.bootstrap_servers)
+                        .await
+                        .ok()
+                        .filter(|fr| !fr.ips.is_empty() && !fr.nxdomain)
+                } else {
+                    None
+                };
+                match fb {
+                    Some(fr) => {
+                        res_ttl = fr.min_ttl;
+                        Arc::new(fr.ips)
+                    }
+                    None => {
+                        self.cache_store_negative(key);
+                        return Err(Error::Dns(format!("域名 {domain} 不存在 (NXDOMAIN)")));
+                    }
+                }
+            }
+            Ok(r) => {
+                res_ttl = r.min_ttl;
+                let ips = Arc::new(r.ips);
                 // 4. 污染检测（CIDR 污染网段 / 非 CN GeoIP 污染剔除）
                 let mut poisoned = false;
                 if let Some(ref ff) = self.fallback_filter {
@@ -790,7 +911,10 @@ impl Resolver {
                     )
                     .await
                     {
-                        Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
+                        Ok(f) if !f.ips.is_empty() && !f.nxdomain => {
+                            res_ttl = f.min_ttl;
+                            Arc::new(f.ips)
+                        }
                         _ => ips,
                     }
                 } else {
@@ -807,7 +931,10 @@ impl Resolver {
                     )
                     .await
                     {
-                        Ok(f_ips) if !f_ips.is_empty() => Arc::new(f_ips),
+                        Ok(f) if !f.ips.is_empty() && !f.nxdomain => {
+                            res_ttl = f.min_ttl;
+                            Arc::new(f.ips)
+                        }
                         _ => {
                             // 主 DNS 与 fallback 均未查得有效 IP，平滑降级系统解析
                             if let Ok(sys_ips) = self.system_lookup(domain).await {
@@ -833,7 +960,7 @@ impl Resolver {
             }
         };
 
-        self.cache_store(key, ips.clone());
+        self.cache_store(key, ips.clone(), res_ttl);
         Ok(ips)
     }
 
@@ -848,7 +975,10 @@ impl Resolver {
             let c = self.cache.lock().unwrap();
             if let Some(e) = c.map.get(&key) {
                 if e.at.elapsed() < Duration::from_secs(e.ttl.max(MIN_TTL) as u64) {
-                    return Ok(e.ips.clone());
+                    return match &e.ips {
+                        Some(ips) => Ok(ips.clone()),
+                        None => Err(Error::Dns(format!("节点域名 {domain} 不存在（负缓存）"))),
+                    };
                 }
             }
         }
@@ -867,10 +997,10 @@ impl Resolver {
                     skip_verify: false,
                 })
                 .collect();
-            if let Ok(ips) = Self::query_servers(&udp_servers, domain, qtype, &[]).await {
-                if !ips.is_empty() {
-                    let ips = Arc::new(ips);
-                    self.cache_store(key, ips.clone());
+            if let Ok(r) = Self::query_servers(&udp_servers, domain, qtype, &[]).await {
+                if !r.ips.is_empty() {
+                    let ips = Arc::new(r.ips);
+                    self.cache_store(key, ips.clone(), r.min_ttl);
                     return Ok(ips);
                 }
             }
@@ -878,23 +1008,36 @@ impl Resolver {
         // 降级使用系统快速并发解析
         let ips = self.system_lookup(domain).await?;
         if !ips.is_empty() {
-            self.cache_store(key, ips.clone());
+            self.cache_store(key, ips.clone(), MIN_TTL);
             return Ok(ips);
         }
         Err(Error::Dns(format!("节点域名 {domain} 未解析到有效 IP")))
     }
 
-    fn cache_store(&self, key: (String, bool), ips: Arc<Vec<IpAddr>>) {
+    fn cache_store(&self, key: (String, bool), ips: Arc<Vec<IpAddr>>, ttl: u32) {
         let mut c = self.cache.lock().unwrap();
-        if c.map.len() >= CACHE_CAP {
-            c.map.clear();
-        }
+        evict_cache(&mut c.map, 1);
+        // 存储上游真实 TTL（钳制在 [MIN_TTL, MAX_TTL] 区间）
         c.map.insert(
             key,
             CacheEntry {
-                ips,
+                ips: Some(ips),
                 at: Instant::now(),
-                ttl: MIN_TTL,
+                ttl: ttl.clamp(MIN_TTL, MAX_TTL),
+            },
+        );
+    }
+
+    /// 负缓存：权威 NXDOMAIN 写入，短 TTL 内同域名查询直接快速失败
+    fn cache_store_negative(&self, key: (String, bool)) {
+        let mut c = self.cache.lock().unwrap();
+        evict_cache(&mut c.map, 1);
+        c.map.insert(
+            key,
+            CacheEntry {
+                ips: None,
+                at: Instant::now(),
+                ttl: NEG_TTL,
             },
         );
     }
@@ -961,13 +1104,13 @@ impl Resolver {
         domain: &str,
         qtype: QType,
         bootstrap: &[SocketAddr],
-    ) -> Result<Vec<IpAddr>> {
+    ) -> Result<Resolved> {
         if servers.is_empty() {
             return Err(Error::Dns("无可用 DNS 服务器".into()));
         }
         if servers.len() == 1 {
             return match query_server(&servers[0], domain, qtype, bootstrap).await {
-                Ok(ips) if !ips.is_empty() => Ok(ips),
+                Ok(r) if !r.ips.is_empty() || r.nxdomain => Ok(r),
                 Ok(_) => Err(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录"))),
                 Err(e) => Err(e),
             };
@@ -983,11 +1126,14 @@ impl Resolver {
             set.spawn(async move { (idx, query_server(&server, &domain, qtype, &bs).await) });
         }
 
-        let mut merged: Vec<(usize, Vec<IpAddr>)> = Vec::new();
+        let mut merged: Vec<(usize, Resolved)> = Vec::new();
         let mut last_err = None;
         while let Some(res) = set.join_next().await {
             match res {
-                Ok((idx, Ok(ips))) if !ips.is_empty() => merged.push((idx, ips)),
+                Ok((idx, Ok(r))) if !r.ips.is_empty() => merged.push((idx, r)),
+                Ok((_, Ok(r))) if r.nxdomain => {
+                    last_err = Some(Error::Dns(format!("域名 {domain} 不存在 (NXDOMAIN)")))
+                }
                 Ok((_, Ok(_))) => {
                     last_err = Some(Error::Dns(format!("域名 {domain} 无 {qtype:?} 记录")))
                 }
@@ -1001,14 +1147,24 @@ impl Resolver {
         merged.sort_by_key(|(idx, _)| *idx);
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for (_, ips) in merged {
-            for ip in ips {
+        let mut min_ttl = u32::MAX;
+        for (_, r) in merged {
+            for ip in r.ips {
                 if seen.insert(ip) {
                     out.push(ip);
                 }
             }
+            min_ttl = min_ttl.min(r.min_ttl);
         }
-        Ok(out)
+        Ok(Resolved {
+            ips: out,
+            min_ttl: if min_ttl == u32::MAX {
+                MIN_TTL
+            } else {
+                min_ttl
+            },
+            nxdomain: false,
+        })
     }
 
     async fn system_lookup(&self, domain: &str) -> Result<Arc<Vec<IpAddr>>> {
@@ -1242,17 +1398,39 @@ async fn query_server(
     domain: &str,
     qtype: QType,
     bootstrap: &[SocketAddr],
-) -> Result<Vec<IpAddr>> {
+) -> Result<Resolved> {
     let mut current_domain = domain.to_string();
     let mut hops = 0;
     loop {
         let msg = query_server_raw(server, &current_domain, qtype, bootstrap).await?;
+        if msg.rcode == 3 {
+            // 权威 NXDOMAIN：域名确认不存在，供上层负缓存
+            return Ok(Resolved {
+                ips: Vec::new(),
+                min_ttl: NEG_TTL,
+                nxdomain: true,
+            });
+        }
         if msg.rcode != 0 {
             return Err(Error::Dns(format!("DNS 错误码 {}", msg.rcode)));
         }
         let ips = wire::extract_ips(&msg, qtype.code());
         if !ips.is_empty() {
-            return Ok(ips.into_iter().map(|(ip, _)| ip).collect());
+            let mut out = Vec::with_capacity(ips.len());
+            let mut min_ttl = u32::MAX;
+            for (ip, ttl) in ips {
+                min_ttl = min_ttl.min(ttl);
+                out.push(ip);
+            }
+            return Ok(Resolved {
+                ips: out,
+                min_ttl: if min_ttl == u32::MAX {
+                    MIN_TTL
+                } else {
+                    min_ttl
+                },
+                nxdomain: false,
+            });
         }
         // 如果应答中只有 CNAME 且没有目标 IP，继续递归跟踪 CNAME
         if let Some(cname) = wire::extract_cname(&msg) {
@@ -1263,7 +1441,11 @@ async fn query_server(
             current_domain = cname;
             continue;
         }
-        return Ok(Vec::new());
+        return Ok(Resolved {
+            ips: Vec::new(),
+            min_ttl: MIN_TTL,
+            nxdomain: false,
+        });
     }
 }
 
@@ -1343,32 +1525,94 @@ async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
     wire::parse_response(&resp).ok_or(Error::Proto("DNS 响应解析失败"))
 }
 
-/// DoT（RFC 7858）：TLS 上的 DNS，2 字节长度前缀帧
+/// DoH/DoT 共用 TLS 流类型
+type DnsTlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+
+// ---------------------------------------------------------------------------
+// DoH/DoT 长连接池：按 endpoint 复用 TLS 会话，消除每查询一次完整 TCP+TLS 握手
+// ---------------------------------------------------------------------------
+
+/// 空闲连接存活时长（超过即丢弃，交由服务端/内核自然回收）
+const POOL_IDLE_TTL: Duration = Duration::from_secs(120);
+/// 单 endpoint 最大空闲连接数
+const POOL_MAX_IDLE: usize = 4;
+
+type PoolMap = HashMap<String, Vec<(DnsTlsStream, Instant)>>;
+
+static CONN_POOL: std::sync::OnceLock<Mutex<PoolMap>> = std::sync::OnceLock::new();
+
+/// 从池中取出一条未过期的空闲连接
+fn pool_take(key: &str) -> Option<DnsTlsStream> {
+    let mut m = CONN_POOL.get_or_init(Default::default).lock().unwrap();
+    let now = Instant::now();
+    let vec = m.get_mut(key)?;
+    while let Some((stream, at)) = vec.pop() {
+        if now.duration_since(at) < POOL_IDLE_TTL {
+            return Some(stream);
+        }
+        // 过期连接直接丢弃（Drop 即关闭底层 TLS/TCP）
+    }
+    None
+}
+
+/// 归还连接入池（超限直接丢弃）
+fn pool_put(key: &str, stream: DnsTlsStream) {
+    let mut m = CONN_POOL.get_or_init(Default::default).lock().unwrap();
+    let vec = m.entry(key.to_string()).or_default();
+    if vec.len() >= POOL_MAX_IDLE {
+        return;
+    }
+    vec.push((stream, Instant::now()));
+}
+
+/// DoT（RFC 7858）：TLS 上的 DNS，2 字节长度前缀帧。
+/// 长连接池复用：消除每查询一次完整 TCP+TLS 握手的延迟与 CPU 开销。
 async fn query_tls(
     addr: SocketAddr,
     sni_host: &str,
     domain: &str,
     qtype: QType,
 ) -> Result<wire::Message> {
-    use tokio::io::AsyncWriteExt;
+    let key = format!("dot|{sni_host}|{addr}");
+    // 复用空闲长连接；若服务端已静默回收（写入/读取失败）则落回新拨重试
+    if let Some(mut tls) = pool_take(&key) {
+        match dot_query_on(&mut tls, domain, qtype).await {
+            Ok(msg) => {
+                pool_put(&key, tls);
+                return Ok(msg);
+            }
+            Err(_) => drop(tls),
+        }
+    }
+    let mut tls = dial_dot(addr, sni_host).await?;
+    let msg = dot_query_on(&mut tls, domain, qtype).await?;
+    pool_put(&key, tls);
+    Ok(msg)
+}
 
+async fn dial_dot(addr: SocketAddr, sni_host: &str) -> Result<DnsTlsStream> {
     let connector = webpki_connector(false);
     let sni = server_name(sni_host, addr.ip())?;
     // DoT 上游必须走绑卡拨号：裸 connect 在 auto-route 下会流回 TUN 自己（回环）
-    let tcp = connect_tcp_bound(addr).await?;
-    let mut tls = connector.connect(sni, tcp).await?;
+    let tcp = with_timeout(connect_tcp_bound(addr)).await?;
+    with_timeout(connector.connect(sni, tcp)).await
+}
+
+/// 在已建立的 DoT 长连接上执行单次查询（长度前缀帧，逐帧精确消费，天然可复用）
+async fn dot_query_on(tls: &mut DnsTlsStream, domain: &str, qtype: QType) -> Result<wire::Message> {
+    use tokio::io::AsyncWriteExt;
 
     let id = query_id();
     let q = wire::build_query(id, domain, qtype);
     let mut framed = Vec::with_capacity(q.len() + 2);
     framed.extend_from_slice(&(q.len() as u16).to_be_bytes());
     framed.extend_from_slice(&q);
-    tls.write_all(&framed).await?;
+    with_timeout(tls.write_all(&framed)).await?;
     let mut len_buf = [0u8; 2];
-    with_timeout(stream_read_exact(&mut tls, &mut len_buf)).await?;
+    with_timeout(stream_read_exact(tls, &mut len_buf)).await?;
     let len = u16::from_be_bytes(len_buf) as usize;
     let mut resp = vec![0u8; len];
-    with_timeout(stream_read_exact(&mut tls, &mut resp)).await?;
+    with_timeout(stream_read_exact(tls, &mut resp)).await?;
     wire::parse_response(&resp).ok_or(Error::Proto("DoT 响应解析失败"))
 }
 
@@ -1479,21 +1723,54 @@ async fn query_doh(
     qtype: QType,
     bootstrap: &[SocketAddr],
 ) -> Result<wire::Message> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // 1) 解析 DoH 服务器自身（优先使用 bootstrap-nameserver，避免系统 DNS 劫持死锁）
     let addr: SocketAddr = match server.addr {
         Some(a) => a,
         None => resolve_bootstrap(&server.host, server.port, bootstrap).await?,
     };
+    let key = format!(
+        "doh|{}|{}|{}|{}",
+        server.host, server.port, server.skip_verify, server.path
+    );
 
-    // 2) TLS —— DoH 上游同样必须走绑卡拨号（裸 connect 在 auto-route 下回环进 TUN）
+    // 2) 复用空闲长连接；服务端可能已静默回收（keep-alive 超时），失败则新拨重试一次
+    if let Some(mut tls) = pool_take(&key) {
+        match doh_query_on(&mut tls, server, domain, qtype).await {
+            Ok((msg, reusable)) => {
+                if reusable {
+                    pool_put(&key, tls);
+                }
+                return Ok(msg);
+            }
+            Err(_) => drop(tls), // 复用连接失效：落回新拨
+        }
+    }
+    let mut tls = dial_doh(server, addr).await?;
+    let (msg, reusable) = doh_query_on(&mut tls, server, domain, qtype).await?;
+    if reusable {
+        pool_put(&key, tls);
+    }
+    Ok(msg)
+}
+
+/// 拨号并完成 TLS 握手（DoH 上游同样必须走绑卡拨号：裸 connect 在 auto-route 下回环进 TUN）
+async fn dial_doh(server: &ServerAddr, addr: SocketAddr) -> Result<DnsTlsStream> {
     let connector = webpki_connector(server.skip_verify);
     let sni = server_name(&server.host, addr.ip())?;
     let tcp = with_timeout(connect_tcp_bound(addr)).await?;
-    let mut tls = with_timeout(connector.connect(sni, tcp)).await?;
+    with_timeout(connector.connect(sni, tcp)).await
+}
 
-    // 3) HTTP/1.1 POST（application/dns-message）
+/// 在已建立的 DoH 连接上执行单次 HTTP/1.1 查询。
+/// 返回 (DNS 消息, 连接是否可复用)；服务端声明 Connection: close 时不可复用。
+async fn doh_query_on(
+    tls: &mut DnsTlsStream,
+    server: &ServerAddr,
+    domain: &str,
+    qtype: QType,
+) -> Result<(wire::Message, bool)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let id = query_id();
     let q = wire::build_query(id, domain, qtype);
     let host_header = if server.port == 443 {
@@ -1501,8 +1778,9 @@ async fn query_doh(
     } else {
         format!("{}:{}", server.host, server.port)
     };
+    // keep-alive 请求：连接查询后归还连接池复用
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
         server.path,
         q.len()
     );
@@ -1510,7 +1788,7 @@ async fn query_doh(
     tls.write_all(&q).await?;
     tls.flush().await?;
 
-    // 4) 读响应头 + body
+    // 读响应头 + body
     let mut head = Vec::with_capacity(1024);
     let mut byte = [0u8; 1];
     loop {
@@ -1530,9 +1808,13 @@ async fn query_doh(
     if status != 200 {
         return Err(Error::Dns(format!("DoH: HTTP {status}")));
     }
-    let body = read_http_body(&mut tls, &headers).await?;
+    let reusable = !headers
+        .iter()
+        .any(|(k, v)| k == "connection" && v.to_ascii_lowercase().contains("close"));
+    let body = read_http_body(tls, &headers).await?;
 
-    wire::parse_response(&body).ok_or(Error::Proto("DoH: DNS 消息解析失败"))
+    let msg = wire::parse_response(&body).ok_or(Error::Proto("DoH: DNS 消息解析失败"))?;
+    Ok((msg, reusable))
 }
 
 /// 解析 HTTP/1.1 响应头：返回 (状态码, 小写头名 → 值)

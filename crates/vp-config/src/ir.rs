@@ -850,6 +850,25 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
             },
             TransportSpec::default(),
         ),
+        ProxyKind::Masque(m) => (
+            OutboundKind::Masque {
+                server: m.server,
+                port: m.port,
+                private_key: m.private_key,
+                public_key: m.public_key,
+                ip: m.ip,
+                ipv6: m.ipv6,
+                uri: m.uri,
+                sni: m.sni,
+                mtu: m.mtu,
+                udp: m.udp,
+                remote_dns_resolve: m.remote_dns_resolve,
+                dns: m.dns,
+                skip_cert_verify: m.skip_cert_verify,
+                network: m.network,
+            },
+            TransportSpec::default(),
+        ),
         ProxyKind::Snell(s) => (
             OutboundKind::Snell {
                 server: s.server,
@@ -1512,6 +1531,37 @@ impl From<OutboundSpec> for ProxyCfg {
                 state_dir,
                 udp: true,
             }),
+            OutboundKind::Masque {
+                server,
+                port,
+                private_key,
+                public_key,
+                ip,
+                ipv6,
+                uri,
+                sni,
+                mtu,
+                udp,
+                remote_dns_resolve,
+                dns,
+                skip_cert_verify,
+                network,
+            } => ProxyKind::Masque(MasqueCfg {
+                server,
+                port,
+                private_key,
+                public_key,
+                ip,
+                ipv6,
+                uri,
+                sni,
+                mtu,
+                udp,
+                remote_dns_resolve,
+                dns,
+                skip_cert_verify,
+                network,
+            }),
             OutboundKind::Snell {
                 server,
                 port,
@@ -1716,5 +1766,57 @@ rules:
         assert_eq!(ir.routes.len(), 2);
         assert_eq!(ir.groups[0].name, "PROXY");
         assert_eq!(ir.routes[0].target, "PROXY");
+    }
+
+    #[test]
+    fn test_masque_yaml_and_ir_roundtrip() {
+        let yaml = r#"
+proxies:
+  - name: "WARP-MASQUE"
+    type: masque
+    server: 162.159.199.2
+    port: 443
+    private-key: "sample_priv_key"
+    public-key: "sample_pub_key"
+    ip: "172.16.0.2"
+    ipv6: "2606:4700:110::1"
+    mtu: 1280
+    udp: true
+    remote-dns-resolve: true
+"#;
+        let cfg = parse(yaml, Format::Yaml).expect("parse masque yaml");
+        assert_eq!(cfg.proxies.len(), 1);
+        let p = &cfg.proxies[0];
+        assert_eq!(p.name, "WARP-MASQUE");
+        match &p.kind {
+            crate::ProxyKind::Masque(m) => {
+                assert_eq!(m.server, "162.159.199.2");
+                assert_eq!(m.port, 443);
+                assert_eq!(m.private_key, "sample_priv_key");
+                assert_eq!(m.public_key.as_deref(), Some("sample_pub_key"));
+                assert_eq!(m.ip.as_deref(), Some("172.16.0.2"));
+                assert_eq!(m.ipv6.as_deref(), Some("2606:4700:110::1"));
+                assert_eq!(m.mtu, Some(1280));
+                assert!(m.udp);
+                assert!(m.remote_dns_resolve);
+            }
+            other => panic!("expected masque, got {other:?}"),
+        }
+
+        let ir = cfg.into_ir().expect("into_ir");
+        let ob = ir
+            .outbounds
+            .iter()
+            .find(|o| o.name == "WARP-MASQUE")
+            .unwrap();
+        assert!(matches!(ob.kind, vp_ir::OutboundKind::Masque { .. }));
+
+        let back_cfg = crate::Config::from(ir);
+        let back_p = back_cfg
+            .proxies
+            .iter()
+            .find(|o| o.name == "WARP-MASQUE")
+            .unwrap();
+        assert_eq!(back_p.kind.type_name(), "masque");
     }
 }

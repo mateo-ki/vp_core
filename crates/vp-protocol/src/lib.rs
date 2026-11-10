@@ -12,6 +12,8 @@ pub mod h3_min;
 pub mod hysteria;
 pub mod hysteria2;
 pub mod inbound;
+pub mod ip_stack;
+pub mod masque;
 pub mod mieru;
 pub mod naive;
 pub mod redir;
@@ -414,10 +416,16 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
             cfg.name.as_str(),
             ts,
         )?),
+        ProxyKind::Masque(m) => Arc::new(masque::MasqueOutbound::new_named(
+            cfg.name.as_str(),
+            m,
+            deps.dns.clone(),
+        )?),
     };
     // udp-over-tcp（UoT）：流型协议出站的 UDP 包装
     let o = match cfg.kind {
         ProxyKind::Wireguard(_)
+        | ProxyKind::Masque(_)
         | ProxyKind::Hysteria(_)
         | ProxyKind::Hysteria2(_)
         | ProxyKind::Tuic(_)
@@ -430,6 +438,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
     // smux 多路复用包装（仅流型协议出站生效）
     let o = match cfg.kind {
         ProxyKind::Wireguard(_)
+        | ProxyKind::Masque(_)
         | ProxyKind::Hysteria(_)
         | ProxyKind::Hysteria2(_)
         | ProxyKind::Tuic(_)

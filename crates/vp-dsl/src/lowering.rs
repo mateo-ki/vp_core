@@ -715,6 +715,72 @@ fn lower_node(
                 exit_node_allow_lan: false,
             }
         }
+        "masque" => {
+            let private_key = map
+                .get("private_key")
+                .or_else(|| map.get("private-key"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "masque 节点缺少 private_key".to_string())?
+                .to_string();
+            let public_key = map
+                .get("public_key")
+                .or_else(|| map.get("public-key"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let ip = map
+                .get("ip")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let ipv6 = map
+                .get("ipv6")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let uri = map
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let sni = map
+                .get("sni")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let mtu = map.get("mtu").and_then(|v| v.as_u16());
+            let udp = map.get("udp").and_then(|v| v.as_bool()).unwrap_or(true);
+            let remote_dns_resolve = map
+                .get("remote_dns_resolve")
+                .or_else(|| map.get("remote-dns-resolve"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let dns = map
+                .get("dns")
+                .and_then(|v| v.as_str_list())
+                .unwrap_or_default();
+            let skip_cert_verify = map
+                .get("skip_cert_verify")
+                .or_else(|| map.get("skip-cert-verify"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let network = map
+                .get("network")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+
+            OutboundKind::Masque {
+                server,
+                port,
+                private_key,
+                public_key,
+                ip,
+                ipv6,
+                uri,
+                sni,
+                mtu,
+                udp,
+                remote_dns_resolve,
+                dns,
+                skip_cert_verify,
+                network,
+            }
+        }
         "snell" => {
             let psk = map
                 .get("psk")

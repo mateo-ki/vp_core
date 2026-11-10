@@ -852,6 +852,7 @@ pub enum ProxyKind {
     Https(HttpCfg),
     Wireguard(WgCfg),
     Tailscale(TailscaleCfg),
+    Masque(MasqueCfg),
     Direct,
     Reject,
 }
@@ -879,6 +880,7 @@ impl ProxyKind {
             ProxyKind::Https(_) => "https",
             ProxyKind::Wireguard(_) => "wireguard",
             ProxyKind::Tailscale(_) => "tailscale",
+            ProxyKind::Masque(_) => "masque",
             ProxyKind::Direct => "direct",
             ProxyKind::Reject => "reject",
         }
@@ -905,6 +907,7 @@ impl ProxyKind {
             ProxyKind::Http(h) | ProxyKind::Https(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Wireguard(w) => Some((w.server.clone(), w.port)),
             ProxyKind::Tailscale(t) => Some((t.server.clone(), t.port)),
+            ProxyKind::Masque(m) => Some((m.server.clone(), m.port)),
             ProxyKind::Direct | ProxyKind::Reject => None,
         }
     }
@@ -932,6 +935,7 @@ impl ProxyKind {
             ProxyKind::Http(_) | ProxyKind::Https(_) => false,
             ProxyKind::Wireguard(_) => true,
             ProxyKind::Tailscale(t) => t.udp,
+            ProxyKind::Masque(m) => m.udp,
             ProxyKind::Direct => true,
             ProxyKind::Reject => false,
         }
@@ -1585,6 +1589,47 @@ fn default_tailscale_server() -> String {
 
 fn default_tailscale_port() -> u16 {
     1055
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MasqueCfg {
+    pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
+    pub port: u16,
+    #[serde(alias = "private-key", alias = "private_key")]
+    pub private_key: String,
+    #[serde(alias = "public-key", alias = "public_key", default)]
+    pub public_key: Option<String>,
+    #[serde(default)]
+    pub ip: Option<String>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub uri: Option<String>,
+    #[serde(default, alias = "server_name", alias = "server-name", alias = "servername")]
+    pub sni: Option<String>,
+    #[serde(default, deserialize_with = "de_opt_u16_lenient")]
+    pub mtu: Option<u16>,
+    #[serde(default = "default_true", deserialize_with = "de_bool_lenient")]
+    pub udp: bool,
+    #[serde(
+        default,
+        alias = "remote_dns_resolve",
+        alias = "remote-dns-resolve",
+        deserialize_with = "de_bool_lenient"
+    )]
+    pub remote_dns_resolve: bool,
+    #[serde(default)]
+    pub dns: Vec<String>,
+    #[serde(
+        default,
+        alias = "skip_cert_verify",
+        alias = "skip-cert-verify",
+        deserialize_with = "de_bool_lenient"
+    )]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

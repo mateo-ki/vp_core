@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.7.3"
+version = "1.7.4"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -114,8 +114,9 @@ maxminddb = { version = "0.24", features = ["mmap"] }
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
 
-# CLI
+# CLI / MASQUE 注册器
 ureq = { version = "2", features = ["tls"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
 clap = { version = "4", features = ["derive", "std", "help", "usage", "error-context"] }
 
 # 插件宿主

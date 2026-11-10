@@ -1,3 +1,24 @@
+# 🚀 VP_Core v1.7.4 发布说明 / Release Notes：支持 MASQUE (Cloudflare WARP) 协议与纯 Rust 用户态网络栈
+
+> **“RFC 9484 CONNECT-IP 胶囊通道、P-256 双向 mTLS、解耦独立的纯 Rust 用户态 smoltcp 驱动器——现代代理协议版图再下一城。”**
+>
+> 🎉 欢迎使用 **VP_Core v1.7.4**！本版本正式引入了对 **MASQUE 协议（Cloudflare WARP MASQUE 模式，RFC 9297 / 9298 / 9484）** 的原生支持。从协议握手、P-256 自签名客户端证书动态签发、服务端公钥 Pinning 校验，到 HTTP/3 控制流与 Extended CONNECT 路由宣告，再到下沉的纯 Rust 用户态网络栈，全链路实现 100% 内存安全闭环，并经过全部 57 个真实订阅 WARP 节点以及四项数据面生命周期深度审计加固。
+
+### 🌟 核心更新全览 (Highlights)
+
+| 类别 | 内容 | 收益 |
+| :--- | :--- | :--- |
+| **MASQUE 协议原生支持** | 完整实现 RFC 9297/9298 HTTP Datagram + RFC 9484 CONNECT-IP (`:protocol = cf-connect-ip`) | 无缝支持 Cloudflare WARP 官方与第三方 MASQUE 出站代理节点 |
+| **P-256 双向 mTLS 认证** | 支持 SEC1/PKCS#8 私钥解析、动态签发客户端 X.509 自签名证书与 SPKI 证书公钥比对校验 | 完美对齐 Cloudflare WARP 身份认证规范与 Mihomo/Clash MASQUE 格式 |
+| **纯 Rust 用户态协议栈 (`ip_stack`)** | 基于 `smoltcp` 解耦出独立的虚拟 IP 驱动栈（支持 `172.16.0.2` 及 IPv6），事件驱动注入与读取 | 免操作系统 TUN 网卡权限即可在用户态完成四层 TCP/UDP 代理转换，统一赋能 WireGuard 与 MASQUE |
+| **配置、IR 与 DSL 100% 往返** | `vp-config` / `vp-ir` / `vp-dsl` 全链路支持 `masque` 类型，支持短横线与下划线别名及驼峰字段 | 25821 节点全量订阅库中的全部 57 个真实 MASQUE 节点反序列化与 DSL 往返编译 100% 通过 |
+| **数据面生命周期深度加固** | 持有 Quinn Endpoint 与关键单向/双向流句柄，彻底根除提前 Drop 导致的 `H3_CLOSED_CRITICAL_STREAM` (0x0104) 强断 | 解决长期连接被对端主动发送重置的致命生命周期 Bug |
+| **异步 DNS 动态解析** | 网关连接自动兼容纯 IP 与域名（支持 `engage.cloudflareclient.com` 等） | 用户无需预先解析 IP，支持官方域名与优选 IP 混合配置 |
+| **事件驱动收发包引擎** | 引入 `Notify` 同步信号替代 1ms 定时器空转轮询，配合 50ms 兜底防竞态 | 数据面待发报文即时唤醒转发，CPU 空转能耗降至趋零 |
+| **双向流保活与排空** | 持续异步读取 Stream 0 响应数据并捕获远端 Capsule 宣告与正常断流信号 | 杜绝流控窗口枯竭与悬挂连接 |
+
+---
+
 # 🚀 VP_Core v1.7.3 发布说明 / Release Notes：决策面优化与大规模测试加固
 
 > **"分流决策的每一微秒、LB 会话的每一次漂移、规则引擎的每一次分配——这次都用大规模测试砸出来了真问题。"**

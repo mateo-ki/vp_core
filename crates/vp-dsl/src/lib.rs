@@ -243,4 +243,74 @@ route {
         let formatted = format_dsl(original_dsl).expect("format_dsl 应当成功");
         assert_eq!(formatted, generated_dsl);
     }
+
+    #[test]
+    fn test_masque_node_dsl_roundtrip() {
+        let script = r#"
+node "warp-masque" masque {
+    server: "162.159.199.2"
+    port: 443
+    private_key: "priv_key_example"
+    public_key: "pub_key_example"
+    ip: "172.16.0.2"
+    ipv6: "2606:4700:110::1"
+    uri: "https://cloudflareaccess.com"
+    sni: "consumer-masque.cloudflareclient.com"
+    mtu: 1280
+    udp: true
+    remote_dns_resolve: true
+    dns: ["1.1.1.1", "2606:4700:4700::1111"]
+    skip_cert_verify: true
+}
+"#;
+        let ir = parse(script).expect("解析 masque 节点成功");
+        let node = ir
+            .outbounds
+            .iter()
+            .find(|o| o.name == "warp-masque")
+            .unwrap();
+        match &node.kind {
+            vp_ir::OutboundKind::Masque {
+                server,
+                port,
+                private_key,
+                public_key,
+                ip,
+                ipv6,
+                uri,
+                sni,
+                mtu,
+                udp,
+                remote_dns_resolve,
+                dns,
+                skip_cert_verify,
+                ..
+            } => {
+                assert_eq!(server, "162.159.199.2");
+                assert_eq!(*port, 443);
+                assert_eq!(private_key, "priv_key_example");
+                assert_eq!(public_key.as_deref(), Some("pub_key_example"));
+                assert_eq!(ip.as_deref(), Some("172.16.0.2"));
+                assert_eq!(ipv6.as_deref(), Some("2606:4700:110::1"));
+                assert_eq!(uri.as_deref(), Some("https://cloudflareaccess.com"));
+                assert_eq!(sni.as_deref(), Some("consumer-masque.cloudflareclient.com"));
+                assert_eq!(*mtu, Some(1280));
+                assert!(*udp);
+                assert!(*remote_dns_resolve);
+                assert_eq!(dns.len(), 2);
+                assert!(*skip_cert_verify);
+            }
+            other => panic!("expected masque, got {other:?}"),
+        }
+
+        let dsl = ir_to_dsl(&ir);
+        assert!(dsl.contains("node \"warp-masque\" masque {"));
+        assert!(dsl.contains("server: \"162.159.199.2\""));
+        assert!(dsl.contains("private_key: \"priv_key_example\""));
+        assert!(dsl.contains("public_key: \"pub_key_example\""));
+        assert!(dsl.contains("dns: [\"1.1.1.1\", \"2606:4700:4700::1111\"]"));
+
+        let roundtrip_ir = parse(&dsl).expect("往返解析 masque 成功");
+        assert_eq!(roundtrip_ir.outbounds.len(), ir.outbounds.len());
+    }
 }

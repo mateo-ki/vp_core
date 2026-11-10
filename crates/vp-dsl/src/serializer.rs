@@ -208,6 +208,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
         OutboundKind::Tuic { .. } => "tuic",
         OutboundKind::Wireguard { .. } => "wireguard",
         OutboundKind::Tailscale { .. } => "tailscale",
+        OutboundKind::Masque { .. } => "masque",
         OutboundKind::Snell { .. } => "snell",
         OutboundKind::Anytls { .. } => "anytls",
         OutboundKind::Ssh { .. } => "ssh",
@@ -397,6 +398,67 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             }
             if *udp {
                 out.push_str("    udp: true\n");
+            }
+        }
+        OutboundKind::Masque {
+            server,
+            port,
+            private_key,
+            public_key,
+            ip,
+            ipv6,
+            uri,
+            sni,
+            mtu,
+            udp,
+            remote_dns_resolve,
+            dns,
+            skip_cert_verify,
+            network,
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            out.push_str(&format!(
+                "    private_key: \"{}\"\n",
+                escape_str(private_key)
+            ));
+            if let Some(pk) = public_key {
+                out.push_str(&format!("    public_key: \"{}\"\n", escape_str(pk)));
+            }
+            if let Some(v4) = ip {
+                out.push_str(&format!("    ip: \"{}\"\n", escape_str(v4)));
+            }
+            if let Some(v6) = ipv6 {
+                out.push_str(&format!("    ipv6: \"{}\"\n", escape_str(v6)));
+            }
+            if let Some(u) = uri {
+                out.push_str(&format!("    uri: \"{}\"\n", escape_str(u)));
+            }
+            if let Some(s) = sni {
+                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
+            }
+            if let Some(m) = mtu {
+                out.push_str(&format!("    mtu: {m}\n"));
+            }
+            if *udp {
+                out.push_str("    udp: true\n");
+            }
+            if *remote_dns_resolve {
+                out.push_str("    remote_dns_resolve: true\n");
+            }
+            if !dns.is_empty() {
+                let list = dns
+                    .iter()
+                    .map(|s| format!("\"{}\"", escape_str(s)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("    dns: [{list}]\n"));
+            }
+            if *skip_cert_verify {
+                out.push_str("    skip_cert_verify: true\n");
+            }
+            if let Some(net) = network {
+                out.push_str(&format!("    network: \"{}\"\n", escape_str(net)));
             }
         }
         OutboundKind::Socks5 {

@@ -192,6 +192,22 @@ pub enum OutboundKind {
         insecure: bool,
         headers: HashMap<String, String>,
     },
+    Masque {
+        server: String,
+        port: u16,
+        private_key: String,
+        public_key: Option<String>,
+        ip: Option<String>,
+        ipv6: Option<String>,
+        uri: Option<String>,
+        sni: Option<String>,
+        mtu: Option<u16>,
+        udp: bool,
+        remote_dns_resolve: bool,
+        dns: Vec<String>,
+        skip_cert_verify: bool,
+        network: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

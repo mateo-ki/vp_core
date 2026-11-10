@@ -50,8 +50,11 @@ hmac.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
+p256.workspace = true
 serde_yaml.workspace = true
 regex.workspace = true
+rcgen.workspace = true
 
 [dev-dependencies]
 vp-router.workspace = true

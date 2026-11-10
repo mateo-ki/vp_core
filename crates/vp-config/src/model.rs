@@ -1606,7 +1606,12 @@ pub struct MasqueCfg {
     pub ipv6: Option<String>,
     #[serde(default)]
     pub uri: Option<String>,
-    #[serde(default, alias = "server_name", alias = "server-name", alias = "servername")]
+    #[serde(
+        default,
+        alias = "server_name",
+        alias = "server-name",
+        alias = "servername"
+    )]
     pub sni: Option<String>,
     #[serde(default, deserialize_with = "de_opt_u16_lenient")]
     pub mtu: Option<u16>,

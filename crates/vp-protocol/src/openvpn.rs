@@ -423,7 +423,7 @@ fn openvpn_prf(
         seed.extend_from_slice(ss);
     }
 
-    let split = (secret.len() + 1) / 2;
+    let split = secret.len().div_ceil(2);
     let s1 = &secret[..split];
     let s2 = &secret[secret.len() - split..];
 
@@ -1289,10 +1289,9 @@ async fn handshake(
     let sni: rustls::pki_types::ServerName<'static> = match &params.sni {
         Some(s) => rustls::pki_types::ServerName::try_from(s.clone())
             .map_err(|_| Error::Config("openvpn: sni 非法".into()))?,
-        None => rustls::pki_types::ServerName::IpAddress(
-            rustls::pki_types::IpAddr::try_from(params.server_ip)
-                .map_err(|_| Error::Config("openvpn: 服务器地址非法".into()))?,
-        ),
+        None => rustls::pki_types::ServerName::IpAddress(rustls::pki_types::IpAddr::from(
+            params.server_ip,
+        )),
     };
     let conn = rustls::ClientConnection::new(Arc::new(tls_cfg), sni)
         .map_err(|e| Error::Config(format!("openvpn TLS 配置: {e}")))?;
@@ -1471,13 +1470,10 @@ async fn handshake(
         flush_tls_out(tcp, session, &adapter).await?;
     }
     let push = push.unwrap();
-    let local_ip = push
-        .ifconfig_v4
-        .and_then(|ip| match ip {
-            IpAddr::V4(v4) => Some(v4),
-            _ => None,
-        })
-        .ok_or_else(|| Error::Proto("openvpn: 推送缺少 ifconfig 隧道地址".into()))?;
+    let local_ip = match push.ifconfig_v4 {
+        Some(IpAddr::V4(v4)) => v4,
+        _ => return Err(Error::Proto("openvpn: 推送缺少 ifconfig 隧道地址")),
+    };
 
     // 6. 协商数据密码 + 派生密钥
     let server_km2 = server_km2.unwrap();
@@ -1491,7 +1487,7 @@ async fn handshake(
         session
             .remote_sid
             .as_ref()
-            .ok_or_else(|| Error::Proto("openvpn: 缺服务器 session-id".into()))?,
+            .ok_or(Error::Proto("openvpn: 缺服务器 session-id"))?,
     );
     let cipher = push
         .data_ciphers
@@ -1499,7 +1495,9 @@ async fn handshake(
         .find_map(|c| DataCipher::parse(c))
         .or_else(|| push.cipher.as_deref().and_then(DataCipher::parse))
         .or_else(|| DataCipher::parse(&params.cipher))
-        .ok_or_else(|| Error::Proto("openvpn: 无支持的数据密码（仅支持 GCM/ChaCha20/CBC）"))?;
+        .ok_or(Error::Proto(
+            "openvpn: 无支持的数据密码（仅支持 GCM/ChaCha20/CBC）",
+        ))?;
     let crypt = DataCrypt::new(cipher, &km2_keys, push.peer_id, 0);
     Ok((crypt, local_ip))
 }
@@ -1664,11 +1662,8 @@ async fn drive_inbound(
     if session.remote_sid.is_none() {
         session.remote_sid = Some(c.session_id);
     }
-    match c.opcode {
-        P_CONTROL_V1 => {
-            adapter.rx.lock().unwrap().extend(c.payload.iter().copied());
-        }
-        _ => {}
+    if c.opcode == P_CONTROL_V1 {
+        adapter.rx.lock().unwrap().extend(c.payload.iter().copied());
     }
     flush_acks(tcp, session).await?;
     Ok(())

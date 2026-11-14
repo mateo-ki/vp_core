@@ -95,6 +95,7 @@ route {
 | `ss` | `server` `cipher` `password` | `plugin` 相关 |
 | `hysteria2` | `server` `password` | `sni`、`up` / `down`、`obfs_password` |
 | `tuic` | `server` `uuid` `password` | `sni`、`alpn` |
+| `juicity` | `server` `uuid` `password` | `sni`、`congestion_controller`、`pinned_cert_chain`（hex/base64 链哈希钉扎） |
 | `wireguard` | `server` `private_key` `public_key` `ip` | `mtu`、`dns`、`allowed_ips` |
 | `masque` | `server` `private_key` `public_key` `ip` | `ipv6`、`mtu`、`sni`、`uri` |
 | `ssh` | `server` + `password` 或 `private_key` | `username`、`host_key` |

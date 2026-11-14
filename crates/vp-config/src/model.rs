@@ -846,6 +846,7 @@ pub enum ProxyKind {
     Naive(NaiveCfg),
     Socks5(SocksCfg),
     Tuic(TuicCfg),
+    Juicity(JuicityCfg),
     Hysteria(Hysteria1Cfg),
     Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
@@ -876,6 +877,7 @@ impl ProxyKind {
             ProxyKind::Hysteria(_) => "hysteria",
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
+            ProxyKind::Juicity(_) => "juicity",
             ProxyKind::Http(_) => "http",
             ProxyKind::Https(_) => "https",
             ProxyKind::Wireguard(_) => "wireguard",
@@ -902,6 +904,7 @@ impl ProxyKind {
             ProxyKind::Naive(n) => Some((n.server.clone(), n.port)),
             ProxyKind::Socks5(s) => Some((s.server.clone(), s.port)),
             ProxyKind::Tuic(t) => Some((t.server.clone(), t.port)),
+            ProxyKind::Juicity(j) => Some((j.server.clone(), j.port)),
             ProxyKind::Hysteria(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Hysteria2(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Http(h) | ProxyKind::Https(h) => Some((h.server.clone(), h.port)),
@@ -930,6 +933,7 @@ impl ProxyKind {
             ProxyKind::Naive(n) => n.udp,
             ProxyKind::Socks5(s) => s.udp,
             ProxyKind::Tuic(_) => true,
+            ProxyKind::Juicity(_) => true,
             ProxyKind::Hysteria(_) => true,
             ProxyKind::Hysteria2(_) => true,
             ProxyKind::Http(_) | ProxyKind::Https(_) => false,
@@ -1544,6 +1548,37 @@ pub struct TuicCfg {
     pub congestion_controller: Option<String>,
     #[serde(default)]
     pub udp_relay_mode: Option<String>,
+}
+
+/// Juicity 出站配置（QUIC；官方 Go 实现语法，认证与 tuic v5 同源但 VER=0x00）
+#[derive(Debug, Clone, Deserialize)]
+pub struct JuicityCfg {
+    pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
+    pub port: u16,
+    pub uuid: String,
+    pub password: String,
+    #[serde(alias = "server_name", alias = "server-name", alias = "sni", default)]
+    pub sni: Option<String>,
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default,
+        deserialize_with = "de_bool_lenient"
+    )]
+    pub skip_cert_verify: bool,
+    #[serde(
+        alias = "congestion-controller",
+        alias = "congestion_controller",
+        alias = "congestion-control",
+        default
+    )]
+    pub congestion_controller: Option<String>,
+    #[serde(alias = "pinned-cert-chain", alias = "pinned_cert_chain", default)]
+    pub pinned_cert_chain: Option<String>,
 }
 
 /// WireGuard 出站配置（Clash 语法）。

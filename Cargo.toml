@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.7.5"
+version = "1.7.6"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -68,7 +68,6 @@ json5 = "0.4"
 serde_path_to_error = "0.1"
 
 # 错误 / 日志
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 

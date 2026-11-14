@@ -11,6 +11,7 @@ pub mod direct;
 pub mod h3_min;
 pub mod hysteria;
 pub mod hysteria2;
+pub mod juicity;
 pub mod inbound;
 pub mod ip_stack;
 pub mod masque;
@@ -440,6 +441,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
         ProxyKind::Hysteria(h) => Arc::new(hysteria::Hysteria1Outbound::new(h)?),
         ProxyKind::Hysteria2(h) => Arc::new(hysteria2::Hysteria2Outbound::new(h)?),
         ProxyKind::Tuic(t) => Arc::new(tuic::TuicOutbound::new(t)?),
+        ProxyKind::Juicity(j) => Arc::new(juicity::JuicityOutbound::new(j)?),
         ProxyKind::Socks5(SocksCfg {
             server,
             port,
@@ -819,6 +821,60 @@ mod shadowtls_transport_tests {
         assert_eq!(st.version, 3);
         // clone_without_shadow_tls 应清除外层
         assert!(t.clone_without_shadow_tls().shadow_tls.is_none());
+    }
+
+    #[test]
+    fn transport_of_full_maps_xhttp_opts() {
+        use std::collections::HashMap;
+        let mut headers = HashMap::new();
+        headers.insert("X-Custom".to_string(), "v1".to_string());
+        let t = transport_of_full(
+            true,
+            &Some("cdn.example.com".into()),
+            false,
+            &Some("xhttp".into()),
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(vp_config::XhttpOpts {
+                path: Some("/dl".into()),
+                host: Some("front.example.com".into()),
+                mode: Some("stream-up".into()),
+                headers: Some(headers.clone()),
+            }),
+            &None,
+        )
+        .expect("transport");
+        let x = t.xhttp.clone().expect("xhttp 配置应存在");
+        assert_eq!(x.path, "/dl");
+        assert_eq!(x.host.as_deref(), Some("front.example.com"));
+        assert_eq!(x.mode.as_deref(), Some("stream-up"));
+        assert_eq!(x.headers.len(), 1);
+        assert_eq!(x.headers[0], ("X-Custom".to_string(), "v1".to_string()));
+        // xhttp 恒走 TLS（ALPN h2 由 wrap_transport 派生，与 grpc 同源），无 ws 层
+        assert!(t.tls);
+        assert!(t.ws.is_none());
+        // splithttp 别名等价，缺省 path 归一为 "/"
+        let t2 = transport_of_full(
+            true,
+            &None,
+            false,
+            &Some("splithttp".into()),
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+        )
+        .expect("transport");
+        assert!(t2.xhttp.is_some());
+        assert_eq!(t2.xhttp.as_ref().unwrap().path, "/");
     }
 
     #[test]

@@ -854,6 +854,19 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
             },
             TransportSpec::default(),
         ),
+        ProxyKind::Juicity(j) => (
+            OutboundKind::Juicity {
+                server: j.server,
+                port: j.port,
+                uuid: j.uuid,
+                password: j.password,
+                congestion_controller: j.congestion_controller,
+                sni: j.sni,
+                insecure: j.skip_cert_verify,
+                pinned_cert_chain: j.pinned_cert_chain,
+            },
+            TransportSpec::default(),
+        ),
         ProxyKind::Wireguard(w) => (
             OutboundKind::Wireguard {
                 server: w.server,
@@ -1568,6 +1581,25 @@ impl From<OutboundSpec> for ProxyCfg {
                 skip_cert_verify: insecure,
                 congestion_controller,
                 udp_relay_mode,
+            }),
+            OutboundKind::Juicity {
+                server,
+                port,
+                uuid,
+                password,
+                congestion_controller,
+                sni,
+                insecure,
+                pinned_cert_chain,
+            } => ProxyKind::Juicity(JuicityCfg {
+                server,
+                port,
+                uuid,
+                password,
+                sni,
+                skip_cert_verify: insecure,
+                congestion_controller,
+                pinned_cert_chain,
             }),
             OutboundKind::Wireguard {
                 server,

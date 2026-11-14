@@ -116,6 +116,7 @@ rules:
 | **Hysteria 2** | Brutal CC、Salamander obfs、端口跳跃 |
 | **Hysteria 1** | QUIC 加速、obfs |
 | **TUIC v5** | 0-RTT、全 UDP 中继 |
+| **Juicity** | QUIC 原生客户端：官方 Go 实现线格式（TLS exporter 认证、trojanc 地址帧、QUIC 模式 UDP 中继）、pinned-cert-chain 钉扎 |
 | **WireGuard** | 用户态网络栈、全 UDP Full-Cone |
 | **MASQUE** | Cloudflare WARP 原生注册、RFC 9484 CONNECT-IP、P-256 mTLS |
 | **AnyTLS / NaiveProxy / Brook / Mieru / Snell / ShadowTLS** | 主流新型协议全覆盖 |
@@ -140,6 +141,7 @@ rules:
 | **HTTPUpgrade** | `httpupgrade` | 101 升级后裸流（无 ws 帧） |
 | **gRPC** | `grpc` | gRPC-Tun 双向流（service_name 伪装） |
 | **HTTP/2** | `h2` | HTTP 伪装 |
+| **ShadowTLS** | — | v3 前置伪装层（SS `plugin: shadow-tls` 形态或独立外层；v1/v2 拒绝并提示） |
 | **REALITY** | — | 任意传输叠加（uTLS 指纹 ClientHello 认证） |
 | **ECH** | — | Encrypted Client Hello（HTTPS(type65) 自动获取或 DoH 查询） |
 

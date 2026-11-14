@@ -100,6 +100,16 @@ pub enum OutboundKind {
         sni: Option<String>,
         insecure: bool,
     },
+    Juicity {
+        server: String,
+        port: u16,
+        uuid: String,
+        password: String,
+        congestion_controller: Option<String>,
+        sni: Option<String>,
+        insecure: bool,
+        pinned_cert_chain: Option<String>,
+    },
     Wireguard {
         server: String,
         port: u16,

@@ -671,6 +671,30 @@ fn lower_node(
                 insecure: transport.insecure,
             }
         }
+        "juicity" => {
+            OutboundKind::Juicity {
+                server,
+                port,
+                uuid: map
+                    .get("uuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                password,
+                congestion_controller: map
+                    .get("congestion_controller")
+                    .or_else(|| map.get("congestion-controller"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                sni: transport.sni.clone(),
+                insecure: transport.insecure,
+                pinned_cert_chain: map
+                    .get("pinned_cert_chain")
+                    .or_else(|| map.get("pinned-cert-chain"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+            }
+        }
         "socks" | "socks5" => {
             let username = map
                 .get("username")

@@ -1,3 +1,29 @@
+# 🚀 VP_Core v1.7.6 发布说明 / Release Notes：Juicity 原生客户端 + 协议矩阵全链路接线
+
+> **"QUIC 族第三员入列：逐文件核实官方 Go 实现线格式，回环测试 5 项全绿。"**
+>
+> 🎉 本版本落地 **Juicity 原生客户端**（对齐官方 `juicity/juicity` + `daeuniverse/outbound` 实现），并打通从配置到 DSL 的全链路接线；顺带补齐 XHTTP 组装缝的专项测试与协议文档。
+
+### 🌟 Juicity 原生客户端（`vp-protocol/src/juicity.rs`）
+
+| 环节 | 实现 |
+| :--- | :--- |
+| **认证** | uni 流 `VER=0x00 TYPE=0x00 + UUID(16) + TOKEN(32)`；TOKEN = TLS exporter（label=UUID 原始字节、context=密码）；流保持打开，对齐官方 UnderlayAuth 机制 |
+| **TCP** | bi 流首写 `0x01 + trojanc 地址 + 端口(2BE)`，请求头立即发出（服务端可先应答），之后裸中继、无响应头 |
+| **UDP（QUIC 模式）** | 每关联一条 bi 流：首包 `0x03 + 地址头×2 + 长度 + 载荷`（连接头与服务端 ReadFrom 各消费一个），后续包 `地址头 + 长度 + 载荷`，按包寻址 |
+| **证书** | ALPN `h3`；`pinned-cert-chain` 官方滚动 SHA-256 链哈希钉扎（hex/base64 双解码）+ `allow_insecure` 跳过验证 |
+
+- **回环测试 5 项全绿**：TCP 中继、UDP 双向（含第二包）、错误钉扎拒绝 / 正确钉扎连通、地址编解码往返、链哈希与官方 `GenerateCertChainHash` 对齐。
+
+### 🔌 配置链路全接
+- `JuicityCfg`（serde alias 全兼容 `sni` / `insecure` / `congestion-control` / `pinned-cert-chain`）→ `ProxyKind::Juicity` → `OutboundKind::Juicity`（vp-ir）→ ir 正/反向映射 → VP-DSL lowering / serializer → 出站工厂；
+- **XHTTP 组装缝专项测试**：`transport_of_full` 对 `xhttp/splithttp` 的 TLS 强制、无 ws 层、`xhttp-opts` 逐字段映射、`splithttp` 别名与缺省 path 归一。
+
+### 📚 文档
+- README 协议表补 **Juicity** 行、传输层表补 **ShadowTLS v3** 行；`docs/dsl.md` 补 juicity 节点速查行。
+
+---
+
 # 🚀 VP_Core v1.7.5 发布说明 / Release Notes：XHTTP / HTTPUpgrade / ShadowTLS 外层传输三线齐发与 DSL 往返无损加固
 
 > **“真实节点测速砸出来的 RFC 9113 合规修复、108 MB/s 回环吞吐、三款 CDN/伪装传输一次到位。”**

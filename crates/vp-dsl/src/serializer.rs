@@ -206,6 +206,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
         OutboundKind::Hysteria { .. } => "hysteria",
         OutboundKind::Hysteria2 { .. } => "hysteria2",
         OutboundKind::Tuic { .. } => "tuic",
+        OutboundKind::Juicity { .. } => "juicity",
         OutboundKind::Wireguard { .. } => "wireguard",
         OutboundKind::Tailscale { .. } => "tailscale",
         OutboundKind::Masque { .. } => "masque",
@@ -364,6 +365,33 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
                 out.push_str(&format!("    heartbeat: \"{}\"\n", escape_str(hb)));
             }
             // sni/insecure 归 serialize_transport 统一输出
+        }
+        OutboundKind::Juicity {
+            server,
+            port,
+            uuid,
+            password,
+            congestion_controller,
+            sni: _,
+            insecure: _,
+            pinned_cert_chain,
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            out.push_str(&format!("    uuid: \"{}\"\n", escape_str(uuid)));
+            out.push_str(&format!("    password: \"{}\"\n", escape_str(password)));
+            if let Some(cc) = congestion_controller {
+                out.push_str(&format!(
+                    "    congestion_controller: \"{}\"\n",
+                    escape_str(cc)
+                ));
+            }
+            if let Some(pin) = pinned_cert_chain {
+                out.push_str(&format!(
+                    "    pinned_cert_chain: \"{}\"\n",
+                    escape_str(pin)
+                ));
+            }
         }
         OutboundKind::Wireguard {
             server,

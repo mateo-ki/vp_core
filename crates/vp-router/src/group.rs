@@ -480,8 +480,7 @@ impl Group {
             .map(|(h, p)| DstAddr::new(h, p))
             .ok_or_else(|| Error::Unsupported("relay 成员缺少服务器地址".into()))?;
         let mut stream = self.members[0].connect_stream(sess, &second_addr).await?;
-        for i in 1..n {
-            let member = &self.members[i];
+        for (i, member) in self.members.iter().enumerate().skip(1) {
             let next_addr: DstAddr = if i + 1 < n {
                 member
                     .remote_addr()

@@ -731,12 +731,10 @@ mod tests {
             got += n;
         }
         let secs = start.elapsed().as_secs_f64();
+        // 只断言数据完整性：吞吐数字仅打印留档，不做绝对阈值断言——
+        // CI 共享 runner 会导致平台性误报（同 ae381aa 的教训）
         assert_eq!(got, total, "回环数据量应守恒");
         let mbps = (total as f64 / 1024.0 / 1024.0) / secs;
         println!("xhttp packet-up loopback: 4 MB in {secs:.3}s = {mbps:.1} MB/s");
-        assert!(
-            mbps > 10.0,
-            "本机回环吞吐不应低于 10 MB/s（实测 {mbps:.1}）"
-        );
     }
 }

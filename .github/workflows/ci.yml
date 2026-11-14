@@ -30,6 +30,13 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      # ipstack 的 build.rs 在 Windows 会把 wintun.dll 拷贝到 target/<profile>/examples/
+      # 但不创建父目录——全新 CI target 目录必然 NotFound (os error 3)。此处预建。
+      - name: Prepare target examples dir (ipstack build script workaround)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: mkdir -p target/debug/examples
+
       - name: Check code formatting
         run: cargo fmt --all -- --check
 

@@ -98,6 +98,7 @@ route {
 | `juicity` | `server` `uuid` `password` | `sni`、`congestion_controller`、`pinned_cert_chain`（hex/base64 链哈希钉扎） |
 | `wireguard` | `server` `private_key` `public_key` `ip` | `mtu`、`dns`、`allowed_ips` |
 | `masque` | `server` `private_key` `public_key` `ip` | `ipv6`、`mtu`、`sni`、`uri` |
+| `openvpn` | `server` `port` `ca` | `proto`（tcp/udp）、`username`/`password`、`cipher`（AEAD/CBC）、`cert`/`key`、`udp` |
 | `ssh` | `server` + `password` 或 `private_key` | `username`、`host_key` |
 | `anytls` / `naive` / `brook` / `mieru` / `snell` / `ssr` | 参见各协议约定 | `password`、`sni` 等 |
 | `http` / `socks5` | `server` | `username`、`password`（级联上游） |

@@ -693,6 +693,42 @@ fn lower_node(
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string),
         },
+        "openvpn" => OutboundKind::OpenVpn {
+            server,
+            port,
+            proto: map
+                .get("proto")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            username: map
+                .get("username")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            password: if password.is_empty() {
+                None
+            } else {
+                Some(password.clone())
+            },
+            ca: map
+                .get("ca")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            cert: map
+                .get("cert")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            key: map
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            cipher: map
+                .get("cipher")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            insecure: transport.insecure,
+            udp: map.get("udp").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
         "socks" | "socks5" => {
             let username = map
                 .get("username")

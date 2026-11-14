@@ -17,6 +17,7 @@ pub mod juicity;
 pub mod masque;
 pub mod mieru;
 pub mod naive;
+pub mod openvpn;
 pub mod redir;
 pub mod shadowtls;
 pub mod smux;
@@ -442,6 +443,7 @@ pub fn build_outbound_eager(cfg: &ProxyCfg, deps: &OutboundDeps) -> Result<Arc<d
         ProxyKind::Hysteria2(h) => Arc::new(hysteria2::Hysteria2Outbound::new(h)?),
         ProxyKind::Tuic(t) => Arc::new(tuic::TuicOutbound::new(t)?),
         ProxyKind::Juicity(j) => Arc::new(juicity::JuicityOutbound::new(j)?),
+        ProxyKind::OpenVpn(o) => Arc::new(openvpn::OpenVpnOutbound::new(o)?),
         ProxyKind::Socks5(SocksCfg {
             server,
             port,

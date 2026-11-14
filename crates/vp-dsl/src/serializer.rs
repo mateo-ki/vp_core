@@ -207,6 +207,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
         OutboundKind::Hysteria2 { .. } => "hysteria2",
         OutboundKind::Tuic { .. } => "tuic",
         OutboundKind::Juicity { .. } => "juicity",
+        OutboundKind::OpenVpn { .. } => "openvpn",
         OutboundKind::Wireguard { .. } => "wireguard",
         OutboundKind::Tailscale { .. } => "tailscale",
         OutboundKind::Masque { .. } => "masque",
@@ -388,6 +389,62 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             }
             if let Some(pin) = pinned_cert_chain {
                 out.push_str(&format!("    pinned_cert_chain: \"{}\"\n", escape_str(pin)));
+            }
+        }
+        OutboundKind::OpenVpn {
+            server,
+            port,
+            proto,
+            username,
+            password,
+            ca,
+            cert,
+            key,
+            cipher,
+            insecure: _,
+            udp,
+        } => {
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!(
+                "    port: {port}
+"
+            ));
+            if let Some(pr) = proto {
+                out.push_str(&format!("    proto: \"{}\"\n", escape_str(pr)));
+            }
+            if let Some(u) = username {
+                out.push_str(&format!("    username: \"{}\"\n", escape_str(u)));
+            }
+            if let Some(pw) = password {
+                out.push_str(&format!("    password: \"{}\"\n", escape_str(pw)));
+            }
+            out.push_str(&format!(
+                "    ca: \"{}\"\n",
+                escape_str(&ca.replace("\n", " "))
+            ));
+            if let Some(c) = cert {
+                out.push_str(&format!(
+                    "    cert: \"{}\"\n",
+                    escape_str(&c.replace("\n", " "))
+                ));
+            }
+            if let Some(k) = key {
+                out.push_str(&format!(
+                    "    key: \"{}\"\n",
+                    escape_str(&k.replace("\n", " "))
+                ));
+            }
+            if let Some(c) = cipher {
+                out.push_str(&format!(
+                    "    cipher: \"{}\"\n",
+                    escape_str(&c.replace("\n", " "))
+                ));
+            }
+            if *udp {
+                out.push_str(
+                    "    udp: true
+",
+                );
             }
         }
         OutboundKind::Wireguard {

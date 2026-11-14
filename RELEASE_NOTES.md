@@ -1,3 +1,62 @@
+# 🚀 VP_Core v1.7.7 发布说明 / Release Notes：OpenVPN 原生客户端（VPN Gate 家宽节点全链路实测通过）
+
+> **"纯 Rust 从零实现 OpenVPN 协议栈：控制信道 + Key Method v2 + openvpn PRF + AEAD/CBC 双数据信道，VPN Gate 真实节点 HTTP 204 端到端打通。"**
+>
+> 🎉 本版本落地 **OpenVPN 原生客户端**（`vp-protocol/src/openvpn.rs`，约 2600 行），补齐订阅面板最常见的家宽 / VPN Gate 类节点支持——此前这类节点只能依赖新版 mihomo 兜底，现在 VP-Core 一等公民直连。
+
+### 🌟 OpenVPN 客户端实现
+
+| 环节 | 实现 |
+| :--- | :--- |
+| **控制信道** | `HARD_RESET_CLIENT_V2` 握手、P_CONTROL/ACK 可靠层（累计 ACK + 150ms 捎带 flush + 独立 ACK 帧）、u16 BE TCP 分帧（有状态 `FrameReader` 续读半帧，永不阻塞） |
+| **TLS** | rustls + 自定义证书校验器（信任下发 CA 链、逐级签名验证、不做主机名匹配）；可选客户端证书，**自动识别 X.509 v1 哑证书降级为无证书**（VPN Gate `VPNGateClientCert1` 实测场景） |
+| **认证** | Key Method v2 记录（preMaster/random1/random2 + options/username/password/peer-info，凭据内嵌），PUSH_REQUEST 重发 + 多段 PUSH_REPLY 合并（continuation=2） |
+| **密钥派生** | openvpn PRF（TLS1.0 风格 MD5/SHA1 XOR，label `OpenVPN master secret` / `OpenVPN key expansion`，会话参数为 OpenVPN session-id） |
+| **数据信道 AEAD** | AES-128/256-GCM、ChaCha20-Poly1305；nonce = packet_id XOR implicit-IV（implicit-IV = 4B 零 + HMAC key 前 8B），AAD 仅 V2 头，tag 前置，64 包 replay 滑窗 |
+| **数据信道 CBC** | **AES-128/256-CBC + HMAC-SHA1**（SoftEther/VPN Gate 兼容）：wire = `header|HMAC(20)|IV(16)|密文`，明文 = packet_id + 载荷 + PKCS7（恒 ≥1 块） |
+| **用户态 IP 栈** | smoltcp（medium-ip）承载 TCP/UDP，与 WireGuard 出站同架构；P_DATA_V1/V2 双头（未分配 peer-id 时自动 V1）、10s PING、软重协商保留旧密钥 |
+
+### 🔌 配置链路全接
+- `OpenVpnCfg`（`proto` / `cipher` / `skip-cert-verify` 等 serde alias 宽容解析，面板额外字段 `dev` / `auth` / `handshake-timeout` 透传忽略）→ `ProxyKind::OpenVpn` → `OutboundKind::OpenVpn`（vp-ir）→ ir 正/反向映射 → VP-DSL lowering / serializer（PEM 块平铺）→ 出站工厂；
+- 密码协商优先级：PUSH `data-ciphers` → PUSH `cipher` → 节点 `cipher`（AEAD 与 CBC 族均可）。
+
+### 🧪 测试
+- **11 项单测全绿**：帧编解码、控制包编解码、KM2 客户端/服务端记录解析（含 NUL 帧残余、v1 哑证书判定）、PRF 确定性与方向性、AEAD V1/V2 回环 + 重放拒绝、CBC 回环 + HMAC 篡改拒绝 + 整块填充、replay 窗口边界、密码协商；
+- **真实节点端到端实测**：VPN Gate 家宽节点（SoftEther 服务端，CBC 数据信道）完整握手 → 认证 → PUSH → 数据中继 → `HTTP/1.1 204 No Content`；`#[ignore]` 探针测试支持 `VPCORE_DEBUG_OVPN_YAML` 注入任意节点。
+
+### 📚 文档
+- README 协议表补 **OpenVPN** 行；`docs/dsl.md` 补 openvpn 节点速查行。
+
+### ⚠️ 已知限制
+- 不支持 tls-auth/tls-crypt、UDP proto 传输、软重协商密钥切换（软重置到达时保留旧密钥继续）；CBC 族仅 SHA1 认证。
+
+---
+
+# 🚀 VP_Core v1.7.6 发布说明 / Release Notes：Juicity 原生客户端 + 协议矩阵全链路接线
+
+> **"QUIC 族第三员入列：逐文件核实官方 Go 实现线格式，回环测试 5 项全绿。"**
+>
+> 🎉 本版本落地 **Juicity 原生客户端**（对齐官方 `juicity/juicity` + `daeuniverse/outbound` 实现），并打通从配置到 DSL 的全链路接线；顺带补齐 XHTTP 组装缝的专项测试与协议文档。
+
+### 🌟 Juicity 原生客户端（`vp-protocol/src/juicity.rs`）
+
+| 环节 | 实现 |
+| :--- | :--- |
+| **认证** | uni 流 `VER=0x00 TYPE=0x00 + UUID(16) + TOKEN(32)`；TOKEN = TLS exporter（label=UUID 原始字节、context=密码）；流保持打开，对齐官方 UnderlayAuth 机制 |
+| **TCP** | bi 流首写 `0x01 + trojanc 地址 + 端口(2BE)`，请求头立即发出（服务端可先应答），之后裸中继、无响应头 |
+| **UDP（QUIC 模式）** | 每关联一条 bi 流：首包 `0x03 + 地址头×2 + 长度 + 载荷`（连接头与服务端 ReadFrom 各消费一个），后续包 `地址头 + 长度 + 载荷`，按包寻址 |
+| **证书** | ALPN `h3`；`pinned-cert-chain` 官方滚动 SHA-256 链哈希钉扎（hex/base64 双解码）+ `allow_insecure` 跳过验证 |
+
+- **回环测试 5 项全绿**：TCP 中继、UDP 双向（含第二包）、错误钉扎拒绝 / 正确钉扎连通、地址编解码往返、链哈希与官方 `GenerateCertChainHash` 对齐。
+
+### 🔌 配置链路全接
+- `JuicityCfg`（serde alias 全兼容 `sni` / `insecure` / `congestion-control` / `pinned-cert-chain`）→ `ProxyKind::Juicity` → `OutboundKind::Juicity`（vp-ir）→ ir 正/反向映射 → VP-DSL lowering / serializer → 出站工厂；
+- **XHTTP 组装缝专项测试**：`transport_of_full` 对 `xhttp/splithttp` 的 TLS 强制、无 ws 层、`xhttp-opts` 逐字段映射、`splithttp` 别名与缺省 path 归一。
+
+### 📚 文档
+- README 协议表补 **Juicity** 行、传输层表补 **ShadowTLS v3** 行；`docs/dsl.md` 补 juicity 节点速查行。
+
+---
 # 🚀 VP_Core v1.7.6 发布说明 / Release Notes：Juicity 原生客户端 + 协议矩阵全链路接线
 
 > **"QUIC 族第三员入列：逐文件核实官方 Go 实现线格式，回环测试 5 项全绿。"**

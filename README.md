@@ -119,6 +119,7 @@ rules:
 | **Juicity** | QUIC 原生客户端：官方 Go 实现线格式（TLS exporter 认证、trojanc 地址帧、QUIC 模式 UDP 中继）、pinned-cert-chain 钉扎 |
 | **WireGuard** | 用户态网络栈、全 UDP Full-Cone |
 | **MASQUE** | Cloudflare WARP 原生注册、RFC 9484 CONNECT-IP、P-256 mTLS |
+| **OpenVPN** | 纯 Rust 客户端：TCP 传输、Key Method v2 认证、openvpn PRF 密钥派生、数据信道 AEAD（GCM/ChaCha20）与 CBC+HMAC-SHA1（SoftEther/VPN Gate 兼容）、smoltcp 用户态 IP 栈、下发 CA 链校验 |
 | **AnyTLS / NaiveProxy / Brook / Mieru / Snell / ShadowTLS** | 主流新型协议全覆盖 |
 | **SSH / SOCKS5 / HTTP(S)** | SSH direct-tcpip、级联上游代理 |
 | **Tailscale** | 节点直连出站 |

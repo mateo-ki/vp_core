@@ -847,6 +847,7 @@ pub enum ProxyKind {
     Socks5(SocksCfg),
     Tuic(TuicCfg),
     Juicity(JuicityCfg),
+    OpenVpn(OpenVpnCfg),
     Hysteria(Hysteria1Cfg),
     Hysteria2(Hysteria2Cfg),
     Http(HttpCfg),
@@ -878,6 +879,7 @@ impl ProxyKind {
             ProxyKind::Hysteria2(_) => "hysteria2",
             ProxyKind::Tuic(_) => "tuic",
             ProxyKind::Juicity(_) => "juicity",
+            ProxyKind::OpenVpn(_) => "openvpn",
             ProxyKind::Http(_) => "http",
             ProxyKind::Https(_) => "https",
             ProxyKind::Wireguard(_) => "wireguard",
@@ -905,6 +907,7 @@ impl ProxyKind {
             ProxyKind::Socks5(s) => Some((s.server.clone(), s.port)),
             ProxyKind::Tuic(t) => Some((t.server.clone(), t.port)),
             ProxyKind::Juicity(j) => Some((j.server.clone(), j.port)),
+            ProxyKind::OpenVpn(o) => Some((o.server.clone(), o.port)),
             ProxyKind::Hysteria(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Hysteria2(h) => Some((h.server.clone(), h.port)),
             ProxyKind::Http(h) | ProxyKind::Https(h) => Some((h.server.clone(), h.port)),
@@ -934,6 +937,8 @@ impl ProxyKind {
             ProxyKind::Socks5(s) => s.udp,
             ProxyKind::Tuic(_) => true,
             ProxyKind::Juicity(_) => true,
+            // OpenVPN tun 模式隧道内原生承载 UDP（服务器允许时）
+            ProxyKind::OpenVpn(o) => o.udp,
             ProxyKind::Hysteria(_) => true,
             ProxyKind::Hysteria2(_) => true,
             ProxyKind::Http(_) | ProxyKind::Https(_) => false,
@@ -1548,6 +1553,45 @@ pub struct TuicCfg {
     pub congestion_controller: Option<String>,
     #[serde(default)]
     pub udp_relay_mode: Option<String>,
+}
+
+/// OpenVPN 出站配置（家宽 / VPN Gate 面板 Clash 语法；mihomo `transport/openvpn` 对齐）
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenVpnCfg {
+    pub server: String,
+    #[serde(deserialize_with = "de_u16_lenient")]
+    pub port: u16,
+    /// tcp / udp（MVP 仅支持 tcp）
+    #[serde(default)]
+    pub proto: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// CA 证书 PEM（信任链根）
+    #[serde(default)]
+    pub ca: String,
+    /// 客户端证书 PEM（可选）
+    #[serde(default)]
+    pub cert: Option<String>,
+    /// 客户端私钥 PEM（可选）
+    #[serde(default)]
+    pub key: Option<String>,
+    /// 数据密码（默认 AES-256-GCM；仅支持 AEAD 族）
+    #[serde(default)]
+    pub cipher: Option<String>,
+    #[serde(
+        alias = "skip-cert-verify",
+        alias = "skip_cert_verify",
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "insecure",
+        default,
+        deserialize_with = "de_bool_lenient"
+    )]
+    pub skip_cert_verify: bool,
+    #[serde(default)]
+    pub udp: bool,
 }
 
 /// Juicity 出站配置（QUIC；官方 Go 实现语法，认证与 tuic v5 同源但 VER=0x00）

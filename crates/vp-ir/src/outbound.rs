@@ -228,6 +228,7 @@ pub struct TransportSpec {
     pub ws: Option<WsSpec>,
     pub grpc: Option<GrpcSpec>,
     pub http: Option<HttpSpec>,
+    pub xhttp: Option<XhttpSpec>,
     pub reality: Option<RealitySpec>,
     pub ech: Option<EchSpec>,
     pub shadow_tls: Option<ShadowTlsSpec>,
@@ -244,6 +245,21 @@ pub struct WsSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GrpcSpec {
     pub service_name: String,
+}
+
+/// XHTTP 传输（Xray SplitHTTP 后继，HTTP/2 或 HTTP/3 承载）。
+/// 上行按 mode 走 POST（packet-up 逐包 POST / stream-up 单条流式 POST），
+/// 下行为 GET {path}/{session} 长响应流。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct XhttpSpec {
+    /// 伪装路径，默认 "/"。约定中可携带 `?ed=` 查询参数，此处原样保留。
+    pub path: String,
+    /// 伪装 Host / :authority；缺省沿用连接目标。
+    pub host: Option<String>,
+    /// auto / packet-up / stream-up / stream-one；空值按 auto 处理。
+    pub mode: Option<String>,
+    /// 额外伪装请求头（应用于上传与下载请求）。
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

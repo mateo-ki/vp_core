@@ -313,4 +313,123 @@ node "warp-masque" masque {
         let roundtrip_ir = parse(&dsl).expect("往返解析 masque 成功");
         assert_eq!(roundtrip_ir.outbounds.len(), ir.outbounds.len());
     }
+
+    /// XHTTP 节点：DSL xhttp 子对象 → IR → 序列化 → 再解析 往返无损
+    #[test]
+    fn test_xhttp_node_dsl_roundtrip() {
+        let script = r#"
+node "cdn-xhttp" vless {
+    server: "104.16.0.1"
+    port: 443
+    uuid: "11111111-2222-3333-4444-555555555555"
+    flow: "xtls-rprx-vision"
+    sni: "cdn.example.com"
+    tls: true
+    udp: true
+    xhttp: {
+        path: "/xhttp-upload"
+        mode: "stream-up"
+        headers: { Host: "cdn.example.com" }
+    }
+}
+"#;
+        let ir = parse(script).expect("解析 xhttp 节点成功");
+        let node = ir.outbounds.iter().find(|o| o.name == "cdn-xhttp").unwrap();
+        let x = node
+            .transport
+            .xhttp
+            .as_ref()
+            .expect("xhttp spec 应当被 lower");
+        assert_eq!(x.path, "/xhttp-upload");
+        assert_eq!(x.mode.as_deref(), Some("stream-up"));
+        assert_eq!(
+            x.headers.get("Host").map(String::as_str),
+            Some("cdn.example.com")
+        );
+        assert_eq!(node.transport.network.as_deref(), Some("xhttp"));
+        assert!(node.transport.tls);
+
+        // 序列化 → 重新解析 → 字段一致
+        let dsl = ir_to_dsl(&ir);
+        assert!(dsl.contains("xhttp: {"));
+        assert!(dsl.contains("path: \"/xhttp-upload\""));
+        assert!(dsl.contains("mode: \"stream-up\""));
+        let rt_ir = parse(&dsl).expect("往返 DSL 解析成功");
+        let rt_node = rt_ir
+            .outbounds
+            .iter()
+            .find(|o| o.name == "cdn-xhttp")
+            .unwrap();
+        let rt_x = rt_node.transport.xhttp.as_ref().expect("往返 xhttp spec");
+        assert_eq!(rt_x.path, "/xhttp-upload");
+        assert_eq!(rt_x.mode.as_deref(), Some("stream-up"));
+        assert_eq!(
+            rt_x.headers.get("Host").map(String::as_str),
+            Some("cdn.example.com")
+        );
+        assert_eq!(rt_node.transport.network.as_deref(), Some("xhttp"));
+    }
+
+    /// shadow_tls 子对象与 network 标识的 DSL 往返回归：
+    /// serializer 输出的 `shadow_tls: {..}` 与 `network: ".."` 必须可被 lowering 还原
+    /// （历史上 lowering 缺失这两个解析臂，往返即丢数据）
+    #[test]
+    fn test_shadowtls_and_network_dsl_roundtrip() {
+        let script = r#"
+node "st-test" trojan {
+    server: "1.2.3.4"
+    port: 443
+    password: "pw"
+    shadow_tls: {
+        password: "stls-pw"
+        sni: "www.apple.com"
+    }
+}
+
+node "hu-node" vless {
+    server: "5.6.7.8"
+    port: 443
+    uuid: "11111111-2222-3333-4444-555555555555"
+    tls: true
+    network: "httpupgrade"
+    ws: {
+        path: "/hu"
+        headers: { Host: "cdn.com" }
+    }
+}
+"#;
+        let ir = parse(script).expect("解析成功");
+
+        // shadow_tls 子对象应被 lowering 捕获
+        let st = ir.outbounds.iter().find(|o| o.name == "st-test").unwrap();
+        let spec = st
+            .transport
+            .shadow_tls
+            .as_ref()
+            .expect("shadow_tls 应被 lower");
+        assert_eq!(spec.password, "stls-pw");
+        assert_eq!(spec.sni, "www.apple.com");
+
+        // network 显式标识应被 lowering 捕获（httpupgrade 场景）
+        let hu = ir.outbounds.iter().find(|o| o.name == "hu-node").unwrap();
+        assert_eq!(hu.transport.network.as_deref(), Some("httpupgrade"));
+
+        // 序列化 → 再解析：两字段均不丢失
+        let dsl = ir_to_dsl(&ir);
+        let rt = parse(&dsl).expect("往返解析成功");
+        let rt_st = rt.outbounds.iter().find(|o| o.name == "st-test").unwrap();
+        let spec2 = rt_st
+            .transport
+            .shadow_tls
+            .as_ref()
+            .expect("往返 shadow_tls 不得丢失");
+        assert_eq!(spec2.password, "stls-pw");
+        assert_eq!(spec2.sni, "www.apple.com");
+        let rt_hu = rt.outbounds.iter().find(|o| o.name == "hu-node").unwrap();
+        assert_eq!(
+            rt_hu.transport.network.as_deref(),
+            Some("httpupgrade"),
+            "往返 network 不得丢失"
+        );
+    }
 }

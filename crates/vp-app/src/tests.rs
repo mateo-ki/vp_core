@@ -91,6 +91,8 @@ async fn vless_ss_listener_e2e() {
         .map(|(_, p)| *p)
         .expect("vless listener 应已监听");
     let out = vp_protocol::vless::VlessOutbound::new(&vp_config::VlessCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port: vl_port,
         uuid: uuid.into(),
@@ -195,6 +197,8 @@ async fn vmess_listener_e2e() {
         .expect("vmess listener 应已监听");
 
     let out = vp_protocol::vmess::VmessOutbound::new(&vp_config::VmessCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port: vm_port,
         uuid: uuid.into(),
@@ -269,6 +273,8 @@ rules: ['MATCH,DIRECT']
         .expect("trojan listener 应已监听");
 
     let out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port: tj_port,
         password: "pw-e2e".into(),
@@ -1269,6 +1275,8 @@ rules: ['MATCH,DIRECT']
 
     // 5. 测试合法 Trojan 客户端代理流量正常通信
     let trojan_out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port: trojan_port,
         password: "pwd-alice".into(),
@@ -1406,6 +1414,8 @@ rules: ['MATCH,DIRECT']
         .unwrap();
 
     let trojan_out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port,
         password: "pwd-charlie".into(),
@@ -1719,6 +1729,8 @@ rules: ['MATCH,DIRECT']
         .unwrap();
 
     let out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port: allowed_port,
         password: "pw-gate".into(),
@@ -1820,6 +1832,8 @@ rules: ['MATCH,DIRECT']
 
     // 3. 敲门成功后：再次发起代理连接，应当顺畅连通
     let out = vp_protocol::trojan::TrojanOutbound::new(&vp_config::TrojanCfg {
+        xhttp_opts: None,
+        shadowtls_opts: None,
         server: "127.0.0.1".into(),
         port: trojan_port,
         password: "pw-stealth".into(),

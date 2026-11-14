@@ -1,29 +1,21 @@
 # VP_Core
 
-**小而快、零运行时开销的全协议代理 / VPN 内核（Rust 实现）。**
+**小而快、零运行时开销的全协议代理 / VPN 内核（纯 Rust 实现）。**
 
-全面对标 **sing-box** 与 **mihomo (Clash.Meta)**，具备极致轻量、高吞吐、超低内存与开箱即用的服务端/客户端一体化能力。
+全面对标 **sing-box** 与 **mihomo (Clash.Meta)**，极致轻量、高吞吐、超低内存，服务端 / 客户端一体化开箱即用。
 
----
-
-## ✨ 核心优势
-
-- ⚡ **极致轻量**：Linux Musl 单文件仅 **4.3 MB**，空载常驻内存 (RSS) 仅 **10~20 MB**（零 GC 停顿），512MB 低配 VPS 轻松拉满。
-- 🚀 **极高吞吐**：基于 Rust + Tokio 异步运行时，全链路池化零拷贝，千兆线速轻松跑满。
-- 🔍 **全景链路诊断与微秒可观测性 (`explain`)**：Chrome DevTools 风格终端高亮决策树，精确度量规则匹配、DNS 解析、节点延迟及全链路决策耗时（精确至微秒 µs），告别黑盒排错。
-- 📝 **工业级声明式 DSL 与 Google CEL 表达式**：消除 YAML 缩进陷阱，支持类似 Wireshark 风格的 `process.name == "git" && dst.port == 22` 复合分流规则，并提供专为大语言模型打造的配置规范与 AI Prompt（详见 [docs/dsl.md](docs/dsl.md)）。
-- 🛡️ **生产级服务端**：原生支持 VLESS (REALITY/WS CDN穿透)、SS-2022、Hysteria 2、Trojan、TUIC v5，内置内核级 iptables 端口跳跃重定向、UDP RRL 防反射与端口敲门隐身防御。
-- 🌐 **一键开服与订阅**：内置开服引擎与动态 HTTP 订阅端点（`/sub`），自动输出 Clash 规则配置与通用节点链接。
-- 🔌 **全协议原生 UDP**：原生支持 VLESS/VMess/Trojan UDP、XUDP (Mux.Cool) 及 packetaddr 编码，支持单连接多目标 (Full-Cone)。
-- 📱 **全平台覆盖**：Windows (Wintun)、Linux (Musl/OpenWrt)、macOS、Android 与 iOS。
+| | |
+| :--- | :--- |
+| 📦 体积 | Linux Musl 单文件 **4.3 MB** |
+| 🧠 内存 | 空载 RSS **10~20 MB**（mimalloc，零 GC 停顿） |
+| 🚀 吞吐 | Rust + Tokio 全链路池化零拷贝，千兆线速 |
+| 📱 平台 | Windows / Linux (Musl·OpenWrt) / macOS / Android / iOS / HarmonyOS NEXT |
 
 ---
 
 ## 🚀 极速上手
 
-### 1. VPS 一键开服部署
-
-在全新的 Linux VPS 上一键自动安装、配置 systemd 并生成节点与订阅：
+### 1. VPS 一键开服
 
 ```bash
 # 自动探测公网 IP 开服（输出全协议节点与一键订阅）
@@ -33,39 +25,22 @@ curl -fsSL https://raw.githubusercontent.com/mateo-ki/vp_core/main/install.sh | 
 curl -fsSL https://raw.githubusercontent.com/mateo-ki/vp_core/main/install.sh | bash -s -- --domain your-domain.com
 ```
 
-### 2. 常用命令
+### 2. 客户端三步走
 
 ```bash
-# 服务端管理
-vpcore gen-server        # 一键生成服务端配置、节点链接及订阅
-vpcore gen-sub           # 导出当前服务端订阅 (支持 clash / base64)
-vpcore update            # 内核跨平台平滑自我更新 (带健康校验)
-
-# 客户端运行
-vpcore sub "<URL>" -o config.vp     # 拉取远程订阅生成客户端配置（直接支持 .vp / .yaml）
-vpcore validate -c config.vp        # 校验配置文件语法（支持 .yaml / .json / .vp）
-vpcore run -c config.vp             # 启动代理 / VPN 服务
-vpcore test -c config.vp            # 全节点延迟并发测速
-vpcore clean-routes                 # 应急清理残留路由与 iptables 端口重定向
-
-# 工具链：一键互转与代码格式化 (convert & fmt)
-vpcore convert -i config.yaml -o config.vp   # YAML / JSON 与 .vp DSL 双向无损互转
-vpcore fmt -w config.vp                     # 自动格式化并对齐 .vp DSL 代码
-vpcore fmt --check config.vp                # CI 门禁检查代码格式规范
-
-# 链路诊断与可观测性 (explain)
-vpcore explain https://www.google.com -c config.yaml  # 诊断路由分流决策与微秒/毫秒耗时
-vpcore explain 10.0.0.1:80 -c config.vp --json         # 输出结构化 JSON 供脚本/面板消费
+vpcore sub "<订阅URL>" -o config.vp   # ① 拉取订阅 → 直接产出 .vp DSL（或 .yaml）
+vpcore validate -c config.vp          # ② 校验配置（支持 .vp / .yaml / .json）
+vpcore run -c config.vp               # ③ 启动
 ```
 
-### 3. 配置示例
+### 3. 配置示例（声明式 DSL，推荐）
 
-#### A. 声明式 DSL 语法 (`config.vp`，推荐，专为 AI 优化)
-详细语法规范与一键丢给 AI 的 Prompt 请参见 [docs/dsl.md](docs/dsl.md)。
+消除 YAML 缩进陷阱，原生支持 Google CEL 复合规则；完整规范与 AI Prompt 见 [docs/dsl.md](docs/dsl.md)。
 
 ```dsl
 inbound mixed { listen: "127.0.0.1:7890" }
 
+// VLESS + REALITY
 node "hk-01" vless {
     server: "hk.example.com:443"
     uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
@@ -73,7 +48,20 @@ node "hk-01" vless {
     tls: reality { sni: "www.amazon.com", public_key: "abc...", short_id: "abcd" }
 }
 
-group "PROXY" select { members: ["hk-01", "DIRECT"] }
+// XHTTP 过 CDN（vless / vmess / trojan 通用）
+node "cf-xhttp" vless {
+    server: "104.16.0.1:443"
+    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811"
+    sni: "cdn.example.com"
+    tls: true
+    xhttp: {
+        path: "/xhttp-upload"
+        mode: "auto"
+        headers: { Host: "cdn.example.com" }
+    }
+}
+
+group "PROXY" select { members: ["hk-01", "cf-xhttp", "DIRECT"] }
 
 route {
     process.name == "git" && dst.port == 22 => "PROXY"
@@ -83,7 +71,8 @@ route {
 }
 ```
 
-#### B. 兼容 Clash YAML 语法 (`config.yaml`，支持内嵌 CEL 表达式)
+<details>
+<summary><b>兼容 Clash YAML 语法（含内嵌 CEL 表达式）</b></summary>
 
 ```yaml
 mixed-port: 7890
@@ -104,57 +93,115 @@ proxies:
     client-fingerprint: chrome
 
 rules:
-  # 支持行内 Google CEL 复合规则
-  - 'process.name == "git" && dst.port == 22,vless-reality'
+  - 'process.name == "git" && dst.port == 22,vless-reality'   # 行内 CEL 复合规则
   - 'net == "tcp" && dst.port in [80, 443] && host.endsWith(".google.com"),vless-reality'
   - GEOIP,CN,DIRECT
   - MATCH,vless-reality
 ```
 
+</details>
+
 ---
 
 ## 🔌 协议支持
 
-- **入站监听 (Inbounds)**: Mixed (HTTP/SOCKS5)、TUN (用户态网络栈)、TProxy/Redir、VLESS (REALITY/WS)、Shadowsocks-2022、Hysteria 2、Trojan、TUIC v5
-- **出站代理 (Outbounds)**: VLESS (Vision/REALITY/XUDP)、VMess (AEAD/XUDP)、Trojan、Shadowsocks、Hysteria 2、TUIC v5、WireGuard、Snell、ShadowsocksR、SSH、Direct、Reject
-- **分流规则与策略组**: Domain、IP-CIDR、GeoIP/GeoSite (`.dat`/`.mmdb`)、Process-Name、嵌套规则集；Select、Url-Test、Fallback、Load-Balance、Relay
+### 出站代理（客户端）
+
+| 协议 | 特性 |
+| :--- | :--- |
+| **VLESS** | Vision (XTLS)、REALITY、XUDP、packetaddr |
+| **VMess** | AEAD 全加密套件、XUDP、Mux.Cool |
+| **Trojan** | Trojan-Go 兼容、WebSocket/gRPC/XHTTP 承载 |
+| **Shadowsocks** | 全_cipher 套件、SS-2022 (blake3-aes-256-gcm 等)、SSR (含 obfs/protocol) |
+| **Hysteria 2** | Brutal CC、Salamander obfs、端口跳跃 |
+| **Hysteria 1** | QUIC 加速、obfs |
+| **TUIC v5** | 0-RTT、全 UDP 中继 |
+| **WireGuard** | 用户态网络栈、全 UDP Full-Cone |
+| **MASQUE** | Cloudflare WARP 原生注册、RFC 9484 CONNECT-IP、P-256 mTLS |
+| **AnyTLS / NaiveProxy / Brook / Mieru / Snell / ShadowTLS** | 主流新型协议全覆盖 |
+| **SSH / SOCKS5 / HTTP(S)** | SSH direct-tcpip、级联上游代理 |
+| **Tailscale** | 节点直连出站 |
+
+### 入站监听（服务端）
+
+| 入站 | 说明 |
+| :--- | :--- |
+| Mixed / SOCKS5 / HTTP | 标准 HTTP + SOCKS5 自适应端口 |
+| TUN | 用户态网络栈全局接管（Wintun / tun fd） |
+| VLESS / Trojan / SS-2022 / Hysteria 2 / TUIC v5 | 生产级服务端（REALITY、iptables 端口跳跃、UDP RRL 防反射） |
+| TProxy / Redir | Linux 透明代理 |
+
+### 传输层（vless / vmess / trojan 共用）
+
+| 传输 | `network` | 要点 |
+| :--- | :--- | :--- |
+| **XHTTP** | `xhttp` | Xray SplitHTTP 后继：H2 GET 下行长流 + POST 上行；`packet-up` / `stream-up` / `stream-one` 三模式；CDN 友好（`xhttp-opts: {path, host, mode, extra-headers}`） |
+| **WebSocket** | `ws` | 0-RTT early-data、v2ray-http-upgrade |
+| **HTTPUpgrade** | `httpupgrade` | 101 升级后裸流（无 ws 帧） |
+| **gRPC** | `grpc` | gRPC-Tun 双向流（service_name 伪装） |
+| **HTTP/2** | `h2` | HTTP 伪装 |
+| **REALITY** | — | 任意传输叠加（uTLS 指纹 ClientHello 认证） |
+| **ECH** | — | Encrypted Client Hello（HTTPS(type65) 自动获取或 DoH 查询） |
+
+### 分流与策略组
+
+- **规则**：Domain / Domain-Suffix / Domain-Keyword / IP-CIDR / GeoIP (`.mmdb`/`.dat`) / GeoSite / IP-ASN / Process-Name / 端口段 / **Google CEL 复合表达式**
+- **策略组**：Select、URL-Test、Fallback、Load-Balance（Jump Consistent Hash）、Relay
+- **DNS**：DoH/DoT/UDP、FakeIP、stale-while-revalidate、RFC 8305 双栈
+
+---
+
+## 🛠️ 工具链
+
+| 命令 | 用途 |
+| :--- | :--- |
+| `vpcore convert -i a.yaml -o b.vp` | Clash YAML / JSON / `.vp` DSL **双向无损互转** |
+| `vpcore fmt -w config.vp` | DSL 自动格式化（`--check` 用于 CI 门禁） |
+| `vpcore sub "<URL>" -o sub.vp` | 拉取订阅直出 `.vp` / `.yaml` |
+| `vpcore test -c config.vp` | 全节点延迟并发测速 |
+| `vpcore explain <URL> -c config.vp` | 路由决策链路诊断（微秒级耗时、命中规则、DNS 解析树；`--json` 供面板消费） |
+| `vpcore gen-server` / `gen-sub` | 服务端一键开服 / 导出订阅 |
+| `vpcore update` | 内核跨平台自我更新（健康校验） |
+| `vpcore clean-routes` | 应急清理残留路由与 iptables 重定向 |
+
+---
+
+## 📱 移动端 SDK
+
+三大移动平台独立 SDK 发布包（详见 `mobile/` 目录）：
+
+- **Android**：`arm64-v8a` / `armeabi-v7a` / `x86_64` + Kotlin 原生类 `com.vpcore.VPCore`，无缝对接 `VpnService`
+- **iOS / macOS**：官方标准 `VPCore.xcframework` + Swift 类 `VPCore.swift`，支持 SPM 一键引入
+- **HarmonyOS NEXT**：ArkTS (`VPCore.ets`) + Node-API C++ 桥接 + 类型定义
+
+---
+
+## 📚 文档
+
+| 文档 | 内容 |
+| :--- | :--- |
+| [docs/dsl.md](docs/dsl.md) | `.vp` DSL 完整语法规范 + CEL 变量表 + AI Prompt |
+| [docs/benchmarks.md](docs/benchmarks.md) | 性能基准留档 |
+| [RELEASE_NOTES.md](RELEASE_NOTES.md) | 各版本发布说明 |
 
 ---
 
 ## 🛠️ 本地构建与测试
 
 ```bash
-# 编译 Release 二进制
-cargo build --release -p vp-bin
-
-# 运行全套测试 (340+ 项测试 100% 通过)
-cargo test --workspace
+cargo build --release -p vp-bin    # 编译 Release 二进制
+cargo test --workspace             # 全套测试（单测 + 回环 e2e 100% 通过）
 ```
 
 ---
 
-## 📱 移动端 SDK 支持 (Android / iOS / 纯血鸿蒙)
+## 🙏 致敬与鸣谢
 
-VP_Core 为三大主流移动端操作系统提供专属独立 SDK 发布包与开箱即用的高层封装（详见 `mobile/` 目录）：
-
-- **Android SDK**：包含 `arm64-v8a`、`armeabi-v7a`、`x86_64` 架构库，内置 `com.vpcore.VPCore` Kotlin 原生类，无缝对接 Android `VpnService`；
-- **iOS / macOS SDK**：包含 Apple 官方标准 `VPCore.xcframework` 与 `VPCore.swift` 原生类，原生支持 Swift Package Manager (SPM) 一键引入；
-- **鸿蒙 NEXT SDK**：专为华为纯血鸿蒙（HarmonyOS NEXT / OpenHarmony 4.0+）设计，提供 ArkTS (`VPCore.ets`)、Node-API C++ 桥接 (`vpcore_napi.cpp`) 与类型定义。
-
----
-
-## 🙏 致敬与鸣谢 (Acknowledgements)
-
-VP_Core 的架构演进与能力进化离不开开源社区优秀先行者的探索与沉淀，特别致谢以下杰出的开源项目：
-
-- **[Mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo)**：引领现代网络代理内核生态标杆。特别鸣谢其优秀的规则集架构与 `.mrs` 二进制预编译规则规范，为本项目实现零拷贝亚毫秒级规则加载提供了重要范式与灵感。
-- **[sing-box](https://github.com/SagerNet/sing-box)**：下一代通用网络代理平台的典范。特别鸣谢其严谨紧凑的 `.srs` 预编译规则设计与现代出入站解耦架构，为本项目的协议实现与跨平台演进提供了极高的工程参考价值。
-- **[MEOW](https://github.com/phuslu/goproxy)**：启发式自适应代理的先驱。特别鸣谢其经典的被动阻断学习与透明失败重试设计思想，本项目借鉴此机制打造了直连毫秒级抗阻断重试与动态 LRU 策略，实现了智能无感知的网络通达。
-
----
+- **[Mihomo (Clash.Meta)](https://github.com/MetaCubeX/mihomo)**：规则集架构与 `.mrs` 二进制预编译规范范式
+- **[sing-box](https://github.com/SagerNet/sing-box)**：`.srs` 预编译设计与出入站解耦架构
+- **[MEOW](https://github.com/phuslu/goproxy)**：被动阻断学习与透明失败重试思想
 
 ## 社区与开源协议
 
 - 社区认可：[LINUX DO 社区](https://linux.do)
 - 开源协议：[MIT License](LICENSE)
-

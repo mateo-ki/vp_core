@@ -712,6 +712,8 @@ mod tests {
         // 场景 A: 验证 Trojan 流量经 mux 入站分发成功
         {
             let trojan_out = TrojanOutbound::new(&TrojanCfg {
+                xhttp_opts: None,
+                shadowtls_opts: None,
                 server: "127.0.0.1".into(),
                 port: mux_port,
                 password: "trojan_secret_password".into(),
@@ -752,6 +754,8 @@ mod tests {
         // 场景 B: 验证 VLESS 流量经 mux 入站分发成功
         {
             let vless_out = VlessOutbound::new(&VlessCfg {
+                xhttp_opts: None,
+                shadowtls_opts: None,
                 server: "127.0.0.1".into(),
                 port: mux_port,
                 uuid: vless_uuid_str.into(),

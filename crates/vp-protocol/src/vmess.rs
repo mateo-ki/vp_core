@@ -892,6 +892,8 @@ impl VmessOutbound {
             &None,
             &cfg.http_opts,
             &cfg.ech_opts,
+            &cfg.xhttp_opts,
+            &cfg.shadowtls_opts,
         )?;
         t.alpn = cfg.alpn.clone().unwrap_or_default();
         Ok(VmessOutbound {
@@ -978,7 +980,7 @@ impl Outbound for VmessOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let io = crate::dial_transport(&self.server, self.port, &self.transport).await?;
         self.handshake(io, dst, CMD_TCP).await
     }
 
@@ -988,7 +990,7 @@ impl Outbound for VmessOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
+        let io = crate::wrap_transport_over(underlying, &self.server, &self.transport).await?;
         self.handshake(io, dst, CMD_TCP).await
     }
 
@@ -1001,7 +1003,7 @@ impl Outbound for VmessOutbound {
     /// - xudp：命令 0x03（Mux.Cool，流模式分块），一条流承载多目标
     /// - packetaddr：命令 0x02 发往魔法地址，每个分块 = IP 目标头 + 数据报
     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let io = crate::dial_transport(&self.server, self.port, &self.transport).await?;
         let (cmd, req_dst, framing) = match self.udp_encoding {
             UdpEncoding::Raw => (CMD_UDP, dst.clone(), PacketFraming::Vmess(dst.clone())),
             UdpEncoding::Xudp => (CMD_MUX, xudp_dst(), PacketFraming::xudp_client(dst)),
@@ -1231,6 +1233,8 @@ mod tests {
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         let out = VmessOutbound::new(&VmessCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             uuid,
@@ -1291,6 +1295,8 @@ mod tests {
         ];
         for (security, enc) in cases {
             let out = VmessOutbound::new(&VmessCfg {
+                xhttp_opts: None,
+                shadowtls_opts: None,
                 server: "127.0.0.1".into(),
                 port,
                 uuid: uuid.clone(),
@@ -1335,6 +1341,8 @@ mod tests {
             VmessInbound::new("127.0.0.1", 0, "vm-srv", std::slice::from_ref(&uuid)).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
         let out = VmessOutbound::new(&VmessCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             uuid: "11111111-2222-3333-4444-555555555555".into(),

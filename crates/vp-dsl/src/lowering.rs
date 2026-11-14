@@ -429,6 +429,84 @@ fn lower_node(
         }
     }
 
+    // xhttp 子对象（serializer 输出形态: xhttp: { path: "...", mode: "...", headers: {...} }）
+    if transport.xhttp.is_none() {
+        if let Some(x_val) = map.get("xhttp").or_else(|| map.get("xhttp_opts")) {
+            if let Some(xm) = x_val.as_map() {
+                let x_map: HashMap<String, DslValue> = xm.iter().cloned().collect();
+                let path = x_map
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/")
+                    .to_string();
+                let host = x_map
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let mode = x_map
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let mut headers = HashMap::new();
+                if let Some(hm) = x_map.get("headers").and_then(|v| v.as_map()) {
+                    for (k, v) in hm {
+                        if let Some(vs) = v.as_str() {
+                            headers.insert(k.clone(), vs.to_string());
+                        }
+                    }
+                }
+                transport.network = Some("xhttp".into());
+                transport.xhttp = Some(XhttpSpec {
+                    path,
+                    host,
+                    mode,
+                    headers,
+                });
+            }
+        }
+    }
+
+    // shadow_tls 子对象（serializer 输出形态: shadow_tls: { password: "...", sni: "..." }）
+    if transport.shadow_tls.is_none() {
+        if let Some(st_val) = map.get("shadow_tls") {
+            if let Some(sm) = st_val.as_map() {
+                let st_map: HashMap<String, DslValue> = sm.iter().cloned().collect();
+                let password = st_map
+                    .get("password")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let sni = st_map
+                    .get("sni")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let version = st_map
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(3);
+                transport.shadow_tls = Some(ShadowTlsSpec {
+                    password,
+                    sni,
+                    version,
+                });
+            }
+        }
+    }
+
+    // network 显式标识（httpupgrade / splithttp 等经 network 字符串表达的传输；
+    // xhttp 子对象已在上方自行设置，此处不覆盖）
+    if transport.network.is_none() {
+        if let Some(net) = map
+            .get("network")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            transport.network = Some(net.to_string());
+        }
+    }
+
     let kind = match lower_kind.as_str() {
         "vless" => {
             let uuid = map

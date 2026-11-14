@@ -62,6 +62,8 @@ impl TrojanOutbound {
             &cfg.reality_opts,
             &cfg.http_opts,
             &cfg.ech_opts,
+            &cfg.xhttp_opts,
+            &cfg.shadowtls_opts,
         )?;
         t.alpn = cfg.alpn.clone().unwrap_or_default();
         Ok(TrojanOutbound {
@@ -103,7 +105,7 @@ impl Outbound for TrojanOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let io = crate::dial_transport(&self.server, self.port, &self.transport).await?;
         self.handshake(io, dst, CMD_CONNECT).await
     }
 
@@ -113,7 +115,7 @@ impl Outbound for TrojanOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
+        let io = crate::wrap_transport_over(underlying, &self.server, &self.transport).await?;
         self.handshake(io, dst, CMD_CONNECT).await
     }
 
@@ -123,7 +125,7 @@ impl Outbound for TrojanOutbound {
 
     /// 原生 UDP（UDP ASSOCIATE）：一条流承载多目标数据报，帧为 `[SOCKS 地址][len][CRLF][data]`
     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let io = crate::dial_transport(&self.server, self.port, &self.transport).await?;
         let stream = self.handshake(io, dst, CMD_UDP_ASSOCIATE).await?;
         Ok(Box::new(StreamPacketConn::new(
             stream,
@@ -489,6 +491,8 @@ mod tests {
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         let out = TrojanOutbound::new(&TrojanCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             password: "pw123".into(),
@@ -527,6 +531,8 @@ mod tests {
         let server = TrojanInbound::new("127.0.0.1", 0, "tr-udp", &["pw123".to_string()]).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
         let out = TrojanOutbound::new(&TrojanCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             password: "pw123".into(),

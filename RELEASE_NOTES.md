@@ -1,3 +1,31 @@
+# 🚀 VP_Core v1.7.5 发布说明 / Release Notes：XHTTP / HTTPUpgrade / ShadowTLS 外层传输三线齐发与 DSL 往返无损加固
+
+> **“真实节点测速砸出来的 RFC 9113 合规修复、108 MB/s 回环吞吐、三款 CDN/伪装传输一次到位。”**
+>
+> 🎉 欢迎使用 **VP_Core v1.7.5**！本版本一口气落地三项主流伪装传输：**XHTTP**（Xray SplitHTTP 后继）、**HTTPUpgrade**（101 升级裸流）与 **ShadowTLS v3 外层**（vless/vmess/trojan 可叠加）。XHTTP 经 786 条真实订阅节点全链路实测，并与 mihomo 内核交叉验证行为一致；实测中还揪出并修复了一个会让所有带 Host 伪装头节点握手必败的 RFC 9113 合规缺陷。
+
+### 🌟 核心更新全览 (Highlights)
+
+| 类别 | 内容 | 收益 |
+| :--- | :--- | :--- |
+| **XHTTP 传输** | RFC 参考实现：HTTP/2 承载，GET 长响应下行 + POST 上行；`packet-up` / `stream-up` / `stream-one` 三模式；兼容服务端 `X-Padding` 响应填充 | Xray 生态新代 CDN 穿透传输原生可用，`xhttp-opts: {path, host, mode, extra-headers}` 全兼容；**与 REALITY/ECH 自由叠加** |
+| **HTTPUpgrade 传输** | 101 升级握手后裸流（无 ws 帧开销），独立于 WebSocket 实现 | sing-box/mihomo `network: httpupgrade` 节点原生直连 |
+| **ShadowTLS v3 外层** | `shadowtls-opts` 作为 vless/vmess/trojan 外层传输（先 shadow-tls 握手再叠加内层 TLS/WS/gRPC/XHTTP） | Clash `shadowtls-opts` 语义对齐，伪装面再下一城 |
+| **RFC 9113 合规修复** | HTTP/2 请求不再携带 `Host` 头（携带即 malformed，服务端必须 400） | 修复所有带 Host 伪装头节点握手必败——真实节点测速砸出来的实锤 bug |
+| **poll_write 重入语义修复** | 缓冲后冲刷 Pending 时的重轮询二次追加缺陷（xhttp + grpc 同源隐患一并根治） | 消除高吞吐场景数据重复风险，grpc 回环测试服务端补 EOS 关流对齐真实语义 |
+| **DSL 往返无损加固** | 修复 `shadow_tls:` 子对象与 `network:` 传输标识在 lowering/serializer 的两个往返丢数据缺口 | httpupgrade/shadow-tls 节点经 DSL 往返不再降级为普通 ws/tcp 节点 |
+| **订阅与 DSL 全链路** | `type=xhttp` / vmess JSON `net=xhttp` 解析、DSL `xhttp: {..}` 子对象、`network:` 显式标识 | 订阅导入 → convert → fmt 全链路幂等无损 |
+| **文档重构** | README 协议矩阵表格化 + 传输层对照表；dsl.md 新增节点速查表 / 传输层速查表 / XHTTP 四模式详解，AI Prompt 补齐传输语法 | 文档结构一目了然，AI 生成配置成功率提升 |
+
+### 🧪 测试与真实节点验证
+
+- **回环 e2e**：XHTTP 三模式（packet-up / stream-up / stream-one）TLS 回环全过，含服务端 X-Padding 填充跳过与 stream-one 双向单流
+- **吞吐基准**：XHTTP packet-up 4 MB 回环 **108.8 MB/s**（防退化门限 10 MB/s 进 CI）
+- **真实节点**：订阅库 786 条 XHTTP 链接全量导入解析 → 40 节点实测；与 **mihomo 内核交叉验证**行为一致（同节点同报 `REALITY authentication failed`，属节点服务端失效而非实现问题）；同库存活 ss 节点对照组 492~775ms 全过
+- **质量门禁**：424 项测试 100% 通过 + `cargo fmt --check` + `clippy -D warnings` 零告警
+
+---
+
 # 🚀 VP_Core v1.7.4 发布说明 / Release Notes：支持 MASQUE (Cloudflare WARP) 协议与纯 Rust 用户态网络栈
 
 > **“RFC 9484 CONNECT-IP 胶囊通道、P-256 双向 mTLS、解耦独立的纯 Rust 用户态 smoltcp 驱动器——现代代理协议版图再下一城。”**

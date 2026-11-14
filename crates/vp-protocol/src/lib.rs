@@ -139,6 +139,8 @@ pub fn transport_of(
         &None,
         &None,
         &None,
+        &None,
+        &None,
     )
 }
 
@@ -154,20 +156,38 @@ pub fn transport_of_full(
     reality_opts: &Option<vp_config::RealityOpts>,
     http_opts: &Option<vp_config::HttpOpts>,
     ech_opts: &Option<vp_config::EchOpts>,
+    xhttp_opts: &Option<vp_config::XhttpOpts>,
+    shadowtls_opts: &Option<vp_config::ShadowTlsCfg>,
 ) -> Result<TransportConfig> {
     let ws = match network.as_deref() {
         None | Some("tcp") | Some("") => None,
         Some("ws") => Some(ws_config(ws_opts).unwrap_or_default()),
-        Some("httpupgrade") | Some("v2ray-http-upgrade") => {
+        // v2ray-http-upgrade：ws 帧封装 + Upgrade 握手（sing-box ws-opts 语义）
+        Some("v2ray-http-upgrade") => {
             let mut cfg = ws_config(ws_opts).unwrap_or_default();
             cfg.v2ray_http_upgrade = true;
             Some(cfg)
         }
         Some("grpc") => None,
         Some("http") | Some("h2") => None,
+        Some("xhttp") | Some("splithttp") => None,
         Some(other) => {
             return Err(Error::Unsupported(format!("传输 {other:?} 暂不支持")));
         }
+    };
+    // HTTPUpgrade：101 升级握手后为**裸流**（无 ws 帧），路径/伪装头沿用 ws-opts（mihomo 语义）
+    let httpupgrade = match network.as_deref() {
+        Some("httpupgrade") => {
+            let o = ws_opts.clone().unwrap_or_default();
+            Some(vp_transport::httpupgrade::HttpUpgradeConfig {
+                path: o.path.unwrap_or_else(|| "/".into()),
+                headers: o
+                    .headers
+                    .map(|h| h.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })
+        }
+        _ => None,
     };
     let http = match network.as_deref() {
         Some("http") | Some("h2") => {
@@ -195,6 +215,23 @@ pub fn transport_of_full(
                 .and_then(|g| g.grpc_service_name.clone())
                 .unwrap_or_else(|| "Turbo".into()),
         }),
+        _ => None,
+    };
+    // XHTTP（SplitHTTP 后继）：network: "xhttp" 时启用，xhttp-opts 提供路径/模式/伪装头
+    let xhttp = match network.as_deref() {
+        Some("xhttp") | Some("splithttp") => {
+            let o = xhttp_opts.clone().unwrap_or_default();
+            Some(vp_transport::xhttp::XhttpConfig {
+                path: o.path.unwrap_or_else(|| "/".into()),
+                host: o.host,
+                mode: o.mode,
+                headers: o
+                    .headers
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            })
+        }
         _ => None,
     };
     let reality = match reality_opts {
@@ -232,12 +269,83 @@ pub fn transport_of_full(
         fingerprint: fingerprint.clone(),
         alpn: Vec::new(),
         ws,
+        httpupgrade,
         http,
         grpc,
+        xhttp,
         reality,
         ech,
+        shadow_tls: shadowtls_from_opts(shadowtls_opts),
         socket_opts: None,
     })
+}
+
+/// shadowtls-opts（Clash `shadowtls-opts` / sing-box detour 语义）→ 传输配置
+fn shadowtls_from_opts(
+    opts: &Option<vp_config::ShadowTlsCfg>,
+) -> Option<vp_transport::ShadowTlsClientCfg> {
+    let o = opts.as_ref()?;
+    let password = o.password.clone()?;
+    if password.is_empty() {
+        return None;
+    }
+    Some(vp_transport::ShadowTlsClientCfg {
+        password,
+        sni: o.host.clone().unwrap_or_default(),
+        version: o.version.unwrap_or(3),
+    })
+}
+
+fn ensure_shadowtls_v3(st: &vp_transport::ShadowTlsClientCfg) -> Result<()> {
+    if st.version != 3 {
+        return Err(Error::Unsupported(format!(
+            "shadow-tls v{} 暂不支持（内核仅实现 v3）",
+            st.version
+        )));
+    }
+    Ok(())
+}
+
+/// 统一出站拨号入口：配置了 shadow-tls 外层时先完成 shadow-tls 客户端握手，
+/// 再在隧道之上叠加内层传输层（TLS/WS/gRPC/XHTTP/HTTPUpgrade...）。
+/// vless / vmess / trojan 等流型协议出站统一走此函数代替裸 `vp_transport::dial`。
+pub async fn dial_transport(
+    server: &str,
+    port: u16,
+    cfg: &TransportConfig,
+) -> Result<Box<dyn ProxyStream>> {
+    match &cfg.shadow_tls {
+        None => vp_transport::dial(server, port, cfg).await,
+        Some(st) => {
+            ensure_shadowtls_v3(st)?;
+            let tcp = vp_transport::dial_tcp_multi_with_opts(
+                server,
+                port,
+                std::time::Duration::from_secs(8),
+                cfg.socket_opts.as_ref(),
+            )
+            .await?;
+            let s = shadowtls::client_handshake(tcp, &st.password, &st.sni).await?;
+            vp_transport::wrap_transport(Box::new(s), server, &cfg.clone_without_shadow_tls()).await
+        }
+    }
+}
+
+/// 链式代理：在既有底层流（已连到节点服务器）之上叠加 shadow-tls 与内层传输层
+pub async fn wrap_transport_over(
+    underlying: Box<dyn ProxyStream>,
+    server_host: &str,
+    cfg: &TransportConfig,
+) -> Result<Box<dyn ProxyStream>> {
+    match &cfg.shadow_tls {
+        None => vp_transport::wrap_transport(underlying, server_host, cfg).await,
+        Some(st) => {
+            ensure_shadowtls_v3(st)?;
+            let s = shadowtls::client_handshake(underlying, &st.password, &st.sni).await?;
+            vp_transport::wrap_transport(Box::new(s), server_host, &cfg.clone_without_shadow_tls())
+                .await
+        }
+    }
 }
 
 /// 惰性懒加载出站代理（Lazy Outbound）：
@@ -675,5 +783,84 @@ pub(crate) mod test_support {
             .unwrap();
         assert_eq!(&pkt.data[..], b"to-second");
         assert_eq!(pkt.src, echo2, "回包来源应为第二个目标");
+    }
+}
+
+#[cfg(test)]
+mod shadowtls_transport_tests {
+    use super::*;
+    use vp_config::ShadowTlsCfg;
+
+    #[test]
+    fn transport_of_full_maps_shadowtls_opts() {
+        let t = transport_of_full(
+            false,
+            &None,
+            false,
+            &Some("tcp".into()),
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(ShadowTlsCfg {
+                host: Some("cam.example.com".into()),
+                password: Some("stls-pass".into()),
+                port: None,
+                version: Some(3),
+            }),
+        )
+        .expect("transport");
+        let st = t.shadow_tls.clone().expect("shadow_tls");
+        assert_eq!(st.password, "stls-pass");
+        assert_eq!(st.sni, "cam.example.com");
+        assert_eq!(st.version, 3);
+        // clone_without_shadow_tls 应清除外层
+        assert!(t.clone_without_shadow_tls().shadow_tls.is_none());
+    }
+
+    #[test]
+    fn shadowtls_v1_v2_rejected() {
+        let cfg = TransportConfig {
+            shadow_tls: Some(vp_transport::ShadowTlsClientCfg {
+                password: "pw".into(),
+                sni: "cam.example.com".into(),
+                version: 2,
+            }),
+            ..Default::default()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(async { dial_transport("127.0.0.1", 1, &cfg).await }) {
+            Ok(_) => panic!("shadow-tls v2 应被拒绝"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("v2"), "错误信息应标明 v2: {err}");
+    }
+
+    #[test]
+    fn shadowtls_opts_without_password_is_none() {
+        let t = transport_of_full(
+            false,
+            &None,
+            false,
+            &Some("tcp".into()),
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &None,
+            &Some(ShadowTlsCfg {
+                host: Some("cam.example.com".into()),
+                password: None,
+                port: None,
+                version: None,
+            }),
+        )
+        .expect("transport");
+        assert!(t.shadow_tls.is_none());
     }
 }

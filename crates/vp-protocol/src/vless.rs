@@ -120,6 +120,8 @@ impl VlessOutbound {
             &cfg.reality_opts,
             &cfg.http_opts,
             &cfg.ech_opts,
+            &cfg.xhttp_opts,
+            &cfg.shadowtls_opts,
         )?;
         t.alpn = cfg.alpn.clone().unwrap_or_default();
         Ok(VlessOutbound {
@@ -349,7 +351,7 @@ impl Outbound for VlessOutbound {
     }
 
     async fn connect_stream(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let io = crate::dial_transport(&self.server, self.port, &self.transport).await?;
         self.handshake(io, dst, CMD_TCP).await
     }
 
@@ -359,7 +361,7 @@ impl Outbound for VlessOutbound {
         dst: &DstAddr,
         underlying: Box<dyn ProxyStream>,
     ) -> Result<Box<dyn ProxyStream>> {
-        let io = transport::wrap_transport(underlying, &self.server, &self.transport).await?;
+        let io = crate::wrap_transport_over(underlying, &self.server, &self.transport).await?;
         self.handshake(io, dst, CMD_TCP).await
     }
 
@@ -372,7 +374,7 @@ impl Outbound for VlessOutbound {
     /// - xudp：命令 0x03（Mux.Cool，不带地址），一条流承载多目标（Xray full-cone）
     /// - packetaddr：命令 0x02 发往魔法地址，每个数据报自带 IP 目标（v2ray 5+）
     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
-        let io = transport::dial(&self.server, self.port, &self.transport).await?;
+        let io = crate::dial_transport(&self.server, self.port, &self.transport).await?;
         let (cmd, req_dst, framing) = match self.udp_encoding {
             UdpEncoding::Raw => (CMD_UDP, dst.clone(), PacketFraming::Len(dst.clone())),
             UdpEncoding::Xudp => (CMD_MUX, xudp_dst(), PacketFraming::xudp_client(dst)),
@@ -758,6 +760,8 @@ mod tests {
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         let out = VlessOutbound::new(&VlessCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             uuid,
@@ -809,6 +813,8 @@ mod tests {
             VlessInbound::new("127.0.0.1", 0, "vl-udp", std::slice::from_ref(&uuid)).unwrap();
         let port = Arc::new(server).start(ctx).await.unwrap();
         let out = VlessOutbound::new(&VlessCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             uuid,
@@ -867,6 +873,8 @@ mod tests {
         let port = Arc::new(server).start(ctx).await.unwrap();
 
         let out = VlessOutbound::new(&VlessCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             uuid,
@@ -932,6 +940,8 @@ mod tests {
 
         // 构造配置了 flow: xtls-rprx-vision 的出站
         let out = VlessOutbound::new(&VlessCfg {
+            xhttp_opts: None,
+            shadowtls_opts: None,
             server: "127.0.0.1".into(),
             port,
             uuid,

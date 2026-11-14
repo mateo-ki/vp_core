@@ -951,6 +951,21 @@ pub struct GrpcOpts {
     pub grpc_service_name: Option<String>,
 }
 
+/// XHTTP 传输选项（Clash `xhttp-opts`，network: "xhttp"，Xray SplitHTTP 后继）。
+/// mode: auto / packet-up / stream-up / stream-one；host 为伪装 :authority；
+/// headers 为额外伪装请求头。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct XhttpOpts {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(alias = "extra-headers", alias = "extra_headers", default)]
+    pub headers: Option<HashMap<String, String>>,
+}
+
 /// ECH（Encrypted Client Hello）选项（Clash `ech-opts`）。
 /// config 为 base64 的 ECHConfigList；未提供时通过 DNS HTTPS(type65) 记录自动获取。
 /// doh 为查询 ECH 记录专用的 DoH 服务器 URL（如 https://dns.alidns.com/dns-query）——
@@ -967,7 +982,7 @@ pub struct EchOpts {
     pub doh: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct WsOpts {
     #[serde(default)]
     pub path: Option<String>,
@@ -1078,6 +1093,10 @@ pub struct VmessCfg {
     pub grpc_opts: Option<GrpcOpts>,
     #[serde(alias = "http-opts", alias = "http_opts", default)]
     pub http_opts: Option<HttpOpts>,
+    #[serde(alias = "xhttp-opts", alias = "xhttp_opts", default)]
+    pub xhttp_opts: Option<XhttpOpts>,
+    #[serde(alias = "shadowtls-opts", alias = "shadowtls_opts", default)]
+    pub shadowtls_opts: Option<ShadowTlsCfg>,
     #[serde(default)]
     pub udp: bool,
     /// UDP 编码：xudp / packetaddr；空为原始编码（mihomo 语义，优先于下面两个布尔开关）
@@ -1138,6 +1157,10 @@ pub struct VlessCfg {
     pub ech_opts: Option<EchOpts>,
     #[serde(alias = "http-opts", alias = "http_opts", default)]
     pub http_opts: Option<HttpOpts>,
+    #[serde(alias = "xhttp-opts", alias = "xhttp_opts", default)]
+    pub xhttp_opts: Option<XhttpOpts>,
+    #[serde(alias = "shadowtls-opts", alias = "shadowtls_opts", default)]
+    pub shadowtls_opts: Option<ShadowTlsCfg>,
     #[serde(default)]
     pub udp: bool,
     /// UDP 编码：xudp / packetaddr；空为原始编码（mihomo 语义，优先于下面两个布尔开关）
@@ -1203,6 +1226,10 @@ pub struct TrojanCfg {
     pub ech_opts: Option<EchOpts>,
     #[serde(alias = "http-opts", alias = "http_opts", default)]
     pub http_opts: Option<HttpOpts>,
+    #[serde(alias = "xhttp-opts", alias = "xhttp_opts", default)]
+    pub xhttp_opts: Option<XhttpOpts>,
+    #[serde(alias = "shadowtls-opts", alias = "shadowtls_opts", default)]
+    pub shadowtls_opts: Option<ShadowTlsCfg>,
     #[serde(default)]
     pub udp: bool,
 }

@@ -263,6 +263,14 @@ impl SsOutbound {
                 let o = cfg.plugin_opts.as_ref().ok_or_else(|| {
                     Error::Config("shadow-tls 插件缺少 plugin-opts（host/password）".into())
                 })?;
+                // 客户端握手仅实现 v3（strict 模式）；v1/v2 明确报错而非神秘握手失败
+                if let Some(v) = o.version {
+                    if v != 3 {
+                        return Err(Error::Config(format!(
+                            "shadow-tls v{v} 暂不支持（内核仅实现 v3）"
+                        )));
+                    }
+                }
                 let host = o
                     .host
                     .clone()

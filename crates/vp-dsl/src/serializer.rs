@@ -287,15 +287,13 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             server,
             port,
             password,
-            network,
+            network: _,
             udp,
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
             out.push_str(&format!("    port: {port}\n"));
             out.push_str(&format!("    password: \"{}\"\n", escape_str(password)));
-            if let Some(net) = network {
-                out.push_str(&format!("    network: \"{}\"\n", escape_str(net)));
-            }
+            // network 由 serialize_transport 统一输出（kind 与 TransportSpec 双写同一来源）
             if *udp {
                 out.push_str("    udp: true\n");
             }
@@ -681,6 +679,11 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
 }
 
 fn serialize_transport(t: &TransportSpec, out: &mut String) {
+    // 传输类型标识（ws/grpc/xhttp/httpupgrade 等非 tcp 传输的往返依赖此字段；
+    // masque 的 network 仅存于 kind，此处恒为 None，不产生重复输出）
+    if let Some(net) = &t.network {
+        out.push_str(&format!("    network: \"{}\"\n", escape_str(net)));
+    }
     if let Some(r) = &t.reality {
         out.push_str("    tls: reality {\n");
         if let Some(sni) = &t.sni {
@@ -735,6 +738,21 @@ fn serialize_transport(t: &TransportSpec, out: &mut String) {
             "        service_name: \"{}\"\n",
             escape_str(&grpc.service_name)
         ));
+        out.push_str("    }\n");
+    }
+
+    if let Some(x) = &t.xhttp {
+        out.push_str("    xhttp: {\n");
+        out.push_str(&format!("        path: \"{}\"\n", escape_str(&x.path)));
+        if let Some(mode) = &x.mode {
+            out.push_str(&format!("        mode: \"{}\"\n", escape_str(mode)));
+        }
+        if let Some(host) = x.headers.get("Host").or_else(|| x.headers.get("host")) {
+            out.push_str(&format!(
+                "        headers: {{ Host: \"{}\" }}\n",
+                escape_str(host)
+            ));
+        }
         out.push_str("    }\n");
     }
 

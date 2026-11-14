@@ -128,6 +128,9 @@ async fn ws_tls_transport_only() {
         }),
         http: None,
         grpc: None,
+        xhttp: None,
+        httpupgrade: None,
+        shadow_tls: None,
         reality: None,
         socket_opts: None,
     };

@@ -72,6 +72,16 @@ impl SubNode {
                 "\n    ws-opts:\n      path: {path}\n      headers:\n        Host: {host}"
             ));
         }
+        // xhttp-opts 块（若存在）
+        if let Some((_, path)) = self.fields.iter().find(|(k, _)| k == "__xhttp_path") {
+            out.push_str(&format!("\n    xhttp-opts:\n      path: {path}"));
+            if let Some((_, mode)) = self.fields.iter().find(|(k, _)| k == "__xhttp_mode") {
+                out.push_str(&format!("\n      mode: {mode}"));
+            }
+            if let Some((_, host)) = self.fields.iter().find(|(k, _)| k == "__xhttp_host") {
+                out.push_str(&format!("\n      headers:\n        Host: {host}"));
+            }
+        }
         // reality-opts 块（若存在）
         if let Some((_, pbk)) = self.fields.iter().find(|(k, _)| k == "__reality_pbk") {
             out.push_str(&format!("\n    reality-opts:\n      public-key: {pbk}"));
@@ -251,7 +261,27 @@ fn parse_vless(rest: &str) -> Result<SubNode> {
         f.pop();
         f.push(("grpc-opts".into(), format!("{{grpc-service-name: {svc}}}")));
     }
+    if network == "xhttp" || network == "splithttp" {
+        push_xhttp_fields(
+            &mut f,
+            p.get("path").cloned().unwrap_or_else(|| "/".into()),
+            p.get("host").cloned().unwrap_or_default(),
+            p.get("mode").cloned().unwrap_or_default(),
+        );
+    }
     Ok(SubNode { fields: f })
+}
+
+/// `type=xhttp` 参数 → `__xhttp_*` 特殊字段（to_yaml 展开为 xhttp-opts 块）。
+/// path/host/mode 分别来自链接 query（vless/trojan）或 vmess JSON 字段。
+fn push_xhttp_fields(f: &mut Vec<(String, String)>, path: String, host: String, mode: String) {
+    f.push(("__xhttp_path".into(), q(&path)));
+    if !host.is_empty() {
+        f.push(("__xhttp_host".into(), q(&host)));
+    }
+    if !mode.is_empty() {
+        f.push(("__xhttp_mode".into(), q(&mode)));
+    }
 }
 
 fn finish_ws(mut f: Vec<(String, String)>, p: &HashMap<String, String>) -> Result<SubNode> {
@@ -346,6 +376,8 @@ fn parse_vmess(rest: &str) -> Result<SubNode> {
             "grpc-opts".into(),
             format!("{{grpc-service-name: {}}}", get("path")),
         ));
+    } else if net == "xhttp" || net == "splithttp" {
+        push_xhttp_fields(&mut f, get("path"), get("host"), get("mode"));
     }
     Ok(SubNode { fields: f })
 }
@@ -399,6 +431,14 @@ fn parse_trojan(rest: &str) -> Result<SubNode> {
             "__ws_host".into(),
             q(&p.get("host").cloned().unwrap_or_default()),
         ));
+    }
+    if network == "xhttp" || network == "splithttp" {
+        push_xhttp_fields(
+            &mut f,
+            p.get("path").cloned().unwrap_or_else(|| "/".into()),
+            p.get("host").cloned().unwrap_or_default(),
+            p.get("mode").cloned().unwrap_or_default(),
+        );
     }
     Ok(SubNode { fields: f })
 }
@@ -963,10 +1003,15 @@ pub fn parse_subscription(text: &str) -> Vec<SubNode> {
     for l in lines.into_iter().filter(|l| l.contains("://")) {
         match parse_uri(&l) {
             Ok(n) => {
-                // 只保留本内核支持的传输（tcp/ws/grpc）；无 network 字段的协议（ss/trojan/anytls）直接接受
+                // 只保留本内核支持的传输（tcp/ws/grpc/xhttp）；无 network 字段的协议（ss/trojan/anytls）直接接受
                 let net_ok = match n.fields.iter().find(|(k, _)| k == "network") {
                     None => true,
-                    Some((_, v)) => matches!(v.trim_matches('"'), "tcp" | "ws" | "grpc"),
+                    Some((_, v)) => {
+                        matches!(
+                            v.trim_matches('"'),
+                            "tcp" | "ws" | "grpc" | "xhttp" | "splithttp"
+                        )
+                    }
                 };
                 if net_ok {
                     out.push(n);
@@ -1328,6 +1373,47 @@ mod tests {
         let y = n.to_yaml();
         assert!(y.contains("type: vless"));
         assert!(y.contains("tls: true"));
+    }
+
+    #[test]
+    fn vless_xhttp_uri() {
+        // Xray xhttp 分享链接：type=xhttp + path/host/mode query 参数
+        let n = parse_uri(
+            "vless://uuid-123@1.2.3.4:443?security=tls&sni=cdn.com&type=xhttp&path=%2Fxhttp-upload&host=cdn.com&mode=stream-up#XHTTP-01",
+        )
+        .unwrap();
+        assert_eq!(n.name(), "XHTTP-01");
+        let y = n.to_yaml();
+        assert!(y.contains("network: xhttp"), "{y}");
+        assert!(y.contains("xhttp-opts:"), "{y}");
+        assert!(y.contains("path: \"/xhttp-upload\""), "{y}");
+        assert!(y.contains("mode: \"stream-up\""), "{y}");
+        assert!(y.contains("Host: \"cdn.com\""), "{y}");
+        // 直转 IR 出站（含 xhttp 传输）
+        let spec = n.to_outbound_spec().unwrap();
+        let x = spec.transport.xhttp.as_ref().expect("IR xhttp spec");
+        assert_eq!(x.path, "/xhttp-upload");
+        assert_eq!(x.mode.as_deref(), Some("stream-up"));
+    }
+
+    #[test]
+    fn vmess_xhttp_json() {
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "ps": "VM-XHTTP", "add": "5.6.7.8", "port": "443",
+            "id": "11111111-2222-3333-4444-555555555555", "aid": "0",
+            "net": "xhttp", "path": "/vm-xhttp", "host": "vm.com",
+            "mode": "auto", "tls": "tls", "sni": "vm.com"
+        });
+        let uri = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(payload.to_string())
+        );
+        let n = parse_uri(&uri).unwrap();
+        let y = n.to_yaml();
+        assert!(y.contains("network: xhttp"), "{y}");
+        assert!(y.contains("xhttp-opts:"), "{y}");
+        assert!(y.contains("path: \"/vm-xhttp\""), "{y}");
     }
 
     #[test]

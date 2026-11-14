@@ -690,6 +690,17 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
                     path: h.path.unwrap_or_default(),
                     headers: h.headers.unwrap_or_default(),
                 }),
+                xhttp: v.xhttp_opts.map(|x| XhttpSpec {
+                    path: x.path.unwrap_or_else(|| "/".into()),
+                    host: x.host,
+                    mode: x.mode,
+                    headers: x.headers.unwrap_or_default(),
+                }),
+                shadow_tls: v.shadowtls_opts.as_ref().map(|o| ShadowTlsSpec {
+                    password: o.password.clone().unwrap_or_default(),
+                    sni: o.host.clone().unwrap_or_default(),
+                    version: o.version.unwrap_or(3),
+                }),
                 ech: v.ech_opts.map(|e| EchSpec {
                     enable: e.enable,
                     config: e.config,
@@ -723,6 +734,17 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
                 }),
                 grpc: v.grpc_opts.map(|g| GrpcSpec {
                     service_name: g.grpc_service_name.unwrap_or_default(),
+                }),
+                xhttp: v.xhttp_opts.map(|x| XhttpSpec {
+                    path: x.path.unwrap_or_else(|| "/".into()),
+                    host: x.host,
+                    mode: x.mode,
+                    headers: x.headers.unwrap_or_default(),
+                }),
+                shadow_tls: v.shadowtls_opts.as_ref().map(|o| ShadowTlsSpec {
+                    password: o.password.clone().unwrap_or_default(),
+                    sni: o.host.clone().unwrap_or_default(),
+                    version: o.version.unwrap_or(3),
                 }),
                 reality: v.reality_opts.map(|r| RealitySpec {
                     public_key: r.public_key,
@@ -761,6 +783,17 @@ fn lower_proxy_cfg(p: ProxyCfg) -> OutboundSpec {
                 }),
                 grpc: t.grpc_opts.map(|g| GrpcSpec {
                     service_name: g.grpc_service_name.unwrap_or_default(),
+                }),
+                xhttp: t.xhttp_opts.map(|x| XhttpSpec {
+                    path: x.path.unwrap_or_else(|| "/".into()),
+                    host: x.host,
+                    mode: x.mode,
+                    headers: x.headers.unwrap_or_default(),
+                }),
+                shadow_tls: t.shadowtls_opts.as_ref().map(|o| ShadowTlsSpec {
+                    password: o.password.clone().unwrap_or_default(),
+                    sni: o.host.clone().unwrap_or_default(),
+                    version: o.version.unwrap_or(3),
                 }),
                 reality: t.reality_opts.map(|r| RealitySpec {
                     public_key: r.public_key,
@@ -1306,6 +1339,22 @@ impl From<OutboundSpec> for ProxyCfg {
                     path: Some(h.path.clone()),
                     headers: Some(h.headers.clone()),
                 }),
+                xhttp_opts: t.xhttp.as_ref().map(|x| XhttpOpts {
+                    path: Some(x.path.clone()),
+                    host: x.host.clone(),
+                    mode: x.mode.clone(),
+                    headers: if x.headers.is_empty() {
+                        None
+                    } else {
+                        Some(x.headers.clone())
+                    },
+                }),
+                shadowtls_opts: t.shadow_tls.as_ref().map(|st| ShadowTlsCfg {
+                    host: Some(st.sni.clone()),
+                    password: Some(st.password.clone()),
+                    port: None,
+                    version: Some(st.version),
+                }),
                 udp: false,
                 packet_encoding: None,
                 xudp: false,
@@ -1362,6 +1411,22 @@ impl From<OutboundSpec> for ProxyCfg {
                     path: Some(h.path),
                     headers: Some(h.headers),
                 }),
+                xhttp_opts: t.xhttp.map(|x| XhttpOpts {
+                    path: Some(x.path),
+                    host: x.host,
+                    mode: x.mode,
+                    headers: if x.headers.is_empty() {
+                        None
+                    } else {
+                        Some(x.headers)
+                    },
+                }),
+                shadowtls_opts: t.shadow_tls.map(|st| ShadowTlsCfg {
+                    host: Some(st.sni),
+                    password: Some(st.password),
+                    port: None,
+                    version: Some(st.version),
+                }),
                 udp,
                 packet_encoding,
                 xudp: false,
@@ -1415,6 +1480,22 @@ impl From<OutboundSpec> for ProxyCfg {
                     method: h.method,
                     path: Some(h.path),
                     headers: Some(h.headers),
+                }),
+                xhttp_opts: t.xhttp.map(|x| XhttpOpts {
+                    path: Some(x.path),
+                    host: x.host,
+                    mode: x.mode,
+                    headers: if x.headers.is_empty() {
+                        None
+                    } else {
+                        Some(x.headers)
+                    },
+                }),
+                shadowtls_opts: t.shadow_tls.map(|st| ShadowTlsCfg {
+                    host: Some(st.sni),
+                    password: Some(st.password),
+                    port: None,
+                    version: Some(st.version),
                 }),
                 udp,
             }),
@@ -1818,5 +1899,80 @@ proxies:
             .find(|o| o.name == "WARP-MASQUE")
             .unwrap();
         assert_eq!(back_p.kind.type_name(), "masque");
+    }
+
+    /// XHTTP（vless/vmess/trojan 共用 xhttp-opts）：YAML → IR → 回写 YAML 往返无损
+    #[test]
+    fn test_xhttp_yaml_and_ir_roundtrip() {
+        let yaml = r#"
+proxies:
+  - name: "CDN-XHTTP"
+    type: vless
+    server: 104.16.0.1
+    port: 443
+    uuid: "11111111-2222-3333-4444-555555555555"
+    tls: true
+    servername: "cdn.example.com"
+    network: xhttp
+    flow: xtls-rprx-vision
+    xhttp-opts:
+      path: "/xhttp-upload"
+      host: "cdn.example.com"
+      mode: auto
+      extra-headers:
+        X-Custom-Flag: "hello"
+    udp: true
+"#;
+        let cfg = parse(yaml, Format::Yaml).expect("parse xhttp yaml");
+        assert_eq!(cfg.proxies.len(), 1);
+        match &cfg.proxies[0].kind {
+            crate::ProxyKind::Vless(v) => {
+                assert_eq!(v.network.as_deref(), Some("xhttp"));
+                let x = v.xhttp_opts.as_ref().expect("xhttp_opts 应当被解析");
+                assert_eq!(x.path.as_deref(), Some("/xhttp-upload"));
+                assert_eq!(x.host.as_deref(), Some("cdn.example.com"));
+                assert_eq!(x.mode.as_deref(), Some("auto"));
+                assert_eq!(
+                    x.headers.as_ref().and_then(|h| h.get("X-Custom-Flag")),
+                    Some(&"hello".to_string())
+                );
+            }
+            other => panic!("expected vless, got {other:?}"),
+        }
+
+        let ir = cfg.into_ir().expect("into_ir");
+        let ob = ir.outbounds.iter().find(|o| o.name == "CDN-XHTTP").unwrap();
+        match &ob.kind {
+            vp_ir::OutboundKind::Vless { .. } => {}
+            other => panic!("expected vless outbound, got {other:?}"),
+        }
+        let x = ob.transport.xhttp.as_ref().expect("IR xhttp spec");
+        assert_eq!(x.path, "/xhttp-upload");
+        assert_eq!(x.mode.as_deref(), Some("auto"));
+        assert_eq!(ob.transport.network.as_deref(), Some("xhttp"));
+        assert!(ob.transport.tls);
+
+        // 反向：IR → Clash 模型，字段应当无损还原
+        let back_cfg = crate::Config::from(ir);
+        match &back_cfg
+            .proxies
+            .iter()
+            .find(|o| o.name == "CDN-XHTTP")
+            .unwrap()
+            .kind
+        {
+            crate::ProxyKind::Vless(v) => {
+                assert_eq!(v.network.as_deref(), Some("xhttp"));
+                let x = v.xhttp_opts.as_ref().expect("反向 xhttp_opts");
+                assert_eq!(x.path.as_deref(), Some("/xhttp-upload"));
+                assert_eq!(x.host.as_deref(), Some("cdn.example.com"));
+                assert_eq!(x.mode.as_deref(), Some("auto"));
+                assert_eq!(
+                    x.headers.as_ref().and_then(|h| h.get("X-Custom-Flag")),
+                    Some(&"hello".to_string())
+                );
+            }
+            other => panic!("expected vless, got {other:?}"),
+        }
     }
 }

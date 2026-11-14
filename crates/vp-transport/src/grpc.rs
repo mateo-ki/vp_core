@@ -169,11 +169,16 @@ impl AsyncWrite for GrpcStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // 先冲刷积压
+        // 注意 poll_write 重入语义：若 flush 返回 Pending，数据已入 send_buf，
+        // 调用方会以同一 buf 重轮询——绝不能再追加。此处接受写入后即使冲刷
+        // 挂起也上报完成，由 poll_flush / poll_shutdown 保证最终投递。
         std::task::ready!(self.flush_pending(cx))?;
         self.send_buf.extend_from_slice(buf);
-        std::task::ready!(self.flush_pending(cx))?;
-        Poll::Ready(Ok(buf.len()))
+        match self.flush_pending(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Ready(Ok(buf.len())),
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -257,9 +262,14 @@ mod tests {
             loop {
                 let n = s.read(&mut b).await.unwrap();
                 if n == 0 {
+                    // 上行 EOF：冲刷残余并显式 EOS 关流，避免 drop 触发 RST
+                    // 丢弃客户端尚未消费的缓冲数据
+                    let _ = s.flush().await;
+                    let _ = s.shutdown().await;
                     break;
                 }
                 s.write_all(&b[..n]).await.unwrap();
+                s.flush().await.unwrap();
             }
         });
 

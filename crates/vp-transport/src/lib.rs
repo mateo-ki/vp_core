@@ -5,11 +5,13 @@ use std::sync::Arc;
 pub mod grpc;
 pub mod hpke;
 pub mod http;
+pub mod httpupgrade;
 pub mod quic;
 pub mod reality_server;
 pub mod tls;
 pub mod utls;
 pub mod ws;
+pub mod xhttp;
 
 pub type ProxyStreamBox = Box<dyn vp_core::ProxyStream>;
 
@@ -371,6 +373,17 @@ pub struct EchRequest {
     pub doh: Option<String>,
 }
 
+/// shadow-tls 外层包装参数（握手由 vp-protocol::dial_transport / wrap_transport_over
+/// 统一处理：先 shadow-tls 客户端握手，再叠加内层 TLS/WS/gRPC 传输层；仅承载数据）
+#[derive(Debug, Clone)]
+pub struct ShadowTlsClientCfg {
+    pub password: String,
+    /// 伪装站域名（写入 ClientHello SNI，需与对端 camouflage 配置一致）
+    pub sni: String,
+    /// 内核仅实现 v3（strict 模式）
+    pub version: u32,
+}
+
 /// 传输配置（各协议出站共用）
 #[derive(Debug, Clone, Default)]
 pub struct TransportConfig {
@@ -386,25 +399,42 @@ pub struct TransportConfig {
     pub ws: Option<WsConfig>,
     /// network: "http" 时启用 HTTP 伪装传输
     pub http: Option<http::HttpConfig>,
+    /// network: "httpupgrade" 时启用 HTTPUpgrade（101 后裸流，无 ws 帧）
+    pub httpupgrade: Option<httpupgrade::HttpUpgradeConfig>,
     /// network: "grpc" 时启用 gRPC（要求 TLS + ALPN h2）
     pub grpc: Option<grpc::GrpcConfig>,
+    /// network: "xhttp" 时启用 XHTTP（SplitHTTP 后继；TLS + ALPN h2）
+    pub xhttp: Option<xhttp::XhttpConfig>,
     /// REALITY 认证扩展
     pub reality: Option<RealityConfig>,
     /// ECH（Encrypted Client Hello）
     pub ech: Option<EchRequest>,
+    /// shadow-tls 外层（vless/vmess/trojan 等流型协议可叠加）
+    pub shadow_tls: Option<ShadowTlsClientCfg>,
     /// 节点专属出站网络选项（独立网卡绑定 interface-name / 路由标记 routing-mark）
     pub socket_opts: Option<SocketOpts>,
 }
 
-/// ALPN 取值：节点显式声明的优先，否则按传输类型推导（grpc→h2，ws→http/1.1）
+impl TransportConfig {
+    /// 去掉 shadow-tls 外层的副本（vp-protocol 完成 shadow-tls 握手后，
+    /// 剩余传输层按普通流程叠加，避免重复处理）
+    pub fn clone_without_shadow_tls(&self) -> TransportConfig {
+        let mut c = self.clone();
+        c.shadow_tls = None;
+        c
+    }
+}
+
+/// ALPN 取值：节点显式声明的优先，否则按传输类型推导
+/// （grpc/xhttp→h2，ws/httpupgrade→http/1.1）
 fn explicit_or_derived_alpn(cfg: &TransportConfig, grpc: &[String], ws: &[String]) -> Vec<String> {
     if !cfg.alpn.is_empty() {
         return cfg.alpn.clone();
     }
-    if cfg.grpc.is_some() {
+    if cfg.grpc.is_some() || cfg.xhttp.is_some() {
         return grpc.to_vec();
     }
-    if cfg.ws.is_some() {
+    if cfg.ws.is_some() || cfg.httpupgrade.is_some() {
         return ws.to_vec();
     }
     Vec::new()
@@ -518,6 +548,11 @@ pub async fn wrap_transport(
             .await?;
             Box::new(vp_core::stream::Opaque(s))
         };
+        if let Some(hu) = &cfg.httpupgrade {
+            // HTTPUpgrade：101 后裸流（无 ws 帧封装）
+            let s = httpupgrade::httpupgrade_connect(tls, server_host, hu).await?;
+            return Ok(Box::new(vp_core::stream::Opaque(s)));
+        }
         if let Some(ws) = &cfg.ws {
             let ws_stream = ws::ws_handshake_client(tls, server_host, ws).await?;
             return Ok(Box::new(ws_stream));
@@ -526,7 +561,16 @@ pub async fn wrap_transport(
             let s = http::http_handshake_client(tls, server_host, h)?;
             return Ok(Box::new(s));
         }
+        if let Some(x) = &cfg.xhttp {
+            // XHTTP（SplitHTTP 后继）：h2 之上 GET 下行长流 + POST 上行
+            let s = xhttp::xhttp_connect(tls, server_host, x).await?;
+            return Ok(Box::new(s));
+        }
         return Ok(tls);
+    }
+    if let Some(hu) = &cfg.httpupgrade {
+        let s = httpupgrade::httpupgrade_connect(stream, server_host, hu).await?;
+        return Ok(Box::new(vp_core::stream::Opaque(s)));
     }
     if let Some(ws) = &cfg.ws {
         let ws_stream = ws::ws_handshake_client(stream, server_host, ws).await?;
@@ -534,6 +578,10 @@ pub async fn wrap_transport(
     }
     if let Some(h) = &cfg.http {
         let s = http::http_handshake_client(stream, server_host, h)?;
+        return Ok(Box::new(s));
+    }
+    if let Some(x) = &cfg.xhttp {
+        let s = xhttp::xhttp_connect(stream, server_host, x).await?;
         return Ok(Box::new(s));
     }
     Ok(stream)

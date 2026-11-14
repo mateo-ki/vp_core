@@ -2587,7 +2587,7 @@ mod tests {
         assert_eq!(&rec[85..85 + 32], &r2);
         let pos = 117;
         let l = u16::from_be_bytes([rec[pos], rec[pos + 1]]) as usize;
-        assert_eq!(l as usize, "V4,cipher AES-256-GCM".len() + 1);
+        assert_eq!(l, "V4,cipher AES-256-GCM".len() + 1);
     }
 
     #[test]
@@ -2701,7 +2701,7 @@ Fku7dGavURO5SVxMn/sL6En5D+oSeXkadHpDs+Airym2YHh15h0+jPSOoR6yiVp/
         let mut recv = DataCrypt::new(DataCipher::Aes256Gcm, &rx_keys, Some(peer_id), 0);
         let pkt = send.encrypt(b"ip-packet-bytes").unwrap();
         assert_eq!(pkt[0], opcode_key_id(P_DATA_V2, 0));
-        assert_eq!(&pkt[1..4], &(peer_id as u32).to_be_bytes()[1..]);
+        assert_eq!(&pkt[1..4], &{ peer_id }.to_be_bytes()[1..]);
         assert_eq!(&pkt[4..8], &1u32.to_be_bytes());
         let out = recv.decrypt(&pkt).unwrap();
         assert_eq!(out, b"ip-packet-bytes");

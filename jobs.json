@@ -1,0 +1,353 @@
+{
+  "total_count": 3,
+  "jobs": [
+    {
+      "id": 132442903335,
+      "run_id": 43593461084,
+      "workflow_name": "CI",
+      "head_branch": "main",
+      "run_url": "https://api.github.com/repos/mateo-ki/vp_core/actions/runs/43593461084",
+      "run_attempt": 1,
+      "node_id": "CR_kwDOVX0f388AAAAe1jZTJw",
+      "head_sha": "10452ec1fa7fbe054a3d988ae4fe2d3c20a8753c",
+      "url": "https://api.github.com/repos/mateo-ki/vp_core/actions/jobs/132442903335",
+      "html_url": "https://github.com/mateo-ki/vp_core/actions/runs/43593461084/job/132442903335",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-11-14T12:10:05Z",
+      "started_at": "2026-11-14T12:10:09Z",
+      "completed_at": "2026-11-14T12:10:30Z",
+      "name": "Test (macos-latest)",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T12:10:11Z",
+          "completed_at": "2026-11-14T12:10:12Z"
+        },
+        {
+          "name": "Checkout repository",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T12:10:12Z",
+          "completed_at": "2026-11-14T12:10:15Z"
+        },
+        {
+          "name": "Set up Rust toolchain",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T12:10:15Z",
+          "completed_at": "2026-11-14T12:10:25Z"
+        },
+        {
+          "name": "Rust Cache",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-11-14T12:10:25Z",
+          "completed_at": "2026-11-14T12:10:25Z"
+        },
+        {
+          "name": "Check code formatting",
+          "status": "completed",
+          "conclusion": "failure",
+          "number": 5,
+          "started_at": "2026-11-14T12:10:25Z",
+          "completed_at": "2026-11-14T12:10:26Z"
+        },
+        {
+          "name": "Run clippy",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 6,
+          "started_at": "2026-11-14T12:10:26Z",
+          "completed_at": "2026-11-14T12:10:26Z"
+        },
+        {
+          "name": "Run workspace tests",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 7,
+          "started_at": "2026-11-14T12:10:26Z",
+          "completed_at": "2026-11-14T12:10:26Z"
+        },
+        {
+          "name": "Gate-check bundled .vp DSL example (validate + fmt --check)",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 8,
+          "started_at": "2026-11-14T12:10:26Z",
+          "completed_at": "2026-11-14T12:10:26Z"
+        },
+        {
+          "name": "Post Rust Cache",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 15,
+          "started_at": "2026-11-14T12:10:26Z",
+          "completed_at": "2026-11-14T12:10:26Z"
+        },
+        {
+          "name": "Post Checkout repository",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-11-14T12:10:26Z",
+          "completed_at": "2026-11-14T12:10:27Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-11-14T12:10:27Z",
+          "completed_at": "2026-11-14T12:10:27Z"
+        }
+      ],
+      "check_run_url": "https://api.github.com/repos/mateo-ki/vp_core/check-runs/132442903335",
+      "labels": [
+        "macos-latest"
+      ],
+      "runner_id": 1000004074,
+      "runner_name": "GitHub Actions 1000004074",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions"
+    },
+    {
+      "id": 132442903524,
+      "run_id": 43593461084,
+      "workflow_name": "CI",
+      "head_branch": "main",
+      "run_url": "https://api.github.com/repos/mateo-ki/vp_core/actions/runs/43593461084",
+      "run_attempt": 1,
+      "node_id": "CR_kwDOVX0f388AAAAe1jZT5A",
+      "head_sha": "10452ec1fa7fbe054a3d988ae4fe2d3c20a8753c",
+      "url": "https://api.github.com/repos/mateo-ki/vp_core/actions/jobs/132442903524",
+      "html_url": "https://github.com/mateo-ki/vp_core/actions/runs/43593461084/job/132442903524",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-11-14T12:10:05Z",
+      "started_at": "2026-11-14T12:10:07Z",
+      "completed_at": "2026-11-14T12:10:46Z",
+      "name": "Test (windows-latest)",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T12:10:08Z",
+          "completed_at": "2026-11-14T12:10:10Z"
+        },
+        {
+          "name": "Checkout repository",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T12:10:10Z",
+          "completed_at": "2026-11-14T12:10:15Z"
+        },
+        {
+          "name": "Set up Rust toolchain",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T12:10:15Z",
+          "completed_at": "2026-11-14T12:10:39Z"
+        },
+        {
+          "name": "Rust Cache",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-11-14T12:10:39Z",
+          "completed_at": "2026-11-14T12:10:40Z"
+        },
+        {
+          "name": "Check code formatting",
+          "status": "completed",
+          "conclusion": "failure",
+          "number": 5,
+          "started_at": "2026-11-14T12:10:40Z",
+          "completed_at": "2026-11-14T12:10:42Z"
+        },
+        {
+          "name": "Run clippy",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 6,
+          "started_at": "2026-11-14T12:10:42Z",
+          "completed_at": "2026-11-14T12:10:42Z"
+        },
+        {
+          "name": "Run workspace tests",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 7,
+          "started_at": "2026-11-14T12:10:42Z",
+          "completed_at": "2026-11-14T12:10:42Z"
+        },
+        {
+          "name": "Gate-check bundled .vp DSL example (validate + fmt --check)",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 8,
+          "started_at": "2026-11-14T12:10:42Z",
+          "completed_at": "2026-11-14T12:10:42Z"
+        },
+        {
+          "name": "Post Rust Cache",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 15,
+          "started_at": "2026-11-14T12:10:42Z",
+          "completed_at": "2026-11-14T12:10:42Z"
+        },
+        {
+          "name": "Post Checkout repository",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-11-14T12:10:42Z",
+          "completed_at": "2026-11-14T12:10:44Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-11-14T12:10:44Z",
+          "completed_at": "2026-11-14T12:10:44Z"
+        }
+      ],
+      "check_run_url": "https://api.github.com/repos/mateo-ki/vp_core/check-runs/132442903524",
+      "labels": [
+        "windows-latest"
+      ],
+      "runner_id": 1000004077,
+      "runner_name": "GitHub Actions 1000004077",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions"
+    },
+    {
+      "id": 132442903658,
+      "run_id": 43593461084,
+      "workflow_name": "CI",
+      "head_branch": "main",
+      "run_url": "https://api.github.com/repos/mateo-ki/vp_core/actions/runs/43593461084",
+      "run_attempt": 1,
+      "node_id": "CR_kwDOVX0f388AAAAe1jZUag",
+      "head_sha": "10452ec1fa7fbe054a3d988ae4fe2d3c20a8753c",
+      "url": "https://api.github.com/repos/mateo-ki/vp_core/actions/jobs/132442903658",
+      "html_url": "https://github.com/mateo-ki/vp_core/actions/runs/43593461084/job/132442903658",
+      "status": "completed",
+      "conclusion": "failure",
+      "created_at": "2026-11-14T12:10:05Z",
+      "started_at": "2026-11-14T12:10:07Z",
+      "completed_at": "2026-11-14T12:10:20Z",
+      "name": "Test (ubuntu-latest)",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-14T12:10:07Z",
+          "completed_at": "2026-11-14T12:10:08Z"
+        },
+        {
+          "name": "Checkout repository",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-14T12:10:08Z",
+          "completed_at": "2026-11-14T12:10:09Z"
+        },
+        {
+          "name": "Set up Rust toolchain",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-14T12:10:09Z",
+          "completed_at": "2026-11-14T12:10:18Z"
+        },
+        {
+          "name": "Rust Cache",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 4,
+          "started_at": "2026-11-14T12:10:18Z",
+          "completed_at": "2026-11-14T12:10:18Z"
+        },
+        {
+          "name": "Check code formatting",
+          "status": "completed",
+          "conclusion": "failure",
+          "number": 5,
+          "started_at": "2026-11-14T12:10:18Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        },
+        {
+          "name": "Run clippy",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 6,
+          "started_at": "2026-11-14T12:10:19Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        },
+        {
+          "name": "Run workspace tests",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 7,
+          "started_at": "2026-11-14T12:10:19Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        },
+        {
+          "name": "Gate-check bundled .vp DSL example (validate + fmt --check)",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 8,
+          "started_at": "2026-11-14T12:10:19Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        },
+        {
+          "name": "Post Rust Cache",
+          "status": "completed",
+          "conclusion": "skipped",
+          "number": 15,
+          "started_at": "2026-11-14T12:10:19Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        },
+        {
+          "name": "Post Checkout repository",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 16,
+          "started_at": "2026-11-14T12:10:19Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        },
+        {
+          "name": "Complete job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 17,
+          "started_at": "2026-11-14T12:10:19Z",
+          "completed_at": "2026-11-14T12:10:19Z"
+        }
+      ],
+      "check_run_url": "https://api.github.com/repos/mateo-ki/vp_core/check-runs/132442903658",
+      "labels": [
+        "ubuntu-latest"
+      ],
+      "runner_id": 1000004078,
+      "runner_name": "GitHub Actions 1000004078",
+      "runner_group_id": 0,
+      "runner_group_name": "GitHub Actions"
+    }
+  ]
+}

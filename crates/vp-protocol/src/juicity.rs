@@ -104,7 +104,9 @@ fn decode_host_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
                 19,
             ))
         }
-        other => Err(Error::ProtoMsg(format!("juicity: 地址类型 {other:#x} 非法"))),
+        other => Err(Error::ProtoMsg(format!(
+            "juicity: 地址类型 {other:#x} 非法"
+        ))),
     }
 }
 
@@ -132,7 +134,7 @@ fn cert_chain_hash(certs: &[rustls::pki_types::CertificateDer<'_>]) -> [u8; 32] 
 
 /// pinned-cert-chain 解析：hex（64 位无歧义优先）/ base64（std 与 url，含无填充）
 fn decode_pin(s: &str) -> Option<[u8; 32]> {
-    use base64::{engine::general_purpose, Engine as _};
+    use base64::{Engine as _, engine::general_purpose};
     let t = s.trim();
     let bytes = if t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()) {
         hex_decode(t)
@@ -312,11 +314,12 @@ impl JuicitySession {
 
 impl JuicityOutbound {
     pub fn new(cfg: &vp_config::JuicityCfg) -> Result<Self> {
-        let pinned = cfg
+        let pinned = cfg.pinned_cert_chain.as_deref().and_then(decode_pin);
+        if cfg
             .pinned_cert_chain
             .as_deref()
-            .and_then(decode_pin);
-        if cfg.pinned_cert_chain.as_deref().is_some_and(|s| !s.trim().is_empty()) && pinned.is_none()
+            .is_some_and(|s| !s.trim().is_empty())
+            && pinned.is_none()
         {
             return Err(Error::Config(
                 "juicity: pinned-cert-chain 无法解析（应为 32 字节 hex/base64）".into(),
@@ -369,7 +372,10 @@ impl JuicityOutbound {
         }))
     }
 
-    async fn connect_quic_addr(&self, addr: SocketAddr) -> Result<(quinn::Connection, quinn::Endpoint)> {
+    async fn connect_quic_addr(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<(quinn::Connection, quinn::Endpoint)> {
         let bind: &'static str = if addr.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -448,11 +454,10 @@ impl Outbound for JuicityOutbound {
 
     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
         let sess = self.get_or_connect().await?;
-        let (send, recv) = sess
-            .conn
-            .open_bi()
-            .await
-            .map_err(|e| Error::Io(std::io::Error::other(format!("juicity udp open_bi: {e}"))))?;
+        let (send, recv) =
+            sess.conn.open_bi().await.map_err(|e| {
+                Error::Io(std::io::Error::other(format!("juicity udp open_bi: {e}")))
+            })?;
         Ok(Box::new(JuicityPacketConn {
             target: dst.clone(),
             send: Mutex::new(send),
@@ -531,7 +536,11 @@ impl PacketConn for JuicityPacketConn {
                 n[0] as usize + 2
             }
             0x04 => 18,
-            other => return Err(Error::ProtoMsg(format!("juicity: 回包地址类型 {other:#x} 非法"))),
+            other => {
+                return Err(Error::ProtoMsg(format!(
+                    "juicity: 回包地址类型 {other:#x} 非法"
+                )));
+            }
         };
         let mut rest_buf = vec![0u8; rest];
         self.recv
@@ -558,7 +567,7 @@ impl PacketConn for JuicityPacketConn {
             Host::Domain(_) => match self.target.host {
                 Host::Ip(ip) => SocketAddr::new(ip, self.target.port),
                 Host::Domain(_) => {
-                    return Err(Error::Proto("juicity: 回包源地址为域名且目标不可解析"))
+                    return Err(Error::Proto("juicity: 回包源地址为域名且目标不可解析"));
                 }
             },
         };
@@ -717,7 +726,9 @@ mod tests {
         // 下行泵
         let mut buf = [0u8; 65536];
         loop {
-            let Ok((n, from)) = sock.recv_from(&mut buf).await else { return };
+            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
             let mut addr = Vec::with_capacity(262);
             if encode_addr(
                 &DstAddr {
@@ -787,7 +798,7 @@ mod tests {
 
     #[test]
     fn pin_decode() {
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         use sha2::{Digest, Sha256};
         let raw: [u8; 32] = Sha256::digest(b"juicity-pin").into();
         let hex_s: String = raw.iter().map(|b| format!("{b:02x}")).collect();
@@ -865,8 +876,8 @@ mod tests {
             }
         });
 
-        let (port, _pin) = mini_server(parse_uuid16("b831381d-6324-4d53-ad4f-8cda48b30811"), "pw")
-            .await;
+        let (port, _pin) =
+            mini_server(parse_uuid16("b831381d-6324-4d53-ad4f-8cda48b30811"), "pw").await;
         let out = mk_outbound(port, None);
 
         // TCP

@@ -387,10 +387,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
                 ));
             }
             if let Some(pin) = pinned_cert_chain {
-                out.push_str(&format!(
-                    "    pinned_cert_chain: \"{}\"\n",
-                    escape_str(pin)
-                ));
+                out.push_str(&format!("    pinned_cert_chain: \"{}\"\n", escape_str(pin)));
             }
         }
         OutboundKind::Wireguard {

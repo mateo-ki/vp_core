@@ -1,3 +1,35 @@
+# 🚀 VP_Core v1.7.8 发布说明 / Release Notes：流量统计闭环 + sing 系互通大修
+
+> **"GUI 三个流量统计页的数据源彻底修好：per-连接计数不再恒为 0、UDP 流量（QUIC/HTTP3）首次进统计，中断连接不丢账；snell/hy2/ss2022/vless 与官方 sing 系双向互通大修。"**
+>
+> 🎉 本版本是 **跨内核实测驱动的大修版**：所有修复都经过 vpcore ↔ mihomo/sing 双向真测，并首次引入**本地提交门禁**（pre-commit 钩子完整复现 CI 五步 + AGENTS.md 实测纪律）。
+
+### 🚨 流量统计闭环（GUI 三个流量统计页的数据源）
+
+| 环节 | 修复 |
+| :--- | :--- |
+| **per-连接计数恒为 0** | 无 QoS 快速路径 `copy_bidirectional` 只在连接结束时才写计数，而条目随即被连接守卫删除——`/connections` 快照里 per-conn 流量永远读不到非零值。新增**读侧实时计数适配器 `CountRead`**：每读到字节立刻入账，连接存活期间快照即可见（回归测试锁定：连接存活期表内计数必须已 > 0） |
+| **UDP 流量整体缺席** | TUN 与 mixed/socks 两条 UDP 路径此前**既不注册连接表也不写全局统计**——QUIC/HTTP3 时代占比极高的 UDP 流量在 `uploadTotal/downloadTotal` 与连接列表里完全消失。现两条路径均注册 UDP 会话（`network: udp`）并逐包双向记账；mixed 直发快速路径用 `CountingPacketSend` 包装器在旁路处入账 |
+| **中断连接丢账** | `copy_bidirectional` 出错不回传已传字节，旧代码 `Err(_) => (0,0)`——浏览器断连等高频场景全局统计也漏计。改用读侧实时计数兜底；Linux splice 路径终值写回条目 |
+
+### 🔄 sing 系互通大修（跨内核矩阵双向真测）
+
+- **snell 重写**：对齐 sing 官方 v4 线格式（argon2id KDF、帧交换、半关闭），适配 sing/mihomo 服务端**懒应答语义**（应答延迟到流首读，同步握手等待会死锁）；v1-v3 分块路径同步修复；
+- **hysteria2 ↔ quic-go 互通**：H3 关键流（control/QPACK encoder/decoder）drain 到 EOF 且持有至连接结束，杜绝 `H3_CLOSED_CRITICAL_STREAM`；TCP 请求帧解析对齐官方布局（QUIC varint）；
+- **tuic 握手竞态**：`Notify` 晚注册丢通知改 `watch::channel`，任务流鉴权等待不再超时；
+- **ss2022/vless**：对齐 SIP022 标准线格式 + vless 兼容性三修（mihomo/shadowsocks-rust 双向互通）；
+- **流式监听器 TLS**：trojan 等流式监听器补 TLS 终结（mihomo 客户端实测通过）。
+
+### 🏗️ 工程化
+
+- **本地提交门禁**：`AGENTS.md`（实测纪律历史教训）+ pre-commit 钩子（fmt → clippy -D warnings → test --workspace → DSL 门五步机械强制，与 CI 完全对齐）；
+- clippy 全量清零（workspace -D warnings）。
+
+### ⚠️ 已知限制
+- Linux splice 零拷贝路径连接存活期 per-conn 计数仍不可见（仅终值写回，Windows 用户不受影响）；DNS 劫持本地应答流量有意不计入代理统计。
+
+---
+
 # 🚀 VP_Core v1.7.7 发布说明 / Release Notes：OpenVPN 原生客户端（VPN Gate 家宽节点全链路实测通过）
 
 > **"纯 Rust 从零实现 OpenVPN 协议栈：控制信道 + Key Method v2 + openvpn PRF + AEAD/CBC 双数据信道，VPN Gate 真实节点 HTTP 204 端到端打通。"**

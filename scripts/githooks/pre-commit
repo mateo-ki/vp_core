@@ -33,7 +33,13 @@ echo "==> [3/5] cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings || fail "clippy 未过"
 
 echo "==> [4/5] cargo test --workspace"
-cargo test --workspace || fail "测试未过"
+# 已知环境竞态：并行链接几十个测试二进制时，AV 实时扫描间歇性抢占 PDB 写入
+# （LNK1201/1104）。失败自动重试一次——连续两次失败才是真问题。
+cargo test --workspace || {
+  echo "    链接竞态/失败，10 秒后自动重试一次…"
+  sleep 10
+  cargo test --workspace || fail "测试未过（重试后仍失败）"
+}
 
 echo "==> [5/5] DSL 门（validate + fmt --check）"
 cargo run -q -p vp-bin -- validate -c example/config.vp \

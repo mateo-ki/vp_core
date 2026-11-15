@@ -414,8 +414,10 @@ pub struct H3CriticalStreams {
     pub qpack_dec: quinn::SendStream,
 }
 
-/// 打开 H3 必需的 uni 流（控制流发空 SETTINGS；QPACK 流保持打开）
-async fn open_h3_streams(conn: &quinn::Connection) -> Result<H3CriticalStreams> {
+/// 打开 H3 必需的 uni 流（控制流发空 SETTINGS；QPACK 流保持打开）。
+/// 客户端与服务端都要调用，且返回值必须持有到连接结束 —— 提前 drop 会发 FIN，
+/// quic-go/sing 对端立刻报 H3_CLOSED_CRITICAL_STREAM。
+pub async fn open_h3_streams(conn: &quinn::Connection) -> Result<H3CriticalStreams> {
     // 控制流 (0x00)
     let mut ctl = conn.open_uni().await.map_err(quic_io_err)?;
     let mut buf = Vec::new();
@@ -467,9 +469,8 @@ pub async fn auth_roundtrip(
     let critical = open_h3_streams(conn).await?;
     spawn_uni_drainer(conn.clone());
     let (mut send, mut recv) = conn.open_bi().await.map_err(quic_io_err)?;
-    send.write_all(&headers_frame(headers))
-        .await
-        .map_err(quic_io_err)?;
+    let frame = headers_frame(headers);
+    send.write_all(&frame).await.map_err(quic_io_err)?;
     send.finish().map_err(quic_io_err)?;
     // 读响应：帧头 + 头块（可能分片到达，增量解析）
     let mut buf = Vec::with_capacity(512);

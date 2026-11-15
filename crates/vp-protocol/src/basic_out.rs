@@ -335,3 +335,75 @@ mod tests {
         assert_eq!(&r, b"pong");
     }
 }
+
+#[cfg(test)]
+mod http_auth_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use vp_common::DstAddr;
+    use vp_core::Session;
+
+    /// 带认证的 HTTP 代理：必须携带 Proxy-Authorization 且 407 拒绝无认证请求
+    #[tokio::test]
+    async fn http_outbound_with_basic_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let mut n = 0;
+            loop {
+                let r = s.read(&mut buf[n..]).await.unwrap();
+                if r == 0 {
+                    break;
+                }
+                n += r;
+                if buf[..n].ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let authed = req.contains("Proxy-Authorization: Basic dXNlcjpwYXNz")
+                && req.starts_with("CONNECT 127.0.0.1:18080");
+            if authed {
+                s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                // 透传一小段
+                let mut b = [0u8; 256];
+                if let Ok(r) = s.read(&mut b).await {
+                    if r > 0 {
+                        let _ = s.write_all(&b[..r]).await;
+                    }
+                }
+            } else {
+                s.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let ob = HttpOutbound {
+            server: addr.ip().to_string(),
+            port: addr.port(),
+            username: Some("user".into()),
+            password: Some("pass".into()),
+            tls: false,
+            skip_cert_verify: false,
+            sni: None,
+        };
+        let sess = Session::new_tcp(Arc::from("t"), None, DstAddr::new("127.0.0.1", 18080));
+        let mut io = ob
+            .connect_stream(&sess, &DstAddr::new("127.0.0.1", 18080))
+            .await
+            .unwrap();
+        use tokio::io::AsyncWriteExt as _;
+        io.write_all(b"hello").await.unwrap();
+        let mut rbuf = [0u8; 5];
+        use tokio::io::AsyncReadExt as _;
+        io.read_exact(&mut rbuf).await.unwrap();
+        assert_eq!(&rbuf, b"hello");
+    }
+}

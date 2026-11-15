@@ -832,7 +832,7 @@ impl TuicInbound {
     #[allow(clippy::type_complexity)]
     async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
         // 并发接受 uni/bi 流与 datagram；认证在首个 uni 流上
-        let authed = Arc::new(tokio::sync::Notify::new());
+        let (authed_tx, authed_rx) = tokio::sync::watch::channel(false);
         let mut udp_sessions: UdpSessions<u16, DstAddr> = HashMap::new();
         let authenticated_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>> =
             Arc::new(tokio::sync::RwLock::new(None));
@@ -899,7 +899,7 @@ impl TuicInbound {
                                 if let Some(ref g) = self.gate {
                                     g.mark_authenticated(conn.remote_address().ip());
                                 }
-                                authed.notify_waiters();
+                                let _ = authed_tx.send(true);
                             } else {
                                 tracing::debug!("tuic auth failed uuid={:02x?}", uuid);
                                 conn.close(quinn::VarInt::from_u32(0x1f), b"auth failed");
@@ -951,13 +951,18 @@ impl TuicInbound {
                         continue;
                     }
                     let src = conn.remote_address();
-                    let authed_wait = authed.clone();
                     let authed_user = authenticated_user.clone();
                     let tag = self.tag.clone();
                     let ctx2 = ctx.clone();
+                    let authed_rx = authed_rx.clone();
                     tokio::spawn(async move {
                         if authed_user.read().await.is_none() {
-                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), authed_wait.notified()).await;
+                            let mut rx = authed_rx;
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                rx.wait_for(|v| *v),
+                            )
+                            .await;
                         }
                         let user = authed_user.read().await.clone();
                         let mut sess = Session::new_tcp(tag, Some(src), dst.clone());

@@ -411,7 +411,7 @@ async fn ss_shadowtls_listener_e2e() {
     });
 
     let cfg = format!(
-        "mixed-port: 17898
+        "mixed-port: 0
 listeners:
   - name: srv-stls
     type: ss

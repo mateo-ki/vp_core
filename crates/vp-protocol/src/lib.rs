@@ -100,6 +100,7 @@ impl<T: Outbound> Outbound for NamedOutbound<T> {
     }
 }
 pub use direct::DirectOutbound;
+pub use inbound::tls_front::TlsFrontInbound;
 pub use inbound::{InboundKind, build_inbound, build_inbound_with_gate, dispatch_stream};
 
 /// 出站构建依赖

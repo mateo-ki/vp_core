@@ -26,7 +26,6 @@ use vp_core::stream::UdpPacket;
 use vp_core::tunnel::{RelayHook, relay};
 use vp_core::{Inbound, Outbound, PacketConn, ProxyStream};
 use vp_crypto::ss::AeadChunkCodec;
-use vp_crypto::{AeadKind, AnyAead};
 use vp_dns::Resolver;
 use vp_transport as transport;
 
@@ -37,6 +36,22 @@ pub const VERSION_2: u8 = 2;
 pub const VERSION_3: u8 = 3;
 pub const VERSION_4: u8 = 4;
 
+/// 出站懒应答门状态：mihomo/sing 系服务端把应答（连同 salt）推迟到回程数据
+/// 首次写出，握手同步等待会死锁 —— 解析延迟到流首读（sing clientConn.Read 语义）
+enum ReplyGate {
+    /// 等服务端 salt（v4 经 read_v4_server_salt；v1-3 直接从原始流收 16 字节）
+    NeedSalt {
+        acc: Vec<u8>,
+        psk: String,
+        version: u8,
+        v4: bool,
+    },
+    /// salt 已就位，等应答状态字节 [0x00]/[0x02+code]
+    NeedReply,
+}
+
+const GATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
 pub const CMD_PING: u8 = 0x00;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_UDP: u8 = 0x02;
@@ -44,68 +59,67 @@ pub const CMD_UDP: u8 = 0x02;
 pub const RESP_SUCCESS: u8 = 0x00;
 pub const RESP_ERROR: u8 = 0x01;
 
-/// 派生 Snell 会话双向 AEAD 编解码器
-/// 返回：(client_to_server_aead, server_to_client_aead)
-pub fn derive_snell_codecs(
-    version: u8,
-    psk: &str,
-    nonce_or_salt: &[u8],
-) -> Result<(AeadChunkCodec, AeadChunkCodec)> {
-    match version {
-        VERSION_1 => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(psk.as_bytes());
-            let hash = hasher.finalize();
-            let c2s = AnyAead::new(AeadKind::Aes128Gcm, &hash[..16])?;
-            let s2c = AnyAead::new(AeadKind::Aes128Gcm, &hash[..16])?;
-            Ok((
-                AeadChunkCodec::from_aead(c2s),
-                AeadChunkCodec::from_aead(s2c),
-            ))
-        }
-        VERSION_2 => {
-            let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(nonce_or_salt), psk.as_bytes());
-            let mut key = [0u8; 32];
-            hk.expand(b"snell", &mut key)
-                .map_err(|_| Error::Proto("HKDF expand 失败"))?;
-            let c2s = AnyAead::new(AeadKind::ChaCha20Poly1305, &key)?;
-            let s2c = AnyAead::new(AeadKind::ChaCha20Poly1305, &key)?;
-            Ok((
-                AeadChunkCodec::from_aead(c2s),
-                AeadChunkCodec::from_aead(s2c),
-            ))
-        }
-        VERSION_3 => {
-            let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(nonce_or_salt), psk.as_bytes());
-            let mut c_key = [0u8; 32];
-            let mut s_key = [0u8; 32];
-            hk.expand(b"snell-v3-client", &mut c_key)
-                .map_err(|_| Error::Proto("HKDF expand client 失败"))?;
-            hk.expand(b"snell-v3-server", &mut s_key)
-                .map_err(|_| Error::Proto("HKDF expand server 失败"))?;
-            let c2s = AnyAead::new(AeadKind::ChaCha20Poly1305, &c_key)?;
-            let s2c = AnyAead::new(AeadKind::ChaCha20Poly1305, &s_key)?;
-            Ok((
-                AeadChunkCodec::from_aead(c2s),
-                AeadChunkCodec::from_aead(s2c),
-            ))
-        }
-        _ => {
-            // v4（默认）
-            let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(nonce_or_salt), psk.as_bytes());
-            let mut c_key = [0u8; 32];
-            let mut s_key = [0u8; 32];
-            hk.expand(b"snell-v4-client", &mut c_key)
-                .map_err(|_| Error::Proto("HKDF expand client 失败"))?;
-            hk.expand(b"snell-v4-server", &mut s_key)
-                .map_err(|_| Error::Proto("HKDF expand server 失败"))?;
-            let c2s = AnyAead::new(AeadKind::ChaCha20Poly1305, &c_key)?;
-            let s2c = AnyAead::new(AeadKind::ChaCha20Poly1305, &s_key)?;
-            Ok((
-                AeadChunkCodec::from_aead(c2s),
-                AeadChunkCodec::from_aead(s2c),
-            ))
+/// 官方 Snell KDF：argon2id（m=8KiB, t=3, p=1, 32B），截取 key_len
+/// （对应 golang.org/x/crypto/argon2.IDKey(psk, salt, 3, 8, 1, 32)）
+pub fn snell_kdf(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let mut out = vec![0u8; 32];
+    let params = Params::new(8, 3, 1, Some(32)).expect("argon2 params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(psk, salt, &mut out)
+        .expect("argon2 derive");
+    out.truncate(key_len);
+    out
+}
+
+/// v1-3 单方向 codec：salt 16B 前缀 + argon2 KDF + 加密长度分块
+/// v1 = chacha20poly1305(key 32B)；v2/v3 = aes-128-gcm(key 16B)
+fn snell_v13_codec(version: u8, psk: &str, salt: &[u8]) -> Result<AeadChunkCodec> {
+    let (cipher, key_len) = if version == VERSION_1 {
+        ("chacha20-ietf-poly1305", 32usize)
+    } else {
+        ("aes-128-gcm", 16usize)
+    };
+    let cipher = vp_crypto::ss::Cipher::parse(cipher)?;
+    let key = snell_kdf(psk.as_bytes(), salt, key_len);
+    AeadChunkCodec::new(&cipher, &key)
+}
+
+/// v4 单方向 codec：aes-128-gcm(key 16B)，帧格式由 SnellStream v4 路径处理
+fn snell_v4_codec(psk: &str, salt: &[u8]) -> Result<AeadChunkCodec> {
+    let cipher = vp_crypto::ss::Cipher::parse("aes-128-gcm")?;
+    let key = snell_kdf(psk.as_bytes(), salt, 16);
+    AeadChunkCodec::new(&cipher, &key)
+}
+/// v4 首帧探测：[E(7B 帧头)][padding][E(payload)]，None = 数据不足
+fn snell_v4_try_first_frame(
+    dec: &mut AeadChunkCodec,
+    raw: &[u8],
+) -> Option<Result<(Vec<u8>, usize)>> {
+    let res = dec.open_raw_record(raw, 7)?;
+    match res {
+        Err(_) => Some(Err(Error::Proto("Snell v4 帧头解密失败"))),
+        Ok((hdr, used1)) => {
+            if hdr.len() < 7 || hdr[0] != 4 {
+                return Some(Err(Error::Proto("Snell v4 帧头非法")));
+            }
+            let pad = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+            let len = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
+            if len == 0 {
+                return Some(Err(Error::Proto("Snell v4 意外零块")));
+            }
+            let need = used1 + pad + len + 16;
+            if raw.len() < need {
+                return None;
+            }
+            let mut payload_cipher = raw[used1 + pad..need].to_vec();
+            for i in (0..pad.min(payload_cipher.len())).step_by(2) {
+                payload_cipher[i] = raw[used1 + i];
+            }
+            match dec.open_raw_record(&payload_cipher, len) {
+                Some(Ok((payload, _))) => Some(Ok((payload, need))),
+                _ => Some(Err(Error::Proto("Snell v4 载荷解密失败"))),
+            }
         }
     }
 }
@@ -115,13 +129,24 @@ pub fn derive_snell_codecs(
 // ---------------------------------------------------------------------------
 
 pub struct SnellStream<S> {
+    /// v4 读方向：帧头已解出（nonce 已消费）但载荷未到齐时挂起的 (pad, len)
+    pending_hdr: Option<(usize, usize)>,
+    /// 出站懒应答门（见 ReplyGate 说明），仅出站流会武装
+    gate: Option<ReplyGate>,
+    gate_started: std::time::Instant,
     inner: S,
     enc: AeadChunkCodec,
-    dec: AeadChunkCodec,
+    /// v4 outbound：服务端 salt 读完前为 None
+    dec: Option<AeadChunkCodec>,
     raw: BytesMut,
     pending: BytesMut,
     out: BytesMut,
     closed: bool,
+    /// v4 官方帧模式（v1-3 为分块模式）
+    v4: bool,
+    enc_salt_written: bool,
+    /// v4 首个数据帧 padding 长度（0x100..0x1FF）
+    initial_pad: u16,
 }
 
 impl<S> vp_core::ProxyStream for SnellStream<S> where
@@ -138,13 +163,116 @@ impl<S> SnellStream<S> {
         initial_raw: BytesMut,
     ) -> Self {
         Self {
+            pending_hdr: None,
+            gate: None,
+            gate_started: std::time::Instant::now(),
             inner,
             enc,
-            dec,
+            dec: Some(dec),
             raw: initial_raw,
             pending: BytesMut::new(),
             out: BytesMut::from(&initial_out[..]),
             closed: false,
+            v4: false,
+            enc_salt_written: true,
+            initial_pad: 0,
+        }
+    }
+
+    /// v4 官方帧模式：写方向 salt 由 initial_out 自带（调用方拼好），
+    /// 读方向 salt 若尚未消费则由调用方先行处理（dec 延迟注入）
+    pub fn new_v4(
+        inner: S,
+        enc: AeadChunkCodec,
+        initial_out: Vec<u8>,
+        initial_raw: BytesMut,
+        initial_pad: u16,
+    ) -> Self {
+        Self {
+            pending_hdr: None,
+            gate: None,
+            gate_started: std::time::Instant::now(),
+            inner,
+            enc,
+            dec: None,
+            raw: initial_raw,
+            pending: BytesMut::new(),
+            out: BytesMut::from(&initial_out[..]),
+            closed: false,
+            v4: true,
+            enc_salt_written: true,
+            initial_pad,
+        }
+    }
+
+    pub fn attach_dec(&mut self, dec: AeadChunkCodec) {
+        self.dec = Some(dec);
+    }
+
+    /// 出站专用：武装懒应答门（握手写完请求后调用，salt/状态字节延迟到首读）
+    pub(crate) fn arm_reply_gate(&mut self, v4: bool, psk: &str, version: u8) {
+        self.gate = Some(ReplyGate::NeedSalt {
+            acc: Vec::new(),
+            psk: psk.to_string(),
+            version,
+            v4,
+        });
+    }
+
+    /// v4 读方向：从内部缓冲消费服务端 salt16（dec 注入前，帧解析自然挂起）
+    pub async fn read_v4_server_salt(&mut self) -> Result<Vec<u8>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncReadExt as _;
+        while self.raw.len() < 16 {
+            let mut tmp = [0u8; 1024];
+            let n = self.inner.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(Error::Proto("Snell v4 服务端 salt 中断"));
+            }
+            self.raw.extend_from_slice(&tmp[..n]);
+        }
+        let salt = self.raw[..16].to_vec();
+        self.raw.advance(16);
+        Ok(salt)
+    }
+
+    /// 官方 v4 帧：[可选 salt][E(7B 帧头)][padding][E(payload)]，偶数位互换
+    /// `first_data` = 本方向首个含载荷帧（带 initial padding）
+    fn seal_v4_frame(&mut self, payload: &[u8]) {
+        if !self.enc_salt_written {
+            // salt 由 initial_out 自带（构造时拼好），此处仅置位
+            self.enc_salt_written = true;
+        }
+        let pad = if payload.is_empty() {
+            0usize
+        } else {
+            self.initial_pad as usize
+        };
+        if pad > 0 {
+            self.initial_pad = 0;
+        }
+        let mut hdr = [0u8; 7];
+        hdr[0] = 4;
+        hdr[3..5].copy_from_slice(&(pad as u16).to_be_bytes());
+        hdr[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        self.enc.seal_raw_record(&hdr, &mut self.out);
+        if payload.is_empty() {
+            return;
+        }
+        let start = self.out.len();
+        self.enc.seal_raw_record(payload, &mut self.out);
+        if pad > 0 {
+            // 随机 padding + 偶数位互换（mihomo swapPadding 语义）
+            let mut padding = vec![0u8; pad];
+            vp_common::rand_bytes(&mut padding);
+            let mut seg = self.out.split_off(start);
+            for i in (0..pad.min(seg.len())).step_by(2) {
+                std::mem::swap(&mut padding[i], &mut seg[i]);
+            }
+            self.out.extend_from_slice(&padding);
+            self.out.extend_from_slice(&seg);
         }
     }
 
@@ -170,15 +298,83 @@ impl<S> SnellStream<S> {
     }
 
     fn try_progress(&mut self) {
-        while let Some(res) = self.dec.try_open_chunk(&self.raw) {
-            match res {
-                Ok((payload, used)) => {
-                    self.raw.advance(used);
-                    self.pending.extend_from_slice(&payload);
+        if self.v4 {
+            self.try_progress_v4();
+            return;
+        }
+        if let Some(dec) = self.dec.as_mut() {
+            while let Some(res) = dec.try_open_chunk(&self.raw) {
+                match res {
+                    Ok((payload, used)) => {
+                        self.raw.advance(used);
+                        self.pending.extend_from_slice(&payload);
+                    }
+                    Err(_) => {
+                        self.closed = true;
+                        break;
+                    }
                 }
-                Err(_) => {
+            }
+        }
+    }
+
+    /// v4 官方帧解析：[E(7B 帧头)][padding][E(payload)]，padding 与载荷密文偶数位互换。
+    /// 帧头解出后（nonce 已消费）若载荷未到齐，把 (pad, len) 存入 pending_hdr 挂起；
+    /// 下次轮询直接按挂起值对齐，绝不重复解帧头（否则 nonce 错位必然解密失败）。
+    fn try_progress_v4(&mut self) {
+        let Some(dec) = self.dec.as_mut() else { return };
+        loop {
+            let (pad, len) = if let Some((pad, len)) = self.pending_hdr {
+                let total = 23 + pad + len + 16;
+                if self.raw.len() < total {
+                    return;
+                }
+                self.pending_hdr = None;
+                self.raw.advance(23);
+                (pad, len)
+            } else {
+                let Some(res) = dec.open_raw_record(&self.raw, 7) else {
+                    return;
+                };
+                match res {
+                    Err(_) => {
+                        self.closed = true;
+                        return;
+                    }
+                    Ok((hdr, used)) => {
+                        if hdr.len() < 7 || hdr[0] != 4 {
+                            self.closed = true;
+                            return;
+                        }
+                        let pad = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                        let len = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
+                        if len == 0 {
+                            // 官方零块：半关闭信号
+                            self.closed = true;
+                            return;
+                        }
+                        let total = used + pad + len + 16;
+                        if self.raw.len() < total {
+                            self.pending_hdr = Some((pad, len));
+                            return;
+                        }
+                        self.raw.advance(used);
+                        (pad, len)
+                    }
+                }
+            };
+            let need = pad + len + 16;
+            // 偶数位互换还原：载荷密文偶数位 ← 帧头后 padding 区原字节
+            let mut payload_cipher = self.raw[pad..need].to_vec();
+            for i in (0..pad.min(payload_cipher.len())).step_by(2) {
+                payload_cipher[i] = self.raw[i];
+            }
+            self.raw.advance(need);
+            match dec.open_raw_record(&payload_cipher, len) {
+                Some(Ok((payload, _))) => self.pending.extend_from_slice(&payload),
+                _ => {
                     self.closed = true;
-                    break;
+                    return;
                 }
             }
         }
@@ -193,6 +389,141 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SnellStream<S> {
     ) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
         loop {
+            // 懒应答门：首读时完成服务端 salt/状态字节解析
+            if this.gate.is_some() {
+                let mut g = this.gate.take().unwrap();
+                let proceed = loop {
+                    match &mut g {
+                        ReplyGate::NeedSalt {
+                            acc,
+                            psk,
+                            version,
+                            v4,
+                        } => {
+                            if this.gate_started.elapsed() > GATE_REPLY_TIMEOUT {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "snell 应答超时",
+                                )));
+                            }
+                            if *v4 {
+                                enum SaltPoll {
+                                    Pending,
+                                    Salt(Vec<u8>),
+                                    Failed(vp_common::Error),
+                                }
+                                let res = {
+                                    let fut = this.read_v4_server_salt();
+                                    tokio::pin!(fut);
+                                    match fut.as_mut().poll(cx) {
+                                        Poll::Pending => SaltPoll::Pending,
+                                        Poll::Ready(Ok(salt)) => SaltPoll::Salt(salt),
+                                        Poll::Ready(Err(e)) => SaltPoll::Failed(e),
+                                    }
+                                };
+                                match res {
+                                    SaltPoll::Pending => {
+                                        this.gate = Some(g);
+                                        return Poll::Pending;
+                                    }
+                                    SaltPoll::Salt(salt) => {
+                                        let dec = snell_v4_codec(psk, &salt)?;
+                                        this.dec = Some(dec);
+                                    }
+                                    SaltPoll::Failed(e) => {
+                                        return Poll::Ready(Err(std::io::Error::other(format!(
+                                            "snell 应答: {e}"
+                                        ))));
+                                    }
+                                }
+                            } else {
+                                // v1-3：直接从原始流收 16 字节服务端 salt
+                                while acc.len() < 16 {
+                                    let mut tmp = [0u8; 1024];
+                                    let mut rb = ReadBuf::new(&mut tmp);
+                                    match Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
+                                        Poll::Pending => {
+                                            // Pending 必须带 gate 状态返回，否则状态丢失
+                                            this.gate = Some(g);
+                                            return Poll::Pending;
+                                        }
+                                        Poll::Ready(res) => {
+                                            res?;
+                                            let n = rb.filled().len();
+                                            if n == 0 {
+                                                return Poll::Ready(Err(std::io::Error::new(
+                                                    std::io::ErrorKind::UnexpectedEof,
+                                                    "snell 应答中断",
+                                                )));
+                                            }
+                                            acc.extend_from_slice(rb.filled());
+                                        }
+                                    }
+                                }
+                                let dec = snell_v13_codec(*version, psk, &acc[..16])?;
+                                this.dec = Some(dec);
+                                // 一次读到的前缀可能超出 16 字节（salt+应答块同段到达），
+                                // 溢出部分必须回灌 raw，否则应答块字节会被吞掉
+                                this.raw.extend_from_slice(&acc[16..]);
+                                acc.clear();
+                            }
+                            g = ReplyGate::NeedReply;
+                        }
+                        ReplyGate::NeedReply => {
+                            if this.gate_started.elapsed() > GATE_REPLY_TIMEOUT {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "snell 应答超时",
+                                )));
+                            }
+                            // 等首块进 pending
+                            this.try_progress();
+                            if this.pending.is_empty() {
+                                this.raw.reserve(16 * 1024);
+                                let spare = this.raw.spare_capacity_mut();
+                                let mut rb = ReadBuf::uninit(spare);
+                                match Pin::new(&mut this.inner).poll_read(cx, &mut rb)? {
+                                    Poll::Pending => {
+                                        this.gate = Some(g);
+                                        return Poll::Pending;
+                                    }
+                                    Poll::Ready(()) => {
+                                        let n = rb.filled().len();
+                                        if n == 0 {
+                                            return Poll::Ready(Err(std::io::Error::new(
+                                                std::io::ErrorKind::UnexpectedEof,
+                                                "snell 应答中断",
+                                            )));
+                                        }
+                                        unsafe { this.raw.advance_mut(n) };
+                                    }
+                                }
+                                continue;
+                            }
+                            let status = this.pending[0];
+                            if status == RESP_ERROR {
+                                let code = if this.pending.len() > 1 {
+                                    this.pending[1]
+                                } else {
+                                    0
+                                };
+                                return Poll::Ready(Err(std::io::Error::other(format!(
+                                    "snell 远端连接失败 code={code}"
+                                ))));
+                            }
+                            if status != RESP_SUCCESS {
+                                return Poll::Ready(Err(std::io::Error::other(
+                                    "snell 远端目标连接失败",
+                                )));
+                            }
+                            this.pending.advance(1); // 剥离状态字节
+                            break true;
+                        }
+                    }
+                };
+                let _ = proceed;
+                this.gate = None;
+            }
             if !this.pending.is_empty() {
                 let n = this.pending.len().min(buf.remaining());
                 buf.put_slice(&this.pending[..n]);
@@ -237,10 +568,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnellStream<S> {
             )));
         }
         std::task::ready!(this.flush_out(cx))?;
-        for chunk in buf.chunks(0x3FFF) {
-            this.enc.seal_chunk_into_bytes(chunk, &mut this.out);
+        if this.v4 {
+            for chunk in buf.chunks(0x3FFF) {
+                this.seal_v4_frame(chunk);
+            }
+        } else {
+            for chunk in buf.chunks(0x3FFF) {
+                this.enc.seal_chunk_into_bytes(chunk, &mut this.out);
+            }
         }
-        let _ = this.flush_out(cx);
+        std::task::ready!(this.flush_out(cx))?;
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -253,7 +590,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SnellStream<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
         if !this.closed {
-            this.enc.seal_chunk_into_bytes(&[], &mut this.out);
+            if this.v4 {
+                // 官方零块：7B 帧头 pad=0 len=0
+                let hdr = [4u8, 0, 0, 0, 0, 0, 0];
+                this.enc.seal_raw_record(&hdr, &mut this.out);
+            } else {
+                this.enc.seal_chunk_into_bytes(&[], &mut this.out);
+            }
             this.closed = true;
         }
         let _ = this.flush_out(cx);
@@ -294,6 +637,7 @@ async fn server_http_obfs<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     initial_buf: &mut [u8],
     filled: &mut usize,
+    crypto_start: &mut usize,
 ) -> Result<()> {
     // 检查是否以 "GET " 开头
     if *filled < 4 {
@@ -302,7 +646,10 @@ async fn server_http_obfs<S: AsyncRead + AsyncWrite + Unpin>(
     }
     if *filled >= 4 && &initial_buf[..4] == b"GET " {
         // 读取直到 \r\n\r\n
-        while !initial_buf[..*filled].windows(4).any(|w| w == b"\r\n\r\n") {
+        while !initial_buf[..*filled]
+            .windows(4)
+            .any(|wk| wk == b"\r\n\r\n")
+        {
             if *filled >= initial_buf.len() {
                 return Err(Error::Proto("Snell 服务端 HTTP obfs 头过长"));
             }
@@ -312,15 +659,22 @@ async fn server_http_obfs<S: AsyncRead + AsyncWrite + Unpin>(
             }
             *filled += n;
         }
+        let mut hdr_end = 0usize;
+        for i in 0..*filled {
+            if initial_buf[i..].starts_with(b"\r\n\r\n") {
+                hdr_end = i + 4;
+                break;
+            }
+        }
         // 发送 101 Switching Protocols
         let resp = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
         io.write_all(resp).await?;
-        *filled = 0; // 已完全消耗
+        // obfs 请求之后的字节属于 crypto 流（salt/帧可能已随读到达）
+        *crypto_start = hdr_end;
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // 出站 (SnellOutbound)
 // ---------------------------------------------------------------------------
 
@@ -380,61 +734,48 @@ impl SnellOutbound {
             client_http_obfs(&mut tcp, host).await?;
         }
 
-        // 2. 构造客户端前置随机 nonce/salt
-        let nonce_len = if self.version == VERSION_1 { 12 } else { 16 };
-        let mut nonce = vec![0u8; nonce_len];
-        vp_common::rand_bytes(&mut nonce);
+        // 2. 官方请求头：[Version=1][cmd][clientID len=0][host_len][host][port 2B BE]
+        //    cmd：v2 → CommandConnectV2(5)，其余 → CommandConnect(1)
+        let host_str = dst.host.to_string();
+        if host_str.len() > 255 {
+            return Err(Error::Proto("Snell 目标主机名过长"));
+        }
+        let mut req_hdr = vec![0x01u8];
+        req_hdr.push(if self.version == VERSION_2 { 0x05 } else { cmd });
+        req_hdr.push(0x00);
+        req_hdr.push(host_str.len() as u8);
+        req_hdr.extend_from_slice(host_str.as_bytes());
+        req_hdr.extend_from_slice(&dst.port.to_be_bytes());
 
-        let mut prefix = Vec::new();
-        match self.version {
-            VERSION_1 | VERSION_2 => {
-                prefix.extend_from_slice(&nonce);
-            }
-            VERSION_3 => {
-                prefix.push(VERSION_3);
-                prefix.extend_from_slice(&nonce);
-            }
-            _ => {
-                prefix.push(VERSION_4);
-                prefix.extend_from_slice(&nonce);
-            }
+        let mut c_salt = vec![0u8; 16];
+        vp_common::rand_bytes(&mut c_salt);
+
+        if self.version >= VERSION_4 {
+            // v4：salt16 前缀 + 帧式请求头（首个数据帧带 initial padding）
+            let enc = snell_v4_codec(&self.psk, &c_salt)?;
+            let mut pad2 = [0u8; 2];
+            vp_common::rand_bytes(&mut pad2);
+            let initial_pad = 0x100 + (u16::from_be_bytes(pad2) % 0x100);
+            let mut stream = SnellStream::new_v4(tcp, enc, c_salt, BytesMut::new(), initial_pad);
+            use tokio::io::AsyncWriteExt as _;
+            stream.write_all(&req_hdr).await?;
+
+            // 响应延迟到流首读（sing 系服务端懒应答，握手同步等待会死锁）
+            stream.arm_reply_gate(true, &self.psk, self.version);
+            return Ok(Box::new(stream));
         }
 
-        let (mut enc, mut dec) = derive_snell_codecs(self.version, &self.psk, &nonce)?;
-
-        // 3. 构建首个请求 payload：[CMD][DST_ADDR]
-        let mut req_payload = vec![cmd];
-        encode_socks_addr(dst, &mut req_payload);
-        let mut init_bytes = prefix;
-        enc.seal_chunk_into(&req_payload, &mut init_bytes);
+        // v1-3：salt16 前缀 + argon2 KDF 分块
+        let mut enc = snell_v13_codec(self.version, &self.psk, &c_salt)?;
+        let mut init_bytes = BytesMut::from(&c_salt[..]);
+        enc.seal_chunk_into_bytes(&req_hdr, &mut init_bytes);
         tcp.write_all(&init_bytes).await?;
 
-        // 4. 等待服务端首块响应：[RESP_SUCCESS]
-        let mut raw = BytesMut::with_capacity(4096);
-        let mut resp_byte = None;
-        while resp_byte.is_none() {
-            let mut read_buf = [0u8; 1024];
-            let n = tcp.read(&mut read_buf).await?;
-            if n == 0 {
-                return Err(Error::Proto("Snell 握手响应中断"));
-            }
-            raw.extend_from_slice(&read_buf[..n]);
-            if let Some(res) = dec.try_open_chunk(&raw) {
-                let (chunk, used) = res?;
-                raw.advance(used);
-                if chunk.is_empty() {
-                    return Err(Error::Proto("Snell 空响应"));
-                }
-                resp_byte = Some(chunk[0]);
-                break;
-            }
-        }
-
-        if resp_byte != Some(RESP_SUCCESS) {
-            return Err(Error::Proto("Snell 远端目标连接失败"));
-        }
-
-        let stream = SnellStream::new(tcp, enc, dec, Vec::new(), raw);
+        // 响应延迟到流首读（与 v4 分支同因：sing 系服务端懒应答）；
+        // dec 先放占位 codec，门在读到服务端 salt 后换成真 codec
+        let dummy_dec = snell_v13_codec(self.version, &self.psk, &[0u8; 16])?;
+        let mut stream = SnellStream::new(tcp, enc, dummy_dec, Vec::new(), BytesMut::new());
+        stream.arm_reply_gate(false, &self.psk, self.version);
         Ok(Box::new(stream))
     }
 }
@@ -580,141 +921,152 @@ impl SnellInbound {
         let mut peek_buf = [0u8; 2048];
         let mut filled = 0;
 
-        // 1. 处理可能的 HTTP Obfs 前导
-        server_http_obfs(&mut stream, &mut peek_buf, &mut filled).await?;
+        // 1. 处理可能的 HTTP Obfs 前导（crypto_start：obfs 请求之后 crypto 流的起始偏移）
+        let mut crypto_start = 0usize;
+        server_http_obfs(&mut stream, &mut peek_buf, &mut filled, &mut crypto_start).await?;
 
-        // 2. 读取版本与 nonce
-        // 尝试探测首字节是否为版本号（0x04 / 0x03），或按照配置版本匹配
-        while filled < 1 {
-            let n = stream.read(&mut peek_buf[filled..1]).await?;
-            if n == 0 {
-                return Err(Error::Proto("Snell 握手中断"));
-            }
-            filled += n;
-        }
-
-        let (ver, nonce_len) = if self.version == VERSION_1 {
-            (VERSION_1, 12)
-        } else if self.version == VERSION_2 {
-            (VERSION_2, 16)
-        } else {
-            match peek_buf[0] {
-                VERSION_4 => (VERSION_4, 16),
-                VERSION_3 => (VERSION_3, 16),
-                _ => (self.version, 16),
-            }
-        };
-
-        let total_prefix_len = if ver == VERSION_3 || ver == VERSION_4 {
-            1 + nonce_len
-        } else {
-            nonce_len
-        };
-
-        while filled < total_prefix_len {
-            let n = stream.read(&mut peek_buf[filled..total_prefix_len]).await?;
-            if n == 0 {
-                return Err(Error::Proto("Snell 前缀读取中断"));
-            }
-            filled += n;
-        }
-
-        let nonce = if ver == VERSION_3 || ver == VERSION_4 {
-            &peek_buf[1..total_prefix_len]
-        } else {
-            &peek_buf[..total_prefix_len]
-        };
-
-        // 3. 多密码尝试鉴权
+        // 2. 官方线格式：读客户端方向 salt16（无版本字节前缀）
+        //    obfs/首读可能已吃掉 salt 前缀字节，先回填；salt 之后的帧字节进 raw
+        let mut c_salt = vec![0u8; 16];
         let mut raw = BytesMut::with_capacity(8192);
-        let mut matched_codecs = None;
-        let mut req_chunk = None;
-
-        // 先把已经 peek 的剩余数据塞入 raw
-        if filled > total_prefix_len {
-            raw.extend_from_slice(&peek_buf[total_prefix_len..filled]);
+        if filled > crypto_start {
+            let avail = filled - crypto_start;
+            let take = avail.min(16);
+            c_salt[..take].copy_from_slice(&peek_buf[crypto_start..crypto_start + take]);
+            if take < 16 {
+                stream.read_exact(&mut c_salt[take..]).await?;
+            }
+            if avail > 16 {
+                raw.extend_from_slice(&peek_buf[crypto_start + 16..filled]);
+            }
+        } else {
+            stream.read_exact(&mut c_salt).await?;
         }
 
+        // 3. 版本自适应 + 多密码探测鉴权（v4 = 帧式，v1-3 = 分块式，两种都试）；
+        //    raw 保持完整，鉴权通过后用全新 codec 从头消费（nonce 状态一致）
+        let mut matched: Option<(String, bool)> = None; // (psk, is_v4)
         loop {
-            // 确保至少读到了 18 字节
-            while raw.len() < 18 {
-                let mut tmp = [0u8; 1024];
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    return Err(Error::Proto("Snell 客户端握手中断"));
-                }
-                raw.extend_from_slice(&tmp[..n]);
-            }
-
-            let mut all_err = true;
             let mut need_more = false;
-
-            // 对每个 PSK 尝试解码
             for psk in &self.psks {
-                if let Ok((c2s, s2c)) = derive_snell_codecs(ver, psk, nonce) {
-                    let mut test_dec = c2s;
-                    match test_dec.try_open_chunk(&raw) {
-                        Some(Ok((chunk, used))) => {
-                            req_chunk = Some((chunk, used));
-                            matched_codecs = Some((test_dec, s2c));
-                            all_err = false;
-                            break;
-                        }
-                        None => {
-                            // 长度块解密可能成功但 payload 尚未接收完整，或者尚未满 18 字节
-                            all_err = false;
-                            need_more = true;
-                        }
-                        Some(Err(_)) => {
-                            // 解密失败（密码不对）
+                let mut matched_v4 = None;
+                // 先试 v4 帧式
+                if let Ok(mut dec) = snell_v4_codec(psk, &c_salt) {
+                    match snell_v4_try_first_frame(&mut dec, &raw) {
+                        Some(Ok(_)) => matched_v4 = Some(true),
+                        Some(Err(_)) => {}
+                        None => need_more = true,
+                    }
+                }
+                // 再试 v1-3 分块式
+                if matched_v4.is_none() {
+                    if let Ok(mut dec) = snell_v13_codec(self.version, psk, &c_salt) {
+                        match dec.try_open_chunk(&raw) {
+                            Some(Ok(_)) => matched_v4 = Some(false),
+                            Some(Err(_)) => {}
+                            None => need_more = true,
                         }
                     }
                 }
+                if let Some(v4) = matched_v4 {
+                    matched = Some((psk.clone(), v4));
+                    break;
+                }
             }
-
-            if matched_codecs.is_some() {
+            if matched.is_some() || !need_more {
                 break;
             }
-
-            if all_err {
-                return Err(Error::Proto("Snell 鉴权失败：密码错误或未匹配"));
+            let mut tmp = [0u8; 1024];
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(Error::Proto("Snell 请求数据中断"));
             }
-
-            if need_more {
-                let mut tmp = [0u8; 1024];
-                let n = stream.read(&mut tmp).await?;
-                if n == 0 {
-                    return Err(Error::Proto("Snell 请求数据中断"));
-                }
-                raw.extend_from_slice(&tmp[..n]);
-            }
+            raw.extend_from_slice(&tmp[..n]);
         }
 
-        let (dec, mut enc) = matched_codecs.unwrap();
-        let (req_data, used) = req_chunk.unwrap();
-        raw.advance(used);
+        eprintln!(
+            "[snell-sdbg] raw前40字节: {:02x?}",
+            &raw[..raw.len().min(40)]
+        );
+        let (psk, is_v4) = matched.ok_or(Error::Proto("Snell 鉴权失败：密码错误或未匹配"))?;
+
+        // 4. 重建读 codec 并解析首块（nonce 从 0 开始，raw 未被消费）
+        let mut dec = if is_v4 {
+            snell_v4_codec(&psk, &c_salt)?
+        } else {
+            snell_v13_codec(self.version, &psk, &c_salt)?
+        };
+        let req_data = if is_v4 {
+            let Some(Ok((payload, used))) = snell_v4_try_first_frame(&mut dec, &raw) else {
+                return Err(Error::Proto("Snell v4 首帧解析失败"));
+            };
+            raw.advance(used);
+            payload
+        } else {
+            let (payload, used) = dec
+                .try_open_chunk(&raw)
+                .ok_or(Error::Proto("Snell 首块不完整"))??;
+            raw.advance(used);
+            payload
+        };
 
         if req_data.is_empty() {
             return Err(Error::Proto("Snell 请求数据为空"));
         }
 
-        let cmd = req_data[0];
+        // 5. 官方请求头：[Version=1][cmd][clientID len][host_len][host][port 2B BE]
+        if req_data[0] != 0x01 {
+            return Err(Error::Proto("Snell 请求头版本非法"));
+        }
+        let cmd = req_data[1];
+        let cid_len = req_data[2] as usize;
+        let p = 3 + cid_len;
+        if req_data.len() < p + 2 {
+            return Err(Error::Proto("Snell 请求头过短"));
+        }
+        let host_len = req_data[p] as usize;
+        if req_data.len() < p + 1 + host_len + 2 {
+            return Err(Error::Proto("Snell 请求地址不完整"));
+        }
+        let host = String::from_utf8_lossy(&req_data[p + 1..p + 1 + host_len]).to_string();
+        let port = u16::from_be_bytes([req_data[p + 1 + host_len], req_data[p + 2 + host_len]]);
+        let dst = DstAddr::new(host, port);
+
+        // 6. 服务端写方向：独立 salt16 + 应答（写 codec 状态延续给流）
+        let mut s_salt = vec![0u8; 16];
+        vp_common::rand_bytes(&mut s_salt);
+        let mut wenc = if is_v4 {
+            snell_v4_codec(&psk, &s_salt)?
+        } else {
+            snell_v13_codec(self.version, &psk, &s_salt)?
+        };
+        let mut init_out = BytesMut::from(&s_salt[..]);
+        let seal_reply = |wenc: &mut AeadChunkCodec, out: &mut BytesMut, ok: bool| {
+            if is_v4 {
+                let hdr = [4u8, 0, 0, 0, 0, 0, 1];
+                wenc.seal_raw_record(&hdr, out);
+                wenc.seal_raw_record(&[if ok { RESP_SUCCESS } else { RESP_ERROR }], out);
+            } else {
+                // 官方应答仅 1 字节命令（0x00 隧道 / 0x02 错误+code），
+                // 多余字节会泄漏进用户数据流
+                let chunk = wenc.seal_chunk(&[if ok { RESP_SUCCESS } else { RESP_ERROR }]);
+                out.extend_from_slice(&chunk);
+            }
+        };
+
         match cmd {
-            CMD_CONNECT => {
-                let (dst, _) = decode_socks_addr(&req_data[1..])?;
+            0x01 | 0x05 => {
                 let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
                 let remote = match self.direct.connect_stream(&sess, &dst).await {
                     Ok(r) => r,
                     Err(e) => {
-                        let err_chunk = enc.seal_chunk(&[RESP_ERROR]);
-                        let _ = stream.write_all(&err_chunk).await;
+                        seal_reply(&mut wenc, &mut init_out, false);
+                        let _ = stream.write_all(&init_out).await;
                         return Err(e);
                     }
                 };
-
-                // 发送成功响应
-                let ok_chunk = enc.seal_chunk(&[RESP_SUCCESS]);
-                stream.write_all(&ok_chunk).await?;
+                seal_reply(&mut wenc, &mut init_out, true);
+                stream.write_all(&init_out).await?;
 
                 let meta = vp_core::conn_table::ConnMeta {
                     id: sess.id,
@@ -736,85 +1088,22 @@ impl SnellInbound {
                     ..Default::default()
                 };
 
-                let client_stream = SnellStream::new(stream, enc, dec, Vec::new(), raw);
+                let client_stream = if is_v4 {
+                    let mut s = SnellStream::new_v4(stream, wenc, Vec::new(), raw, 0);
+                    s.attach_dec(dec);
+                    s
+                } else {
+                    SnellStream::new(stream, wenc, dec, Vec::new(), raw)
+                };
                 tokio::spawn(async move {
                     let _ = relay(Box::new(client_stream), remote, hook).await;
                 });
                 Ok(())
             }
-            CMD_PING => {
-                let ok_chunk = enc.seal_chunk(&[RESP_SUCCESS]);
-                stream.write_all(&ok_chunk).await?;
-                Ok(())
-            }
-            CMD_UDP => {
-                let ok_chunk = enc.seal_chunk(&[RESP_SUCCESS]);
-                stream.write_all(&ok_chunk).await?;
-                // 原生 Snell UDP 代理转发协程
-                let mut client_stream = SnellStream::new(stream, enc, dec, Vec::new(), raw);
-                let udp_sock = Arc::new(vp_transport::create_udp_socket(
-                    "0.0.0.0:0".parse().unwrap(),
-                )?);
-                let sock_r = udp_sock.clone();
-
-                tokio::spawn(async move {
-                    let mut ubuf = vec![0u8; 65535];
-                    loop {
-                        // 读取客户端请求：[addr][len][data]
-                        let mut hdr = [0u8; 1];
-                        if client_stream.read_exact(&mut hdr).await.is_err() {
-                            break;
-                        }
-                        let atyp = hdr[0];
-                        let addr_bytes_len = match atyp {
-                            0x01 => 4,
-                            0x03 => {
-                                let mut dlen = [0u8; 1];
-                                if client_stream.read_exact(&mut dlen).await.is_err() {
-                                    break;
-                                }
-                                dlen[0] as usize
-                            }
-                            0x04 => 16,
-                            _ => break,
-                        };
-                        let mut full_addr = vec![atyp];
-                        if atyp == 0x03 {
-                            full_addr.push(addr_bytes_len as u8);
-                        }
-                        let mut addr_rest = vec![0u8; addr_bytes_len + 2];
-                        if client_stream.read_exact(&mut addr_rest).await.is_err() {
-                            break;
-                        }
-                        full_addr.extend_from_slice(&addr_rest);
-                        let Ok((dst, _)) = decode_socks_addr(&full_addr) else {
-                            break;
-                        };
-
-                        let mut len_b = [0u8; 2];
-                        if client_stream.read_exact(&mut len_b).await.is_err() {
-                            break;
-                        }
-                        let datalen = u16::from_be_bytes(len_b) as usize;
-                        if datalen > ubuf.len() {
-                            break;
-                        }
-                        if client_stream
-                            .read_exact(&mut ubuf[..datalen])
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-
-                        if let Ok(ip) = dst.host.to_string().parse::<std::net::IpAddr>() {
-                            let _ = sock_r
-                                .send_to(&ubuf[..datalen], std::net::SocketAddr::new(ip, dst.port))
-                                .await;
-                        }
-                    }
-                });
-
+            0x00 => {
+                // PING
+                seal_reply(&mut wenc, &mut init_out, true);
+                stream.write_all(&init_out).await?;
                 Ok(())
             }
             _ => Err(Error::Proto("未知 Snell 命令")),
@@ -930,8 +1219,17 @@ mod tests {
 
         let dst = DstAddr::new("127.0.0.1", 80);
         let sess = Session::new_tcp("t".into(), None, dst.clone());
+        // 懒应答语义：错误 PSK 下服务端探测失败直接断开，拒绝在读首读时暴露
         let res = out.connect_stream(&sess, &dst).await;
-        assert!(res.is_err(), "错误 PSK 必须被服务端立即拦截拒绝");
+        match res {
+            Err(_) => {}
+            Ok(mut s) => {
+                use tokio::io::AsyncReadExt as _;
+                let mut probe = [0u8; 1];
+                let read_err = s.read_exact(&mut probe).await.is_err();
+                assert!(read_err, "错误 PSK 必须在首读被拒绝");
+            }
+        }
     }
 
     async fn test_snell_loopback(version: u8, http_obfs: bool) {

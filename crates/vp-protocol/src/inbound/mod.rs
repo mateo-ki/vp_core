@@ -5,6 +5,7 @@ mod http_in;
 mod mixed;
 pub mod mux_in;
 mod socks5_in;
+pub mod tls_front;
 pub mod udp_nat;
 
 pub use dispatch::dispatch_stream;
@@ -12,6 +13,7 @@ pub use http_in::HttpInbound;
 pub use mixed::MixedInbound;
 pub use mux_in::{TlsMuxInbound, TlsMuxOptions};
 pub use socks5_in::Socks5Inbound;
+pub use tls_front::TlsFrontInbound;
 pub use udp_nat::UdpNat;
 
 use std::sync::Arc;

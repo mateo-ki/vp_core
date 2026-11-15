@@ -331,3 +331,76 @@ mod tests {
         assert_eq!(mac.finalize().into_bytes().len(), 20);
     }
 }
+
+#[cfg(test)]
+mod snell_v4_frame_tests {
+    use super::*;
+
+    /// 官方 snell v4 帧往返独立验证（argon2 KDF + salt + swap）
+    #[test]
+    fn v4_frame_roundtrip_with_swap() {
+        let psk = b"correct-psk";
+        let salt = [7u8; 16];
+        let cipher = Cipher::parse("aes-128-gcm").unwrap();
+        let key = {
+            use argon2::{Algorithm, Argon2, Params, Version};
+            let mut out = vec![0u8; 32];
+            let params = Params::new(8, 3, 1, Some(32)).unwrap();
+            Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+                .hash_password_into(psk, &salt, &mut out)
+                .unwrap();
+            out.truncate(16);
+            out
+        };
+        let mut wenc = AeadChunkCodec::new(&cipher, &key).unwrap();
+
+        let payload = [0x01u8, 0x01, 0x00, 0x09];
+        let payload = {
+            let mut v = payload.to_vec();
+            v.extend_from_slice(b"127.0.0.1");
+            v.extend_from_slice(&12345u16.to_be_bytes());
+            v
+        };
+        let pad = 506usize;
+
+        let mut out = bytes::BytesMut::new();
+        out.extend_from_slice(&salt);
+        let mut hdr = [0u8; 7];
+        hdr[0] = 4;
+        hdr[3..5].copy_from_slice(&(pad as u16).to_be_bytes());
+        hdr[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        wenc.seal_raw_record(&hdr, &mut out);
+        let start = out.len();
+        wenc.seal_raw_record(&payload, &mut out);
+        let mut padding = vec![0u8; pad];
+        for (i, b) in padding.iter_mut().enumerate() {
+            *b = (i * 7 + 3) as u8;
+        }
+        let mut seg = out.split_off(start);
+        for i in (0..pad.min(seg.len())).step_by(2) {
+            std::mem::swap(&mut padding[i], &mut seg[i]);
+        }
+        out.extend_from_slice(&padding);
+        out.extend_from_slice(&seg);
+
+        // ===== 读取侧 =====
+        let mut rdec = AeadChunkCodec::new(&cipher, &key).unwrap();
+        let body = &out[16..];
+        let (hdr, used1) = rdec.open_raw_record(body, 7).unwrap().unwrap();
+        assert_eq!(hdr[0], 4);
+        let pad_r = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+        let len_r = u16::from_be_bytes([hdr[5], hdr[6]]) as usize;
+        assert_eq!(pad_r, pad);
+        assert_eq!(len_r, payload.len());
+        let need = used1 + pad_r + len_r + 16;
+        let mut payload_cipher = body[used1 + pad_r..need].to_vec();
+        for i in (0..pad_r.min(payload_cipher.len())).step_by(2) {
+            payload_cipher[i] = body[used1 + i];
+        }
+        let (pt, _) = rdec
+            .open_raw_record(&payload_cipher, len_r)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pt, payload, "v4 帧载荷往返必须一致");
+    }
+}

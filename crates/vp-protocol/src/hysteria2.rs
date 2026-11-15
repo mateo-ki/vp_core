@@ -80,34 +80,6 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
 }
 
 /// 流式读取 QUIC varint（TCPResponse 字段边界可能落在任意字节处）。
-async fn read_varint_async(recv: &mut quinn::RecvStream) -> Result<(u64, usize)> {
-    let mut one = [0u8; 1];
-    recv.read_exact(&mut one)
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 varint: {e}"))))?;
-    let b0 = one[0];
-    let len = match b0 >> 6 {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        _ => 8,
-    };
-    if len == 1 {
-        return Ok((b0 as u64, 1));
-    }
-    let mut b = [0u8; 8];
-    b[0] = b0 & 0x3f;
-    recv.read_exact(&mut b[1..len])
-        .await
-        .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 varint: {e}"))))?;
-    let v = match len {
-        2 => u16::from_be_bytes([b[0], b[1]]) as u64,
-        4 => u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64,
-        _ => u64::from_be_bytes(b),
-    };
-    Ok((v, len))
-}
-
 fn addr_text(dst: &DstAddr) -> String {
     dst.to_string()
 }
@@ -720,7 +692,7 @@ impl Outbound for Hysteria2Outbound {
         for attempt in 0..2 {
             let sess = self.get_or_connect_session().await?;
             let open_res = sess.conn.open_bi().await;
-            let (mut send, mut recv) = match open_res {
+            let (mut send, recv) = match open_res {
                 Ok(pair) => pair,
                 Err(e) => {
                     let mut guard = self.session.lock().await;
@@ -750,33 +722,16 @@ impl Outbound for Hysteria2Outbound {
             }
 
             // TCPResponse: [u8 status][varint |msg|][msg][varint |pad|][pad]
-            let mut status = [0u8; 1];
-            if let Err(e) = recv.read_exact(&mut status).await {
-                let mut guard = self.session.lock().await;
-                *guard = None;
-                if attempt == 0 {
-                    continue;
-                }
-                return Err(Error::Io(std::io::Error::other(format!("hy2 读响应: {e}"))));
-            }
-            if status[0] != 0x00 {
-                return Err(Error::ProtoMsg("hy2 TCPResponse 错误".into()));
-            }
-            let (msg_len, _) = read_varint_async(&mut recv).await?;
-            if msg_len > 0 {
-                let mut msg = vec![0u8; msg_len as usize];
-                recv.read_exact(&mut msg)
-                    .await
-                    .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读消息: {e}"))))?;
-            }
-            let (pad_len, _) = read_varint_async(&mut recv).await?;
-            if pad_len > 0 {
-                let mut pad = vec![0u8; pad_len as usize];
-                recv.read_exact(&mut pad).await.map_err(|e| {
-                    Error::Io(std::io::Error::other(format!("hy2 跳过 padding: {e}")))
-                })?;
-            }
-            return Ok(Box::new(QuicBiStream { send, recv }));
+            // sing 系服务端只在回程数据首次写出时才带上响应头 —— 客户端在这里
+            // 同步等响应会死锁（请求已发、回程数据未至）。读取推迟到流首读，
+            // 与官方 sing 客户端的 clientConn.Read 语义一致。
+            return Ok(Box::new(Hy2TcpStream {
+                send,
+                recv,
+                resp_acc: Some(Vec::new()),
+                pending: bytes::BytesMut::new(),
+                started: std::time::Instant::now(),
+            }));
         }
         Err(Error::ProtoMsg("hy2 连接重试失败".into()))
     }
@@ -802,6 +757,172 @@ impl Outbound for Hysteria2Outbound {
 
     fn remote_addr(&self) -> Option<(String, u16)> {
         Some((self.server.clone(), self.port))
+    }
+}
+
+/// hy2 客户端 TCP 请求流：首读时解析 TCPResponse（status/msg/padding），
+/// 之后与 sing 客户端一致地透传载荷。sing 系服务端只在回程数据首次写出时
+/// 才附带响应，客户端同步等待会死锁，因此解析放在读路径且为取消安全的状态机。
+pub struct Hy2TcpStream {
+    pub send: quinn::SendStream,
+    pub recv: quinn::RecvStream,
+    /// None = 响应已消费；Some(acc) = 响应字节累积中
+    resp_acc: Option<Vec<u8>>,
+    /// 响应前缀之后的载荷残片（同一 QUIC 包里可能紧跟数据）
+    pending: bytes::BytesMut,
+    started: std::time::Instant,
+}
+
+impl Hy2TcpStream {
+    const RESP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+    /// 从 acc 解析响应头；Ok((0, None)) = 数据不足；
+    /// Err(reason) = 协议错误；Ok((consumed, err_msg_opt)) = 完整消费
+    fn parse_head(acc: &[u8]) -> std::result::Result<(usize, Option<String>), String> {
+        let mut i = 0usize;
+        if acc.is_empty() {
+            return Ok((0, None));
+        }
+        let status = acc[0];
+        i += 1;
+        fn read_varint(acc: &[u8], i: &mut usize) -> std::result::Result<Option<u64>, String> {
+            // QUIC varint：首字节高 2 位 = 长度编码（00=1B/01=2B/10=4B/11=8B），
+            // 值 = 首字节低 6 位 + 后续字节大端拼接
+            if *i >= acc.len() {
+                return Ok(None);
+            }
+            let first = acc[*i];
+            let len = 1usize << (first >> 6);
+            if acc.len() < *i + len {
+                return Ok(None);
+            }
+            let mut val = (first & 0x3f) as u64;
+            for k in 1..len {
+                val = (val << 8) | acc[*i + k] as u64;
+            }
+            *i += len;
+            Ok(Some(val))
+        }
+        let Some(msg_len) = read_varint(acc, &mut i)? else {
+            return Ok((0, None));
+        };
+        if msg_len > 4096 {
+            return Err("响应消息过长".into());
+        }
+        if acc.len() < i + msg_len as usize {
+            return Ok((0, None));
+        }
+        let msg = String::from_utf8_lossy(&acc[i..i + msg_len as usize]).to_string();
+        i += msg_len as usize;
+        let Some(pad_len) = read_varint(acc, &mut i)? else {
+            return Ok((0, None));
+        };
+        if acc.len() < i + pad_len as usize {
+            return Ok((0, None));
+        }
+        i += pad_len as usize;
+        let err = if status != 0x00 { Some(msg) } else { None };
+        Ok((i, err))
+    }
+}
+
+impl vp_core::ProxyStream for Hy2TcpStream {}
+
+impl AsyncRead for Hy2TcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut this = self.as_mut();
+        if !this.pending.is_empty() {
+            let n = this.pending.len().min(buf.remaining());
+            buf.put_slice(&this.pending[..n]);
+            let _ = this.pending.split_to(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // TCPResponse 前缀解析：数据不足时继续从 recv 累积，响应消费完之前
+        // 绝不允许绕过解析直接裸读 recv（否则前缀会原样漏给上层）。
+        while this.resp_acc.is_some() {
+            if this.started.elapsed() > Hy2TcpStream::RESP_TIMEOUT {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "hy2 TCPResponse 超时",
+                )));
+            }
+            let mut acc = this.resp_acc.take().unwrap();
+            match Hy2TcpStream::parse_head(&acc) {
+                Err(reason) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                        "hy2 响应: {reason}"
+                    ))));
+                }
+                Ok((0, _)) => {
+                    // 数据不足：从 recv 收一段再回到解析。
+                    // Pending 时必须先把 acc 存回 resp_acc 再返回，
+                    // 否则下次轮询 resp_acc=None 会绕过解析裸读 recv。
+                    let mut tmp = [0u8; 4096];
+                    let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+                    match std::pin::Pin::new(&mut this.recv).poll_read(cx, &mut rb) {
+                        std::task::Poll::Pending => {
+                            this.resp_acc = Some(acc);
+                            return std::task::Poll::Pending;
+                        }
+                        std::task::Poll::Ready(res) => {
+                            res?;
+                            let n = rb.filled().len();
+                            if n == 0 {
+                                return std::task::Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "hy2 响应中断",
+                                )));
+                            }
+                            acc.extend_from_slice(&tmp[..n]);
+                            this.resp_acc = Some(acc);
+                        }
+                    }
+                }
+                Ok((consumed, err)) => {
+                    if let Some(msg) = err {
+                        return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                            "hy2 远端错误: {msg}"
+                        ))));
+                    }
+                    // 响应之后的载荷残片（与响应同一 QUIC 包送达的部分）
+                    this.pending.extend_from_slice(&acc[consumed..]);
+                    // resp_acc 保持 None：后续读直通 recv
+                }
+            }
+        }
+        if !this.pending.is_empty() {
+            let n = this.pending.len().min(buf.remaining());
+            buf.put_slice(&this.pending[..n]);
+            let _ = this.pending.split_to(n);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        AsyncRead::poll_read(std::pin::Pin::new(&mut this.recv), cx, buf)
+    }
+}
+
+impl AsyncWrite for Hy2TcpStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write(std::pin::Pin::new(&mut self.send), cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        AsyncWrite::poll_flush(std::pin::Pin::new(&mut self.send), cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        AsyncWrite::poll_shutdown(std::pin::Pin::new(&mut self.send), cx)
     }
 }
 
@@ -1299,6 +1420,9 @@ impl Hysteria2Inbound {
         let authenticated_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>> =
             Arc::new(tokio::sync::RwLock::new(None));
         let mut udp_sessions: UdpSessions<u32, DstAddr> = HashMap::new();
+        // H3 三件套（control/QPACK enc/QPACK dec）每连接只开一次；
+        // 必须持有到连接结束，提前 drop = FIN = 对端 H3_CLOSED_CRITICAL_STREAM
+        let mut _h3_streams: Option<crate::h3_min::H3CriticalStreams> = None;
         loop {
             tokio::select! {
                 uni = conn.accept_uni() => {
@@ -1308,11 +1432,17 @@ impl Hysteria2Inbound {
                         continue;
                     }
                     let st = read_varint(&tb).map(|(v, _)| v).unwrap_or(u64::MAX);
-                    if st == crate::h3_min::STREAM_CONTROL {
-                        // 客户端开了控制流：服务端也开一条并回应空 SETTINGS
-                        if let Ok(out) = conn.open_uni().await {
-                            let _ = crate::h3_min::server_init_stream(out, crate::h3_min::STREAM_CONTROL).await;
-                        }
+                    if st == crate::h3_min::STREAM_CONTROL && _h3_streams.is_none() {
+                        // 客户端开了控制流：按 H3 规范服务端也须开 control + QPACK 三件套
+                        _h3_streams = crate::h3_min::open_h3_streams(&conn).await.ok();
+                    }
+                    if matches!(st, crate::h3_min::STREAM_CONTROL | crate::h3_min::STREAM_QPACK_ENCODER | crate::h3_min::STREAM_QPACK_DECODER) {
+                        // 关键流只能排空到 EOF，绝不能中途 drop —— quinn 的 drop 会发
+                        // STOP_SENDING，quic-go 对端立刻报 H3_CLOSED_CRITICAL_STREAM
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 4096];
+                            while matches!(s.read(&mut buf).await, Ok(Some(_))) {}
+                        });
                     }
                 }
                 bi = conn.accept_bi() => {
@@ -1410,6 +1540,7 @@ impl Hysteria2Inbound {
         _ctx: &InboundCtx,
         authed_user: Arc<tokio::sync::RwLock<Option<Arc<vp_core::UserAccount>>>>,
     ) {
+        tracing::info!("[hy2-dbg] 收到请求头: {:?}", headers);
         let path = headers
             .iter()
             .find(|(k, _)| k == ":path")

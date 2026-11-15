@@ -171,6 +171,44 @@ pub fn global_root_store() -> &'static Arc<RootCertStore> {
     })
 }
 
+/// 构建服务端 TLS 接受器（流式入站共享）：PEM 路径或内联 PEM 均可
+pub fn server_acceptor(cert_pem: &[u8], key_pem: &[u8], alpn: &[&str]) -> Result<TlsAcceptor> {
+    use rustls_pemfile::Item;
+    use std::io::BufReader;
+
+    let mut certs = Vec::new();
+    let mut key = None;
+    let mut rd = BufReader::new(cert_pem);
+    for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut rd).transpose()) {
+        if let Item::X509Certificate(c) =
+            item.map_err(|e| Error::Config(format!("证书 PEM 解析失败: {e}")))?
+        {
+            certs.push(c);
+        }
+    }
+    let mut rd = BufReader::new(key_pem);
+    for item in std::iter::from_fn(|| rustls_pemfile::read_one(&mut rd).transpose()) {
+        match item.map_err(|e| Error::Config(format!("私钥 PEM 解析失败: {e}")))? {
+            Item::Pkcs8Key(k) => key = Some(k.into()),
+            Item::Pkcs1Key(k) => key = Some(k.into()),
+            Item::Sec1Key(k) => key = Some(k.into()),
+            _ => {}
+        }
+    }
+    let key = key.ok_or_else(|| Error::Config("私钥 PEM 缺失或不支持".into()))?;
+    if certs.is_empty() {
+        return Err(Error::Config("证书 PEM 缺失".into()));
+    }
+    let mut cfg = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::Config(format!("服务端 TLS 配置非法: {e}")))?;
+    if !alpn.is_empty() {
+        cfg.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    }
+    Ok(TlsAcceptor::from(std::sync::Arc::new(cfg)))
+}
+
 /// 全局客户端连接器缓存：高频配置直接走无锁 OnceLock，消除海量 ClientConfig 分配
 pub fn get_tls_connector(skip_cert_verify: bool, alpn: &[String]) -> TlsConnector {
     static DEFAULT_CONNECTOR: std::sync::OnceLock<TlsConnector> = std::sync::OnceLock::new();

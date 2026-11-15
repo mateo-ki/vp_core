@@ -28,6 +28,7 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
+argon2 = "0.5"
 # 内部 crate
 vp-common = { path = "crates/vp-common" }
 vp-core = { path = "crates/vp-core" }

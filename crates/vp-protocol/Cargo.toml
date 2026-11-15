@@ -25,6 +25,7 @@ http.workspace = true
 h2.workspace = true
 vp-crypto.workspace = true
 vp-dns.workspace = true
+argon2.workspace = true
 vp-plugin.workspace = true
 vp-rule.workspace = true
 tokio.workspace = true

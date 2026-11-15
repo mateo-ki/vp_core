@@ -1576,6 +1576,47 @@ pub fn compile_inbound_gate(
 }
 
 /// 构建 listeners / inbounds 段的服务端入站（tproxy/redir/mixed/socks5/http/trojan/vmess/vless/ss...）
+/// 流式监听器统一出口：配置了 cert/key 时套 TLS 前置层
+/// （对外终结 TLS，明文回送内层；内层固定 127.0.0.1:0，公网不可达）。
+/// 仅给 cert 或仅给 key 视为配置错误（不再静默忽略）。
+fn finish_tcp_listener(
+    l: &vp_config::ListenerCfg,
+    tag: &str,
+    gate: Option<Arc<vp_core::InboundGate>>,
+    alpn: &[&str],
+    build: impl FnOnce(&str, u16) -> Result<Arc<dyn vp_core::Inbound>>,
+) -> Result<Arc<dyn vp_core::Inbound>> {
+    let tls = match (l.cert.as_deref(), l.key.as_deref()) {
+        (Some(c), Some(k)) => Some(vp_transport::tls::server_acceptor(
+            &load_pem(c, "cert")?,
+            &load_pem(k, "key")?,
+            alpn,
+        )?),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Error::Config(format!(
+                "{tag} listener: cert 与 key 必须成对提供"
+            )));
+        }
+        _ => None,
+    };
+    match tls {
+        // TLS 前置：内层固定回环 + 随机端口，公网不可达
+        Some(acc) => {
+            let inner = build("127.0.0.1", 0)?;
+            Ok(Arc::new(vp_protocol::TlsFrontInbound::new(
+                l.listen.clone().unwrap_or_else(|| "0.0.0.0".into()),
+                l.port,
+                tag,
+                acc,
+                inner,
+                gate,
+            )))
+        }
+        // 无 TLS：内层直连对外端口
+        None => build(l.listen.as_deref().unwrap_or("0.0.0.0"), l.port),
+    }
+}
+
 fn build_listener(
     l: &vp_config::ListenerCfg,
     global_user_mgr: Arc<vp_core::UserManager>,
@@ -1621,23 +1662,27 @@ fn build_listener(
                     "trojan listener 需要 users（密码）或 fallback 回落目标".into(),
                 ));
             }
-            Ok(Arc::new(vp_protocol::trojan::TrojanInbound::with_gate(
-                bind,
-                l.port,
-                tag,
-                &users,
-                l.fallback.clone(),
-                Some(global_user_mgr),
-                gate,
-            )?))
+            finish_tcp_listener(l, tag, gate.clone(), &[], move |bind, port| {
+                Ok(Arc::new(vp_protocol::trojan::TrojanInbound::with_gate(
+                    bind,
+                    port,
+                    tag,
+                    &users,
+                    l.fallback.clone(),
+                    Some(global_user_mgr),
+                    gate,
+                )?))
+            })
         }
         "vmess" => {
             if l.users.is_empty() {
                 return Err(Error::Config("vmess listener 需要 users（uuid）".into()));
             }
-            Ok(Arc::new(vp_protocol::vmess::VmessInbound::new(
-                bind, l.port, tag, &l.users,
-            )?))
+            finish_tcp_listener(l, tag, gate, &[], |bind, port| {
+                Ok(Arc::new(vp_protocol::vmess::VmessInbound::new(
+                    bind, port, tag, &l.users,
+                )?))
+            })
         }
         "vless" => {
             populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
@@ -1656,23 +1701,27 @@ fn build_listener(
                     "vless listener 需要 users（uuid）或 fallback 回落目标".into(),
                 ));
             }
-            Ok(Arc::new(vp_protocol::vless::VlessInbound::with_gate(
-                bind,
-                l.port,
-                tag,
-                &users,
-                l.fallback.clone(),
-                Some(global_user_mgr),
-                gate,
-            )?))
+            finish_tcp_listener(l, tag, gate.clone(), &[], move |bind, port| {
+                Ok(Arc::new(vp_protocol::vless::VlessInbound::with_gate(
+                    bind,
+                    port,
+                    tag,
+                    &users,
+                    l.fallback.clone(),
+                    Some(global_user_mgr),
+                    gate,
+                )?))
+            })
         }
         "anytls" => {
             if l.users.is_empty() {
                 return Err(Error::Config("anytls listener 需要 users（密码）".into()));
             }
-            Ok(Arc::new(vp_protocol::anytls::AnytlsInbound::new(
-                bind, l.port, tag, &l.users,
-            )?))
+            finish_tcp_listener(l, tag, gate, &[], |bind, port| {
+                Ok(Arc::new(vp_protocol::anytls::AnytlsInbound::new(
+                    bind, port, tag, &l.users,
+                )?))
+            })
         }
         "mieru" => {
             if l.users.is_empty() {
@@ -1680,17 +1729,21 @@ fn build_listener(
                     "mieru listener 需要 users（username:password）".into(),
                 ));
             }
-            Ok(Arc::new(vp_protocol::mieru::MieruInbound::new(
-                bind, l.port, tag, &l.users,
-            )?))
+            finish_tcp_listener(l, tag, gate, &[], |bind, port| {
+                Ok(Arc::new(vp_protocol::mieru::MieruInbound::new(
+                    bind, port, tag, &l.users,
+                )?))
+            })
         }
         "brook" => {
             if l.users.is_empty() {
                 return Err(Error::Config("brook listener 需要 users（密码）".into()));
             }
-            Ok(Arc::new(vp_protocol::brook::BrookInbound::new(
-                bind, l.port, tag, &l.users,
-            )?))
+            finish_tcp_listener(l, tag, gate, &[], |bind, port| {
+                Ok(Arc::new(vp_protocol::brook::BrookInbound::new(
+                    bind, port, tag, &l.users,
+                )?))
+            })
         }
         "snell" => {
             if l.users.is_empty() {
@@ -1698,13 +1751,15 @@ fn build_listener(
                     "snell listener 需要 users（psk 凭据）".into(),
                 ));
             }
-            Ok(Arc::new(vp_protocol::snell::SnellInbound::new(
-                bind,
-                l.port,
-                tag,
-                &l.users,
-                vp_protocol::snell::VERSION_4,
-            )?))
+            finish_tcp_listener(l, tag, gate, &[], |bind, port| {
+                Ok(Arc::new(vp_protocol::snell::SnellInbound::new(
+                    bind,
+                    port,
+                    tag,
+                    &l.users,
+                    vp_protocol::snell::VERSION_4,
+                )?))
+            })
         }
         "naive" => {
             if l.users.is_empty() {
@@ -1712,9 +1767,16 @@ fn build_listener(
                     "naive listener 需要 users（username:password）".into(),
                 ));
             }
-            Ok(Arc::new(vp_protocol::naive::NaiveInbound::new(
-                bind, l.port, tag, &l.users,
-            )?))
+            if l.cert.is_none() || l.key.is_none() {
+                return Err(Error::Config(
+                    "naive listener 需要 cert/key（naive 协议本身即 HTTPS/H2）".into(),
+                ));
+            }
+            finish_tcp_listener(l, tag, gate, &["h2"], |bind, port| {
+                Ok(Arc::new(vp_protocol::naive::NaiveInbound::new(
+                    bind, port, tag, &l.users,
+                )?))
+            })
         }
         "ss" => {
             populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);

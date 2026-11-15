@@ -1254,9 +1254,9 @@ mod tests {
             packet_encoding: None,
             xudp: false,
             packet_addr: false,
-                host: None,
-                path: None,
-            })
+            host: None,
+            path: None,
+        })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), echo_addr.port());
         let sess = Session::new_tcp("t".into(), None, dst.clone());
@@ -1366,9 +1366,9 @@ mod tests {
             packet_encoding: None,
             xudp: false,
             packet_addr: false,
-                host: None,
-                path: None,
-            })
+            host: None,
+            path: None,
+        })
         .unwrap();
         let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), 80);
         let sess = Session::new_tcp("t".into(), None, dst.clone());

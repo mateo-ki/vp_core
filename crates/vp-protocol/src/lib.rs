@@ -295,7 +295,13 @@ pub fn legacy_ws_opts(
         return ws_opts.clone();
     }
     let mut o = ws_opts.clone().unwrap_or_default();
-    if path_v.is_some() && o.path.as_deref().map(str::trim).filter(|p| !p.is_empty()).is_none() {
+    if path_v.is_some()
+        && o.path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .is_none()
+    {
         o.path = path.clone();
     }
     if let Some(h) = host_v {

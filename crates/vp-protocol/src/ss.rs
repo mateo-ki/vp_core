@@ -84,7 +84,7 @@ impl<S> SsCryptoStream<S> {
             enc.seal_raw_record(&hdr, &mut out);
             let mut varhdr = addr.to_vec();
             varhdr.extend_from_slice(&(pad_len as u16).to_be_bytes());
-            varhdr.extend(std::iter::repeat(0u8).take(pad_len));
+            varhdr.extend(std::iter::repeat_n(0u8, pad_len));
             enc.seal_raw_record(&varhdr, &mut out);
         } else {
             enc.seal_chunk_into_bytes(&first_payload, &mut out);
@@ -767,14 +767,13 @@ impl SsInbound {
         let mut raw = BytesMut::new();
         raw.reserve(16 * 1024);
         let is_2022 = self.cipher.is_2022;
-        let mut matched: Option<(
+        let matched: Option<(
             Option<Arc<vp_core::UserAccount>>,
             Vec<u8>,
             AeadChunkCodec,
             Vec<u8>,
             usize,
-        )> = None;
-        'identify: loop {
+        )> = 'identify: loop {
             let n = stream.read_buf(&mut raw).await?;
             if n == 0 {
                 return Err(Error::Proto("ss 入站: 首包中断"));
@@ -796,8 +795,7 @@ impl SsInbound {
                         dec.try_open_chunk(&raw)
                     };
                     if let Some(Ok((payload, used))) = probe {
-                        matched = Some((Some(user.clone()), k.clone(), dec, payload, used));
-                        break 'identify;
+                        break 'identify Some((Some(user.clone()), k.clone(), dec, payload, used));
                     }
                 }
             } else {
@@ -809,15 +807,14 @@ impl SsInbound {
                     dec.try_open_chunk(&raw)
                 };
                 if let Some(Ok((payload, used))) = probe {
-                    matched = Some((None, self.key.clone(), dec, payload, used));
-                    break;
+                    break 'identify Some((None, self.key.clone(), dec, payload, used));
                 }
             }
             // 不完整记录 → 继续读；防止无限膨胀
             if raw.len() > 64 * 1024 {
                 return Err(Error::Proto("ss 入站: 首包过大"));
             }
-        }
+        };
 
         let (matched_user, use_key, mut dec, first, used) = match matched {
             Some(m) => m,
@@ -857,7 +854,8 @@ impl SsInbound {
             if varhdr.len() < addr_used + 2 {
                 return Err(Error::Proto("ss 入站: 2022 变长头缺 padding 长度"));
             }
-            let padding_size = u16::from_be_bytes([varhdr[addr_used], varhdr[addr_used + 1]]) as usize;
+            let padding_size =
+                u16::from_be_bytes([varhdr[addr_used], varhdr[addr_used + 1]]) as usize;
             let payload_start = addr_used + 2 + padding_size;
             if varhdr.len() < payload_start {
                 return Err(Error::Proto("ss 入站: 2022 变长头 padding 越界"));
@@ -887,7 +885,8 @@ impl SsInbound {
         };
         let remote = res.outbound.connect_stream(&sess, &dst).await?;
 
-        let client = SsCryptoStream::new_server(stream, self.cipher.clone(), use_key, &salt, dec, raw)?;
+        let client =
+            SsCryptoStream::new_server(stream, self.cipher.clone(), use_key, &salt, dec, raw)?;
         let meta = vp_core::conn_table::ConnMeta {
             id: sess.id,
             inbound: self.tag.clone(),

@@ -20,8 +20,8 @@ async fn probe_all_nodes_vpcore() {
         println!("跳过：未设置 VPCORE_PROBE_INPUT");
         return;
     };
-    let out_path =
-        std::env::var("VPCORE_PROBE_OUT").unwrap_or_else(|_| "target/probe_results_vpcore.json".into());
+    let out_path = std::env::var("VPCORE_PROBE_OUT")
+        .unwrap_or_else(|_| "target/probe_results_vpcore.json".into());
     let raw = std::fs::read_to_string(&input).expect("read input");
     let nodes: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("parse input");
     println!("VP-Core 探针：{} 节点，并发 {CONCURRENCY}", nodes.len());
@@ -46,7 +46,7 @@ async fn probe_all_nodes_vpcore() {
         let sem = sem.clone();
         tasks.spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let mut fail = |err: String| {
+            let fail = |err: String| {
                 serde_json::json!({"id": id, "protocol": proto, "ok": false, "latency_ms": null, "err": err})
             };
             let cfg: vp_config::ProxyCfg = match serde_json::from_value(cfgv) {
@@ -92,7 +92,8 @@ async fn probe_all_nodes_vpcore() {
     while let Some(j) = tasks.join_next().await {
         match j {
             Ok(v) => results.push(v),
-            Err(e) => results.push(serde_json::json!({"id": null, "ok": false, "err": format!("join: {e}")})),
+            Err(e) => results
+                .push(serde_json::json!({"id": null, "ok": false, "err": format!("join: {e}")})),
         }
         done += 1;
         if done % 1000 == 0 {

@@ -1136,11 +1136,7 @@ pub struct VlessCfg {
     #[serde(default)]
     pub flow: Option<String>,
     /// Clash `tls` 布尔；V2Ray/URI 风格 `security: "tls" | "reality"` 也映射到本字段
-    #[serde(
-        alias = "security",
-        default,
-        deserialize_with = "de_bool_lenient"
-    )]
+    #[serde(alias = "security", default, deserialize_with = "de_bool_lenient")]
     pub tls: bool,
     #[serde(
         alias = "servername",

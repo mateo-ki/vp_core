@@ -237,15 +237,17 @@ impl AeadChunkCodec {
         let n = Self::ss_nonce(self.next_nonce());
         let start = out.len();
         out.extend_from_slice(payload);
-        let tag = self
-            .aead
-            .seal_in_place_detached(&n, &mut out[start..], b"");
+        let tag = self.aead.seal_in_place_detached(&n, &mut out[start..], b"");
         out.extend_from_slice(&tag);
     }
 
     /// SIP022 裸记录解密：`buf` 须含完整记录（pt_len + tag）；nonce 计数器连续。
     /// 返回 (明文, 消费字节数)。记录不完整返回 None，解密失败返回 Some(Err)。
-    pub fn open_raw_record(&mut self, buf: &[u8], pt_len: usize) -> Option<Result<(Vec<u8>, usize)>> {
+    pub fn open_raw_record(
+        &mut self,
+        buf: &[u8],
+        pt_len: usize,
+    ) -> Option<Result<(Vec<u8>, usize)>> {
         let total = pt_len + self.tag_len;
         if buf.len() < total {
             return None;

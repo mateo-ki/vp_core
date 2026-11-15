@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# 极致测试门禁（与 .github/workflows/ci.yml 完全对齐 + 本地加固）：
+#   fmt --check → clippy -D warnings → cargo test → DSL 门（validate + fmt --check）
+# 文档/.github/钩子脚本本身的改动免测；FORCE_FULL_GATE=1 强制全门。
+set -uo pipefail
+
+run_full=0
+if [ "${FORCE_FULL_GATE:-}" = "1" ]; then
+  run_full=1
+else
+  while IFS= read -r -d '' f; do
+    case "$f" in
+      *.md|*.txt|*.png|*.ico|.github/*|scripts/githooks/*) ;;
+      *) run_full=1; break ;;
+    esac
+  done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+fi
+
+if [ "$run_full" -eq 0 ]; then
+  echo "⏭  仅文档/工具改动，跳过全量门禁"
+  exit 0
+fi
+
+fail() { echo "✗ 提交被门禁拦截：$1"; exit 1; }
+
+echo "==> [1/5] mkdir target/debug/examples（ipstack 构建脚本规避）"
+mkdir -p target/debug/examples
+
+echo "==> [2/5] cargo fmt --all -- --check"
+cargo fmt --all -- --check || fail "格式化未过：先跑 cargo fmt --all 再 git add"
+
+echo "==> [3/5] cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings || fail "clippy 未过"
+
+echo "==> [4/5] cargo test --workspace"
+cargo test --workspace || fail "测试未过"
+
+echo "==> [5/5] DSL 门（validate + fmt --check）"
+cargo run -q -p vp-bin -- validate -c example/config.vp \
+  || fail "DSL validate 未过（OS error 32 = vpcore.exe 被占用，先停运行中的内核）"
+cargo run -q -p vp-bin -- fmt --check example/config.vp \
+  || fail "DSL fmt --check 未过"
+
+echo "✓ 极致测试门禁全部通过"

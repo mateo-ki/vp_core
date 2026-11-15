@@ -5,10 +5,11 @@
 //! - 连接表/统计挂载
 
 use std::future::poll_fn;
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::Poll;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::task::JoinHandle;
 use vp_common::{Stats, get_buf};
@@ -92,6 +93,53 @@ async fn drain_side(
     true
 }
 
+/// 读侧实时计数适配器：包装一端流，每读到字节立刻 `fetch_add` 入账。
+/// 供无 QoS 快速路径使用 —— `copy_bidirectional` 期间连接表快照即可看到
+/// 实时 per-conn 流量，出错中断时也已入账（copy_bidirectional 出错不回传字节数）。
+struct CountRead<'a, S: ?Sized> {
+    inner: &'a mut S,
+    counter: Arc<AtomicU64>,
+}
+
+impl<S: AsyncRead + ?Sized + Unpin> AsyncRead for CountRead<'_, S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        rb: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = rb.filled().len();
+        match Pin::new(&mut *this.inner).poll_read(cx, rb) {
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len() - before;
+                if n > 0 {
+                    this.counter.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<S: AsyncWrite + ?Sized + Unpin> AsyncWrite for CountRead<'_, S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// 双向转发。返回 (up, down) 字节数。任何一侧结束都会向对端传播关闭。
 pub async fn relay(
     #[allow(unused_mut)] mut left: Box<dyn ProxyStream>,
@@ -141,6 +189,11 @@ pub async fn relay(
                     };
                     match splice::relay_pair(a, b, hook.stats.clone()).await {
                         Ok((up, down)) => {
+                            // 终值写回连接表条目（条目随守卫移除，但保持计数语义一致）
+                            if let Some(rc) = &registered {
+                                rc.up.store(up, Ordering::Relaxed);
+                                rc.down.store(down, Ordering::Relaxed);
+                            }
                             drop(splice_guard);
                             return (up + pre_up, down + pre_down);
                         }
@@ -202,19 +255,35 @@ pub async fn relay(
         // 等量内存可多承载约 60% 并发连接。下行 128KB 与缓冲池块尺寸对齐。
         const UP_BUF_SIZE: usize = 32 * 1024;
         const DOWN_BUF_SIZE: usize = 128 * 1024;
-        let (up_bytes, down_bytes) = match tokio::io::copy_bidirectional_with_sizes(
-            &mut left,
-            &mut right,
+        // 读侧实时计数：每读到字节立刻入账，连接存活期间 /connections 快照就能看到
+        // 实时 per-conn 流量（此前只在连接结束时 store 一次，而 RelayGuard 随即删条目，
+        // 计数对外永远为 0 —— GUI 三个流量统计页全 0 的根因）。
+        let mut up_src = CountRead {
+            inner: &mut left,
+            counter: up.clone(),
+        };
+        let mut down_src = CountRead {
+            inner: &mut right,
+            counter: down.clone(),
+        };
+        let copy_res = tokio::io::copy_bidirectional_with_sizes(
+            &mut up_src,
+            &mut down_src,
             UP_BUF_SIZE,
             DOWN_BUF_SIZE,
         )
-        .await
-        {
-            Ok((u, d)) => (u, d),
-            Err(_) => (0, 0),
+        .await;
+        let (up_bytes, down_bytes) = match copy_res {
+            Ok((u, d)) => {
+                up.store(u, Ordering::Relaxed);
+                down.store(d, Ordering::Relaxed);
+                (u, d)
+            }
+            Err(_) => {
+                // 中断路径 copy_bidirectional 不回传已传字节：用读侧实时计数兜底，不丢账
+                (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed))
+            }
         };
-        up.store(up_bytes, Ordering::Relaxed);
-        down.store(down_bytes, Ordering::Relaxed);
         if let Some(s) = &hook.stats {
             s.add_up(up_bytes);
             s.add_down(down_bytes);
@@ -574,6 +643,60 @@ mod tests {
         b2.read_exact(&mut buf).await.unwrap();
         a2.shutdown().await.unwrap();
         b2.shutdown().await.unwrap();
+        let (up, down) = handle.await.unwrap();
+        assert_eq!(up, 100);
+        assert_eq!(down, 0);
+        assert!(table.is_empty());
+    }
+
+    /// 回归（GUI 三个流量统计页全 0 的根因）：无 QoS 快速路径此前只在连接结束时
+    /// store 计数，而条目随即被 RelayGuard 删除 —— /connections 快照里 per-conn
+    /// 流量恒为 0。现在读侧实时计数，连接存活期间就必须可见。
+    #[tokio::test]
+    async fn conn_counters_visible_while_connection_alive() {
+        let table = Arc::new(ConnTable::new());
+        let stats = Arc::new(Stats::default());
+        let meta = ConnMeta {
+            id: 7,
+            inbound: "mixed".into(),
+            network: "tcp",
+            host: "live.local".into(),
+            dst_port: 80,
+            src: None,
+            process: None,
+            user: None,
+            rule: None,
+            chain: None,
+            start: 0,
+        };
+        let (a1, mut a2) = duplex(4096);
+        let (b1, mut b2) = duplex(4096);
+        let t = table.clone();
+        let handle = tokio::spawn(async move {
+            let h = RelayHook {
+                table: Some(t),
+                meta: Some(meta),
+                stats: Some(stats.clone()),
+                ..Default::default()
+            };
+            relay(Box::new(a1), Box::new(b1), h).await
+        });
+
+        a2.write_all(&[0u8; 100]).await.unwrap();
+        let mut buf = [0u8; 100];
+        b2.read_exact(&mut buf).await.unwrap();
+
+        // 连接仍然存活（两端都未关闭）：per-conn 计数必须已经可见
+        let snap = table.list();
+        assert_eq!(snap.len(), 1, "连接存活期间连接表应有且仅有这一条");
+        assert!(
+            snap[0].upload >= 100,
+            "连接存活期间 per-conn 上行应实时可见，实际 {}",
+            snap[0].upload
+        );
+
+        a2.shutdown().await.unwrap();
+        drop(b2);
         let (up, down) = handle.await.unwrap();
         assert_eq!(up, 100);
         assert_eq!(down, 0);

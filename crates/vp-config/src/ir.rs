@@ -1388,6 +1388,8 @@ impl From<OutboundSpec> for ProxyCfg {
                 packet_encoding: None,
                 xudp: false,
                 packet_addr: false,
+                host: None,
+                path: None,
             }),
             OutboundKind::Vless {
                 server,
@@ -1460,6 +1462,8 @@ impl From<OutboundSpec> for ProxyCfg {
                 packet_encoding,
                 xudp: false,
                 packet_addr: false,
+                host: None,
+                path: None,
             }),
             OutboundKind::Trojan {
                 server,
@@ -1527,6 +1531,8 @@ impl From<OutboundSpec> for ProxyCfg {
                     version: Some(st.version),
                 }),
                 udp,
+                host: None,
+                path: None,
             }),
             OutboundKind::Hysteria {
                 server,

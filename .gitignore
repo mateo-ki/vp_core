@@ -13,3 +13,4 @@ __pycache__/
 sync_to_wsl.sh
 scripts/wsl_baseline_test.sh
 scripts/wsl_diag_one.sh
+target-interop/

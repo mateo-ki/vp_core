@@ -46,7 +46,12 @@ impl Cipher {
     }
 
     pub fn salt_len(&self) -> usize {
+        // 2022（sing/mihomo 实现）：salt 长度 = key_len（aes-128→16，aes-256→32）
         self.kind.salt_len()
+    }
+
+    pub fn tag_len(&self) -> usize {
+        self.kind.tag_len()
     }
 
     /// 由密码推导主密钥
@@ -71,12 +76,15 @@ impl Cipher {
     /// 由主密钥 + salt 派生子密钥
     pub fn subkey(&self, key: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
         if self.is_2022 {
-            // 2022: blake3(key || salt) 截断 key_len
-            let mut h = blake3::Hasher::new();
+            // SIP022：blake3 keyed-derive（context = "shadowsocks 2022 session subkey"，
+            // 输入 key||salt），XOF 输出 key_len 字节
+            const BLAKE3_KEY_DERIVE_CONTEXT: &str = "shadowsocks 2022 session subkey";
+            let mut h = blake3::Hasher::new_derive_key(BLAKE3_KEY_DERIVE_CONTEXT);
             h.update(key);
             h.update(salt);
-            let out = h.finalize();
-            Ok(out.as_bytes()[..self.key_len()].to_vec())
+            let mut out = vec![0u8; self.key_len()];
+            h.finalize_xof().fill(&mut out);
+            Ok(out)
         } else {
             // legacy: HKDF-SHA1(key, salt, "ss-subkey", key_len)
             let hk = Hkdf::<Sha1>::new(Some(salt), key);
@@ -221,6 +229,35 @@ impl AeadChunkCodec {
             return Some(Err(e));
         }
         self.counter += 2;
+        Some(Ok((data, total)))
+    }
+
+    /// SIP022 裸记录加密：单次 AEAD op，无长度前缀（定长头/变长头用），nonce 计数器连续
+    pub fn seal_raw_record(&mut self, payload: &[u8], out: &mut bytes::BytesMut) {
+        let n = Self::ss_nonce(self.next_nonce());
+        let start = out.len();
+        out.extend_from_slice(payload);
+        let tag = self
+            .aead
+            .seal_in_place_detached(&n, &mut out[start..], b"");
+        out.extend_from_slice(&tag);
+    }
+
+    /// SIP022 裸记录解密：`buf` 须含完整记录（pt_len + tag）；nonce 计数器连续。
+    /// 返回 (明文, 消费字节数)。记录不完整返回 None，解密失败返回 Some(Err)。
+    pub fn open_raw_record(&mut self, buf: &[u8], pt_len: usize) -> Option<Result<(Vec<u8>, usize)>> {
+        let total = pt_len + self.tag_len;
+        if buf.len() < total {
+            return None;
+        }
+        let n = Self::ss_nonce(self.counter);
+        let mut data = buf[..pt_len].to_vec();
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&buf[pt_len..total]);
+        if let Err(e) = self.aead.open_in_place_detached(&n, &mut data, &tag, b"") {
+            return Some(Err(e));
+        }
+        self.counter += 1;
         Some(Ok((data, total)))
     }
 }

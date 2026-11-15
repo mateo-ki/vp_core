@@ -282,6 +282,31 @@ pub fn transport_of_full(
     })
 }
 
+/// 兼容旧版 clash 顶层 host/path 写法（mihomo 同样接受）：ws-opts 缺省或缺 Host 时合成。
+/// 优先级：显式 ws-opts > 顶层 host/path。
+pub fn legacy_ws_opts(
+    ws_opts: &Option<WsOpts>,
+    host: &Option<String>,
+    path: &Option<String>,
+) -> Option<WsOpts> {
+    let host_v = host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+    let path_v = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    if host_v.is_none() && path_v.is_none() {
+        return ws_opts.clone();
+    }
+    let mut o = ws_opts.clone().unwrap_or_default();
+    if path_v.is_some() && o.path.as_deref().map(str::trim).filter(|p| !p.is_empty()).is_none() {
+        o.path = path.clone();
+    }
+    if let Some(h) = host_v {
+        let headers = o.headers.get_or_insert_with(Default::default);
+        if !headers.keys().any(|k| k.eq_ignore_ascii_case("host")) {
+            headers.insert("Host".into(), h.to_string());
+        }
+    }
+    Some(o)
+}
+
 /// shadowtls-opts（Clash `shadowtls-opts` / sing-box detour 语义）→ 传输配置
 fn shadowtls_from_opts(
     opts: &Option<vp_config::ShadowTlsCfg>,

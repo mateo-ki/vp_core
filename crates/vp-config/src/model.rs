@@ -61,7 +61,8 @@ where
         Some(serde_yaml::Value::Bool(b)) => Ok(b),
         Some(serde_yaml::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
             // "auto" 兜底为 true（sanitize 层已按端口推断过，此处多为 443 的 TLS 节点）
-            "tls" | "auto" | "true" | "1" | "yes" | "on" => Ok(true),
+            // "reality"：REALITY 传输同样走 TLS 栈（是否真正启用由 reality-opts 决定）
+            "tls" | "reality" | "auto" | "true" | "1" | "yes" | "on" => Ok(true),
             "none" | "false" | "0" | "no" | "off" | "" => Ok(false),
             other => Err(D::Error::custom(format!("布尔字段非法: {other:?}"))),
         },
@@ -1115,6 +1116,11 @@ pub struct VmessCfg {
     pub xudp: bool,
     #[serde(alias = "packet-addr", default)]
     pub packet_addr: bool,
+    /// 旧版 clash 顶层 host/path（ws 传输兼容；mihomo 同样接受该写法）
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 fn default_vmess_cipher() -> String {
@@ -1129,7 +1135,12 @@ pub struct VlessCfg {
     pub uuid: String,
     #[serde(default)]
     pub flow: Option<String>,
-    #[serde(default, deserialize_with = "de_bool_lenient")]
+    /// Clash `tls` 布尔；V2Ray/URI 风格 `security: "tls" | "reality"` 也映射到本字段
+    #[serde(
+        alias = "security",
+        default,
+        deserialize_with = "de_bool_lenient"
+    )]
     pub tls: bool,
     #[serde(
         alias = "servername",
@@ -1179,6 +1190,11 @@ pub struct VlessCfg {
     pub xudp: bool,
     #[serde(alias = "packet-addr", default)]
     pub packet_addr: bool,
+    /// 旧版 clash 顶层 host/path（ws 传输兼容；mihomo 同样接受该写法）
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1241,6 +1257,11 @@ pub struct TrojanCfg {
     pub shadowtls_opts: Option<ShadowTlsCfg>,
     #[serde(default)]
     pub udp: bool,
+    /// 旧版 clash 顶层 host/path（ws 传输兼容；mihomo 同样接受该写法）
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// ssh：SSH-2.0 出站（direct-tcpip 通道）。password 与 private-key 二选一。

@@ -1642,8 +1642,12 @@ fn build_listener(
         "vless" => {
             populate_user_manager(&global_user_mgr, &l.user_configs, &l.users);
             let mut users = l.users.clone();
+            // 全局用户池可能含其它协议监听器的非 UUID 凭据（ss/trojan 密码等），
+            // vless 只能接受合法 UUID，否则整条监听器构建失败
             for u in global_user_mgr.all_users() {
-                if !users.iter().any(|s| s == &*u.secret) {
+                if !users.iter().any(|s| s == &*u.secret)
+                    && vp_crypto::vmess_kdf::parse_uuid(&u.secret).is_ok()
+                {
                     users.push(u.secret.to_string());
                 }
             }

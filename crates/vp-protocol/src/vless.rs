@@ -114,7 +114,7 @@ impl VlessOutbound {
             &cfg.server_name,
             cfg.skip_cert_verify,
             &cfg.network,
-            &cfg.ws_opts,
+            &crate::legacy_ws_opts(&cfg.ws_opts, &cfg.host, &cfg.path),
             &cfg.grpc_opts,
             &cfg.client_fingerprint,
             &cfg.reality_opts,
@@ -781,7 +781,9 @@ mod tests {
             packet_encoding: None,
             xudp: false,
             packet_addr: false,
-        })
+                host: None,
+                path: None,
+            })
         .unwrap();
         let dst = DstAddr::new("127.0.0.1", echo_addr.port());
         let sess = Session::new_tcp("t".into(), None, dst.clone());
@@ -834,7 +836,9 @@ mod tests {
             packet_encoding: enc.map(Into::into),
             xudp: false,
             packet_addr: false,
-        })
+                host: None,
+                path: None,
+            })
         .unwrap();
         assert!(out.support_udp());
         let dst = DstAddr::ip(echo.ip(), echo.port());
@@ -899,7 +903,9 @@ mod tests {
             packet_encoding: None,
             xudp: false,
             packet_addr: false,
-        })
+                host: None,
+                path: None,
+            })
         .unwrap();
         let dst = DstAddr::new("127.0.0.1", echo_addr.port());
         let sess = Session::new_tcp("t".into(), None, dst.clone());
@@ -961,7 +967,9 @@ mod tests {
             packet_encoding: None,
             xudp: false,
             packet_addr: false,
-        })
+                host: None,
+                path: None,
+            })
         .unwrap();
 
         let dst = DstAddr::new("127.0.0.1", echo_addr.port());

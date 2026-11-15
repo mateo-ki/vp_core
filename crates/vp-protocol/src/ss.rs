@@ -31,6 +31,12 @@ pub struct SsCryptoStream<S> {
     dec: Option<AeadChunkCodec>,
     /// 是否需要从对端读取 salt（客户端方向）
     expect_peer_salt: bool,
+    /// SIP022：接收方向是否还差定长头记录（客户端读服务端响应时）
+    rx_2022_fixed_pending: bool,
+    /// SIP022：定长头之后待读的首段数据记录长度（None = 已读完）
+    rx_2022_payload_len: Option<usize>,
+    /// 客户端自身请求 salt（校验服务端响应回显）
+    own_salt: Vec<u8>,
     raw: BytesMut,
     pending: BytesMut,
     out: BytesMut,
@@ -54,8 +60,35 @@ impl<S> SsCryptoStream<S> {
         vp_common::rand_bytes(&mut salt);
         let sub = cipher.subkey(&key, &salt)?;
         let mut enc = AeadChunkCodec::new(&cipher, &sub)?;
+        let is_2022 = cipher.is_2022;
         let mut out = BytesMut::from(&salt[..]);
-        enc.seal_chunk_into_bytes(&first_payload, &mut out);
+        if is_2022 {
+            // SIP022 请求：record1 = [type 0][time 8][n 2]，record2 = [addr][padding_size 0]
+            let first_payload: Vec<u8> = {
+                // first_payload = [time 8][addr...]；time 移入定长头
+                first_payload
+            };
+            if first_payload.len() < 8 {
+                return Err(vp_common::Error::Config("ss 2022: 首载荷缺时间戳".into()));
+            }
+            let addr = &first_payload[8..];
+            // 抗指纹随机 padding 1..=900（与 mihomo 客户端一致）
+            let mut pad2 = [0u8; 2];
+            vp_common::rand_bytes(&mut pad2);
+            let pad_len = (u16::from_be_bytes(pad2) % 900 + 1) as usize;
+            let n = addr.len() as u16 + 2 + pad_len as u16;
+            let mut hdr = Vec::with_capacity(11);
+            hdr.push(0u8);
+            hdr.extend_from_slice(&first_payload[..8]);
+            hdr.extend_from_slice(&n.to_be_bytes());
+            enc.seal_raw_record(&hdr, &mut out);
+            let mut varhdr = addr.to_vec();
+            varhdr.extend_from_slice(&(pad_len as u16).to_be_bytes());
+            varhdr.extend(std::iter::repeat(0u8).take(pad_len));
+            enc.seal_raw_record(&varhdr, &mut out);
+        } else {
+            enc.seal_chunk_into_bytes(&first_payload, &mut out);
+        }
         Ok(SsCryptoStream {
             inner,
             cipher,
@@ -63,6 +96,9 @@ impl<S> SsCryptoStream<S> {
             enc: Some(enc),
             dec: None,
             expect_peer_salt: true,
+            rx_2022_fixed_pending: is_2022,
+            rx_2022_payload_len: None,
+            own_salt: salt,
             raw: BytesMut::new(),
             pending: BytesMut::new(),
             out,
@@ -75,13 +111,30 @@ impl<S> SsCryptoStream<S> {
         inner: S,
         cipher: Cipher,
         key: Vec<u8>,
+        request_salt: &[u8],
         dec: AeadChunkCodec,
         initial_raw: BytesMut,
     ) -> Result<Self> {
         let mut own_salt = vec![0u8; cipher.salt_len()];
         vp_common::rand_bytes(&mut own_salt);
         let own_sub = cipher.subkey(&key, &own_salt)?;
-        let enc = AeadChunkCodec::new(&cipher, &own_sub)?;
+        let mut enc = AeadChunkCodec::new(&cipher, &own_sub)?;
+        let mut out = BytesMut::from(&own_salt[..]);
+        if cipher.is_2022 {
+            // SIP022 响应：record1 = [type 1][time 8][请求 salt 回显][数据长度]
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut hdr = Vec::with_capacity(11 + request_salt.len());
+            hdr.push(1u8);
+            hdr.extend_from_slice(&ts.to_be_bytes());
+            hdr.extend_from_slice(request_salt);
+            hdr.extend_from_slice(&0u16.to_be_bytes());
+            enc.seal_raw_record(&hdr, &mut out);
+            // record2 = 首段响应数据（暂无数据 → 空记录；mihomo/shadowsocks-rust 客户端均无条件读取）
+            enc.seal_raw_record(&[], &mut out);
+        }
         Ok(SsCryptoStream {
             inner,
             cipher,
@@ -89,9 +142,12 @@ impl<S> SsCryptoStream<S> {
             enc: Some(enc),
             dec: Some(dec),
             expect_peer_salt: false,
+            rx_2022_fixed_pending: false,
+            rx_2022_payload_len: None,
+            own_salt: Vec::new(),
             raw: initial_raw,
             pending: BytesMut::new(),
-            out: BytesMut::from(&own_salt[..]),
+            out,
             closed: false,
         })
     }
@@ -132,6 +188,58 @@ impl<S> SsCryptoStream<S> {
             } else {
                 return;
             }
+        }
+        // SIP022 响应：定长头 [type 1][time 8][请求 salt 回显][数据长度]，随后首段数据记录（可为空）
+        if self.rx_2022_fixed_pending {
+            let sl = self.cipher.salt_len();
+            let fixed = 11 + sl;
+            if let Some(dec) = self.dec.as_mut() {
+                match dec.open_raw_record(&self.raw, fixed) {
+                    None => return, // 记录不完整
+                    Some(Err(_)) => {
+                        self.closed = true;
+                        return;
+                    }
+                    Some(Ok((hdr, used))) => {
+                        self.raw.advance(used);
+                        if hdr.len() < fixed || hdr[0] != 1 {
+                            self.closed = true;
+                            return;
+                        }
+                        let ts = u64::from_be_bytes(hdr[1..9].try_into().unwrap());
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if now.abs_diff(ts) > 30
+                            || self.own_salt.len() != sl
+                            || hdr[9..9 + sl] != self.own_salt[..]
+                        {
+                            self.closed = true;
+                            return;
+                        }
+                        let n = u16::from_be_bytes([hdr[9 + sl], hdr[10 + sl]]) as usize;
+                        self.rx_2022_payload_len = Some(n);
+                    }
+                }
+            }
+            self.rx_2022_fixed_pending = false;
+        }
+        if let Some(n) = self.rx_2022_payload_len {
+            if let Some(dec) = self.dec.as_mut() {
+                match dec.open_raw_record(&self.raw, n) {
+                    None => return, // 首段数据记录不完整
+                    Some(Err(_)) => {
+                        self.closed = true;
+                        return;
+                    }
+                    Some(Ok((data, used))) => {
+                        self.raw.advance(used);
+                        self.pending.extend_from_slice(&data);
+                    }
+                }
+            }
+            self.rx_2022_payload_len = None;
         }
         while let Some(dec) = self.dec.as_mut() {
             match dec.try_open_chunk(&self.raw) {
@@ -655,14 +763,10 @@ impl SsInbound {
         let mut salt = vec![0u8; self.cipher.salt_len()];
         stream.read_exact(&mut salt).await?;
 
-        // 读首个分块并尝试解密匹配用户
+        // 读首个分块并尝试解密匹配用户（SIP022：先读 11B 定长头记录，不完整则续读）
         let mut raw = BytesMut::new();
         raw.reserve(16 * 1024);
-        let n = stream.read_buf(&mut raw).await?;
-        if n == 0 {
-            return Err(Error::Proto("ss 入站: 首包中断"));
-        }
-
+        let is_2022 = self.cipher.is_2022;
         let mut matched: Option<(
             Option<Arc<vp_core::UserAccount>>,
             Vec<u8>,
@@ -670,31 +774,52 @@ impl SsInbound {
             Vec<u8>,
             usize,
         )> = None;
-        if !self.user_keys.is_empty() {
-            for (user, k) in &self.user_keys {
-                if user.is_quota_exceeded() {
-                    continue;
+        'identify: loop {
+            let n = stream.read_buf(&mut raw).await?;
+            if n == 0 {
+                return Err(Error::Proto("ss 入站: 首包中断"));
+            }
+            if !self.user_keys.is_empty() {
+                for (user, k) in &self.user_keys {
+                    if user.is_quota_exceeded() {
+                        continue;
+                    }
+                    let Ok(sub) = self.cipher.subkey(k, &salt) else {
+                        continue;
+                    };
+                    let Ok(mut dec) = AeadChunkCodec::new(&self.cipher, &sub) else {
+                        continue;
+                    };
+                    let probe = if is_2022 {
+                        dec.open_raw_record(&raw, 11)
+                    } else {
+                        dec.try_open_chunk(&raw)
+                    };
+                    if let Some(Ok((payload, used))) = probe {
+                        matched = Some((Some(user.clone()), k.clone(), dec, payload, used));
+                        break 'identify;
+                    }
                 }
-                let Ok(sub) = self.cipher.subkey(k, &salt) else {
-                    continue;
+            } else {
+                let sub = self.cipher.subkey(&self.key, &salt)?;
+                let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
+                let probe = if is_2022 {
+                    dec.open_raw_record(&raw, 11)
+                } else {
+                    dec.try_open_chunk(&raw)
                 };
-                let Ok(mut dec) = AeadChunkCodec::new(&self.cipher, &sub) else {
-                    continue;
-                };
-                if let Some(Ok((payload, used))) = dec.try_open_chunk(&raw) {
-                    matched = Some((Some(user.clone()), k.clone(), dec, payload, used));
+                if let Some(Ok((payload, used))) = probe {
+                    matched = Some((None, self.key.clone(), dec, payload, used));
                     break;
                 }
             }
-        } else {
-            let sub = self.cipher.subkey(&self.key, &salt)?;
-            let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
-            if let Some(Ok((payload, used))) = dec.try_open_chunk(&raw) {
-                matched = Some((None, self.key.clone(), dec, payload, used));
+            // 不完整记录 → 继续读；防止无限膨胀
+            if raw.len() > 64 * 1024 {
+                return Err(Error::Proto("ss 入站: 首包过大"));
             }
         }
 
-        let (matched_user, use_key, dec, first, used) = match matched {
+        let (matched_user, use_key, mut dec, first, used) = match matched {
             Some(m) => m,
             None => return Err(Error::Proto("ss 入站: 身份验证失败或秘钥不匹配")),
         };
@@ -703,24 +828,48 @@ impl SsInbound {
         }
         raw.advance(used);
 
-        let addr_buf: &[u8] = if self.cipher.is_2022 {
-            if first.len() < 8 {
-                return Err(Error::Proto("ss 入站: 2022 首块缺时间戳"));
+        let addr_buf: Vec<u8> = if is_2022 {
+            // first = 定长头明文 [type 0][time 8][n 2]
+            if first.len() < 11 || first[0] != 0 {
+                return Err(Error::Proto("ss 入站: 2022 定长头非法"));
             }
-            let ts = u64::from_be_bytes(first[..8].try_into().unwrap());
+            let ts = u64::from_be_bytes(first[1..9].try_into().unwrap());
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            if now.abs_diff(ts) > 60 {
+            if now.abs_diff(ts) > 30 {
                 return Err(Error::Proto("ss 入站: 2022 时间戳超窗"));
             }
-            &first[8..]
+            let n = u16::from_be_bytes(first[9..11].try_into().unwrap()) as usize;
+            if n < 3 {
+                return Err(Error::Proto("ss 入站: 2022 变长头过短"));
+            }
+            // record2 = [addr][padding_size 2][padding][首段数据...]（mihomo 将首段数据并入本记录）
+            let (varhdr, used2) = match dec.open_raw_record(&raw, n) {
+                Some(Ok(x)) => x,
+                Some(Err(_)) => return Err(Error::Proto("ss 入站: 2022 变长头解密失败")),
+                None => return Err(Error::Proto("ss 入站: 2022 变长头不完整")),
+            };
+            raw.advance(used2);
+            // padding_size 紧跟 addr 之后，先解析 addr 才能定位
+            let (_, addr_used) = decode_socks_addr(&varhdr)?;
+            if varhdr.len() < addr_used + 2 {
+                return Err(Error::Proto("ss 入站: 2022 变长头缺 padding 长度"));
+            }
+            let padding_size = u16::from_be_bytes([varhdr[addr_used], varhdr[addr_used + 1]]) as usize;
+            let payload_start = addr_used + 2 + padding_size;
+            if varhdr.len() < payload_start {
+                return Err(Error::Proto("ss 入站: 2022 变长头 padding 越界"));
+            }
+            // 并入 record2 的首段数据推回流
+            raw.extend_from_slice(&varhdr[payload_start..]);
+            varhdr[..addr_used].to_vec()
         } else {
-            &first[..]
+            first
         };
-        let (dst, used_addr) = decode_socks_addr(addr_buf)?;
-        if addr_buf.len() > used_addr {
+        let (dst, used_addr) = decode_socks_addr(&addr_buf)?;
+        if !is_2022 && addr_buf.len() > used_addr {
             raw.extend_from_slice(&addr_buf[used_addr..]);
         }
 
@@ -738,7 +887,7 @@ impl SsInbound {
         };
         let remote = res.outbound.connect_stream(&sess, &dst).await?;
 
-        let client = SsCryptoStream::new_server(stream, self.cipher.clone(), use_key, dec, raw)?;
+        let client = SsCryptoStream::new_server(stream, self.cipher.clone(), use_key, &salt, dec, raw)?;
         let meta = vp_core::conn_table::ConnMeta {
             id: sess.id,
             inbound: self.tag.clone(),

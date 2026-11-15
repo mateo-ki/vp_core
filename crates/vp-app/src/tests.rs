@@ -112,7 +112,9 @@ async fn vless_ss_listener_e2e() {
         packet_encoding: None,
         xudp: false,
         packet_addr: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
     let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
@@ -218,7 +220,9 @@ async fn vmess_listener_e2e() {
         packet_encoding: None,
         xudp: false,
         packet_addr: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
     let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
@@ -290,7 +294,9 @@ rules: ['MATCH,DIRECT']
         reality_opts: None,
         ech_opts: None,
         udp: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
     let sess = vp_core::Session::new_tcp("t".into(), None, dst.clone());
@@ -1292,7 +1298,9 @@ rules: ['MATCH,DIRECT']
         ech_opts: None,
         http_opts: None,
         udp: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
 
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -1431,7 +1439,9 @@ rules: ['MATCH,DIRECT']
         ech_opts: None,
         http_opts: None,
         udp: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
 
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -1746,7 +1756,9 @@ rules: ['MATCH,DIRECT']
         reality_opts: None,
         ech_opts: None,
         udp: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
 
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);
@@ -1849,7 +1861,9 @@ rules: ['MATCH,DIRECT']
         reality_opts: None,
         ech_opts: None,
         udp: false,
-    })
+                host: None,
+                path: None,
+            })
     .unwrap();
 
     let dst = vp_common::DstAddr::ip("127.0.0.1".parse().unwrap(), echo_port);

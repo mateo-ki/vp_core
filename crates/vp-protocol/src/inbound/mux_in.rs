@@ -729,6 +729,8 @@ mod tests {
                 reality_opts: None,
                 ech_opts: None,
                 udp: false,
+                host: None,
+                path: None,
             })
             .unwrap();
 
@@ -775,6 +777,8 @@ mod tests {
                 packet_encoding: None,
                 xudp: false,
                 packet_addr: false,
+                host: None,
+                path: None,
             })
             .unwrap();
 

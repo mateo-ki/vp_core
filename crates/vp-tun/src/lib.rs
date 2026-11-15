@@ -518,6 +518,25 @@ async fn dispatch_udp(
         )));
     }
     let mut conn = res.outbound.connect_packet(&sess, &sess.dst).await?;
+    // UDP 会话入表 + 实时记账：此前 UDP 流量既不进连接表也不进全局统计，
+    // QUIC/HTTP3 时代 UDP 占比极高，GUI 三个流量统计页会整体漏计
+    let meta = vp_core::ConnMeta {
+        id: sess.id,
+        inbound: sess.inbound.clone(),
+        network: "udp",
+        host: sess.dst.host.to_string(),
+        dst_port: sess.dst.port,
+        src: sess.src.map(|s| s.to_string()),
+        process: sess.process.clone(),
+        user: None,
+        rule: res
+            .rule
+            .as_ref()
+            .map(|r| format!("{} => {}", r.rule, r.target)),
+        chain: Some(res.via.clone()),
+        start: vp_common::now_millis(),
+    };
+    let rc = ctx.conns.register(meta);
     let dst_addr: SocketAddr = match &sess.dst.host {
         vp_common::Host::Ip(ip) => SocketAddr::new(*ip, sess.dst.port),
         vp_common::Host::Domain(_) => SocketAddr::new(udp.peer_addr().ip(), sess.dst.port),
@@ -529,8 +548,12 @@ async fn dispatch_udp(
             data: up_buf[..n].to_vec().into(),
         };
         if conn.send(&pkt).await.is_err() {
+            ctx.conns.remove(rc.id);
             return Ok(());
         }
+        rc.up
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        ctx.stats.add_up(n as u64);
     }
     let idle_timeout = std::time::Duration::from_secs(60);
     loop {
@@ -548,6 +571,8 @@ async fn dispatch_udp(
                         if conn.send(&pkt).await.is_err() {
                             break;
                         }
+                        rc.up.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                        ctx.stats.add_up(n as u64);
                     }
                 }
             }
@@ -558,6 +583,9 @@ async fn dispatch_udp(
                         if udp.write_all(&pkt.data).await.is_err() {
                             break;
                         }
+                        rc.down
+                            .fetch_add(pkt.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        ctx.stats.add_down(pkt.data.len() as u64);
                     }
                     Err(_) => break,
                 }
@@ -568,6 +596,7 @@ async fn dispatch_udp(
             }
         }
     }
+    ctx.conns.remove(rc.id);
     Ok(())
 }
 

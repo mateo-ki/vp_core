@@ -14,10 +14,10 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use vp_common::{DstAddr, Host, Result};
+use vp_common::{DstAddr, Host, Result, Stats};
 use vp_core::inbound::InboundCtx;
 use vp_core::session::{Network, Session};
-use vp_core::stream::UdpPacket;
+use vp_core::stream::{PacketSend, UdpPacket};
 
 /// DNS 查询瞬态请求极速老化超时（5 秒）：一问一答完成后迅速回收端口与内存
 pub const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,6 +25,26 @@ pub const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const GAME_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// NAT 会话表分片数：锁竞争随分片摊薄，高 PPS 场景不再全表单锁串行
 const NAT_SHARDS: usize = 16;
+
+/// 直发句柄计数包装：直发路径的上行数据报绕过 mpsc 中继臂，在此处入账
+struct CountingPacketSend {
+    inner: Arc<dyn PacketSend>,
+    up: Arc<std::sync::atomic::AtomicU64>,
+    stats: Arc<Stats>,
+}
+
+#[async_trait::async_trait]
+impl PacketSend for CountingPacketSend {
+    async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+        let n = pkt.data.len() as u64;
+        let res = self.inner.send(pkt).await;
+        if res.is_ok() {
+            self.up.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            self.stats.add_up(n);
+        }
+        res
+    }
+}
 
 /// UDP NAT 会话键：客户端源地址 + 目标（域名或 IP + 端口）
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -257,8 +277,35 @@ impl UdpNat {
             )));
         }
         let mut conn = res.outbound.connect_packet(&sess, dst).await?;
-        // 直发句柄需在建连后、conn 移交后台任务前提取
-        let direct = conn.send_handle();
+        // UDP 会话入表 + 实时记账：此前 mixed/socks UDP 流量既不进连接表也不进全局
+        // 统计，QUIC/HTTP3 时代 UDP 占比极高，GUI 三个流量统计页会整体漏计
+        let meta = vp_core::ConnMeta {
+            id: sess.id,
+            inbound: self.tag.clone(),
+            network: "udp",
+            host: dst.host.to_string(),
+            dst_port: dst.port,
+            src: Some(client.to_string()),
+            process: sess.process.clone(),
+            user: None,
+            rule: res
+                .rule
+                .as_ref()
+                .map(|r| format!("{} => {}", r.rule, r.target)),
+            chain: Some(res.via.clone()),
+            start: vp_common::now_millis(),
+        };
+        let rc = self.ctx.conns.register(meta);
+        let stats = self.ctx.stats.clone();
+        // 直发句柄需在建连后、conn 移交后台任务前提取；
+        // 包一层计数器——直发路径的上行数据报绕过 mpsc 中继臂，在此处入账
+        let direct = conn.send_handle().map(|inner| {
+            Arc::new(CountingPacketSend {
+                inner,
+                up: rc.up.clone(),
+                stats: stats.clone(),
+            }) as Arc<dyn PacketSend>
+        });
         let relay = self.relay.clone();
         let reply_formatter = self.reply_formatter.lock().unwrap().clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
@@ -298,6 +345,11 @@ impl UdpNat {
                                 } else {
                                     let _ = relay.send_to(&pkt.data, client).await;
                                 }
+                                rc.down.fetch_add(
+                                    pkt.data.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                stats.add_down(pkt.data.len() as u64);
                             }
                             Err(e) => {
                                 tracing::debug!("udp 回包失败: {e}");
@@ -313,6 +365,11 @@ impl UdpNat {
                                 if conn.send(&pkt).await.is_err() {
                                     break;
                                 }
+                                rc.up.fetch_add(
+                                    pkt.data.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                stats.add_up(pkt.data.len() as u64);
                             }
                             None => break,
                         }
@@ -322,6 +379,7 @@ impl UdpNat {
                 }
             }
             debug!("udp 会话回收: {} -> {dst_key}", client);
+            this.ctx.conns.remove(rc.id);
             let key = SessionKey {
                 client,
                 host: dst_key.host.clone(),

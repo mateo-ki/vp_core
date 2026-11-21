@@ -89,37 +89,11 @@
 - README 协议表补 **Juicity** 行、传输层表补 **ShadowTLS v3** 行；`docs/dsl.md` 补 juicity 节点速查行。
 
 ---
-# 🚀 VP_Core v1.7.6 发布说明 / Release Notes：Juicity 原生客户端 + 协议矩阵全链路接线
-
-> **"QUIC 族第三员入列：逐文件核实官方 Go 实现线格式，回环测试 5 项全绿。"**
->
-> 🎉 本版本落地 **Juicity 原生客户端**（对齐官方 `juicity/juicity` + `daeuniverse/outbound` 实现），并打通从配置到 DSL 的全链路接线；顺带补齐 XHTTP 组装缝的专项测试与协议文档。
-
-### 🌟 Juicity 原生客户端（`vp-protocol/src/juicity.rs`）
-
-| 环节 | 实现 |
-| :--- | :--- |
-| **认证** | uni 流 `VER=0x00 TYPE=0x00 + UUID(16) + TOKEN(32)`；TOKEN = TLS exporter（label=UUID 原始字节、context=密码）；流保持打开，对齐官方 UnderlayAuth 机制 |
-| **TCP** | bi 流首写 `0x01 + trojanc 地址 + 端口(2BE)`，请求头立即发出（服务端可先应答），之后裸中继、无响应头 |
-| **UDP（QUIC 模式）** | 每关联一条 bi 流：首包 `0x03 + 地址头×2 + 长度 + 载荷`（连接头与服务端 ReadFrom 各消费一个），后续包 `地址头 + 长度 + 载荷`，按包寻址 |
-| **证书** | ALPN `h3`；`pinned-cert-chain` 官方滚动 SHA-256 链哈希钉扎（hex/base64 双解码）+ `allow_insecure` 跳过验证 |
-
-- **回环测试 5 项全绿**：TCP 中继、UDP 双向（含第二包）、错误钉扎拒绝 / 正确钉扎连通、地址编解码往返、链哈希与官方 `GenerateCertChainHash` 对齐。
-
-### 🔌 配置链路全接
-- `JuicityCfg`（serde alias 全兼容 `sni` / `insecure` / `congestion-control` / `pinned-cert-chain`）→ `ProxyKind::Juicity` → `OutboundKind::Juicity`（vp-ir）→ ir 正/反向映射 → VP-DSL lowering / serializer → 出站工厂；
-- **XHTTP 组装缝专项测试**：`transport_of_full` 对 `xhttp/splithttp` 的 TLS 强制、无 ws 层、`xhttp-opts` 逐字段映射、`splithttp` 别名与缺省 path 归一。
-
-### 📚 文档
-- README 协议表补 **Juicity** 行、传输层表补 **ShadowTLS v3** 行；`docs/dsl.md` 补 juicity 节点速查行。
-
----
-
 # 🚀 VP_Core v1.7.5 发布说明 / Release Notes：XHTTP / HTTPUpgrade / ShadowTLS 外层传输三线齐发与 DSL 往返无损加固
 
 > **“真实节点测速砸出来的 RFC 9113 合规修复、108 MB/s 回环吞吐、三款 CDN/伪装传输一次到位。”**
 >
-> 🎉 欢迎使用 **VP_Core v1.7.5**！本版本一口气落地三项主流伪装传输：**XHTTP**（Xray SplitHTTP 后继）、**HTTPUpgrade**（101 升级裸流）与 **ShadowTLS v3 外层**（vless/vmess/trojan 可叠加）。XHTTP 经 786 条真实订阅节点全链路实测，并与 mihomo 内核交叉验证行为一致；实测中还揪出并修复了一个会让所有带 Host 伪装头节点握手必败的 RFC 9113 合规缺陷。
+> 🎉 欢迎使用 **VP_Core v1.7.5**！本版本一口气落地三项主流伪装传输：**XHTTP**（Xray SplitHTTP 后继）、**HTTPUpgrade**（101 升级裸流）与 **ShadowTLS v3 外层**（vless/vmess/trojan 可叠加）。XHTTP 经 786 条真实订阅节点全链路实测，并与 mihomo 内核交叉验证行为一致；实测中还修正了 HTTP/2 的 Host 头处理：带 Host 伪装头的请求不再携带 `Host` 头、仅以 `:authority` 承载主机（注：RFC 9113 并不禁止 Host 头，当时把握手失败归因于此是误判——真实根因是目标节点 REALITY 认证失败，mihomo 内核同样失败；跳过 Host 头保留为对 RFC 兼容性与 CDN 兼容性的双保险）。
 
 ### 🌟 核心更新全览 (Highlights)
 
@@ -128,7 +102,7 @@
 | **XHTTP 传输** | RFC 参考实现：HTTP/2 承载，GET 长响应下行 + POST 上行；`packet-up` / `stream-up` / `stream-one` 三模式；兼容服务端 `X-Padding` 响应填充 | Xray 生态新代 CDN 穿透传输原生可用，`xhttp-opts: {path, host, mode, extra-headers}` 全兼容；**与 REALITY/ECH 自由叠加** |
 | **HTTPUpgrade 传输** | 101 升级握手后裸流（无 ws 帧开销），独立于 WebSocket 实现 | sing-box/mihomo `network: httpupgrade` 节点原生直连 |
 | **ShadowTLS v3 外层** | `shadowtls-opts` 作为 vless/vmess/trojan 外层传输（先 shadow-tls 握手再叠加内层 TLS/WS/gRPC/XHTTP） | Clash `shadowtls-opts` 语义对齐，伪装面再下一城 |
-| **RFC 9113 合规修复** | HTTP/2 请求不再携带 `Host` 头（携带即 malformed，服务端必须 400） | 修复所有带 Host 伪装头节点握手必败——真实节点测速砸出来的实锤 bug |
+| **Host 头处理修正** | HTTP/2 请求不再携带 `Host` 伪装头，仅以 `:authority` 承载主机（RFC 9113 允许 Host，"携带即 400"为误判；当时握手失败的真实根因是节点 REALITY 认证失败） | 对 RFC 兼容性与 CDN 兼容性的双保险收敛 |
 | **poll_write 重入语义修复** | 缓冲后冲刷 Pending 时的重轮询二次追加缺陷（xhttp + grpc 同源隐患一并根治） | 消除高吞吐场景数据重复风险，grpc 回环测试服务端补 EOS 关流对齐真实语义 |
 | **DSL 往返无损加固** | 修复 `shadow_tls:` 子对象与 `network:` 传输标识在 lowering/serializer 的两个往返丢数据缺口 | httpupgrade/shadow-tls 节点经 DSL 往返不再降级为普通 ws/tcp 节点 |
 | **订阅与 DSL 全链路** | `type=xhttp` / vmess JSON `net=xhttp` 解析、DSL `xhttp: {..}` 子对象、`network:` 显式标识 | 订阅导入 → convert → fmt 全链路幂等无损 |

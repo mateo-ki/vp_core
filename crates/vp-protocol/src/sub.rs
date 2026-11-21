@@ -198,6 +198,12 @@ fn split_main(rest: &str) -> Result<UriParts> {
     let (host, port) = hostport
         .rsplit_once(':')
         .ok_or(Error::Config("缺少端口".into()))?;
+    // 部分机场生成 host:443/?params 形态，端口后带路径斜杠——剥掉，否则
+    // port="443/" 写进配置后加载必败（真实订阅实测炸出的兼容缺口）
+    let port = port.trim_end_matches('/');
+    if port.is_empty() {
+        return Err(Error::Config("缺少端口".into()));
+    }
     Ok((
         userinfo.to_string(),
         host.to_string(),
@@ -1373,6 +1379,20 @@ mod tests {
         let y = n.to_yaml();
         assert!(y.contains("type: vless"));
         assert!(y.contains("tls: true"));
+    }
+
+    #[test]
+    fn vless_uri_trailing_slash_port() {
+        // 部分机场生成 host:443/?params 形态（端口后带斜杠）——
+        // 此前 port="443/" 写进配置后加载必败（真实订阅实测炸出）
+        let n =
+            parse_uri("vless://uuid-123@1.2.3.4:443/?security=tls&sni=cdn.com#SLASH-01").unwrap();
+        assert_eq!(n.name(), "SLASH-01");
+        let spec = n.to_outbound_spec().unwrap();
+        let vp_ir::outbound::OutboundKind::Vless { port, .. } = spec.kind else {
+            panic!("应为 vless 节点");
+        };
+        assert_eq!(port, 443, "端口不得携带斜杠");
     }
 
     #[test]

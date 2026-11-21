@@ -114,7 +114,7 @@ proxies:
   - {{name: A-trojan, type: trojan, server: 127.0.0.1, port: 18507, password: "{TROJAN_PW}", sni: local.test, skip-cert-verify: true, udp: true}}
   - {{name: A-anytls, type: anytls, server: 127.0.0.1, port: 18508, password: "{ANYTLS_PW}", sni: local.test, skip-cert-verify: true, udp: true}}
   - {{name: A-mieru, type: mieru, server: 127.0.0.1, port: 18509, transport: TCP, username: "{MIERU_USER}", password: "{MIERU_PASS}"}}
-  - {{name: A-snell, type: snell, server: 127.0.0.1, port: 18510, psk: "{SNELL_PSK}"}}
+  - {{name: A-snell, type: snell, server: 127.0.0.1, port: 18510, psk: "{SNELL_PSK}", version: 4}}
   - {{name: A-tuic, type: tuic, server: 127.0.0.1, port: 18511, uuid: "{VMESS_UUID}", password: "{TUIC_PW}", sni: local.test, skip-cert-verify: true, congestion-controller: bbr, udp-relay-mode: native}}
   - {{name: A-hy2, type: hysteria2, server: 127.0.0.1, port: 18512, password: "{HY2_PW}", sni: local.test, skip-cert-verify: true}}
 proxy-groups: []
@@ -136,7 +136,7 @@ proxies:
   - {{name: B-vless, type: vless, server: 127.0.0.1, port: 18606, uuid: "{VLESS_UUID}", tls: true, servername: local.test, skip-cert-verify: true, udp: true}}
   - {{name: B-trojan, type: trojan, server: 127.0.0.1, port: 18607, password: "{TROJAN_PW}", sni: local.test, skip-cert-verify: true, udp: true}}
   - {{name: B-anytls, type: anytls, server: 127.0.0.1, port: 18608, password: "{ANYTLS_PW}", sni: local.test, skip-cert-verify: true, udp: true}}
-  - {{name: B-mieru, type: mieru, server: 127.0.0.1, port: 18609, username: matrix, password: "{MIERU_PASS}"}}
+  - {{name: B-mieru, type: mieru, server: 127.0.0.1, port: 18609, username: u1, password: "{MIERU_PASS}"}}
   - {{name: B-snell, type: snell, server: 127.0.0.1, port: 18611, psk: "{SNELL_PSK}"}}
   - {{name: B-tuic, type: tuic, server: 127.0.0.1, port: 18612, uuid: "{VMESS_UUID}", password: "{TUIC_PW}", sni: local.test, skip-cert-verify: true, congestion-controller: bbr}}
   - {{name: B-hy2, type: hysteria2, server: 127.0.0.1, port: 18613, password: "{HY2_PW}", sni: local.test, skip-cert-verify: true}}

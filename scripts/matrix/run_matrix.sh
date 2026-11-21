@@ -36,10 +36,10 @@ report() {
 }
 
 "$PY" "$SCRIPT_DIR/echo_204.py" 18999 & TARGET_PID=$!
-A_VP_PID=""; A_MH_PID=""; B_MH_PID=""
+A_VP_PID=""; A_MH_PID=""; B_MH_PID=""; B_VP_PID=""
 cleanup() {
   # 按 PID 精确清理（禁用过宽的 CommandLine 模糊匹配 —— 历史误杀教训）
-  for p in "${A_VP_PID:-}" "${A_MH_PID:-}" "${B_MH_PID:-}" "${TARGET_PID:-}"; do
+  for p in "${A_VP_PID:-}" "${A_MH_PID:-}" "${B_MH_PID:-}" "${B_VP_PID:-}" "${TARGET_PID:-}"; do
     [ -n "$p" ] && kill "$p" 2>/dev/null && wait "$p" 2>/dev/null
   done
 }
@@ -74,7 +74,10 @@ sleep 1
 
 # ==================== 方向 B：mihomo 服务端 ← vpcore 客户端 ====================
 echo "==> 方向B: mihomo 服务端 + vpcore test 探测"
-"$MIHOMO_BIN" -d "$OUT_DIR/mh_server_home" -f "$OUT_DIR/mihomo_server.yaml" >/dev/null 2>&1 & B_MH_PID=$!
+# 证书在 $OUT_DIR 内，-d 必须指 OUT_DIR（mihomo 拒绝加载 home 目录外证书：SAFE_PATHS 校验）
+"$MIHOMO_BIN" -d "$OUT_DIR" -f "$OUT_DIR/mihomo_server.yaml" >/dev/null 2>&1 & B_MH_PID=$!
+# B-naive / B-brook 打 vpcore 服务端监听（18513/18514）作内核自洽校验——需同场运行
+"$VPCORE_BIN" run -c "$OUT_DIR/vpcore_server.yaml" >/dev/null 2>&1 & B_VP_PID=$!
 sleep 2
 
 "$VPCORE_BIN" test -c "$OUT_DIR/vpcore_client.yaml" >"$OUT_DIR/dir_b.log" 2>&1
@@ -90,8 +93,8 @@ for node in B-socks B-http B-ss B-ss22 B-vmess B-vless B-trojan B-anytls B-mieru
   esac
 done
 
-kill "$B_MH_PID" 2>/dev/null; wait "$B_MH_PID" 2>/dev/null
-B_MH_PID=""
+kill "$B_MH_PID" "$B_VP_PID" 2>/dev/null; wait "$B_MH_PID" "$B_VP_PID" 2>/dev/null
+B_MH_PID=""; B_VP_PID=""
 
 # ==================== 汇总 ====================
 echo "=============================================="

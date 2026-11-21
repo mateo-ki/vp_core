@@ -117,6 +117,9 @@ route {
 | WebSocket | `ws: { path: "/path", headers: { Host: "cdn.com" } }` | CDN 穿透经典款 |
 | gRPC | `grpc: { service_name: "mysvc" }` | gRPC-Tun 双向流 |
 | **XHTTP** | `xhttp: { path: "/up", mode: "auto", headers: { Host: "cdn.com" } }` | Xray SplitHTTP 后继，H2 承载 |
+| HTTP 伪装 | `http: { method: "GET", path: ["/a", "/b"], headers: { "X-A": ["v"] } }` | HTTP/2 伪装承载 |
+| ECH | `ech: { enable: true, config: "...", query_server_name: "...", doh: "https://..." }` | Encrypted Client Hello；config 缺省时经 DNS HTTPS(type65) 自动获取或走 doh 查询 |
+| ShadowTLS | `shadow_tls: { password: "...", sni: "..." }` | v3 前置伪装层 |
 
 ### XHTTP 写法详解
 
@@ -147,6 +150,25 @@ node "cf-xhttp" vless {
 | `stream-one` | 单条双向 POST（请求体上行） | 同请求的响应体 | H3 友好场景 |
 
 与 REALITY 叠加：在节点里同时写 `tls: reality { ... }` 与 `xhttp: { ... }` 即可。
+
+### 节点级元字段（所有协议通用）
+
+| 字段 | 写法 | 说明 |
+| :--- | :--- | :--- |
+| 拨号链 | `dialer_proxy: "upstream-group"` | 经由指定组/节点出站 |
+| 路由标记 | `routing_mark: 7777` | Linux SO_MARK |
+| 绑定网卡 | `interface: "eth0"` | 出站绑定接口 |
+| UDP over TCP | `udp_over_tcp: true` 或 `udp_over_tcp: 2` | bool = UoT v1，数字 `2` = UoT v2 |
+| SMux 多路复用 | `smux: { enabled: true, protocol: "h2mux", max_connections: 4, min_streams: 2, max_streams: 8, padding: true }` | 全部子字段可省略，enabled 缺省 true |
+
+```dsl
+node "meta" vmess {
+    server: "1.2.3.4:10086"
+    uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    udp_over_tcp: 2
+    smux: { enabled: true, protocol: "h2mux", max_streams: 8 }
+}
+```
 
 ---
 

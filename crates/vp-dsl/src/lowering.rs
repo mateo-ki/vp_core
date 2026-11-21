@@ -884,33 +884,37 @@ fn lower_node(
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
             let mtu = map.get("mtu").and_then(|v| v.as_u16());
-            // reserved: [1, 2, 3] 列表或 "1,2,3" 字符串（此前 DSL 侧恒为 None，转换静默丢失）
-            let reserved = map.get("reserved").and_then(|v| match v {
-                DslValue::List(items) => {
+            // reserved: [1, 2, 3] 列表或 "1,2,3" 字符串（此前 DSL 侧恒为 None，转换静默丢失；
+            // 字节域 0-255 越界此前会静默截断，现显式报错）
+            let reserved = match map.get("reserved") {
+                Some(DslValue::List(items)) => {
                     let arr: Vec<u8> = items
                         .iter()
-                        .filter_map(|i| i.as_u32().map(|n| n as u8))
-                        .collect();
-                    if arr.len() == 3 {
-                        Some([arr[0], arr[1], arr[2]])
-                    } else {
-                        None
-                    }
+                        .filter_map(|i| i.as_u32())
+                        .map(|n| {
+                            if n > 255 {
+                                Err(format!("wireguard reserved 字节越界（0-255，实际 {n}）"))
+                            } else {
+                                Ok(n as u8)
+                            }
+                        })
+                        .collect::<Result<Vec<u8>, String>>()?;
+                    (arr.len() == 3).then_some([arr[0], arr[1], arr[2]])
                 }
-                DslValue::Str(s) => {
-                    let arr: Vec<u8> = s
+                Some(DslValue::Str(sv)) => {
+                    let arr: Vec<u8> = sv
                         .split(&[',', ' '][..])
                         .filter(|p| !p.is_empty())
-                        .filter_map(|p| p.trim().parse::<u8>().ok())
-                        .collect();
-                    if arr.len() == 3 {
-                        Some([arr[0], arr[1], arr[2]])
-                    } else {
-                        None
-                    }
+                        .map(|p| {
+                            p.trim()
+                                .parse::<u8>()
+                                .map_err(|_| format!("wireguard reserved 字节非法（{p:?}）"))
+                        })
+                        .collect::<Result<Vec<u8>, String>>()?;
+                    (arr.len() == 3).then_some([arr[0], arr[1], arr[2]])
                 }
                 _ => None,
-            });
+            };
             let workers = map
                 .get("workers")
                 .and_then(|v| v.as_u32())
@@ -1043,12 +1047,15 @@ fn lower_node(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            // version 非法值此前静默回落 4（v2/v3/v4 线格式差异大，必须显式报错）
+            // version 非法值此前静默回落 4（各版本线格式差异大，必须显式报错；
+            // mihomo 历史上接受 1-4，这里只拦非数字与越界值）
             let version = match map.get("version") {
                 Some(v) => match v.as_u64() {
-                    Some(n) if (2..=4).contains(&n) => n as u8,
+                    Some(n) if (1..=4).contains(&n) => n as u8,
                     _ => {
-                        return Err(format!("snell 节点 version 非法（应为 2/3/4，实际 {v:?}）"));
+                        return Err(format!(
+                            "snell 节点 version 非法（应为 1/2/3/4，实际 {v:?}）"
+                        ));
                     }
                 },
                 None => 4,
@@ -1231,6 +1238,7 @@ fn lower_node(
     let udp_over_tcp = map.get("udp_over_tcp").and_then(|v| match v {
         DslValue::Bool(true) => Some(UotVersion::V1),
         DslValue::Bool(false) => None,
+        DslValue::Int(n) if *n <= 0 => None,
         DslValue::Int(n) => Some(if *n >= 2 {
             UotVersion::V2
         } else {

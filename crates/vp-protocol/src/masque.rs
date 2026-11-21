@@ -587,12 +587,11 @@ fn build_quinn_client_config(cfg: &MasqueCfg, _sni: &str) -> Result<quinn::Clien
         None
     };
 
+    let verifier = build_server_verifier(cfg.skip_cert_verify, pinned_pub)?;
+
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(MasqueCertVerifier {
-            skip_verify: cfg.skip_cert_verify,
-            pinned_pubkey: pinned_pub,
-        }))
+        .with_custom_certificate_verifier(Arc::new(verifier))
         .with_client_auth_cert(client_cert, client_key)
         .map_err(|e| Error::Config(format!("配置 mTLS 客户端认证失败: {e}")))?;
     crypto.alpn_protocols = vec![b"h3".to_vec()];
@@ -615,24 +614,53 @@ fn build_quinn_client_config(cfg: &MasqueCfg, _sni: &str) -> Result<quinn::Clien
 
 #[derive(Debug)]
 struct MasqueCertVerifier {
+    /// 标准 webpki 校验器（证书链 + 主机名）；仅显式 skip_cert_verify 时为 None
+    inner: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    pinned_pubkey: Option<Vec<u8>>,
+}
+
+/// 构造 MASQUE 服务器证书校验器。
+/// dangerous() 自定义校验器会整体替换 rustls 标准校验，因此：
+/// - 显式 skip_cert_verify 才无条件信任；
+/// - 缺省必须走标准 webpki 校验（证书链 + 主机名），pin 存在时再叠加钉选比对。
+///   此前缺省时直接放行，等于公网 MASQUE 节点默认零服务器校验（MITM 可劫持）。
+fn build_server_verifier(
     skip_verify: bool,
     pinned_pubkey: Option<Vec<u8>>,
+) -> Result<MasqueCertVerifier> {
+    let inner: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> = if skip_verify {
+        None
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Some(
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| Error::Config(format!("构建 webpki 证书校验器失败: {e}")))?,
+        )
+    };
+    Ok(MasqueCertVerifier {
+        inner,
+        pinned_pubkey,
+    })
 }
 
 impl rustls::client::danger::ServerCertVerifier for MasqueCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if self.skip_verify {
-            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        // 无 inner = 用户显式 skip_cert_verify：跳过标准链校验；
+        // 但配置了钉选公钥时钉选依然强制生效（显式配置优先于跳过）
+        if let Some(inner) = &self.inner {
+            inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
         }
 
-        // 钉选对端公钥校验
+        // 叠加钉选对端公钥校验（配置了 public-key 时）
         if let Some(ref expected) = self.pinned_pubkey {
             let cert_bytes = end_entity.as_ref();
             // 检查证书中是否包含钉选公钥（或 SPKI 的未压缩点字节 65 字节）
@@ -658,28 +686,37 @@ impl rustls::client::danger::ServerCertVerifier for MasqueCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        match &self.inner {
+            Some(v) => v.verify_tls12_signature(message, cert, dss),
+            None => Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
+        }
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        match &self.inner {
+            Some(v) => v.verify_tls13_signature(message, cert, dss),
+            None => Ok(rustls::client::danger::HandshakeSignatureValid::assertion()),
+        }
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
+        match &self.inner {
+            Some(v) => v.supported_verify_schemes(),
+            None => vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ED25519,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+            ],
+        }
     }
 }
 
@@ -775,5 +812,63 @@ mod tests {
 
         let client_cfg = build_quinn_client_config(&cfg, "consumer-masque.cloudflareclient.com");
         assert!(client_cfg.is_ok(), "应当成功解析私钥并生成自签名证书");
+    }
+
+    use rustls::client::danger::ServerCertVerifier;
+
+    fn self_signed_cert() -> rustls::pki_types::CertificateDer<'static> {
+        let ck = rcgen::generate_simple_self_signed(vec!["self-signed.example.com".to_string()])
+            .expect("生成自签名证书失败");
+        rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec())
+    }
+
+    fn dns_name(name: &str) -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::try_from(name.to_string()).expect("ServerName 非法")
+    }
+
+    #[test]
+    fn test_masque_verifier_default_rejects_untrusted() {
+        // 回归：缺省（未配 skip_cert_verify）必须走标准 webpki 校验——
+        // 此前自定义校验器兜底直接 Ok(assertion())，自签名证书无条件放行
+        let v = build_server_verifier(false, None).unwrap();
+        let cert = self_signed_cert();
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &dns_name("self-signed.example.com"),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_err(), "缺省校验器必须拒绝不受信任的证书");
+    }
+
+    #[test]
+    fn test_masque_verifier_explicit_skip_accepts() {
+        // 显式 skip_cert_verify: true 才无条件信任
+        let v = build_server_verifier(true, None).unwrap();
+        let cert = self_signed_cert();
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &dns_name("self-signed.example.com"),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_ok(), "显式 skip_cert_verify 应放行");
+    }
+
+    #[test]
+    fn test_masque_verifier_pin_mismatch_rejects() {
+        // 自签名场景（skip=true）+ 钉选公钥不匹配：仍必须拒绝
+        let v = build_server_verifier(true, Some(vec![0u8; 65])).unwrap();
+        let cert = self_signed_cert();
+        let res = v.verify_server_cert(
+            &cert,
+            &[],
+            &dns_name("self-signed.example.com"),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(res.is_err(), "钉选公钥不匹配必须拒绝");
     }
 }

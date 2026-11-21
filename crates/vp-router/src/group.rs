@@ -572,8 +572,44 @@ async fn probe_target(o: &Arc<dyn Outbound>, target: &ProbeTarget) -> Result<Dur
             stream
         };
         stream.write_all(&target.req_bytes).await?;
-        let mut byte = [0u8; 1];
-        stream.read_exact(&mut byte).await?;
+        // 读到响应头结束为止（此前只读 1 字节：被劫持的拦截页/403 响应也算"活着"）
+        let mut head = Vec::with_capacity(512);
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(Error::Io(std::io::Error::other(
+                    "probe: 连接在响应头结束前被对端关闭",
+                )));
+            }
+            head.extend_from_slice(&chunk[..n]);
+            if head.windows(4).any(|w| w == b"\r\n\r\n") || head.len() > 8192 {
+                break;
+            }
+        }
+        // 解析状态行 "HTTP/1.x NNN ..."：仅 2xx/3xx 视为健康
+        let line_end = head
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap_or(head.len().min(255));
+        let status_line = String::from_utf8_lossy(&head[..line_end]);
+        let code = status_line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok());
+        match code {
+            Some(c) if (200..400).contains(&c) => {}
+            Some(c) => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "probe: HTTP {c}（{status_line}）"
+                ))));
+            }
+            None => {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "probe: 响应非 HTTP 格式（{status_line}）"
+                ))));
+            }
+        }
         Ok(started.elapsed())
     })
     .await
@@ -978,6 +1014,130 @@ mod tests {
 
     fn sess() -> Session {
         Session::new_tcp("test".into(), None, dst())
+    }
+
+    /// 固定应答指定 HTTP 状态行的假出站（probe_target 状态码语义回归用）
+    struct HttpStatusOutbound {
+        name: Arc<str>,
+        response: &'static str,
+    }
+
+    #[async_trait]
+    impl Outbound for HttpStatusOutbound {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn connect_stream(
+            &self,
+            _sess: &Session,
+            _dst: &DstAddr,
+        ) -> Result<Box<dyn ProxyStream>> {
+            let (a, mut b) = tokio::io::duplex(4096);
+            let resp = self.response.to_string();
+            tokio::spawn(async move {
+                let _ = b.write_all(resp.as_bytes()).await;
+                // drop(b) → EOF
+            });
+            Ok(Box::new(a))
+        }
+
+        async fn connect_over(
+            &self,
+            _sess: &Session,
+            _dst: &DstAddr,
+            underlying: Box<dyn ProxyStream>,
+        ) -> Result<Box<dyn ProxyStream>> {
+            Ok(underlying)
+        }
+
+        fn support_udp(&self) -> bool {
+            false
+        }
+
+        async fn connect_packet(
+            &self,
+            _sess: &Session,
+            _dst: &DstAddr,
+        ) -> Result<Box<dyn PacketConn>> {
+            Err(Error::Unsupported("mock".into()))
+        }
+
+        fn remote_addr(&self) -> Option<(String, u16)> {
+            None
+        }
+    }
+
+    fn probe_target_of() -> ProbeTarget {
+        ProbeTarget {
+            host: "probe.local".into(),
+            port: 80,
+            dst: DstAddr::new("probe.local", 80),
+            is_https: false,
+            req_bytes: Arc::new(
+                b"HEAD / HTTP/1.1\r\nHost: probe.local\r\nConnection: close\r\n\r\n".to_vec(),
+            ),
+        }
+    }
+
+    /// 回归（审计 A3）：探测必须解析 HTTP 状态码——2xx/3xx 才算活，
+    /// 4xx/5xx/非 HTTP 一律判死。此前只读 1 字节，403/拦截页也算健康。
+    #[tokio::test]
+    async fn probe_accepts_2xx_3xx_rejects_4xx_5xx_and_garbage() {
+        let target = probe_target_of();
+
+        let o204 = Arc::new(HttpStatusOutbound {
+            name: "o204".into(),
+            response: "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+        });
+        assert!(
+            probe_target(&(o204 as Arc<dyn Outbound>), &target)
+                .await
+                .is_ok(),
+            "204 必须判活"
+        );
+
+        let o302 = Arc::new(HttpStatusOutbound {
+            name: "o302".into(),
+            response: "HTTP/1.1 302 Found\r\nLocation: /r\r\n\r\n",
+        });
+        assert!(
+            probe_target(&(o302 as Arc<dyn Outbound>), &target)
+                .await
+                .is_ok(),
+            "3xx 重定向应判活"
+        );
+
+        let o403 = Arc::new(HttpStatusOutbound {
+            name: "o403".into(),
+            response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        });
+        let err = probe_target(&(o403 as Arc<dyn Outbound>), &target)
+            .await
+            .expect_err("403 必须判死");
+        assert!(err.to_string().contains("403"), "错误信息应含状态码: {err}");
+
+        let o500 = Arc::new(HttpStatusOutbound {
+            name: "o500".into(),
+            response: "HTTP/1.1 500 Internal Server Error\r\n\r\n",
+        });
+        assert!(
+            probe_target(&(o500 as Arc<dyn Outbound>), &target)
+                .await
+                .is_err(),
+            "5xx 必须判死"
+        );
+
+        let ogarbage = Arc::new(HttpStatusOutbound {
+            name: "ogarbage".into(),
+            response: "NOT-HTTP-GARBAGE\r\n\r\n",
+        });
+        assert!(
+            probe_target(&(ogarbage as Arc<dyn Outbound>), &target)
+                .await
+                .is_err(),
+            "非 HTTP 响应必须判死"
+        );
     }
 
     /// 回归（审计报告任务1）：健康检查任务必须有明确生命周期。

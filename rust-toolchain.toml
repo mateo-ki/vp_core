@@ -1,6 +1,9 @@
 # 工具链钉版：本地与 CI 强制同版本，杜绝 rustup 漂移让新 lint 在 CI 爆雷。
 # （v1.7.5 教训：本地 stable 落后 CI stable，1.100.0 新 lint 三平台连环挂，被迫重打 tag）
 # 升级流程：改 channel → rustup toolchain install <ver> → 全量门禁 → 提交。
+# 注意：dtolnay/rust-toolchain 空输入不读本文件——以下 5 处 workflow 的
+# toolchain 输入须与本 channel 同步修改：
+#   ci.yml ×1、release.yml ×4（gate/build-desktop/build-android/build-ios）、matrix.yml ×1
 [toolchain]
 channel = "1.100.0"
 components = ["clippy", "rustfmt"]

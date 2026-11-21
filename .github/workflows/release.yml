@@ -25,6 +25,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           components: clippy, rustfmt
 
       - name: Rust Cache
@@ -82,6 +83,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           targets: ${{ matrix.target }}
 
       - name: Install musl tools (Linux)
@@ -158,6 +160,8 @@ jobs:
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
 
       - name: Set up Android NDK & targets
         run: |
@@ -203,6 +207,8 @@ jobs:
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.100.0"
 
       - name: Set up iOS targets
         run: |

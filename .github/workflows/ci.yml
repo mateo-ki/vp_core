@@ -22,10 +22,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 工具链由 rust-toolchain.toml 统一钉版（与本地完全一致，防止 stable 漂移）
+      # 工具链钉版：必须显式传 toolchain（dtolnay action 空输入不读 rust-toolchain.toml）。
+      # 版本与仓库根 rust-toolchain.toml 保持一致，升级时两处同步改。
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.100.0"
           components: clippy, rustfmt
 
       - name: Rust Cache

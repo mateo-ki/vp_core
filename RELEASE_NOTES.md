@@ -1,3 +1,64 @@
+# 🚀 VP_Core v1.7.9 发布说明 / Release Notes：安全加固 + 可观测性 + DSL 往返无损穷举
+
+> **"一次深度代码审计驱动的版本：MASQUE 证书校验缺口修复、坏节点黑洞可观测、12 处 YAML→DSL 静默丢数据根治——全部经 197 真实节点测速 + vpcore↔mihomo 26 项跨内核矩阵实测验证。"**
+>
+> 🎉 本版本是 **审计 + 实测双驱动**：新增全字段穷举回归（23 种协议 × 全部传输块 IR→DSL→IR 逐节点全等）与可执行化的跨内核矩阵（vpcore↔mihomo 双向 26 项，夜间 CI 持续把守），并在实测中揪出分享链接解析兼容缺口。
+
+### 🔒 安全：MASQUE 证书校验缺口修复
+
+| 项 | 修复前 | 修复后 |
+| :--- | :--- | :--- |
+| **服务器证书校验** | `dangerous()` 自定义校验器在未配 `public-key` 钉选且未显式 `skip_cert_verify` 时兜底直接放行——公网 MASQUE 节点默认零校验（MITM 可劫持） | 缺省走标准 webpki 校验（证书链 + 主机名）；钉选存在时叠加比对；**仅显式** `skip_cert_verify: true` 才跳过 |
+| **钉选语义** | `skip_cert_verify: true` 会连带跳过钉选 | 跳过链校验时已配置的钉选公钥**依然强制生效**（显式配置优先于跳过） |
+
+> ⚠️ 行为变更提示：此前依赖"无校验默认放行"连接自签证书 MASQUE 服务器的用户，需显式配置 `skip_cert_verify: true`（WARP 官方节点为公共可信证书，不受影响）。
+
+### 👁 可观测性：坏节点黑洞不再静默
+
+- **XHTTP 上行响应状态告警**：此前 packet-up / stream-up 每个 POST 的响应只排空不看状态码，服务端回 400/403/500（REALITY 认证失败、CDN 拦截、路径错）时数据包照样"发送成功"——上层连接看似建立实际黑洞。现非 2xx 首次 `warn`（含 seq），之后降级 `debug` 防刷屏
+- **健康探测解析 HTTP 状态码**：此前只读 1 字节就算活——被劫持的拦截页、403 响应、任意垃圾字节都能让死节点判"活"。现读到响应头结束解析状态行，**仅 2xx/3xx 判活**，4xx/5xx/非 HTTP 一律判死（错误信息带状态码便于排障）；197 真实节点改前改后对比**零误杀**
+
+### 🧩 DSL：穷举测试根治 12 处 YAML→DSL 静默丢数据
+
+新增全字段穷举回归：全部 23 种 OutboundKind × 全部传输块 × 元字段，IR→DSL→IR 逐节点全等。暴露并修复：
+
+| 缺口 | 修复 |
+| :--- | :--- |
+| **ws** | headers 此前只输出单个 Host 头（其余伪装头丢失）；`max_early_data`、`v2ray_http_upgrade` 全部丢失 |
+| **http 传输 / ECH** | 整个 HttpSpec（method/path/headers）与 EchSpec 两侧（序列化+解析）缺失 |
+| **xhttp** | `host` 字段与全量 headers 丢失 |
+| **reality** | `spider_x` + alpn/insecure/client_fingerprint 丢失 |
+| **hysteria v1 / openvpn / wireguard / tailscale / snell / ssh / http 出站** | 各自 kind 级字段静默丢失（tailscale 连 server/port 都丢） |
+| **smux / udp_over_tcp** | DSL 两侧完全不支持 → 新增语法（`udp_over_tcp: true`=V1 / `: 2`=V2；`smux: { enabled, protocol, max_connections, min_streams, max_streams, padding }`），并修复 `as_bool(Int)` 语义陷阱（非零 Int 恒 true 把 2 吞成 V1） |
+
+配套严格化：snell `version` 非法值由静默回落 4 改为显式报错（合法域 1-4）；wireguard `reserved` 字节越界显式报错（此前 300 静默截断为 44）；`udp_over_tcp: 0` 视为未启用。`docs/dsl.md` 补齐新语法文档。
+
+### 🔧 兼容与工程化
+
+- **sub 分享链接解析**：容忍 `host:443/` 端口后尾斜杠形态（部分机场生成，此前写进配置后加载必败——13915 条真实订阅链接实测炸出）
+- **Release 全量门禁**：release.yml 新增 gate job（完整复现 CI 五步），`publish-release` 需 gate 全绿——此前 tag push 不触发 CI，挂了 tag 也能出包；移动端构建门禁前移
+- **工具链钉版**：`rust-toolchain.toml` 钉 1.100.0，CI/Release 显式传 toolchain（核实 dtolnay action 空输入不读该文件）——根治 v1.7.5 式 stable 漂移连环挂
+- **跨内核矩阵可执行化**：`scripts/matrix/` 入库（配置生成器 + 双方向驱动脚本），vpcore↔mihomo 双向 26 项全绿（方向A：mihomo 客户端 × 12 协议打 vpcore 监听；方向B：vpcore × 14 打 mihomo 监听）；新增 `matrix.yml` 手动/夜间触发持续把守
+- **bench 脚本可移植**：内核路径支持环境变量覆盖
+
+### 📚 文档
+
+- 修正 v1.7.5 发布说明中"HTTP/2 携带 Host 即 malformed"的错误归因（RFC 9113 允许 Host；真实根因是节点 REALITY 认证失败）与 v1.7.6 重复段落
+- `docs/dsl.md` 补 http 传输块 / ECH / ShadowTLS / smux / udp_over_tcp 文档
+
+### ✅ 验证矩阵
+
+| 验证项 | 结果 |
+| :--- | :--- |
+| 全量门禁（fmt/clippy/test/DSL 双门） | 每次提交全绿（pre-commit 钩子强制） |
+| 真实节点测速对比 | 197 节点改前改后：4 节点双活延迟一致，零误杀 |
+| 真实节点吞吐 A/B | 同节点 30MB×3 + 反向对照：数据路径无回退 |
+| DSL 三步往返 | 199 真实节点 yaml→vp→yaml→json 逐字段无损 |
+| 跨内核矩阵 | vpcore↔mihomo 26/26 全绿 |
+| xhttp 回环 + 吞吐测试 | packet-up/stream-up/stream-one 全绿 |
+
+---
+
 # 🚀 VP_Core v1.7.8 发布说明 / Release Notes：流量统计闭环 + sing 系互通大修
 
 > **"GUI 三个流量统计页的数据源彻底修好：per-连接计数不再恒为 0、UDP 流量（QUIC/HTTP3）首次进统计，中断连接不丢账；snell/hy2/ss2022/vless 与官方 sing 系双向互通大修。"**

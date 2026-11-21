@@ -1,0 +1,6 @@
+# 工具链钉版：本地与 CI 强制同版本，杜绝 rustup 漂移让新 lint 在 CI 爆雷。
+# （v1.7.5 教训：本地 stable 落后 CI stable，1.100.0 新 lint 三平台连环挂，被迫重打 tag）
+# 升级流程：改 channel → rustup toolchain install <ver> → 全量门禁 → 提交。
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]

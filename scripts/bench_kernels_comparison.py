@@ -32,12 +32,17 @@ try:
 except Exception:
     pass
 
-# 路径常量
-VPCORE_BIN = r"D:\software\VPN Parser\data\kernels\vpcore\vpcore.exe"
-MIHOMO_BIN = r"D:\software\VPN Parser\data\kernels\mihomo\mihomo.exe"
-SINGBOX_BIN = r"D:\software\VPN Parser\data\kernels\sing-box\sing-box.exe"
+# 路径常量：支持环境变量覆盖（VPCORE_BIN / MIHOMO_BIN / SINGBOX_BIN / BENCH_WORK_DIR），
+# 缺省沿用本地 kernels 安装位置；对应内核缺省不存在时由主流程跳过该项
+VPCORE_BIN = os.environ.get(
+    "VPCORE_BIN", r"D:\software\VPN Parser\data\kernels\vpcore\vpcore.exe")
+MIHOMO_BIN = os.environ.get(
+    "MIHOMO_BIN", r"D:\software\VPN Parser\data\kernels\mihomo\mihomo.exe")
+SINGBOX_BIN = os.environ.get(
+    "SINGBOX_BIN", r"D:\software\VPN Parser\data\kernels\sing-box\sing-box.exe")
 
-WORK_DIR = r"C:\Users\loukas\AppData\Local\Temp\kernel-bench\multi-kernel"
+WORK_DIR = os.environ.get(
+    "BENCH_WORK_DIR", r"C:\Users\loukas\AppData\Local\Temp\kernel-bench\multi-kernel")
 os.makedirs(WORK_DIR, exist_ok=True)
 
 # 端口规划

@@ -7,7 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-bytes.workspace = true
 serde = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 

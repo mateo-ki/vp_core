@@ -3128,7 +3128,6 @@ name = "vp-common"
 version = "1.7.8"
 dependencies = [
  "arc-swap",
- "bytes",
  "rand 0.9.5",
  "serde",
 ]
@@ -3186,7 +3185,6 @@ dependencies = [
  "rand 0.9.5",
  "sha1",
  "sha2",
- "sha3",
  "vp-common",
 ]
 

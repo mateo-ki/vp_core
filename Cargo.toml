@@ -59,7 +59,6 @@ tokio = { version = "1", features = [
 ] }
 bytes = "1"
 async-trait = "0.1"
-pin-project-lite = "0.2"
 
 # 序列化 / 配置
 serde = { version = "1", features = ["derive"] }

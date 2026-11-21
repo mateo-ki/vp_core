@@ -1,0 +1,55 @@
+name: Cross-Kernel Matrix
+
+# vpcore↔mihomo 跨内核互操作矩阵（AGENTS.md 规则6 可执行化）。
+# 手动/夜间触发，不阻塞主干 CI；失败日志以 artifact 留档。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 21 * * *" # 每日 UTC 21:00 = 北京时间次日 05:00
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  matrix:
+    name: vpcore ↔ mihomo 双向矩阵
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 工具链由 rust-toolchain.toml 统一钉版（与本地完全一致）
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build vpcore
+        run: cargo build --release -p vp-bin
+
+      - name: Install mihomo
+        run: |
+          URL="$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+            | grep browser_download_url | grep 'mihomo-linux-amd64-' | grep -v 'compatible\|arm\|go120\|go1.20' | head -1 | cut -d '"' -f 4)"
+          echo "mihomo: $URL"
+          curl -fsSL "$URL" -o mihomo.gz
+          gunzip -f mihomo.gz && chmod +x mihomo
+          ./mihomo -v
+
+      - name: Run cross-kernel matrix
+        run: |
+          bash scripts/matrix/run_matrix.sh \
+            target/release/vpcore \
+            "$PWD/mihomo" \
+            target/matrix_run
+
+      - name: Upload matrix logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-logs
+          path: |
+            target/matrix_run/dir_b.log
+            target/matrix_run/*.yaml
+          if-no-files-found: ignore

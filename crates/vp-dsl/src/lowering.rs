@@ -429,6 +429,81 @@ fn lower_node(
         }
     }
 
+    // http 传输子对象（HTTP 伪装承载，serializer 输出形态:
+    // http: { method: "...", path: ["/a", "/b"], headers: { "K": ["v1", "v2"] } }）
+    if transport.http.is_none() {
+        if let Some(h_val) = map.get("http") {
+            if let Some(hm) = h_val.as_map() {
+                let h_map: HashMap<String, DslValue> = hm.iter().cloned().collect();
+                let method = h_map
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let path = h_map
+                    .get("path")
+                    .and_then(|v| v.as_str_list())
+                    .unwrap_or_default();
+                let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+                if let Some(km) = h_map.get("headers").and_then(|v| v.as_map()) {
+                    for (k, v) in km {
+                        match v {
+                            DslValue::Str(s) => {
+                                headers.insert(k.clone(), vec![s.clone()]);
+                            }
+                            DslValue::List(items) => {
+                                let vals: Vec<String> = items
+                                    .iter()
+                                    .filter_map(|i| i.as_str().map(ToString::to_string))
+                                    .collect();
+                                if !vals.is_empty() {
+                                    headers.insert(k.clone(), vals);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                transport.network = Some("http".into());
+                transport.http = Some(HttpSpec {
+                    method,
+                    path,
+                    headers,
+                });
+            }
+        }
+    }
+
+    // ech 子对象（Encrypted Client Hello，serializer 输出形态:
+    // ech: { enable: true, config: "...", query_server_name: "...", doh: "..." }）
+    if transport.ech.is_none() {
+        if let Some(e_val) = map.get("ech") {
+            if let Some(em) = e_val.as_map() {
+                let e_map: HashMap<String, DslValue> = em.iter().cloned().collect();
+                transport.ech = Some(EchSpec {
+                    enable: e_map
+                        .get("enable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                    config: e_map
+                        .get("config")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string),
+                    query_server_name: e_map
+                        .get("query_server_name")
+                        .or_else(|| e_map.get("query-server-name"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string),
+                    doh: e_map
+                        .get("doh")
+                        .or_else(|| e_map.get("doh-url"))
+                        .or_else(|| e_map.get("doh_url"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string),
+                });
+            }
+        }
+    }
+
     // xhttp 子对象（serializer 输出形态: xhttp: { path: "...", mode: "...", headers: {...} }）
     if transport.xhttp.is_none() {
         if let Some(x_val) = map.get("xhttp").or_else(|| map.get("xhttp_opts")) {
@@ -757,6 +832,15 @@ fn lower_node(
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
             let is_https = lower_kind == "https" || transport.tls;
+            // headers: http 出站的自定义请求头（此前 DSL 侧恒为空，转换静默丢失）
+            let mut headers = HashMap::new();
+            if let Some(hm) = map.get("headers").and_then(|v| v.as_map()) {
+                for (k, v) in hm {
+                    if let Some(vs) = v.as_str() {
+                        headers.insert(k.clone(), vs.to_string());
+                    }
+                }
+            }
             OutboundKind::Http {
                 server,
                 port,
@@ -769,7 +853,7 @@ fn lower_node(
                 tls: is_https,
                 sni: transport.sni.clone(),
                 insecure: transport.insecure,
-                headers: HashMap::new(),
+                headers,
             }
         }
         "wireguard" | "wg" => {
@@ -800,6 +884,37 @@ fn lower_node(
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
             let mtu = map.get("mtu").and_then(|v| v.as_u16());
+            // reserved: [1, 2, 3] 列表或 "1,2,3" 字符串（此前 DSL 侧恒为 None，转换静默丢失）
+            let reserved = map.get("reserved").and_then(|v| match v {
+                DslValue::List(items) => {
+                    let arr: Vec<u8> = items
+                        .iter()
+                        .filter_map(|i| i.as_u32().map(|n| n as u8))
+                        .collect();
+                    if arr.len() == 3 {
+                        Some([arr[0], arr[1], arr[2]])
+                    } else {
+                        None
+                    }
+                }
+                DslValue::Str(s) => {
+                    let arr: Vec<u8> = s
+                        .split(&[',', ' '][..])
+                        .filter(|p| !p.is_empty())
+                        .filter_map(|p| p.trim().parse::<u8>().ok())
+                        .collect();
+                    if arr.len() == 3 {
+                        Some([arr[0], arr[1], arr[2]])
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            let workers = map
+                .get("workers")
+                .and_then(|v| v.as_u32())
+                .map(|n| n as usize);
             OutboundKind::Wireguard {
                 server,
                 port,
@@ -809,8 +924,8 @@ fn lower_node(
                 public_key,
                 preshared_key,
                 mtu,
-                reserved: None,
-                workers: None,
+                reserved,
+                workers,
                 udp: true,
             }
         }
@@ -840,6 +955,11 @@ fn lower_node(
                 .or_else(|| map.get("exit-node"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
+            let exit_node_allow_lan = map
+                .get("exit_node_allow_lan")
+                .or_else(|| map.get("exit-node-allow-lan"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             OutboundKind::Tailscale {
                 server,
                 port,
@@ -848,7 +968,7 @@ fn lower_node(
                 hostname,
                 state_dir,
                 exit_node,
-                exit_node_allow_lan: false,
+                exit_node_allow_lan,
             }
         }
         "masque" => {
@@ -923,13 +1043,43 @@ fn lower_node(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let version = map.get("version").and_then(|v| v.as_u64()).unwrap_or(4) as u8;
+            // version 非法值此前静默回落 4（v2/v3/v4 线格式差异大，必须显式报错）
+            let version = match map.get("version") {
+                Some(v) => match v.as_u64() {
+                    Some(n) if (2..=4).contains(&n) => n as u8,
+                    _ => {
+                        return Err(format!("snell 节点 version 非法（应为 2/3/4，实际 {v:?}）"));
+                    }
+                },
+                None => 4,
+            };
+            // obfs_opts 子对象（此前 DSL 侧恒为 None，转换静默丢失）
+            let obfs_opts = map
+                .get("obfs_opts")
+                .and_then(|v| v.as_map())
+                .map(|entries| {
+                    let m: HashMap<String, DslValue> = entries.iter().cloned().collect();
+                    SnellObfsSpec {
+                        mode: m
+                            .get("mode")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
+                        host: m
+                            .get("host")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
+                        path: m
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string),
+                    }
+                });
             OutboundKind::Snell {
                 server,
                 port,
                 psk,
                 version,
-                obfs_opts: None,
+                obfs_opts,
                 udp,
             }
         }
@@ -950,6 +1100,11 @@ fn lower_node(
                 .or_else(|| map.get("host-key"))
                 .and_then(|v| v.as_str())
                 .map(ToString::to_string);
+            let private_key_passphrase = map
+                .get("private_key_passphrase")
+                .or_else(|| map.get("private-key-passphrase"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
             OutboundKind::Ssh {
                 server,
                 port,
@@ -960,7 +1115,7 @@ fn lower_node(
                     Some(password)
                 },
                 private_key,
-                private_key_passphrase: None,
+                private_key_passphrase,
                 host_key,
             }
         }
@@ -1071,6 +1226,53 @@ fn lower_node(
         other => return Err(format!("未识别的节点协议类型: '{other}'")),
     };
 
+    // udp_over_tcp：bool → V1；数字 → 2 表示 V2（UoT 版本协商）。
+    // 不能走 as_bool 判断——as_bool 对非零 Int 恒返回 true，会把 2 吞成 V1。
+    let udp_over_tcp = map.get("udp_over_tcp").and_then(|v| match v {
+        DslValue::Bool(true) => Some(UotVersion::V1),
+        DslValue::Bool(false) => None,
+        DslValue::Int(n) => Some(if *n >= 2 {
+            UotVersion::V2
+        } else {
+            UotVersion::V1
+        }),
+        DslValue::Str(s) => {
+            let s = s.trim();
+            match s.parse::<u32>() {
+                Ok(n) if n >= 2 => Some(UotVersion::V2),
+                Ok(_) => Some(UotVersion::V1),
+                Err(_) if s.eq_ignore_ascii_case("true") => Some(UotVersion::V1),
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    });
+
+    // smux 子对象：{ enabled, protocol, max_connections, min_streams, max_streams, padding }
+    let smux = map.get("smux").and_then(|v| v.as_map()).map(|entries| {
+        let m: HashMap<String, DslValue> = entries.iter().cloned().collect();
+        SmuxSpec {
+            enabled: m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            protocol: m
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string),
+            max_connections: m
+                .get("max_connections")
+                .and_then(|v| v.as_u32())
+                .map(|n| n as usize),
+            min_streams: m
+                .get("min_streams")
+                .and_then(|v| v.as_u32())
+                .map(|n| n as usize),
+            max_streams: m
+                .get("max_streams")
+                .and_then(|v| v.as_u32())
+                .map(|n| n as usize),
+            padding: m.get("padding").and_then(|v| v.as_bool()).unwrap_or(false),
+        }
+    });
+
     Ok(OutboundSpec {
         name,
         kind,
@@ -1085,8 +1287,8 @@ fn lower_node(
             .get("interface")
             .and_then(|v| v.as_str())
             .map(ToString::to_string),
-        udp_over_tcp: None,
-        smux: None,
+        udp_over_tcp,
+        smux,
     })
 }
 

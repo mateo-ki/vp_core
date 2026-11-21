@@ -401,7 +401,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             cert,
             key,
             cipher,
-            insecure: _,
+            insecure,
             udp,
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
@@ -440,11 +440,12 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
                     escape_str(&c.replace("\n", " "))
                 ));
             }
+            // openvpn 的 insecure 存于 kind，lowering 从顶层属性回填；此前不输出静默丢失
+            if *insecure {
+                out.push_str("    insecure: true\n");
+            }
             if *udp {
-                out.push_str(
-                    "    udp: true
-",
-                );
+                out.push_str("    udp: true\n");
             }
         }
         OutboundKind::Wireguard {
@@ -456,8 +457,9 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             public_key,
             preshared_key,
             mtu,
+            reserved,
+            workers,
             udp,
-            ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
             out.push_str(&format!("    port: {port}\n"));
@@ -475,6 +477,13 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             }
             if let Some(m) = mtu {
                 out.push_str(&format!("    mtu: {m}\n"));
+            }
+            // reserved/workers 此前不输出，YAML→DSL 转换静默丢失
+            if let Some(r) = reserved {
+                out.push_str(&format!("    reserved: [{}, {}, {}]\n", r[0], r[1], r[2]));
+            }
+            if let Some(w) = workers {
+                out.push_str(&format!("    workers: {w}\n"));
             }
             if *udp {
                 out.push_str("    udp: true\n");
@@ -568,6 +577,7 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             port,
             username,
             password,
+            headers,
             ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
@@ -578,7 +588,15 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             if let Some(p) = password {
                 out.push_str(&format!("    password: \"{}\"\n", escape_str(p)));
             }
-            // 同上：tls/sni/insecure 归 serialize_transport 统一输出
+            // 同上：tls/sni/insecure 归 serialize_transport 统一输出；
+            // headers（http 出站自定义请求头）此前不输出，转换静默丢失
+            if !headers.is_empty() {
+                let kv: Vec<String> = headers
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\": \"{}\"", escape_str(k), escape_str(v)))
+                    .collect();
+                out.push_str(&format!("    headers: {{ {} }}\n", kv.join(", ")));
+            }
         }
         OutboundKind::Mieru {
             server,
@@ -604,13 +622,29 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             port,
             psk,
             version,
+            obfs_opts,
             udp,
-            ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
             out.push_str(&format!("    port: {port}\n"));
             out.push_str(&format!("    psk: \"{}\"\n", escape_str(psk)));
             out.push_str(&format!("    version: {version}\n"));
+            if let Some(o) = obfs_opts {
+                // obfs_opts 此前不输出，YAML→DSL 转换静默丢失
+                let mut parts = Vec::new();
+                if let Some(m) = &o.mode {
+                    parts.push(format!("mode: \"{}\"", escape_str(m)));
+                }
+                if let Some(h) = &o.host {
+                    parts.push(format!("host: \"{}\"", escape_str(h)));
+                }
+                if let Some(p) = &o.path {
+                    parts.push(format!("path: \"{}\"", escape_str(p)));
+                }
+                if !parts.is_empty() {
+                    out.push_str(&format!("    obfs_opts: {{ {} }}\n", parts.join(", ")));
+                }
+            }
             if *udp {
                 out.push_str("    udp: true\n");
             }
@@ -621,14 +655,20 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             username,
             password,
             private_key,
+            private_key_passphrase,
             host_key,
-            ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
             out.push_str(&format!("    port: {port}\n"));
             out.push_str(&format!("    username: \"{}\"\n", escape_str(username)));
             if let Some(p) = password {
                 out.push_str(&format!("    password: \"{}\"\n", escape_str(p)));
+            }
+            if let Some(pp) = private_key_passphrase {
+                out.push_str(&format!(
+                    "    private_key_passphrase: \"{}\"\n",
+                    escape_str(pp)
+                ));
             }
             if let Some(pk) = private_key {
                 out.push_str(&format!("    private_key: \"{}\"\n", escape_str(pk)));
@@ -686,6 +726,9 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             down_mbps,
             obfs,
             obfs_password,
+            sni,
+            alpn,
+            insecure,
             ..
         } => {
             out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
@@ -705,7 +748,21 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
             if let Some(op) = obfs_password {
                 out.push_str(&format!("    obfs_password: \"{}\"\n", escape_str(op)));
             }
-            // sni/insecure 归 serialize_transport 统一输出
+            // hysteria 的 sni/alpn/insecure 存于 kind（lowering 从顶层属性回填），
+            // 此前不输出导致 YAML→DSL 转换静默丢失
+            if let Some(s) = sni {
+                out.push_str(&format!("    sni: \"{}\"\n", escape_str(s)));
+            }
+            if !alpn.is_empty() {
+                let alpns: Vec<String> = alpn
+                    .iter()
+                    .map(|a| format!("\"{}\"", escape_str(a)))
+                    .collect();
+                out.push_str(&format!("    alpn: [{}]\n", alpns.join(", ")));
+            }
+            if *insecure {
+                out.push_str("    insecure: true\n");
+            }
         }
         OutboundKind::Brook {
             server,
@@ -741,6 +798,38 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
                 out.push_str("    udp: true\n");
             }
         }
+        OutboundKind::Tailscale {
+            server,
+            port,
+            authkey,
+            control_url,
+            hostname,
+            state_dir,
+            exit_node,
+            exit_node_allow_lan,
+        } => {
+            // 此前无字段臂，全部字段（含 server/port）在 YAML→DSL 转换中静默丢失
+            out.push_str(&format!("    server: \"{}\"\n", escape_str(server)));
+            out.push_str(&format!("    port: {port}\n"));
+            if let Some(k) = authkey {
+                out.push_str(&format!("    authkey: \"{}\"\n", escape_str(k)));
+            }
+            if let Some(u) = control_url {
+                out.push_str(&format!("    control_url: \"{}\"\n", escape_str(u)));
+            }
+            if let Some(h) = hostname {
+                out.push_str(&format!("    hostname: \"{}\"\n", escape_str(h)));
+            }
+            if let Some(d) = state_dir {
+                out.push_str(&format!("    state_dir: \"{}\"\n", escape_str(d)));
+            }
+            if let Some(e) = exit_node {
+                out.push_str(&format!("    exit_node: \"{}\"\n", escape_str(e)));
+            }
+            if *exit_node_allow_lan {
+                out.push_str("    exit_node_allow_lan: true\n");
+            }
+        }
         _ => {}
     }
 
@@ -752,6 +841,30 @@ fn serialize_outbound(ob: &OutboundSpec, out: &mut String) {
     }
     if let Some(bi) = &ob.bind_interface {
         out.push_str(&format!("    interface: \"{}\"\n", escape_str(bi)));
+    }
+    if let Some(uot) = ob.udp_over_tcp {
+        // bool=V1 / 2=V2，与 lowering 双向对齐
+        out.push_str(&format!(
+            "    udp_over_tcp: {}\n",
+            if uot == UotVersion::V2 { "2" } else { "true" }
+        ));
+    }
+    if let Some(smux) = &ob.smux {
+        let mut parts = vec![format!("enabled: {}", smux.enabled)];
+        if let Some(p) = &smux.protocol {
+            parts.push(format!("protocol: \"{}\"", escape_str(p)));
+        }
+        if let Some(n) = smux.max_connections {
+            parts.push(format!("max_connections: {n}"));
+        }
+        if let Some(n) = smux.min_streams {
+            parts.push(format!("min_streams: {n}"));
+        }
+        if let Some(n) = smux.max_streams {
+            parts.push(format!("max_streams: {n}"));
+        }
+        parts.push(format!("padding: {}", smux.padding));
+        out.push_str(&format!("    smux: {{ {} }}\n", parts.join(", ")));
     }
 
     // 传输层参数序列化 (TransportSpec)
@@ -778,7 +891,25 @@ fn serialize_transport(t: &TransportSpec, out: &mut String) {
         if let Some(sid) = &r.short_id {
             out.push_str(&format!("        short_id: \"{}\"\n", escape_str(sid)));
         }
+        if let Some(sx) = &r.spider_x {
+            out.push_str(&format!("        spider_x: \"{}\"\n", escape_str(sx)));
+        }
         out.push_str("    }\n");
+        // reality 分支同样需要 alpn / insecure / client_fingerprint（此前仅 else 分支输出）
+        if t.insecure {
+            out.push_str("    insecure: true\n");
+        }
+        if let Some(fp) = &t.client_fingerprint {
+            out.push_str(&format!("    client_fingerprint: \"{}\"\n", escape_str(fp)));
+        }
+        if !t.alpn.is_empty() {
+            let alpns: Vec<String> = t
+                .alpn
+                .iter()
+                .map(|a| format!("\"{}\"", escape_str(a)))
+                .collect();
+            out.push_str(&format!("    alpn: [{}]\n", alpns.join(", ")));
+        }
     } else {
         if t.tls {
             out.push_str("    tls: true\n");
@@ -805,11 +936,20 @@ fn serialize_transport(t: &TransportSpec, out: &mut String) {
     if let Some(ws) = &t.ws {
         out.push_str("    ws: {\n");
         out.push_str(&format!("        path: \"{}\"\n", escape_str(&ws.path)));
-        if let Some(host) = ws.headers.get("Host").or_else(|| ws.headers.get("host")) {
-            out.push_str(&format!(
-                "        headers: {{ Host: \"{}\" }}\n",
-                escape_str(host)
-            ));
+        if !ws.headers.is_empty() {
+            // 全量输出（此前仅输出单个 Host 头，其余伪装头经 YAML→DSL 转换会静默丢失）
+            let kv: Vec<String> = ws
+                .headers
+                .iter()
+                .map(|(k, v)| format!("\"{}\": \"{}\"", escape_str(k), escape_str(v)))
+                .collect();
+            out.push_str(&format!("        headers: {{ {} }}\n", kv.join(", ")));
+        }
+        if let Some(ed) = ws.max_early_data {
+            out.push_str(&format!("        max_early_data: {ed}\n"));
+        }
+        if ws.v2ray_http_upgrade {
+            out.push_str("        v2ray_http_upgrade: true\n");
         }
         out.push_str("    }\n");
     }
@@ -823,17 +963,54 @@ fn serialize_transport(t: &TransportSpec, out: &mut String) {
         out.push_str("    }\n");
     }
 
+    if let Some(h) = &t.http {
+        // HTTP 伪装承载（此前完全不输出，YAML→DSL 转换会静默丢失整个 http 传输）
+        out.push_str("    http: {\n");
+        if let Some(method) = &h.method {
+            out.push_str(&format!("        method: \"{}\"\n", escape_str(method)));
+        }
+        if !h.path.is_empty() {
+            let list: Vec<String> = h
+                .path
+                .iter()
+                .map(|p| format!("\"{}\"", escape_str(p)))
+                .collect();
+            out.push_str(&format!("        path: [{}]\n", list.join(", ")));
+        }
+        if !h.headers.is_empty() {
+            let kv: Vec<String> = h
+                .headers
+                .iter()
+                .map(|(k, vs)| {
+                    let vals: Vec<String> = vs
+                        .iter()
+                        .map(|v| format!("\"{}\"", escape_str(v)))
+                        .collect();
+                    format!("\"{}\": [{}]", escape_str(k), vals.join(", "))
+                })
+                .collect();
+            out.push_str(&format!("        headers: {{ {} }}\n", kv.join(", ")));
+        }
+        out.push_str("    }\n");
+    }
+
     if let Some(x) = &t.xhttp {
         out.push_str("    xhttp: {\n");
         out.push_str(&format!("        path: \"{}\"\n", escape_str(&x.path)));
         if let Some(mode) = &x.mode {
             out.push_str(&format!("        mode: \"{}\"\n", escape_str(mode)));
         }
-        if let Some(host) = x.headers.get("Host").or_else(|| x.headers.get("host")) {
-            out.push_str(&format!(
-                "        headers: {{ Host: \"{}\" }}\n",
-                escape_str(host)
-            ));
+        if let Some(host) = &x.host {
+            out.push_str(&format!("        host: \"{}\"\n", escape_str(host)));
+        }
+        if !x.headers.is_empty() {
+            // 全量输出（此前仅输出 Host 单头，其余伪装头经转换静默丢失）
+            let kv: Vec<String> = x
+                .headers
+                .iter()
+                .map(|(k, v)| format!("\"{}\": \"{}\"", escape_str(k), escape_str(v)))
+                .collect();
+            out.push_str(&format!("        headers: {{ {} }}\n", kv.join(", ")));
         }
         out.push_str("    }\n");
     }
@@ -845,6 +1022,27 @@ fn serialize_transport(t: &TransportSpec, out: &mut String) {
             escape_str(&st.password)
         ));
         out.push_str(&format!("        sni: \"{}\"\n", escape_str(&st.sni)));
+        out.push_str("    }\n");
+    }
+
+    if let Some(e) = &t.ech {
+        // ECH（此前完全不输出，YAML→DSL 转换会静默丢失 ech-opts）
+        out.push_str("    ech: {\n");
+        if e.enable {
+            out.push_str("        enable: true\n");
+        }
+        if let Some(c) = &e.config {
+            out.push_str(&format!("        config: \"{}\"\n", escape_str(c)));
+        }
+        if let Some(q) = &e.query_server_name {
+            out.push_str(&format!(
+                "        query_server_name: \"{}\"\n",
+                escape_str(q)
+            ));
+        }
+        if let Some(d) = &e.doh {
+            out.push_str(&format!("        doh: \"{}\"\n", escape_str(d)));
+        }
         out.push_str("    }\n");
     }
 }

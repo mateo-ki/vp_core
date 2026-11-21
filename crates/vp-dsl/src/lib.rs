@@ -432,4 +432,602 @@ node "hu-node" vless {
             "往返 network 不得丢失"
         );
     }
+
+    /// 穷举回归：全部 23 种 OutboundKind + 全部传输层块 + 元字段（smux/uot/拨号链）
+    /// IR → DSL → IR 逐节点全等。任何 serializer/lowering 缺字段都会在此炸出。
+    #[test]
+    fn test_exhaustive_ir_roundtrip_all_protocols() {
+        use std::collections::HashMap;
+        use vp_ir::outbound::*;
+
+        let mut headers = HashMap::new();
+        headers.insert("X-Foo".to_string(), "bar".to_string());
+
+        let plain = TransportSpec::default();
+        let tr = |t: TransportSpec| t;
+
+        let full_tls = TransportSpec {
+            tls: true,
+            sni: Some("sni.example.com".into()),
+            alpn: vec!["h2".into(), "http/1.1".into()],
+            insecure: true,
+            client_fingerprint: Some("chrome".into()),
+            ..TransportSpec::default()
+        };
+
+        let mut ws = full_tls.clone();
+        ws.network = Some("ws".into());
+        ws.ws = Some(WsSpec {
+            path: "/ws-path".into(),
+            headers: headers.clone(),
+            max_early_data: Some(2048),
+            v2ray_http_upgrade: true,
+        });
+
+        let mut grpc = full_tls.clone();
+        grpc.network = Some("grpc".into());
+        grpc.grpc = Some(GrpcSpec {
+            service_name: "grpc-svc".into(),
+        });
+
+        let mut httpt = full_tls.clone();
+        httpt.network = Some("http".into());
+        let mut h_headers: HashMap<String, Vec<String>> = HashMap::new();
+        h_headers.insert("X-A".to_string(), vec!["a1".to_string()]);
+        httpt.http = Some(HttpSpec {
+            method: Some("GET".into()),
+            path: vec!["/p1".into(), "/p2".into()],
+            headers: h_headers,
+        });
+
+        let mut xhttp = full_tls.clone();
+        xhttp.network = Some("xhttp".into());
+        xhttp.xhttp = Some(XhttpSpec {
+            path: "/xh".into(),
+            host: Some("xh.example.com".into()),
+            mode: Some("stream-up".into()),
+            headers: headers.clone(),
+        });
+
+        let reality = TransportSpec {
+            network: Some("tcp".into()),
+            // 规范形：reality 块隐含 tls（lowering 解析 reality 时置 tls=true，语义保留）
+            tls: true,
+            reality: Some(RealitySpec {
+                public_key: "pbk-0123456789abcdef".into(),
+                short_id: Some("0123456789abcdef".into()),
+                spider_x: Some("https://www.bing.com".into()),
+            }),
+            client_fingerprint: Some("chrome".into()),
+            ..TransportSpec::default()
+        };
+
+        let mut ech = full_tls.clone();
+        ech.ech = Some(EchSpec {
+            enable: true,
+            config: Some("AER+HQ".into()),
+            query_server_name: Some("q.example.com".into()),
+            doh: Some("https://1.1.1.1/dns-query".into()),
+        });
+
+        let mut stls = full_tls.clone();
+        stls.shadow_tls = Some(ShadowTlsSpec {
+            password: "stls-pw".into(),
+            sni: "www.apple.com".into(),
+            version: 3,
+        });
+
+        let node = |name: &str, kind: OutboundKind, t: TransportSpec| OutboundSpec {
+            name: name.into(),
+            kind,
+            transport: t,
+            dialer_proxy: None,
+            routing_mark: None,
+            bind_interface: None,
+            udp_over_tcp: None,
+            smux: None,
+        };
+
+        let outbounds = vec![
+            node(
+                "n-ss",
+                OutboundKind::Ss {
+                    server: "1.1.1.1".into(),
+                    port: 8388,
+                    cipher: "aes-256-gcm".into(),
+                    password: "ss-pw".into(),
+                    udp: true,
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-ssr",
+                OutboundKind::Ssr {
+                    server: "1.1.1.1".into(),
+                    port: 8389,
+                    password: "ssr-pw".into(),
+                    cipher: "rc4-md5".into(),
+                    protocol: "auth_sha1_v4".into(),
+                    obfs: "http_simple".into(),
+                    obfs_param: Some("obfstest".into()),
+                    protocol_param: Some("protest".into()),
+                    udp: false,
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-vmess",
+                OutboundKind::Vmess {
+                    server: "2.2.2.2".into(),
+                    port: 10086,
+                    uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                    alter_id: 8,
+                    security: Some("aes-128-gcm".into()),
+                    udp: true,
+                },
+                tr(ws.clone()),
+            ),
+            node(
+                "n-vless-tls",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: Some("xtls-rprx-vision".into()),
+                    packet_encoding: Some("packetaddr".into()),
+                    udp: true,
+                },
+                tr(full_tls.clone()),
+            ),
+            node(
+                "n-vless-ws",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: None,
+                    packet_encoding: None,
+                    udp: false,
+                },
+                tr(ws.clone()),
+            ),
+            node(
+                "n-vless-grpc",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: None,
+                    packet_encoding: None,
+                    udp: false,
+                },
+                tr(grpc.clone()),
+            ),
+            node(
+                "n-vless-http",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: None,
+                    packet_encoding: None,
+                    udp: false,
+                },
+                tr(httpt.clone()),
+            ),
+            node(
+                "n-vless-xhttp",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: None,
+                    packet_encoding: None,
+                    udp: false,
+                },
+                tr(xhttp.clone()),
+            ),
+            node(
+                "n-vless-reality",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: Some("xtls-rprx-vision".into()),
+                    packet_encoding: None,
+                    udp: true,
+                },
+                tr(reality.clone()),
+            ),
+            node(
+                "n-vless-ech",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: None,
+                    packet_encoding: None,
+                    udp: false,
+                },
+                tr(ech.clone()),
+            ),
+            node(
+                "n-vless-stls",
+                OutboundKind::Vless {
+                    server: "3.3.3.3".into(),
+                    port: 443,
+                    uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                    flow: None,
+                    packet_encoding: None,
+                    udp: false,
+                },
+                tr(stls.clone()),
+            ),
+            node(
+                "n-trojan",
+                OutboundKind::Trojan {
+                    server: "4.4.4.4".into(),
+                    port: 443,
+                    password: "trojan-pw".into(),
+                    network: Some("grpc".into()),
+                    udp: true,
+                },
+                tr(grpc.clone()),
+            ),
+            node(
+                "n-hy1",
+                OutboundKind::Hysteria {
+                    server: "5.5.5.5".into(),
+                    port: 443,
+                    auth: Some("hy1-auth".into()),
+                    up_mbps: Some(50),
+                    down_mbps: Some(200),
+                    obfs: Some("salamander".into()),
+                    obfs_password: Some("obfs-pw".into()),
+                    sni: Some("hy.example.com".into()),
+                    alpn: vec!["h3".into()],
+                    insecure: true,
+                },
+                {
+                    // DSL 往返规范形：hysteria 系 sni/alpn/insecure 存 kind，
+                    // lowering 从顶层属性回填 kind 同时镜像进 transport（语义等价）
+                    let mut t = plain.clone();
+                    t.sni = Some("hy.example.com".into());
+                    t.alpn = vec!["h3".into()];
+                    t.insecure = true;
+                    t
+                },
+            ),
+            node(
+                "n-hy2",
+                OutboundKind::Hysteria2 {
+                    server: "5.5.5.5".into(),
+                    port: 8443,
+                    ports: Some("20000-30000".into()),
+                    password: Some("hy2-pw".into()),
+                    up_mbps: Some(100),
+                    down_mbps: Some(500),
+                    obfs: Some("salamander".into()),
+                    obfs_password: Some("obfs-pw".into()),
+                    sni: Some("hy2.example.com".into()),
+                    insecure: true,
+                },
+                {
+                    let mut t = plain.clone();
+                    t.sni = Some("hy2.example.com".into());
+                    t.insecure = true;
+                    t
+                },
+            ),
+            node(
+                "n-tuic",
+                OutboundKind::Tuic {
+                    server: "6.6.6.6".into(),
+                    port: 8443,
+                    uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                    password: "tuic-pw".into(),
+                    congestion_controller: Some("bbr".into()),
+                    udp_relay_mode: Some("native".into()),
+                    zero_rtt_handshake: true,
+                    heartbeat: Some("10s".into()),
+                    sni: Some("tuic.example.com".into()),
+                    insecure: true,
+                },
+                {
+                    let mut t = plain.clone();
+                    t.sni = Some("tuic.example.com".into());
+                    t.insecure = true;
+                    t
+                },
+            ),
+            node(
+                "n-juicity",
+                OutboundKind::Juicity {
+                    server: "7.7.7.7".into(),
+                    port: 8443,
+                    uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                    password: "juicity-pw".into(),
+                    congestion_controller: Some("bbr".into()),
+                    sni: Some("ju.example.com".into()),
+                    insecure: false,
+                    pinned_cert_chain: Some("aabbccdd".into()),
+                },
+                {
+                    let mut t = plain.clone();
+                    t.sni = Some("ju.example.com".into());
+                    t
+                },
+            ),
+            node(
+                "n-openvpn",
+                OutboundKind::OpenVpn {
+                    server: "8.8.8.8".into(),
+                    port: 1194,
+                    proto: Some("tcp".into()),
+                    username: Some("ovpn-user".into()),
+                    password: Some("ovpn-pass".into()),
+                    ca: "-----BEGIN CERT-----".into(),
+                    cert: Some("-----BEGIN CERT2-----".into()),
+                    key: Some("-----BEGIN KEY-----".into()),
+                    cipher: Some("AES-256-GCM".into()),
+                    insecure: true,
+                    udp: false,
+                },
+                {
+                    // DSL 规范形：kind.insecure 由顶层属性回填，transport 镜像 true
+                    let mut t = plain.clone();
+                    t.insecure = true;
+                    t
+                },
+            ),
+            node(
+                "n-wg",
+                OutboundKind::Wireguard {
+                    server: "9.9.9.9".into(),
+                    port: 51820,
+                    ip: "172.16.0.2".into(),
+                    ipv6: Some("fd00::2".into()),
+                    private_key: "wg-priv".into(),
+                    public_key: "wg-pub".into(),
+                    preshared_key: Some("wg-psk".into()),
+                    mtu: Some(1420),
+                    reserved: Some([1, 2, 3]),
+                    workers: Some(4),
+                    udp: true,
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-tailscale",
+                OutboundKind::Tailscale {
+                    server: "10.10.10.10".into(),
+                    port: 443,
+                    authkey: Some("ts-key".into()),
+                    control_url: Some("https://control.tailscale.com".into()),
+                    hostname: Some("ts-host".into()),
+                    state_dir: Some("/tmp/ts".into()),
+                    exit_node: Some("ts-exit".into()),
+                    exit_node_allow_lan: true,
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-masque",
+                OutboundKind::Masque {
+                    server: "162.159.192.1".into(),
+                    port: 443,
+                    private_key: "MHcCAQEEI".into(),
+                    public_key: Some("MFkwEwYH".into()),
+                    ip: Some("172.16.0.2".into()),
+                    ipv6: Some("2606:4700::1".into()),
+                    uri: Some("https://warp.example.com".into()),
+                    sni: Some("warp.example.com".into()),
+                    mtu: Some(1280),
+                    udp: true,
+                    remote_dns_resolve: true,
+                    dns: vec!["1.1.1.1".into()],
+                    skip_cert_verify: false,
+                    network: None,
+                },
+                {
+                    // DSL 规范形：kind.sni 序列化为顶层属性，transport 镜像
+                    let mut t = plain.clone();
+                    t.sni = Some("warp.example.com".into());
+                    t
+                },
+            ),
+            node(
+                "n-snell",
+                OutboundKind::Snell {
+                    server: "11.11.11.11".into(),
+                    port: 6160,
+                    psk: "snell-psk".into(),
+                    version: 4,
+                    obfs_opts: Some(SnellObfsSpec {
+                        mode: Some("http".into()),
+                        host: Some("obfs.example.com".into()),
+                        path: Some("/obfs".into()),
+                    }),
+                    udp: true,
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-anytls",
+                OutboundKind::Anytls {
+                    server: "12.12.12.12".into(),
+                    port: 8443,
+                    password: "anytls-pw".into(),
+                    // DSL 规范形：kind.sni 与 transport.sni 同源镜像（YAML→IR 两侧一致）
+                    sni: Some("sni.example.com".into()),
+                    client_fingerprint: Some("chrome".into()),
+                    udp: true,
+                },
+                tr(full_tls.clone()),
+            ),
+            node(
+                "n-ssh",
+                OutboundKind::Ssh {
+                    server: "13.13.13.13".into(),
+                    port: 22,
+                    username: "ssh-user".into(),
+                    password: Some("ssh-pass".into()),
+                    private_key: Some("/tmp/id_ed25519".into()),
+                    private_key_passphrase: Some("key-pass".into()),
+                    host_key: Some("sha256-abc".into()),
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-brook",
+                OutboundKind::Brook {
+                    server: "14.14.14.14".into(),
+                    port: 9999,
+                    password: "brook-pw".into(),
+                    protocol: Some("ws".into()),
+                    udp: true,
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-mieru",
+                OutboundKind::Mieru {
+                    server: "15.15.15.15".into(),
+                    port: 8443,
+                    username: "mieru-u".into(),
+                    password: "mieru-p".into(),
+                    transport: Some("TCP".into()),
+                    multiplexing: Some("MULTIPLEX".into()),
+                },
+                tr(plain.clone()),
+            ),
+            node(
+                "n-naive",
+                OutboundKind::Naive {
+                    server: "16.16.16.16".into(),
+                    port: 443,
+                    username: "naive-u".into(),
+                    password: "naive-p".into(),
+                    // DSL 规范形：kind.sni := transport.sni（lowering 回填）
+                    sni: Some("sni.example.com".into()),
+                    client_fingerprint: Some("chrome".into()),
+                    udp: true,
+                },
+                tr(full_tls.clone()),
+            ),
+            node(
+                "n-socks5",
+                OutboundKind::Socks5 {
+                    server: "17.17.17.17".into(),
+                    port: 1080,
+                    username: Some("sk-u".into()),
+                    password: Some("sk-p".into()),
+                    tls: true,
+                    sni: Some("sk.example.com".into()),
+                    insecure: true,
+                    udp: true,
+                },
+                {
+                    // DSL 规范形：kind.tls/sni/insecure 由 transport 镜像（序列化去重设计）
+                    let mut t = plain.clone();
+                    t.tls = true;
+                    t.sni = Some("sk.example.com".into());
+                    t.insecure = true;
+                    t
+                },
+            ),
+            node(
+                "n-http",
+                OutboundKind::Http {
+                    server: "18.18.18.18".into(),
+                    port: 8080,
+                    username: Some("http-u".into()),
+                    password: Some("http-p".into()),
+                    tls: true,
+                    sni: Some("http.example.com".into()),
+                    insecure: false,
+                    headers: headers.clone(),
+                },
+                {
+                    // DSL 规范形：kind.tls/sni 由 transport 镜像
+                    let mut t = plain.clone();
+                    t.tls = true;
+                    t.sni = Some("http.example.com".into());
+                    t
+                },
+            ),
+        ];
+
+        let ir = VpIr {
+            outbounds,
+            ..Default::default()
+        };
+
+        let dsl = ir_to_dsl(&ir);
+        let rt = parse(&dsl).expect("穷举往返：DSL 解析成功");
+        for n in &ir.outbounds {
+            let got = rt
+                .outbounds
+                .iter()
+                .find(|o| o.name == n.name)
+                .unwrap_or_else(|| panic!("穷举往返：节点 {} 丢失", n.name));
+            assert_eq!(
+                got, n,
+                "穷举往返：节点 {} 字段不一致\n--- DSL ---\n{dsl}",
+                n.name
+            );
+        }
+        assert_eq!(
+            rt.outbounds.len(),
+            ir.outbounds.len() + 2, // DIRECT/REJECT 兜底节点
+            "往返不得引入或丢失节点"
+        );
+    }
+
+    /// 元字段穷举：smux / udp_over_tcp（此前 DSL 侧完全不支持，YAML→DSL 转换会静默丢弃）
+    #[test]
+    fn test_exhaustive_ir_roundtrip_meta_fields() {
+        use vp_ir::outbound::*;
+
+        // 注：security None 与 Some("auto") 语义等价，lowering 统一规范化为 Some("auto")，
+        // 穷举输入按规范形构造（None 的规范化属预期行为，非数据丢失）
+        let vmess = OutboundKind::Vmess {
+            server: "2.2.2.2".into(),
+            port: 10086,
+            uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+            alter_id: 0,
+            security: Some("auto".into()),
+            udp: true,
+        };
+        let ob = OutboundSpec {
+            name: "n-meta".into(),
+            kind: vmess,
+            transport: TransportSpec::default(),
+            dialer_proxy: Some("upstream-group".into()),
+            routing_mark: Some(7777),
+            bind_interface: Some("eth5".into()),
+            udp_over_tcp: Some(UotVersion::V2),
+            smux: Some(SmuxSpec {
+                enabled: true,
+                protocol: Some("h2mux".into()),
+                max_connections: Some(4),
+                min_streams: Some(2),
+                max_streams: Some(8),
+                padding: true,
+            }),
+        };
+        let ir = VpIr {
+            outbounds: vec![ob],
+            ..Default::default()
+        };
+
+        let dsl = ir_to_dsl(&ir);
+        assert!(dsl.contains("udp_over_tcp: 2"), "uot V2 应序列化为 2");
+        assert!(dsl.contains("smux: {"), "smux 应序列化");
+        assert!(dsl.contains("dialer_proxy: \"upstream-group\""));
+
+        let rt = parse(&dsl).expect("元字段往返解析成功");
+        let got = rt.outbounds.iter().find(|o| o.name == "n-meta").unwrap();
+        assert_eq!(&ir.outbounds[0], got, "元字段往返不一致\n{dsl}");
+    }
 }

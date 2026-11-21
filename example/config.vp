@@ -19,7 +19,7 @@ node "vmess-示例" vmess {
     sni: "v.example.com"
     ws: {
         path: "/path"
-        headers: { Host: "v.example.com" }
+        headers: { "Host": "v.example.com" }
     }
 }
 

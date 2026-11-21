@@ -18,6 +18,7 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use tracing::warn;
 use vp_common::{Error, Result};
 
 /// XHTTP 传输配置
@@ -111,6 +112,8 @@ enum UploadSide {
         session_path: String,
         query: String,
         seq: u64,
+        /// 已告警过非 2xx 响应（此后降级 debug，避免坏节点刷屏）
+        warned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
     /// 流式 POST：body 即上行流（stream-up / stream-one 共用）
     Stream {
@@ -242,6 +245,7 @@ where
             session_path: format!("{base}/{session}"),
             query,
             seq: 0,
+            warned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
         XhttpMode::StreamOne => unreachable!("stream-one 已在函数前段提前返回"),
         XhttpMode::StreamUp => {
@@ -257,9 +261,16 @@ where
             let (resp_fut, send) = client
                 .send_request(up_req, false)
                 .map_err(|e| Error::ProtoMsg(format!("xhttp 上行请求发送失败: {e}")))?;
-            // stream-up：响应在后台排空（服务端可能立即回 200 或延迟回复）
+            // stream-up：响应在后台排空（服务端可能立即回 200 或延迟回复）；
+            // 非 2xx 说明上行流被服务端拒绝，此前静默吞掉导致节点黑洞无从排查
             tokio::spawn(async move {
                 if let Ok(resp) = resp_fut.await {
+                    if !resp.status().is_success() {
+                        warn!(
+                            "xhttp stream-up 上行流响应 {}（服务端可能拒绝上行流，检查 TLS/REALITY/路径配置）",
+                            resp.status()
+                        );
+                    }
                     let mut body = resp.into_body();
                     while let Some(chunk) = body.data().await {
                         match chunk {
@@ -373,6 +384,7 @@ impl AsyncWrite for XhttpStream {
                 session_path,
                 query,
                 seq,
+                warned,
             } => {
                 std::task::ready!(
                     client
@@ -392,9 +404,25 @@ impl AsyncWrite for XhttpStream {
                 // 整包数据一次写入并 EOS 关闭
                 send.send_data(Bytes::copy_from_slice(buf), true)
                     .map_err(|e| std::io::Error::other(format!("xhttp send: {e}")))?;
-                // 后台排空响应（服务端回 200 空体），避免 h2 连接流控窗口堆积
+                // 后台排空响应（服务端回 200 空体），避免 h2 连接流控窗口堆积；
+                // 非 2xx 说明该包被服务端/CDN 拒收（REALITY 认证失败、路径错等），
+                // 此前被静默吞掉导致节点黑洞无从排查——首次 warn，之后降级 debug 防刷屏
+                let seq_val = *seq;
+                let warned = warned.clone();
                 tokio::spawn(async move {
                     if let Ok(resp) = resp_fut.await {
+                        if !resp.status().is_success() {
+                            let status = resp.status();
+                            if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                warn!(
+                                    "xhttp packet-up 上行 POST 响应 {status}（seq={seq_val}，该包大概率未被服务端接受，检查 TLS/REALITY/路径配置）"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "xhttp packet-up 上行 POST 响应 {status}（seq={seq_val}）"
+                                );
+                            }
+                        }
                         let mut body = resp.into_body();
                         while let Some(chunk) = body.data().await {
                             match chunk {

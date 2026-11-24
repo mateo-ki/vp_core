@@ -1264,43 +1264,70 @@ impl App {
         Ok(Arc::new(app))
     }
 
+    /// 全组或指定节点测速（CLI test 用，支持自定义 URL、超时与节点过滤，返回名称与延迟结果）
+    pub async fn url_test_custom(
+        &self,
+        url_override: Option<&str>,
+        timeout_dur: std::time::Duration,
+        node_filter: Option<&str>,
+    ) -> std::collections::BTreeMap<String, Option<u32>> {
+        let router = self.router.current();
+        let groups = router.groups();
+
+        // 收集待测速目标：若指定了 node_filter，则仅测试该节点；否则收集所有底层节点
+        let mut targets: Vec<String> = Vec::new();
+        if let Some(target) = node_filter {
+            targets.push(target.to_string());
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            for g in groups.values() {
+                for m in g.member_names() {
+                    if router.outbound(m).is_some() && seen.insert(m.to_string()) {
+                        targets.push(m.to_string());
+                    }
+                }
+            }
+            if targets.is_empty() {
+                targets = router.outbounds().keys().cloned().collect();
+            }
+        }
+
+        let test_url = url_override
+            .or_else(|| groups.values().next().map(|g| g.test_url()))
+            .unwrap_or("http://www.gstatic.com/generate_204");
+
+        let mut set = tokio::task::JoinSet::new();
+        for target in targets {
+            let r_clone = router.clone();
+            let url = test_url.to_string();
+            set.spawn(async move {
+                let res = r_clone
+                    .url_test_node_with_timeout(&target, &url, timeout_dur)
+                    .await;
+                (target, res.ok())
+            });
+        }
+
+        let mut results = std::collections::BTreeMap::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok((target, delay)) = res {
+                results.insert(target, delay);
+            }
+        }
+        results
+    }
+
     /// 全组测速（CLI test 用）
     pub async fn url_test_all_groups(&self) {
+        let _ = self
+            .url_test_custom(None, std::time::Duration::from_secs(5), None)
+            .await;
         let router = self.router.current();
         let groups = router.groups();
         if groups.is_empty() {
             println!("没有可测速的策略组");
             return;
         }
-
-        // 收集所有策略组中所有唯一的底层节点名称，避免多组重叠导致同一节点被重复连接测速数次
-        let mut unique_members: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for g in groups.values() {
-            for m in g.member_names() {
-                if router.outbound(m).is_some() && seen.insert(m.to_string()) {
-                    unique_members.push(m.to_string());
-                }
-            }
-        }
-
-        let test_url = groups
-            .values()
-            .next()
-            .map(|g| g.test_url())
-            .unwrap_or("http://www.gstatic.com/generate_204");
-
-        // 一次性高并发（128 并发通道）批量探测所有唯一节点，结果自动同步回填至所有策略组
-        let mut set = tokio::task::JoinSet::new();
-        for member in unique_members {
-            let r_clone = router.clone();
-            let url = test_url.to_string();
-            set.spawn(async move {
-                let _ = r_clone.url_test_node(&member, &url).await;
-            });
-        }
-        while set.join_next().await.is_some() {}
-
         for (name, g) in groups {
             println!("组 {name} [{}]:", g.ty().as_str());
             for (member, delay, alive) in g.member_states() {

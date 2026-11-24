@@ -287,35 +287,44 @@ impl Group {
         self.probe_all().await;
     }
 
-    /// 单成员测速（返回毫秒）
-    pub async fn url_test_member(&self, member: &str) -> Result<u32> {
+    /// 单成员测速（支持指定自定义 URL 与超时）
+    pub async fn url_test_member_with_options(
+        &self,
+        member: &str,
+        url: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<u32> {
         let i = self
             .member_names
             .iter()
             .position(|n| &**n == member)
             .ok_or_else(|| Error::Other(format!("成员 {member:?} 不存在")))?;
-        let target = ProbeTarget::build(&self.test_url)?;
-        let sem = global_probe_semaphore().clone();
-        let _permit = sem.acquire().await.ok();
-        let d = probe_target(&self.members[i], &target).await;
-        let (ok, ms) = match d {
-            Ok(dur) => (true, (dur.as_millis() as u32).max(1)),
+        let target_url = url.unwrap_or(&self.test_url);
+        let timeout_dur = timeout.unwrap_or_else(|| Duration::from_secs(5));
+        let ms = url_test_outbound_with_timeout(&self.members[i], target_url, timeout_dur).await;
+        let (ok, res_ms) = match ms {
+            Ok(dur_ms) => (true, dur_ms),
             Err(_) => (false, 0),
         };
         {
             let mut alive = self.alive.lock().unwrap();
             let mut delay = self.delay_ms.lock().unwrap();
             alive[i] = ok;
-            delay[i] = if ok { Some(ms) } else { None };
+            delay[i] = if ok { Some(res_ms) } else { None };
         }
         if ok {
-            Ok(ms)
+            Ok(res_ms)
         } else {
             Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "测速失败",
             )))
         }
+    }
+
+    /// 单成员测速（返回毫秒）
+    pub async fn url_test_member(&self, member: &str) -> Result<u32> {
+        self.url_test_member_with_options(member, None, None).await
     }
 
     /// 外部单节点测速完成后，将结果回填至包含该成员的策略组状态表
@@ -395,7 +404,7 @@ impl Group {
                     }
                     let m = members[i].clone();
                     let _permit = sem.acquire().await.ok();
-                    let ms = match probe_target(&m, &target).await {
+                    let ms = match probe_target(&m, &target, Duration::from_secs(5)).await {
                         Ok(d) => (d.as_millis() as u32).max(1),
                         Err(_) => u32::MAX,
                     };
@@ -538,8 +547,9 @@ impl ProbeTarget {
         let (host, port, path) = parse_test_url(url)?;
         let is_https = port == 443 || url.starts_with("https://");
         let dst = DstAddr::new(host.clone(), port);
+        // 使用标准 GET 请求，避免部分 204 端点（如 Cloudflare）对 HEAD 请求返回 405 或断开连接
         let req = format!(
-            "HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: vpcore/health\r\nConnection: close\r\n\r\n"
         );
         Ok(Self {
             host,
@@ -551,18 +561,52 @@ impl ProbeTarget {
     }
 }
 
-/// 对任意独立出站节点执行 URL 延迟探测（返回毫秒）
-pub async fn url_test_outbound(o: &Arc<dyn Outbound>, url: &str) -> Result<u32> {
+/// 对任意独立出站节点执行 URL 延迟探测（返回毫秒，支持自定义超时与容灾回退）
+pub async fn url_test_outbound_with_timeout(
+    o: &Arc<dyn Outbound>,
+    url: &str,
+    timeout: Duration,
+) -> Result<u32> {
     let target = ProbeTarget::build(url)?;
     let sem = global_probe_semaphore().clone();
     let _permit = sem.acquire().await.ok();
-    let d = probe_target(o, &target).await?;
-    Ok((d.as_millis() as u32).max(1))
+
+    // 1. 优先尝试主测速目标
+    match probe_target(o, &target, timeout).await {
+        Ok(d) => Ok((d.as_millis() as u32).max(1)),
+        Err(primary_err) => {
+            // 2. 跨目标双探活容灾：若主目标为 gstatic/google 失败，自动尝试 cloudflare 204；反之亦然
+            let fallback_url = if url.contains("gstatic.com") || url.contains("google.com") {
+                Some("http://cp.cloudflare.com/generate_204")
+            } else if url.contains("cloudflare.com") {
+                Some("http://www.gstatic.com/generate_204")
+            } else {
+                None
+            };
+            if let Some(fb) = fallback_url {
+                if let Ok(fb_target) = ProbeTarget::build(fb) {
+                    if let Ok(d) = probe_target(o, &fb_target, timeout).await {
+                        return Ok((d.as_millis() as u32).max(1));
+                    }
+                }
+            }
+            Err(primary_err)
+        }
+    }
+}
+
+/// 对任意独立出站节点执行 URL 延迟探测（返回毫秒，默认 5 秒超时）
+pub async fn url_test_outbound(o: &Arc<dyn Outbound>, url: &str) -> Result<u32> {
+    url_test_outbound_with_timeout(o, url, Duration::from_secs(5)).await
 }
 
 /// 通过预编译的目标与静态字节高效探测指定出站（零格式化开销，精准计时）
-async fn probe_target(o: &Arc<dyn Outbound>, target: &ProbeTarget) -> Result<Duration> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+async fn probe_target(
+    o: &Arc<dyn Outbound>,
+    target: &ProbeTarget,
+    timeout: Duration,
+) -> Result<Duration> {
+    tokio::time::timeout(timeout, async {
         let sess = Session::new_tcp("healthcheck".into(), None, target.dst.clone());
         let started = std::time::Instant::now();
         let stream = o.connect_stream(&sess, &target.dst).await?;
@@ -1091,9 +1135,13 @@ mod tests {
             response: "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
         });
         assert!(
-            probe_target(&(o204 as Arc<dyn Outbound>), &target)
-                .await
-                .is_ok(),
+            probe_target(
+                &(o204 as Arc<dyn Outbound>),
+                &target,
+                Duration::from_secs(5)
+            )
+            .await
+            .is_ok(),
             "204 必须判活"
         );
 
@@ -1102,9 +1150,13 @@ mod tests {
             response: "HTTP/1.1 302 Found\r\nLocation: /r\r\n\r\n",
         });
         assert!(
-            probe_target(&(o302 as Arc<dyn Outbound>), &target)
-                .await
-                .is_ok(),
+            probe_target(
+                &(o302 as Arc<dyn Outbound>),
+                &target,
+                Duration::from_secs(5)
+            )
+            .await
+            .is_ok(),
             "3xx 重定向应判活"
         );
 
@@ -1112,9 +1164,13 @@ mod tests {
             name: "o403".into(),
             response: "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
         });
-        let err = probe_target(&(o403 as Arc<dyn Outbound>), &target)
-            .await
-            .expect_err("403 必须判死");
+        let err = probe_target(
+            &(o403 as Arc<dyn Outbound>),
+            &target,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("403 必须判死");
         assert!(err.to_string().contains("403"), "错误信息应含状态码: {err}");
 
         let o500 = Arc::new(HttpStatusOutbound {
@@ -1122,9 +1178,13 @@ mod tests {
             response: "HTTP/1.1 500 Internal Server Error\r\n\r\n",
         });
         assert!(
-            probe_target(&(o500 as Arc<dyn Outbound>), &target)
-                .await
-                .is_err(),
+            probe_target(
+                &(o500 as Arc<dyn Outbound>),
+                &target,
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err(),
             "5xx 必须判死"
         );
 
@@ -1133,9 +1193,13 @@ mod tests {
             response: "NOT-HTTP-GARBAGE\r\n\r\n",
         });
         assert!(
-            probe_target(&(ogarbage as Arc<dyn Outbound>), &target)
-                .await
-                .is_err(),
+            probe_target(
+                &(ogarbage as Arc<dyn Outbound>),
+                &target,
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err(),
             "非 HTTP 响应必须判死"
         );
     }

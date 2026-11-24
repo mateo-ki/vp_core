@@ -144,22 +144,20 @@ pub(crate) async fn handle_group_delay(
     let timeout_ms: u64 = query_param(query, "timeout")
         .and_then(|s| s.parse().ok())
         .unwrap_or(5000);
+    let url_opt = query_param(query, "url");
     if let Some(g) = router.get_group(name) {
         let members = g.member_names().to_vec();
         let mut set = tokio::task::JoinSet::new();
         for member_arc in members {
             let g_clone = g.clone();
             let member = member_arc.to_string();
+            let url_clone = url_opt.clone();
             set.spawn(async move {
-                let res = tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    g_clone.url_test_member(&member),
-                )
-                .await;
-                let delay = match res {
-                    Ok(Ok(ms)) => ms,
-                    _ => 0,
-                };
+                let dur = std::time::Duration::from_millis(timeout_ms);
+                let res = g_clone
+                    .url_test_member_with_options(&member, url_clone.as_deref(), Some(dur))
+                    .await;
+                let delay = res.unwrap_or_default();
                 (member, delay)
             });
         }
@@ -183,22 +181,87 @@ pub(crate) async fn handle_proxy_delay(
 ) {
     let url =
         query_param(query, "url").unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
+    let timeout_ms: u64 = query_param(query, "timeout")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+
     if let Some(g) = router.get_group(name) {
         let member = query_param(query, "member");
-        let ms = match member {
-            Some(m) => g.url_test_member(&m).await,
-            None => g.url_test_member(&g.selected_name()).await,
+        let target = match member {
+            Some(ref m) => m.as_str(),
+            None => &g.selected_name(),
         };
+        let ms = g
+            .url_test_member_with_options(target, Some(&url), Some(timeout))
+            .await;
         match ms {
             Ok(ms) => reply(stream, 200, "OK", &json!({"delay": ms, "url": url})).await,
-            Err(_) => reply(stream, 408, "Timeout", &json!({"message": "测速失败"})).await,
+            Err(_) => reply(stream, 408, "Timeout", &json!({"message": "Timeout"})).await,
         }
     } else if router.outbound(name).is_some() {
-        match router.url_test_node(name, &url).await {
+        match router.url_test_node_with_timeout(name, &url, timeout).await {
             Ok(ms) => reply(stream, 200, "OK", &json!({"delay": ms, "url": url})).await,
-            Err(_) => reply(stream, 408, "Timeout", &json!({"message": "测速失败"})).await,
+            Err(_) => reply(stream, 408, "Timeout", &json!({"message": "Timeout"})).await,
         }
     } else {
         reply(stream, 404, "Not Found", &json!({"message": "not found"})).await
     }
+}
+
+pub(crate) async fn handle_batch_delay(
+    stream: &mut tokio::net::TcpStream,
+    router: &std::sync::Arc<vp_router::Router>,
+    query: &str,
+    body_bytes: &[u8],
+) {
+    let parsed: serde_json::Value = serde_json::from_slice(body_bytes).unwrap_or(json!({}));
+    let mut names: Vec<String> = if let Some(arr) = parsed.as_array() {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    } else if let Some(arr) = parsed.get("names").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if names.is_empty() {
+        names = router.outbounds().keys().cloned().collect();
+    }
+    let url = parsed
+        .get("url")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .or_else(|| query_param(query, "url"))
+        .unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
+    let timeout_ms: u64 = parsed
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .or_else(|| query_param(query, "timeout").and_then(|s| s.parse().ok()))
+        .unwrap_or(5000);
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+
+    let mut set = tokio::task::JoinSet::new();
+    for name in names {
+        let r_clone = std::sync::Arc::clone(router);
+        let u_clone = url.clone();
+        set.spawn(async move {
+            let res = r_clone
+                .url_test_node_with_timeout(&name, &u_clone, timeout)
+                .await;
+            (name, res)
+        });
+    }
+    let mut results = serde_json::Map::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok((name, res)) = res {
+            let entry = match res {
+                Ok(ms) => json!({ "delay": ms }),
+                Err(e) => json!({ "delay": 0, "error": e.to_string() }),
+            };
+            results.insert(name, entry);
+        }
+    }
+    reply(stream, 200, "OK", &json!({ "results": results })).await;
 }

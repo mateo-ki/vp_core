@@ -199,6 +199,9 @@ async fn serve(mut stream: tokio::net::TcpStream, st: &ApiState) -> Result<()> {
         ("GET", ["proxies"]) => {
             proxies::handle_proxies_list(&mut stream, &router).await;
         }
+        ("POST", ["proxies", "delay"]) => {
+            proxies::handle_batch_delay(&mut stream, &router, &req.query, &req.body).await;
+        }
         ("GET", ["proxies", name]) => {
             proxies::handle_proxy_get(&mut stream, &router, name).await;
         }

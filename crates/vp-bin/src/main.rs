@@ -88,10 +88,23 @@ enum Cmd {
         #[arg(short, long)]
         output: PathBuf,
     },
-    /// 全组测速
+    /// 全组或指定节点测速
     Test {
+        /// 配置文件（.yaml / .yml / .json / .vp）
         #[arg(short, long)]
         config: PathBuf,
+        /// 自定义测速 URL（默认 http://www.gstatic.com/generate_204）
+        #[arg(short, long)]
+        url: Option<String>,
+        /// 超时毫秒数（默认 5000）
+        #[arg(short, long, default_value_t = 5000)]
+        timeout: u64,
+        /// 仅测试指定节点或策略组名称
+        #[arg(short, long)]
+        node: Option<String>,
+        /// 输出 JSON 格式
+        #[arg(long)]
+        json: bool,
     },
     /// 拉取订阅并生成配置
     Sub {
@@ -883,7 +896,13 @@ async fn async_main() {
                 println!("  ... 共 {count} 个");
             }
         }
-        Cmd::Test { config } => {
+        Cmd::Test {
+            config,
+            url,
+            timeout,
+            node,
+            json,
+        } => {
             init_logging("warn");
             let text = std::fs::read_to_string(&config).unwrap_or_else(|e| {
                 eprintln!("读取 {} 失败: {e}", config.display());
@@ -895,7 +914,26 @@ async fn async_main() {
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf();
             match vp_app::App::start(&text, fmt, &dir, false).await {
-                Ok(app) => app.url_test_all_groups().await,
+                Ok(app) => {
+                    let dur = std::time::Duration::from_millis(timeout);
+                    let results = app
+                        .url_test_custom(url.as_deref(), dur, node.as_deref())
+                        .await;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&results).unwrap_or_default()
+                        );
+                    } else {
+                        println!("测速完成（共 {} 个目标）：", results.len());
+                        for (target, delay) in results {
+                            match delay {
+                                Some(ms) => println!("  {target:<28} {ms:>5} ms"),
+                                None => println!("  {target:<28} 失败"),
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("启动失败: {e}");
                     std::process::exit(1);

@@ -98,6 +98,25 @@ rules: ['MATCH,PROXY']
     assert_eq!(resp.0, 200);
     assert!(resp.1.contains("PROXY"));
 
+    // 验证 /proxies/NON_EXISTENT/delay 404
+    let resp = http_get(&ctl_addr, "/proxies/NON_EXISTENT/delay", Some("s3cret")).await;
+    assert_eq!(resp.0, 404);
+
+    // 验证 /group/PROXY/delay
+    let resp = http_get(&ctl_addr, "/group/PROXY/delay?timeout=200", Some("s3cret")).await;
+    assert_eq!(resp.0, 200);
+
+    // 验证 POST /proxies/delay 批量测速
+    let resp = http_post(
+        &ctl_addr,
+        "/proxies/delay?timeout=200",
+        Some("s3cret"),
+        r#"{"names":["PROXY"]}"#,
+    )
+    .await;
+    assert_eq!(resp.0, 200);
+    assert!(resp.1.contains("results"));
+
     // GET /configs 初始模式应为 rule
     let resp = http_get(&ctl_addr, "/configs", Some("s3cret")).await;
     assert_eq!(resp.0, 200);

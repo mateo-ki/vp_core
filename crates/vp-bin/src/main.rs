@@ -324,8 +324,9 @@ fn init_logging(level: &str) {
     use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let ansi = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_timer(LocalTimer)
         .with_target(false)

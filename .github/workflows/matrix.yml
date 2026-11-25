@@ -52,6 +52,6 @@ jobs:
         with:
           name: matrix-logs
           path: |
-            target/matrix_run/dir_b.log
+            target/matrix_run/*.log
             target/matrix_run/*.yaml
           if-no-files-found: ignore

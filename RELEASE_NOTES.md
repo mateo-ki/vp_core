@@ -1,3 +1,29 @@
+# 🚀 VP_Core v1.7.10 发布说明 / Release Notes：AnyTLS 背压防重传 + 明文 HTTP 代理合规转发 + RESTful 批量探针
+
+> **"根治经 AnyTLS 出站 / 混合入站发起上游 HTTPS 请求时偶发 `502 proxy-reset / UND_ERR_SOCKET` 的两大协议栈边界缺陷，并补齐 Clash RESTful 批量延迟探针与 CLI `--json` 干净管道输出。"**
+
+### 🐛 协议栈与入站核心修复
+
+- **AnyTLS 回压帧重入防重复（`vp-protocol/src/anytls.rs`）**：
+  - 修复 `AnytlsStream::poll_write` 在 `enqueue_psh(buf)` 后调用 `ready!(drive_out)` 时若底层 TLS socket 返回 `Poll::Pending` 回压，导致上层 `AsyncWrite` 用同一缓冲区重调 `poll_write` 并二次封帧写入的严重缺陷（此前会破坏内层 HTTP/TLS 流并触发对端 reset / `502`）；现改为按 `min(len, 64 KiB)` 入队并立即按消费字节数返回 `Poll::Ready(take)`，同步在 `poll_read` 中驱动 `outq` 冲刷；
+  - 新增回环压测回归测试 `anytls_backpressure_pending_does_not_duplicate_payload`（限速交替 `Poll::Pending` socket 传输 192 KiB 校验字节零膨胀、零错位）。
+- **Mixed / HTTP 入站合规转发与容灾（`vp-protocol/src/inbound/http_in.rs`）**：
+  - **CONNECT TLS 预读粘包保留**：当客户端随 `CONNECT` 请求提前送出 TLS `ClientHello`（`body_prefix`）时改为 `PeekedStream` 包装后送入 `dispatch_stream`，杜绝粘包首字节被丢弃；
+  - **明文 HTTP 代理逐跳头剥离**：`rewrite_http_proxy_request` 在将 `absolute-form` 改写为 `origin-form` 时保留原路径查询并剥离 `Proxy-Connection`、`Proxy-Authorization`、`Connection` 逐跳头，显式写入 `Connection: close`，防止单次转发模型下连接池复用误 reset（新增单元测试 `rewrites_proxy_headers_to_origin_close` 与 e2e 回归测试 `mixed_http_plain_proxy_strips_hop_headers_and_closes_cleanly`）；
+  - **DIRECT 超时自适应重试与明确错误应答**：DIRECT 出站受 `DIRECT_CONNECT_TIMEOUT_MS` 超时保护并接入自适应代理重试，REJECT 返回明确 `HTTP/1.1 403 Forbidden`，出站/写失败显式返回 `HTTP/1.1 502 Bad Gateway` 而非静默断开，并通过 `tunnel::relay` + `RelayHook` 完成连接统计。
+
+### ⚡ 高并发 RESTful 探针与 CLI 可观测性
+
+- **Clash 兼容批量探针**：支持 `POST /proxies/delay`（接受节点数组或 `names` 对象、自定义目标 `url` 与超时），`GET /proxies/{name}/delay` 支持自定义 `url` / `timeout` 参数并将超时的状态码/文案对齐标准 `Timeout`（408）响应；
+- **`vpcore test --json` 管道纯净输出**：默认日志输出定向至 `stderr`，避免污染 `--json` 标准输出与下游管道解析。
+
+### 🧪 矩阵与工程测试
+
+- 跨内核验证矩阵（`scripts/matrix/`）：`echo_204.py` 升级为 `ThreadingHTTPServer` 多线程并发监听，补齐方向 B `mihomo_server_ctrl` 端口就绪轮询与全量工作流日志保留；
+- 全套工作区门禁（`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` 与 `example/config.vp` validate / fmt 双门）全部通过。
+
+---
+
 # 🚀 VP_Core v1.7.9 发布说明 / Release Notes：安全加固 + 可观测性 + DSL 往返无损穷举
 
 > **"一次深度代码审计驱动的版本：MASQUE 证书校验缺口修复、坏节点黑洞可观测、12 处 YAML→DSL 静默丢数据根治——全部经 197 真实节点测速 + vpcore↔mihomo 26 项跨内核矩阵实测验证。"**

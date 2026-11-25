@@ -161,7 +161,7 @@ rules:
 | `vpcore convert -i a.yaml -o b.vp` | Clash YAML / JSON / `.vp` DSL **双向无损互转** |
 | `vpcore fmt -w config.vp` | DSL 自动格式化（`--check` 用于 CI 门禁） |
 | `vpcore sub "<URL>" -o sub.vp` | 拉取订阅直出 `.vp` / `.yaml` |
-| `vpcore test -c config.vp` | 全节点延迟并发测速 |
+| `vpcore test -c config.vp` | 全节点延迟并发测速（支持 `--json` 机器消费与 RESTful `POST /proxies/delay`） |
 | `vpcore explain <URL> -c config.vp` | 路由决策链路诊断（微秒级耗时、命中规则、DNS 解析树；`--json` 供面板消费） |
 | `vpcore gen-server` / `gen-sub` | 服务端一键开服 / 导出订阅 |
 | `vpcore update` | 内核跨平台自我更新（健康校验） |

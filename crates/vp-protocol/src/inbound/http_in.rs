@@ -160,10 +160,15 @@ where
         if let Some(u) = user {
             sess = sess.with_inbound_user(u);
         }
+        let client: Box<dyn vp_core::ProxyStream> = if body_prefix.is_empty() {
+            Box::new(stream)
+        } else {
+            Box::new(vp_core::PeekedStream::new(stream, body_prefix))
+        };
         dispatch_stream(
             ctx,
             sess,
-            Box::new(stream),
+            client,
             ClientReply::Http("200 Connection established"),
         )
         .await;
@@ -215,15 +220,9 @@ where
         Ok(ip) => DstAddr::ip(ip, target_port),
         Err(_) => DstAddr::new(target_host, target_port),
     };
-    // 改写请求行（absolute-form → origin-form），保留首个 \r\n 与后续头（零拷贝拼接）
-    let mut new_req = Vec::with_capacity(method.len() + rewritten.len() + buf.len() + 16);
-    new_req.extend_from_slice(method.as_bytes());
-    new_req.push(b' ');
-    new_req.extend_from_slice(rewritten.as_bytes());
-    new_req.extend_from_slice(b" HTTP/1.1");
-    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-        new_req.extend_from_slice(&buf[pos..]);
-    }
+    // 改写请求行（absolute-form → origin-form），剥离代理逐跳头并强制 Connection: close
+    //（单次请求模型下避免上游保持 keep-alive 导致连接池复用时被误 reset）。
+    let mut new_req = rewrite_http_proxy_request(method, rewritten, &buf);
     if !body_prefix.is_empty() {
         new_req.extend_from_slice(&body_prefix);
     }
@@ -234,49 +233,168 @@ where
         sess = sess.with_inbound_user(u);
     }
     let outbound = ctx.router.pick(&sess).await;
-    match outbound.outbound.connect_stream(&sess, &sess.dst).await {
-        Ok(mut remote) => {
-            remote.write_all(&new_req).await?;
-            let client: Box<dyn vp_core::ProxyStream> = Box::new(stream);
-            let hook = vp_core::tunnel::RelayHook {
-                table: Some(ctx.conns.clone()),
-                meta: Some(vp_core::conn_table::ConnMeta {
-                    id: sess.id,
-                    inbound: sess.inbound.clone(),
-                    network: "tcp",
-                    host: sess.dst.host.to_string(),
-                    dst_port: sess.dst.port,
-                    src: sess.src.map(|s| s.to_string()),
-                    process: sess.process.clone(),
-                    user: None,
-                    rule: outbound
-                        .rule
-                        .as_ref()
-                        .map(|r| format!("{} => {}", r.rule, r.target)),
-                    chain: Some(outbound.via.clone()),
-                    start: vp_common::now_millis(),
-                }),
-                stats: Some(ctx.stats.clone()),
-                ..Default::default()
-            };
-            let _ = vp_core::tunnel::relay(client, remote, hook).await;
-            Ok(())
+    let connect_res = if outbound.outbound.name() == crate::consts::OUTBOUND_DIRECT {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(crate::consts::DIRECT_CONNECT_TIMEOUT_MS),
+            outbound.outbound.connect_stream(&sess, &sess.dst),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(vp_common::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "DIRECT 直连超时 ({}ms)",
+                    crate::consts::DIRECT_CONNECT_TIMEOUT_MS
+                ),
+            ))),
+        }
+    } else {
+        outbound.outbound.connect_stream(&sess, &sess.dst).await
+    };
+    let (mut remote, effective_via) = match connect_res {
+        Ok(rem) => (rem, outbound.via.clone()),
+        Err(e) if outbound.outbound.name() == crate::consts::OUTBOUND_DIRECT => {
+            if let Some(host_str) = sess.dst.host.as_domain() {
+                vp_core::adaptive::record_block(host_str);
+            }
+            if let Some(fallback) = ctx.router.fallback_proxy_outbound() {
+                match fallback.connect_stream(&sess, &sess.dst).await {
+                    Ok(rem) => (rem, Arc::from(format!("Adaptive > {}", fallback.name()))),
+                    Err(proxy_err) => {
+                        warn!(
+                            "[HTTP] {} 自适应重试代理 {} 亦失败: {}",
+                            sess.dst,
+                            fallback.name(),
+                            proxy_err
+                        );
+                        send_http_reply(
+                            &mut stream,
+                            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
+            } else {
+                warn!("http 入站 DIRECT 出站失败且无可用代理: {e}");
+                send_http_reply(
+                    &mut stream,
+                    b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
+                return Ok(());
+            }
         }
         Err(e) => {
             if outbound.outbound.name() == "REJECT" || e.to_string().contains("REJECT") {
                 tracing::info!("[HTTP] {} 出站 REJECT 阻断", sess.dst);
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                    )
-                    .await;
+                send_http_reply(
+                    &mut stream,
+                    b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await;
                 return Ok(());
             }
             warn!("http 入站出站失败: {e}");
-            stream
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await?;
-            Ok(())
+            send_http_reply(
+                &mut stream,
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+            return Ok(());
         }
+    };
+    if let Err(e) = remote.write_all(&new_req).await {
+        warn!("http 入站写入上游请求失败: {e}");
+        send_http_reply(
+            &mut stream,
+            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        return Ok(());
+    }
+    let client: Box<dyn vp_core::ProxyStream> = Box::new(stream);
+    let hook = vp_core::tunnel::RelayHook {
+        table: Some(ctx.conns.clone()),
+        meta: Some(vp_core::conn_table::ConnMeta {
+            id: sess.id,
+            inbound: sess.inbound.clone(),
+            network: "tcp",
+            host: sess.dst.host.to_string(),
+            dst_port: sess.dst.port,
+            src: sess.src.map(|s| s.to_string()),
+            process: sess.process.clone(),
+            user: None,
+            rule: outbound
+                .rule
+                .as_ref()
+                .map(|r| format!("{} => {}", r.rule, r.target)),
+            chain: Some(effective_via),
+            start: vp_common::now_millis(),
+        }),
+        stats: Some(ctx.stats.clone()),
+        ..Default::default()
+    };
+    let _ = vp_core::tunnel::relay(client, remote, hook).await;
+    Ok(())
+}
+
+async fn send_http_reply<S: AsyncWrite + Unpin>(stream: &mut S, reply: &[u8]) {
+    let _ = stream.write_all(reply).await;
+    let _ = stream.shutdown().await;
+}
+
+/// 改写发往上游的 HTTP/1.1 请求头：
+/// - 替换请求目标为 origin-form；
+/// - 剥离 `Proxy-Connection` / `Proxy-Authorization` 等代理逐跳头；
+/// - 强制 `Connection: close`，防止上游保持 keep-alive 导致无循环转发在复用时重置。
+fn rewrite_http_proxy_request(method: &str, rewritten_target: &str, raw_head: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(raw_head);
+    let mut lines = text.split("\r\n");
+    let _req_line = lines.next();
+
+    let mut out = Vec::with_capacity(raw_head.len() + 32);
+    out.extend_from_slice(method.as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(rewritten_target.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\n");
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, _)) = line.split_once(':') {
+            let key = name.trim();
+            if key.eq_ignore_ascii_case("proxy-connection")
+                || key.eq_ignore_ascii_case("proxy-authorization")
+                || key.eq_ignore_ascii_case("connection")
+            {
+                continue;
+            }
+        }
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrites_proxy_headers_to_origin_close() {
+        let raw = b"POST http://api.example.com/v1/messages HTTP/1.1\r\nHost: api.example.com\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic abc\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\n";
+        let got = rewrite_http_proxy_request("POST", "/v1/messages", raw);
+        let text = String::from_utf8(got).unwrap();
+        assert!(text.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+        assert!(text.contains("Host: api.example.com\r\n"));
+        assert!(text.contains("Content-Length: 2\r\n"));
+        assert!(!text.to_ascii_lowercase().contains("proxy-connection:"));
+        assert!(!text.to_ascii_lowercase().contains("proxy-authorization:"));
+        assert_eq!(text.matches("Connection: close\r\n").count(), 1);
+        assert!(text.ends_with("\r\n\r\n"));
     }
 }

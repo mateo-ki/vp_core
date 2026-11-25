@@ -570,6 +570,9 @@ impl<S: ProxyStream + Unpin> AsyncRead for AnytlsStream<S> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
+            if !this.outq.is_empty() && !this.fin_sent {
+                let _ = this.drive_out(cx);
+            }
             if this.rpos < this.rbuf.len() {
                 let n = buf.remaining().min(this.rbuf.len() - this.rpos);
                 buf.put_slice(&this.rbuf[this.rpos..this.rpos + n]);
@@ -587,6 +590,9 @@ impl<S: ProxyStream + Unpin> AsyncRead for AnytlsStream<S> {
                 return Poll::Ready(Ok(()));
             }
             ready!(this.pump_read(cx))?;
+            if !this.outq.is_empty() && !this.fin_sent {
+                let _ = this.drive_out(cx);
+            }
         }
     }
 }
@@ -606,16 +612,19 @@ impl<S: ProxyStream + Unpin> AsyncWrite for AnytlsStream<S> {
         }
         if !this.outq.is_empty() {
             ready!(this.drive_out(cx))?;
-            if !this.outq.is_empty() {
-                return Poll::Pending;
-            }
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        this.enqueue_psh(buf);
-        ready!(this.drive_out(cx))?;
-        Poll::Ready(Ok(buf.len()))
+        // 分块入队并立刻按消费字节数回报 Ready：若此处在 enqueue_psh 之后再 ready!(drive_out)，
+        // 一旦底层 socket 回压返回 Poll::Pending，tokio 会拿同一份 buf 重调 poll_write，
+        // 导致整块载荷被重复写入并破坏内层 TLS/HTTP 流（引发对端 ECONNRESET / 502）。
+        let take = buf.len().min(64 * 1024);
+        this.enqueue_psh(&buf[..take]);
+        if let Poll::Ready(Err(e)) = this.drive_out(cx) {
+            return Poll::Ready(Err(e));
+        }
+        Poll::Ready(Ok(take))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1235,5 +1244,94 @@ mod tests {
             std::str::from_utf8(&body).unwrap(),
             "client did not send its settings"
         );
+    }
+
+    #[tokio::test]
+    async fn anytls_backpressure_pending_does_not_duplicate_payload() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// 模拟底层 socket 写缓冲回压：每次只收 512 字节且交替返回 Pending。
+        struct ThrottledStream {
+            inner: tokio::io::DuplexStream,
+            yield_next: bool,
+        }
+
+        impl AsyncRead for ThrottledStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for ThrottledStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.yield_next = !self.yield_next;
+                if self.yield_next {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                let take = buf.len().min(512);
+                Pin::new(&mut self.inner).poll_write(cx, &buf[..take])
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        impl vp_core::ProxyStream for ThrottledStream {}
+
+        let (client_end, mut server_end) = tokio::io::duplex(256 * 1024);
+        let factory = PaddingFactory::new(DEFAULT_PADDING_SCHEME).unwrap();
+        let mut client = AnytlsStream::new(
+            ThrottledStream {
+                inner: client_end,
+                yield_next: false,
+            },
+            1,
+            Padder::new(factory),
+        );
+
+        let payload: Vec<u8> = (0..(192 * 1024)).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+
+        let reader = tokio::spawn(async move {
+            let mut sr = SessionReader::new(&mut server_end);
+            let mut got = Vec::new();
+            loop {
+                let (cmd, _sid, data) = sr.next_frame().await.unwrap();
+                match cmd {
+                    CMD_PSH => got.extend_from_slice(&data),
+                    CMD_FIN => break,
+                    _ => {}
+                }
+            }
+            while sr.next_frame().await.is_ok() {}
+            got
+        });
+
+        client.write_all(&payload).await.unwrap();
+        client.shutdown().await.unwrap();
+        let got = timeout(Duration::from_secs(10), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), expected.len(), "回压下载荷长度不得膨胀或截断");
+        assert_eq!(got, expected, "回压下载荷不得重复或错字节");
     }
 }

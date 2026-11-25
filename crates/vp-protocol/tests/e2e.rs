@@ -233,3 +233,49 @@ async fn test_adaptive_retry_direct_blocked_falls_back_to_proxy() {
         Some("Adaptive(LRU)")
     );
 }
+
+#[tokio::test]
+async fn mixed_http_plain_proxy_strips_hop_headers_and_closes_cleanly() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let srv_port = listener.local_addr().unwrap().port();
+    let server_task = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            sock.read_exact(&mut b).await.unwrap();
+            req.push(b[0]);
+            if req.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let req_text = String::from_utf8(req).unwrap();
+        assert!(req_text.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+        assert!(!req_text.to_ascii_lowercase().contains("proxy-connection:"));
+        assert!(
+            !req_text
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
+        );
+        assert!(req_text.contains("Connection: close\r\n"));
+        sock.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        let _ = sock.shutdown().await;
+    });
+
+    let (port, _router, _echo_port) = build_core().await;
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let req = format!(
+        "POST http://127.0.0.1:{srv_port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{srv_port}\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic dGVzdDp0ZXN0\r\nContent-Length: 0\r\n\r\n"
+    );
+    c.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    c.read_to_end(&mut resp).await.unwrap();
+    let resp_text = String::from_utf8(resp).unwrap();
+    assert!(resp_text.starts_with("HTTP/1.1 200 OK"));
+    assert!(resp_text.ends_with("\r\n\r\nok"));
+    server_task.await.unwrap();
+}

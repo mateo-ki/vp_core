@@ -271,11 +271,16 @@ async fn mixed_http_plain_proxy_strips_hop_headers_and_closes_cleanly() {
     let req = format!(
         "POST http://127.0.0.1:{srv_port}/v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{srv_port}\r\nProxy-Connection: keep-alive\r\nProxy-Authorization: Basic dGVzdDp0ZXN0\r\nContent-Length: 0\r\n\r\n"
     );
-    c.write_all(req.as_bytes()).await.unwrap();
-    let mut resp = Vec::new();
-    c.read_to_end(&mut resp).await.unwrap();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        c.read_to_end(&mut resp).await.unwrap();
+        server_task.await.unwrap();
+        resp
+    })
+    .await
+    .expect("明文 HTTP 代理端到端测试超时");
     let resp_text = String::from_utf8(resp).unwrap();
     assert!(resp_text.starts_with("HTTP/1.1 200 OK"));
     assert!(resp_text.ends_with("\r\n\r\nok"));
-    server_task.await.unwrap();
 }

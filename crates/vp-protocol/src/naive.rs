@@ -250,7 +250,9 @@ impl AsyncWrite for NaiveStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.closed {
             ready!(self.flush_pending(cx))?;
-            let _ = self.send.send_trailers(http::HeaderMap::new());
+            // 对 HTTP/2 CONNECT 隧道发送 END_STREAM 空 DATA 帧干净半关闭，
+            // 避免 drop(SendStream) 或空 trailers 导致对端收到 RST_STREAM(CANCEL)。
+            let _ = self.send.send_data(Bytes::new(), true);
             self.closed = true;
         }
         Poll::Ready(Ok(()))
@@ -501,12 +503,15 @@ impl NaiveInbound {
                 let sess = Session::new_tcp(tag, Some(src), dst.clone());
                 match direct.connect_stream(&sess, &dst).await {
                     Ok(remote) => {
-                        let (mut cr, mut cw) = tokio::io::split(client_stream);
-                        let (mut rr, mut rw) = tokio::io::split(remote);
-                        let _ = tokio::select! {
-                            r1 = tokio::io::copy(&mut cr, &mut rw) => r1,
-                            r2 = tokio::io::copy(&mut rr, &mut cw) => r2,
-                        };
+                        // 使用双向转发并严格传播半关闭（EOF -> shutdown）：
+                        // 此前用 select! 在远端短连接率先 EOF 时直接丢弃未关闭的 NaiveStream，
+                        // 会触发 h2 SendStream::drop 发出 RST_STREAM(CANCEL) 截断响应。
+                        let _ = vp_core::tunnel::relay(
+                            Box::new(client_stream),
+                            remote,
+                            vp_core::tunnel::RelayHook::default(),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::warn!("naive 目标连接失败: {e}");
@@ -676,7 +681,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        wtask.await.unwrap();
+        timeout(Duration::from_secs(10), wtask)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rb, big, "大回显逐字节不一致");
     }
 
@@ -744,6 +752,67 @@ mod tests {
             resp.status(),
             http::StatusCode::BAD_REQUEST,
             "缺少 padding 必须返回 400"
+        );
+    }
+
+    #[tokio::test]
+    async fn naive_short_http_response_closes_cleanly_without_cancel() {
+        let srv = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_port = srv.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = srv.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut b = [0u8; 1];
+            while s.read_exact(&mut b).await.is_ok() {
+                req.push(b[0]);
+                if req.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            // 立即关闭 TCP（模拟 echo_204.py / Connection: close 短连接服务端）
+        });
+
+        let server = Arc::new(
+            NaiveInbound::new("127.0.0.1", 0, "naive-srv", &["user1:pass1".to_string()]).unwrap(),
+        );
+        let naive_port = server.clone().start(test_ctx()).await.unwrap();
+
+        let cfg = NaiveCfg {
+            server: "127.0.0.1".into(),
+            port: naive_port,
+            username: "user1".into(),
+            password: "pass1".into(),
+            server_name: None,
+            skip_cert_verify: false,
+            client_fingerprint: None,
+            alpn: None,
+            tls: false,
+            udp: false,
+        };
+        let out = NaiveOutbound::new(&cfg).unwrap();
+        let dst = DstAddr::new("127.0.0.1", srv_port);
+        let sess = Session::new_tcp("t".into(), None, dst.clone());
+        let mut s = timeout(Duration::from_secs(5), out.connect_stream(&sess, &dst))
+            .await
+            .unwrap()
+            .unwrap();
+
+        s.write_all(b"GET /generate_204 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        let mut resp = Vec::new();
+        timeout(Duration::from_secs(5), s.read_to_end(&mut resp))
+            .await
+            .expect("Naive 短连接应答不得超时或被 CANCEL")
+            .expect("Naive 响应读取不得失败");
+        assert!(
+            String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 204"),
+            "unexpected resp: {:?}",
+            String::from_utf8_lossy(&resp)
         );
     }
 }

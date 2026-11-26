@@ -616,6 +616,7 @@ async fn probe_target(
             stream
         };
         stream.write_all(&target.req_bytes).await?;
+        stream.flush().await?;
         // 读到响应头结束为止（此前只读 1 字节：被劫持的拦截页/403 响应也算"活着"）
         let mut head = Vec::with_capacity(512);
         let mut chunk = [0u8; 512];

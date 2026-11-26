@@ -570,9 +570,6 @@ impl<S: ProxyStream + Unpin> AsyncRead for AnytlsStream<S> {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         loop {
-            if !this.outq.is_empty() && !this.fin_sent {
-                let _ = this.drive_out(cx);
-            }
             if this.rpos < this.rbuf.len() {
                 let n = buf.remaining().min(this.rbuf.len() - this.rpos);
                 buf.put_slice(&this.rbuf[this.rpos..this.rpos + n]);
@@ -590,9 +587,6 @@ impl<S: ProxyStream + Unpin> AsyncRead for AnytlsStream<S> {
                 return Poll::Ready(Ok(()));
             }
             ready!(this.pump_read(cx))?;
-            if !this.outq.is_empty() && !this.fin_sent {
-                let _ = this.drive_out(cx);
-            }
         }
     }
 }
@@ -1155,7 +1149,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        wtask.await.unwrap();
+        timeout(Duration::from_secs(10), wtask)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rb, big, "大回显逐字节不一致");
     }
 
@@ -1325,12 +1322,13 @@ mod tests {
             got
         });
 
-        client.write_all(&payload).await.unwrap();
-        client.shutdown().await.unwrap();
-        let got = timeout(Duration::from_secs(10), reader)
-            .await
-            .unwrap()
-            .unwrap();
+        let got = timeout(Duration::from_secs(15), async {
+            client.write_all(&payload).await.unwrap();
+            client.shutdown().await.unwrap();
+            reader.await.unwrap()
+        })
+        .await
+        .expect("AnyTLS 回压测试超时");
         assert_eq!(got.len(), expected.len(), "回压下载荷长度不得膨胀或截断");
         assert_eq!(got, expected, "回压下载荷不得重复或错字节");
     }
